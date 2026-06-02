@@ -354,6 +354,17 @@ llama_kv_cache::~llama_kv_cache() {
                 kv_swap_bytes / (1024.0 * 1024.0),
                 (unsigned long long) kv_swap_out_us,
                 kv_swap_out_us / 1000.0);
+        LLAMA_LOG_INFO("%s: kv swap stats: swap_in_count=%llu restored_bytes=%llu (%.2f MiB) "
+                "swap_in_us=%llu (%.2f ms) ensure_resident_calls=%llu ensure_resident_cells_checked=%llu "
+                "ensure_resident_cells_restored=%llu\n", __func__,
+                (unsigned long long) kv_swap_in_count,
+                (unsigned long long) kv_swap_in_bytes,
+                kv_swap_in_bytes / (1024.0 * 1024.0),
+                (unsigned long long) kv_swap_in_us,
+                kv_swap_in_us / 1000.0,
+                (unsigned long long) kv_swap_ensure_calls,
+                (unsigned long long) kv_swap_ensure_checked,
+                (unsigned long long) kv_swap_ensure_restored);
     }
 }
 
@@ -1245,6 +1256,93 @@ uint64_t llama_kv_cache::swap_out_cell(uint32_t i) {
     return 1;
 }
 
+void llama_kv_cache::ensure_resident(uint32_t n_kv) {
+    if (!kv_swap_enabled) {
+        return;
+    }
+
+    // demo boundary: same guards as swap-out (single unified stream, V non-transposed).
+    if (v_trans || n_stream != 1) {
+        if (!kv_swap_warned_in) {
+            LLAMA_LOG_WARN("%s: --kv-swap swap-in requires V non-transposed (flash_attn=true / -fa) "
+                    "and a single unified stream (v_trans=%d n_stream=%u) - skipping swap-in\n",
+                    __func__, (int) v_trans, n_stream);
+            kv_swap_warned_in = true;
+        }
+        return;
+    }
+
+    auto & cells = v_cells[0];
+
+    // the read path (get_k/get_v) physically touches cells [0, n_kv); mask only zeroes
+    // attention scores, it does not skip physical reads. So every swapped cell in that
+    // range must be restored before the graph runs.
+    const uint32_t n = std::min(n_kv, cells.size());
+    if (n == 0) {
+        return;
+    }
+
+    const int64_t t_start = ggml_time_us();
+
+    kv_swap_ensure_calls += 1;
+    kv_swap_ensure_checked += n;
+
+    for (uint32_t i = 0; i < n; ++i) {
+        if (!cells.is_swapped(i)) {
+            continue;
+        }
+        kv_swap_ensure_restored += swap_in_cell(i);
+    }
+
+    kv_swap_in_us += (uint64_t) (ggml_time_us() - t_start);
+}
+
+uint64_t llama_kv_cache::swap_in_cell(uint32_t i) {
+    auto & cells = v_cells[0];
+
+    // walk the backing store from the offset recorded at swap-out time, in the exact same
+    // layer/K-then-V order that swap_out_cell() appended the bytes (the format is implicit).
+    uint64_t offset = cells.get_swap_offset(i);
+
+    uint64_t cell_bytes = 0;
+
+    for (const auto & layer : layers) {
+        const uint32_t il = layer.il;
+
+        ggml_tensor * k = layer.k_stream[0];
+        ggml_tensor * v = layer.v_stream[0];
+
+        if (k) {
+            const uint64_t k_size_row = ggml_row_size(k->type, hparams.n_embd_k_gqa(il));
+            // restore in place: cell i occupies a contiguous row at i * k_size_row
+            ggml_backend_tensor_set(k, kv_swap_storage.data() + offset, i * k_size_row, k_size_row);
+            offset     += k_size_row;
+            cell_bytes += k_size_row;
+        }
+
+        if (v) {
+            // !v_trans path: cell i occupies a contiguous row at offset i * v_size_row
+            const uint64_t v_size_row = ggml_row_size(v->type, hparams.n_embd_v_gqa(il));
+            ggml_backend_tensor_set(v, kv_swap_storage.data() + offset, i * v_size_row, v_size_row);
+            offset     += v_size_row;
+            cell_bytes += v_size_row;
+        }
+    }
+
+    // restored in place; pos/seq/shift untouched. clear the swapped tag only.
+    cells.set_swapped(i, false);
+
+    kv_swap_in_count += 1;
+    kv_swap_in_bytes += cell_bytes;
+
+    if (debug > 0) {
+        LLAMA_LOG_INFO("%s: swapped in cell %u (pos %d), %llu bytes from offset %llu\n",
+                __func__, i, cells.pos_get(i), (unsigned long long) cell_bytes,
+                (unsigned long long) cells.get_swap_offset(i));
+    }
+
+    return 1;
+}
 
 bool llama_kv_cache::get_can_shift() const {
     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
@@ -2574,6 +2672,11 @@ bool llama_kv_cache_context::apply() {
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv = kv->get_n_kv(sinfos[i_cur]);
+
+    // stage D: restore any swapped cell in [0, n_kv) before the graph reads K/V. This is
+    // graph-external and runs after n_kv is known but before process_ubatch builds get_k/get_v.
+    // No-op unless --kv-swap is enabled.
+    kv->ensure_resident(n_kv);
 
     return true;
 }

@@ -187,6 +187,10 @@ public:
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
 
+    // stage D: before the read path, restore any swapped cell in [0, n_kv) back into its
+    // original physical slot. No-op unless kv_swap_enabled. assumes !v_trans / n_stream==1.
+    void ensure_resident(uint32_t n_kv);
+
     //
     // input API
     //
@@ -250,16 +254,18 @@ private:
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
 
-    // runtime KV swap demo (stage C: fixed-window synchronous swap-out prototype).
+    // runtime KV swap demo (stage C: fixed-window synchronous swap-out;
+    // stage D: read-before synchronous swap-in / ensure_resident).
     // Configured via env vars LLAMA_ARG_KV_SWAP / LLAMA_ARG_KV_SWAP_WINDOW (see arg.cpp),
-    // so the public llama.h ABI is left untouched. This only copies K/V bytes to an
-    // in-process backing store and tags cells; it never frees or mutates the original
-    // KV buffer, and there is no swap-in yet. See docs/kv_runtime_swap_stage_c.md.
+    // so the public llama.h ABI is left untouched. Stage C/D copy K/V bytes to an
+    // in-process backing store, tag cells, and restore them in place before the read
+    // path; they never free the original KV buffer and do not poison it (no destructive
+    // swap-out). See docs/kv_runtime_swap_stage_c.md and docs/kv_runtime_swap_stage_d.md.
     bool     kv_swap_enabled = false;
     uint32_t kv_swap_window  = 256;
 
     // minimal in-process backing store: swapped-out bytes are appended here and the
-    // start offset is recorded in cells.swap_offset(i). Offsets are not reused in stage C.
+    // start offset is recorded in cells.swap_offset(i). Offsets are not reused in stage C/D.
     std::vector<uint8_t> kv_swap_storage;
 
     // minimal swap-out statistics
@@ -269,6 +275,15 @@ private:
     uint64_t kv_swap_out_us      = 0; // cumulative time spent in swap-out
     bool     kv_swap_warned_vtrans = false; // emit the v_trans fail-fast warning only once
 
+    // minimal swap-in statistics (stage D)
+    uint64_t kv_swap_in_count       = 0; // total cells restored from the backing store
+    uint64_t kv_swap_in_bytes       = 0; // total bytes written back to the KV tensors
+    uint64_t kv_swap_in_us          = 0; // cumulative time spent in swap-in
+    uint64_t kv_swap_ensure_calls   = 0; // number of ensure_resident() invocations (kv_swap_enabled)
+    uint64_t kv_swap_ensure_checked = 0; // total cells inspected across ensure_resident()
+    uint64_t kv_swap_ensure_restored= 0; // total swapped cells found and restored by ensure_resident()
+    bool     kv_swap_warned_in      = false; // emit the swap-in guard warning only once
+
     // fixed-window synchronous swap-out: evict cells in stream 0 older than the most
     // recent kv_swap_window cells. No-op unless kv_swap_enabled.
     void swap_out_window();
@@ -276,6 +291,10 @@ private:
     // copy one cell's K/V bytes (all layers, stream 0) into the backing store and tag it.
     // returns the number of cells moved (0 or 1). assumes !v_trans and n_stream == 1.
     uint64_t swap_out_cell(uint32_t i);
+
+    // restore one cell's K/V bytes (all layers, stream 0) from the backing store into the
+    // original tensor position and clear its swapped tag. returns cells restored (0 or 1).
+    uint64_t swap_in_cell(uint32_t i);
 
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
