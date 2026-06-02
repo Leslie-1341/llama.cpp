@@ -9,6 +9,7 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-vm.h"
 #include "llama-ext.h"
 #include "llama.h"
 
@@ -2321,6 +2322,10 @@ ggml_status llama_context::graph_compute(
     // set the number of threads for all the backends
     for (const auto & set_n_threads_fn : set_n_threads_fns) {
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
+    }
+
+    if (auto * vm = model.get_vm_context()) {
+        llama_vm_on_graph_compute_begin(*vm, gf);
     }
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);

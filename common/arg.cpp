@@ -3312,6 +3312,102 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_BENCH}));
     add_opt(common_arg(
+        {"--vm-debug-log"},
+        "Dump VM mmap region/block classification and graph prefetch plan",
+        [](common_params & params) {
+            params.vm_debug_log = true;
+            params.verbosity = LOG_LEVEL_DEBUG;
+            common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
+        }
+    ));
+    add_opt(common_arg(
+        {"--vm-block-size-mb"}, "N",
+        string_format("VM weight block size for mmap prefetching, in MiB (default: %d)", params.vm_block_size_mb),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.vm_block_size_mb = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--vm-pin-small-mb"}, "N",
+        string_format("VM small tensor mlock threshold, in MiB (default: %d)", params.vm_pin_small_mb),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.vm_pin_small_mb = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--vm-pin-budget-mb"}, "N",
+        string_format("VM total mlock budget for small tensors, in MiB (default: %d)", params.vm_pin_budget_mb),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.vm_pin_budget_mb = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--vm-prefetch-budget-mb"}, "N",
+        string_format("VM graph prefetch budget, in MiB (default: %d)", params.vm_prefetch_budget_mb),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.vm_prefetch_budget_mb = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--vm-window-steps"}, "N",
+        string_format("VM graph prefetch window in execution-plan steps (default: %d)", params.vm_window_steps),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.vm_window_steps = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--vm-dontneed"},
+        "VM reclaim prefetched mmap pages that are not used by the current graph plan (default: disabled)",
+        [](common_params & params) {
+            params.vm_dontneed = true;
+        }
+    ));
+    add_opt(common_arg(
+        {"--vm-reclaim-budget-mb"}, "N",
+        string_format("VM DONTNEED reclaim budget per graph, in MiB (default: %d)", params.vm_reclaim_budget_mb),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.vm_reclaim_budget_mb = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--vm-keep-behind-steps"}, "N",
+        string_format("VM keep-behind steps for conservative reclaim (default: %d)", params.vm_keep_behind_steps),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.vm_keep_behind_steps = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--vm-plan-cache"}, "N",
+        string_format("VM max graph exec-plan cache entries (default: %d)", params.vm_plan_cache_entries),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.vm_plan_cache_entries = value;
+        }
+    ));
+    add_opt(common_arg(
         {"--log-disable"},
         "Log disable",
         [](common_params &) {

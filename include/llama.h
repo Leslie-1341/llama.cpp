@@ -315,9 +315,20 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        int32_t vm_block_size_mb;      // VM weight block size for mmap prefetching
+        int32_t vm_pin_small_mb;       // VM small tensor mlock threshold
+        int32_t vm_pin_budget_mb;      // VM total mlock budget
+        int32_t vm_prefetch_budget_mb; // VM graph prefetch budget
+        int32_t vm_window_steps;       // VM graph prefetch window in execution steps
+        int32_t vm_reclaim_budget_mb;  // VM DONTNEED reclaim budget
+        int32_t vm_keep_behind_steps;  // VM keep-behind window for reclaim
+        int32_t vm_plan_cache_entries; // VM max graph plan cache entries
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool use_mmap;        // use mmap if possible
+        bool vm_debug_log;    // dump VM mmap region residency classification
+        bool vm_dontneed;     // reclaim unused mmap pages with MADV_DONTNEED
         bool use_direct_io;   // use direct io, takes precedence over use_mmap when supported
         bool use_mlock;       // force system to keep model in RAM
         bool check_tensors;   // validate model tensor data

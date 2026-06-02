@@ -1509,6 +1509,16 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.split_mode      = params.split_mode;
     mparams.tensor_split    = params.tensor_split;
     mparams.use_mmap        = params.use_mmap;
+    mparams.vm_debug_log    = params.vm_debug_log;
+    mparams.vm_block_size_mb      = params.vm_block_size_mb;
+    mparams.vm_pin_small_mb       = params.vm_pin_small_mb;
+    mparams.vm_pin_budget_mb      = params.vm_pin_budget_mb;
+    mparams.vm_prefetch_budget_mb = params.vm_prefetch_budget_mb;
+    mparams.vm_window_steps       = params.vm_window_steps;
+    mparams.vm_reclaim_budget_mb  = params.vm_reclaim_budget_mb;
+    mparams.vm_keep_behind_steps  = params.vm_keep_behind_steps;
+    mparams.vm_plan_cache_entries = params.vm_plan_cache_entries;
+    mparams.vm_dontneed           = params.vm_dontneed;
     mparams.use_direct_io   = params.use_direct_io;
     mparams.use_mlock       = params.use_mlock;
     mparams.check_tensors   = params.check_tensors;

@@ -13,6 +13,7 @@
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
+#include "llama-vm.h"
 
 #include "models/models.h"
 
@@ -32,6 +33,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
@@ -939,6 +941,8 @@ struct llama_model::impl {
     llama_mlocks mlock_bufs;
     llama_mlocks mlock_mmaps;
 
+    std::unique_ptr<llama_vm_context> vm;
+
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
@@ -1559,6 +1563,44 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    if (ml.use_mmap && !ml.mappings.empty()) {
+        std::vector<llama_vm_region_input> vm_inputs;
+        vm_inputs.reserve(ml.weights_map.size());
+
+        for (const auto & it : ml.weights_map) {
+            const auto & weight = it.second;
+            if (weight.idx >= ml.mappings.size()) {
+                continue;
+            }
+
+            const auto & mapping = ml.mappings.at(weight.idx);
+            if (!mapping) {
+                continue;
+            }
+
+            llama_vm_region_input input;
+            input.name = it.first;
+            input.addr = (uint8_t *) mapping->addr() + weight.offs;
+            input.size = ggml_nbytes(weight.tensor);
+            input.file_idx = weight.idx;
+            input.file_offset = weight.offs;
+            vm_inputs.emplace_back(std::move(input));
+        }
+
+        llama_vm_params vm_params;
+        vm_params.debug_log = params.vm_debug_log;
+        vm_params.block_size = size_t(std::max(1, params.vm_block_size_mb)) * 1024ull * 1024ull;
+        vm_params.pin_small_bytes = size_t(std::max(0, params.vm_pin_small_mb)) * 1024ull * 1024ull;
+        vm_params.pin_budget_bytes = size_t(std::max(0, params.vm_pin_budget_mb)) * 1024ull * 1024ull;
+        vm_params.prefetch_budget_bytes = size_t(std::max(0, params.vm_prefetch_budget_mb)) * 1024ull * 1024ull;
+        vm_params.reclaim_budget_bytes = size_t(std::max(0, params.vm_reclaim_budget_mb)) * 1024ull * 1024ull;
+        vm_params.window_steps = std::max(1, params.vm_window_steps);
+        vm_params.keep_behind_steps = std::max(0, params.vm_keep_behind_steps);
+        vm_params.max_plan_cache_entries = std::max(0, params.vm_plan_cache_entries);
+        vm_params.use_dontneed = params.vm_dontneed;
+        pimpl->vm = llama_vm_build_index(vm_inputs, hparams.n_layer, vm_params);
+    }
+
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
@@ -1897,6 +1939,10 @@ bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
 }
 
+llama_vm_context * llama_model::get_vm_context() const {
+    return pimpl->vm.get();
+}
+
 const ggml_tensor * llama_model::get_tensor(const char * name) const {
     auto it = std::find_if(tensors_by_name.begin(), tensors_by_name.end(),
             [name](const std::pair<std::string, ggml_tensor *> & it) {
@@ -2137,8 +2183,18 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.vm_block_size_mb            =*/ 4,
+        /*.vm_pin_small_mb             =*/ 2,
+        /*.vm_pin_budget_mb            =*/ 128,
+        /*.vm_prefetch_budget_mb       =*/ 512,
+        /*.vm_window_steps             =*/ 2,
+        /*.vm_reclaim_budget_mb        =*/ 256,
+        /*.vm_keep_behind_steps        =*/ 2,
+        /*.vm_plan_cache_entries       =*/ 8,
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,
+        /*.vm_debug_log                =*/ false,
+        /*.vm_dontneed                 =*/ false,
         /*.use_direct_io               =*/ false,
         /*.use_mlock                   =*/ false,
         /*.check_tensors               =*/ false,

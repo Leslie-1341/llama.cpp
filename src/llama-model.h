@@ -17,6 +17,7 @@
 struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
+struct llama_vm_context;
 
 // available models
 enum llm_type {
@@ -617,6 +618,7 @@ struct llama_model {
     bool has_tensor_overrides() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
+    llama_vm_context * get_vm_context() const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;

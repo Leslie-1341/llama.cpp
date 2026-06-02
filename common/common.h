@@ -546,6 +546,16 @@ struct common_params {
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool use_mmap          = true;  // enable mmap to use filesystem cache
+    bool vm_debug_log      = false; // dump VM region residency classification
+    int32_t vm_block_size_mb       = 4;   // VM weight block size in MiB
+    int32_t vm_pin_small_mb        = 2;   // VM small tensor pin threshold in MiB
+    int32_t vm_pin_budget_mb       = 128; // VM total mlock budget in MiB
+    int32_t vm_prefetch_budget_mb  = 512; // VM graph prefetch budget in MiB
+    int32_t vm_window_steps        = 2;   // VM graph prefetch window in execution steps
+    int32_t vm_reclaim_budget_mb   = 256; // VM DONTNEED reclaim budget in MiB
+    int32_t vm_keep_behind_steps   = 2;   // VM keep-behind steps for reclaim
+    int32_t vm_plan_cache_entries  = 8;   // VM max graph plan cache entries
+    bool vm_dontneed      = false; // use MADV_DONTNEED for safe VM reclaim
     bool use_direct_io     = false; // read from disk without buffering
     bool use_mlock         = false; // use mlock to keep model in memory
     bool verbose_prompt    = false; // print prompt tokens before generation
