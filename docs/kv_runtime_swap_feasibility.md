@@ -95,15 +95,15 @@
 
 > 以下均标注"仍需验证",是继续深入前应优先解决的问题。
 
-1. **state_read_data 是否适合增量换入**:已确认具备非连续 scatter 原位写回(`:2241-2247`),但 `state_read_meta`(`:2068`)在全量恢复时 `clear(true)`、单序列恢复走 `find_slot` 重新分配——**纯增量、不重分配的换入路径需绕开 meta 编排**,可行性与改造面 **仍需验证**。
-2. **V 转置路径的换出/换入开销**:`v_trans = !flash_attn`;转置下搬运按 `n_embd_v_gqa × cell_count` 元素级碎片化(`:2055-2062`、`:2331-2347`),小粒度 I/O 可能吞噬 swap 收益。**flash_attn 开启时 V 非转置**,代价更低——**两种配置下的实测搬运代价仍需验证**。
+1. **state_read_data 是否适合增量换入**:**数据路径已澄清(第二轮验证)**——`state_read_data`(`:2187`)内部不调用 meta,可复用其 scatter 写回(`:2241-2247`),**需绕开 `state_read_meta`(`:2068`)的 `clear(true)`/`find_slot` 重分配编排,并在换出时保留物理槽位映射、换入时保持 cell pos/seq/shift 不动**;具体实现仍需验证。
+2. **V 转置路径的换出/换入开销**:`v_trans = !flash_attn`;转置下搬运按 `n_embd_v_gqa × cell_count` 元素级碎片化(`:2055-2062`、`:2331-2347`),小粒度 I/O 可能吞噬 swap 收益。**风险等级:中——可通过限定 flash_attn=true / V 非转置规避**(该配置下 V 按 cell 连续搬运)。两种配置下的实测搬运代价仍需验证。
 3. **连续 view 是否迫使大范围换入**:`n_kv` 按 `used_max_p1()` pad 到 ≥256(`:1129`/`:1134`),读区间随高水位单调增长;高水位下即便有效 cell 稀疏,换入也须覆盖整个区间——**对稀疏占用场景的换入放大效应仍需验证**。
 4. **多 backend(CPU/Metal/CUDA)额外限制**:搬运层 `ggml_backend_tensor_get/set` 后端无关(正面),但 attention 内核与异步拷贝能力各后端不同;**非 CPU 后端的原位换入时序与异步预取支持仍需验证**(沿用 analysis 附录(a))。
-5. **是否破坏现有机制**:
-   - K-shift:换出 cell 被 shift 时其 `shift` 元数据与物理字节须一致,换入后需重放或保序——**仍需验证**;
-   - SWA/iSWA:`kv_base`/`kv_swa` 双实例 + 窗外回收与换出驱逐可能语义重叠/冲突——**仍需验证**;
-   - seq_cp:同 stream 位图共享的 cell 被换出时,多 seq 引用的回写一致性——**仍需验证**;
-   - find_slot:换出 cell 是否标记为"可被覆盖"会与 swapped 态冲突,需明确优先级——**仍需验证**。
+5. **是否破坏现有机制**(第二轮已细化风险等级):
+   - K-shift:换出 cell 被 shift 时其 `shift` 元数据与物理字节须一致,换入后需重放或保序——**高风险**,demo 应避开 context shift 场景;仍需验证;
+   - SWA/iSWA:`kv_base`/`kv_swa` 双实例 + 窗外回收与换出驱逐可能语义重叠/冲突——**中~高风险**,demo 用标准 attention 避开;仍需验证;
+   - seq_cp:同 stream 位图共享的 cell 被换出时,多 seq 引用的回写一致性——**中~高风险**,demo 暂不支持 seq_cp;仍需验证;
+   - find_slot:换出 cell 若被 `can_use`(`:962`)判为可覆盖会被新 token 覆盖、丢失换出数据——**高风险,必须处理**(将 `swapped` 态纳入 `can_use` 判定);仍需验证。
 
 ---
 
@@ -129,7 +129,21 @@
 
 依据:① 数据搬运原语 `ggml_backend_tensor_get/set` 后端无关、可直接复用(`src/llama-context.cpp:2506-2535`);② `state_read_data` 已具非连续 scatter 原位写回(`src/llama-kv-cache.cpp:2241-2247`),"原位换入"与连续 view 天然兼容,**最小 demo 不需改 attention kernel**;③ 触发点(`update` `:742` / 解码循环)与元数据载体(`llama_kv_cells`)清晰。
 
-保留项(决定可行性上界,须在深入阶段解决):V 转置碎片化搬运代价、连续 view 在稀疏占用下的换入放大、绕开 meta 重分配实现纯增量换入、与 K-shift/SWA/seq_cp 的不变量协同——均标注"仍需验证"。
+保留项(决定可行性上界,须在深入阶段解决):V 转置碎片化搬运代价(中风险,可由 flash_attn=true 规避)、连续 view 在稀疏占用下的换入放大、与 K-shift(高)/find_slot 覆盖(高)/SWA/seq_cp 的不变量协同——均标注"仍需验证"。
+
+**第二轮风险验证(2026/05/31)增强了该方向的可信度**:纯增量换入数据路径已澄清(绕开 meta、复用 scatter 写回),全部主要风险均已定位到具体源码并有 demo 规避路径,prefetch 已识别出 decode 主循环这一可重叠插桩点。详见 [kv_runtime_swap_risk_validation.md](kv_runtime_swap_risk_validation.md)。结论维持"**值得继续验证**"。
 
 > 本结论为"值得继续验证",**非**确定采用;不含实现方案与代码。
+
+---
+
+## 八、更新记录
+
+- **2026/05/31 第一轮验证**:本文件初稿,确认 state 搬运通道可复用、连续读约束、最小条件。
+- **2026/05/31 回填(基于 [kv_runtime_swap_risk_validation.md](kv_runtime_swap_risk_validation.md) 第二轮风险验证)**:
+  - 第五节风险 1:纯增量原位换入由"仍需验证"改为"数据路径已澄清,需绕开 meta,具体实现仍需验证";
+  - 第五节风险 2:V 转置标注"中风险,可由 flash_attn=true / V 非转置规避";
+  - 第五节风险 5:补 find_slot 覆盖语义冲突=高、K-shift=高、seq_cp/SWA=中高;
+  - 第七节结论:维持"值得继续验证",说明第二轮验证增强可信度;
+  - 未修改源码;未确定最终方案;**下一步可进入 minimal demo plan 设计**。
 

@@ -83,7 +83,7 @@ llama.cpp **并非没有 KV cache 优化**:它已有 cell 级元数据管理、c
 - **源码**:`get_k` / `get_v` `src/llama-kv-cache.cpp:1145`;mask `set_input_kq_mask_impl` `src/llama-kv-cache.cpp:1434`;读区间长度 `get_n_kv` `:1129`;消费处 `build_attn_mha` `src/llama-graph.cpp:1953`(取 K/V 于 `:2240-2241`)。
 - **逻辑**:读 `[0, n_kv)` 连续视图(`ggml_view_4d`),用 -INFINITY mask 屏蔽无效 cell,逻辑上等效"只读有效 token"。`n_kv` 由 `used_max_p1()` 向上 pad 到 ≥256(`:1134`)。
 - **局限**:**读侧未分页**;n_kv 增大时即便有效 token 稀疏,读取与 mask 计算仍覆盖整个连续区间。这是与 PagedAttention 的核心差距点。
-- **对 runtime swap 的约束(本轮补充)**:mask 仅置 -INFINITY **屏蔽 softmax 数值,不避免物理读取**——被 mask 的 cell 物理上仍被内核按连续步长读到。因此 runtime swap 前**必须保证 `[0, n_kv)` 读区间内需要访问的 cell 已 resident**;落在该区间的换出 cell 须先换回。详见 [kv_runtime_swap_feasibility.md](kv_runtime_swap_feasibility.md) 第三节。
+- **对 runtime swap 的约束(本轮补充)**:mask 仅置 -INFINITY **屏蔽 softmax 数值,不避免物理读取**——被 mask 的 cell 物理上仍被内核按连续步长读到。因此 runtime swap 前**必须保证 `[0, n_kv)` 读区间内需要访问的 cell 已 resident**;落在该区间的换出 cell 须先换回。**换入放大程度与 `[0, n_kv)` 长度 / 有效 used cell 数量的比例相关**(高水位稀疏时放大显著);详见 [kv_runtime_swap_feasibility.md](kv_runtime_swap_feasibility.md) 第三节与 [kv_runtime_swap_risk_validation.md](kv_runtime_swap_risk_validation.md) 第四节。
 
 ### 4. seq_cp / prefix reuse / cell bitset 共享
 - **解决**:序列间共享相同前缀的 KV,避免重复计算 / 拷贝。
@@ -116,6 +116,7 @@ llama.cpp **并非没有 KV cache 优化**:它已有 cell 级元数据管理、c
   - 读侧 `state_read_data` **已内置非连续 scatter 路径**:`sinfo.is_contiguous()` 为真走单次 memcpy 快路径,为假则**逐 cell 按 `sinfo.idxs[i]` 写回精确物理槽位**(K `:2241-2247`、V 非转置 `:2284-2290`、V 转置 `:2339-2347`)——即"原位写回"能力已存在。
   - 底层搬运 `write_tensor` / `read_tensor` 经 `ggml_backend_tensor_get` / `ggml_backend_tensor_set`(`src/llama-context.cpp:2506-2535`),**后端无关**(CPU / CUDA / Metal 统一)。
 - **限定(为何仍非 runtime swap)**:尽管数据搬运层已具 runtime swap 基础,当前机制仍是**持久化语义**而非热路径 swap,因为 meta 编排层(`state_read_meta` `:2068`)在全量恢复时 `clear(true)`(`:2141`)、单序列恢复走 `find_slot` **重新分配**(`:2113`),且**无 `resident` / `dirty` / `swap_offset` 状态、无内存压力触发、无异步搬运**。可作为未来 runtime swap 的**数据通道**复用,但编排与触发机制需重写。
+- **纯增量原位换入的复用边界(第二轮验证)**:`state_read_data`(`:2187`)内部**不调用 meta**,仅做类型/行宽校验 + 按 `sinfo` 的 scatter 写回(`:2241-2247`)。因此纯增量原位换入应**绕开 `state_read_meta`,只复用 `state_read_data` / `read_tensor` / scatter 写回的数据路径**,并在换出时自行保留物理槽位映射(cell idx / stream / swap_offset / type / v_trans)。关键约束:换入时**必须保持 cell 的 `pos` / `seq` / `shift` 元数据不动,只搬运 K/V 字节**——否则重走 `find_slot` 会破坏"原位"前提。详见 [kv_runtime_swap_risk_validation.md](kv_runtime_swap_risk_validation.md) 第二节。
 
 
 ### 9. backend offload / KQV offload
@@ -192,7 +193,21 @@ llama.cpp **并非没有 KV cache 优化**:它已有 cell 级元数据管理、c
 - **(a)** 非 CPU 后端(CUDA / Metal / SYCL)fattn / matmul kernel 内 KV dequant 细节;以及各后端**异步拷贝能力**(影响 runtime swap 预取重叠)。
 - **(b)** ~~`state_read_data` 精确行号区间~~ —— **已确认**:`state_read_data` 止于 `src/llama-kv-cache.cpp:2353`。本项消除。
 - **(c)** 跨 stream 拷贝在 `update` 中的完整执行序(`sc_info` → `ggml_backend_tensor_copy`)本轮未重读全程。
-- **(d)** runtime swap 落地相关(详见 [kv_runtime_swap_feasibility.md](kv_runtime_swap_feasibility.md) 第五节):V 转置路径的换出 / 换入搬运代价;连续 view 在稀疏占用下的换入放大效应;绕开 meta 重分配实现"纯增量原位换入"的可行性;与 K-shift / SWA / seq_cp 现有不变量的协同。
+- **(d)** runtime swap 落地相关(详见 [kv_runtime_swap_feasibility.md](kv_runtime_swap_feasibility.md) 第五节、[kv_runtime_swap_risk_validation.md](kv_runtime_swap_risk_validation.md)):
+  - **纯增量换入是否可绕开 meta** → **路径已澄清**(可复用 `state_read_data` scatter 数据路径、绕开 `state_read_meta`、换出时保留物理映射),**具体实现仍需验证**;
+  - V 转置路径的换出 / 换入搬运代价(**中风险,可由 flash_attn=true / V 非转置规避**,实测耗时仍需验证);
+  - 连续 view 在稀疏占用下的换入放大比例(与有效占用率相关,实测仍需验证);
+  - 与 K-shift / SWA / seq_cp 现有不变量的协同(K-shift、find_slot 覆盖语义为高风险,仍需验证);
+  - 非 CPU 后端异步拷贝能力(仍需验证)。
 
 其余结论均已对当前工作区源码核对。
+
+---
+
+## 更新记录
+
+- **初稿**:llama.cpp KV cache 现状分析(总体设计、数据结构、生命周期、已有优化、与 PagedAttention 对照、缺口、精炼表述)。
+- **回填一(基于 [kv_runtime_swap_feasibility.md](kv_runtime_swap_feasibility.md))**:修正机制 8(state 已具 scatter 原位写回 + 后端无关搬运)、机制 3(mask 不避免物理读取)、数据结构表(kv_cells 无换出态字段)、附录(b)消项。
+- **回填二(基于 [kv_runtime_swap_risk_validation.md](kv_runtime_swap_risk_validation.md) 第二轮风险验证)**:机制 8 补纯增量原位换入复用边界(绕开 `state_read_meta`、保持 pos/seq/shift 不动);机制 3 补换入放大与有效占用率比例相关;附录(d)细化(纯增量换入路径已澄清待实现验证、V 转置中风险可规避、K-shift/find_slot 高风险)。
+- 未修改源码;未确定最终方案;**下一步可进入 minimal demo plan 设计**。
 

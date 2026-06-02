@@ -32,7 +32,7 @@
 | 1 | 缺 block/page 抽象 | cell(单 token)+ 每层连续大张量 `kv_layer.k/v`(`llama-kv-cache.h:215`) | 逻辑单元过细,无固定块抽象 | PagedAttention block | 中 | `llama-kv-cache.cpp` 构造(:80)、`find_slot`(:818) | 高 | 改动面大,牵动读写两侧 | B |
 | 2 | 缺 block table(逻辑→物理映射) | `slot_info.idxs` 仅用于写侧 scatter(`llama-kv-cache.h:34`) | 无持久逻辑→物理映射供读侧 gather | vLLM block table | 中 | `slot_info`、`cpy_k/cpy_v`(:1197)、`get_k/get_v`(:1145) | 高 | 需新数据结构贯穿生命周期 | B |
 | 3 | 缺 physical block pool | 构造期全量预分配单块连续 buffer(:80) | 运行时不增不减,无独立物理块池 | vLLM block allocator | 高 | `llama_kv_cache` 构造、buffer 分配段(:254 区域,仍需验证行号) | 高 | 预分配模型改动深 | B |
-| 4 | 缺 runtime swap-in/out | `state_write_data`(:1969)/`state_read_data`(:2187):**数据搬运层已可复用**(后端无关 + scatter 原位写回),缺的是 runtime 编排 | 无运行时换入换出热路径(meta 编排 + 触发机制需重写) | KV offloading、FlexInfer、vLLM swap | **高** | `state_write_data`/`state_read_data`、`update`(:742) | 中(搬运高复用,编排需重写) | 与推理主循环时序耦合;V 转置碎片化、连续 view 换入放大(仍需验证) | **A**(值得继续验证) |
+| 4 | 缺 runtime swap-in/out | `state_write_data`(:1969)/`state_read_data`(:2187):**数据搬运层已可复用**(后端无关 + scatter 原位写回),缺的是 runtime 编排 | 无运行时换入换出热路径(meta 编排 + 触发机制需重写) | KV offloading、FlexInfer、vLLM swap | **高** | `state_write_data`/`state_read_data`、`update`(:742) | 中(搬运高复用,编排需重写;纯增量换入路径已澄清) | **find_slot 覆盖语义与 swapped 态冲突=高**;K-shift=高;seq_cp/SWA=中高;V 转置碎片化=中(可规避);连续 view 换入放大(仍需验证) | **A**(值得继续验证) |
 | 5 | 缺 resident/swapped/dirty 状态 | `llama_kv_cells` 有 pos/seq/used,无换出态 | 无法表达"已换出/需回写" | 操作系统页表 present/dirty 位 | **高** | `llama-kv-cells.h` 字段(:458 区域) | 中 | 状态机需与 find_slot/mask 协同 | **A** |
 | 6 | 缺异步预取机制 | 无 | 无预取,无 I/O 与计算重叠 | 预取 / double buffering、FlexInfer | **高** | `update`(:742)、解码主循环(`llama-context.cpp` decode) | 中 | 预取命中率与时序难调 | **A** |
 | 7 | 缺非连续 paged read | `get_k/get_v` 连续 `ggml_view_4d`(:1145) | 读侧不能按块表 gather | PagedAttention kernel | 低 | `get_k/get_v`、`build_attn_mha`(`llama-graph.cpp:1953`)、各后端 fattn kernel | **很高** | 须改 attention kernel,跨后端 | C |
@@ -40,7 +40,7 @@
 | 9 | 缺内存压力联动 preemption/recompute | 无 | 无抢占、无重算恢复 | vLLM preemption + recompute | 中 | `init_batch`/`prepare`(:676 区域)、`find_slot` 失败路径 | 高 | 调度逻辑复杂,易引入正确性 bug | C |
 | 10 | 读侧连续 view+mask 的无效计算 | `set_input_kq_mask_impl` 置 -INFINITY(:1434) | n_kv 大且稀疏时仍全区间读 + mask | 稀疏 attention、块级跳过 | 中 | `get_n_kv`、`set_input_kq_mask_impl`(:1434) | 高 | 与 kernel 耦合 | C |
 | 11 | KV 量化仅统一 type_k/type_v | 全局 `type_k/type_v`(来自 cparams) | 无冷热混合精度、无逐块精度 | KV quant、H2O(冷热区分) | 中 | `create_memory`(`llama-model.cpp:1935`)、cpy/get、ggml kernel type traits | 高 | 混合精度须 kernel 支持 | C |
-| 12 | state save/load 未作 runtime swap 通道 | `state_read_data` **已具非连续 scatter 原位写回**(:2241-2247)+ 后端无关搬运 `ggml_backend_tensor_get/set`(`llama-context.cpp:2506-2535`) | 数据通路具备 swap 基础;但 meta 编排仍 `clear(true)`/`find_slot` 重分配,无 resident/dirty/swap_offset、无压力触发与异步 | mmap/分页换出、增量 checkpoint | **高** | `state_write_data`/`state_read_data`、`state_read_meta`(:2068)、按 cell range 序列化逻辑 | 中(搬运可复用,编排+触发需重写) | 纯增量换入须绕开 meta 重分配(仍需验证);V 转置碎片化(仍需验证) | **A**(值得继续验证) |
+| 12 | state save/load 未作 runtime swap 通道 | `state_read_data` **已具非连续 scatter 原位写回**(:2241-2247)+ 后端无关搬运 `ggml_backend_tensor_get/set`(`llama-context.cpp:2506-2535`) | 数据通路具备 swap 基础;但 meta 编排仍 `clear(true)`/`find_slot` 重分配,无 resident/dirty/swap_offset、无压力触发与异步 | mmap/分页换出、增量 checkpoint | **高** | `state_write_data`/`state_read_data`、`state_read_meta`(:2068)、按 cell range 序列化逻辑 | 中(搬运可复用,编排+触发需重写;纯增量换入路径已澄清=绕开 meta) | find_slot 覆盖语义冲突=高;V 转置碎片化=中(可规避);连续 view 换入放大(仍需验证) | **A**(值得继续验证) |
 
 > 评级口径:契合赛题"高"= 直接对应"减少物理内存 / 换入换出 / 预取";难度按是否需改 ggml kernel 与跨后端判断;深入程度 A>B>C>D(见第五节)。
 
@@ -62,10 +62,10 @@
 - **解决问题**:把不活跃 KV 换出到更慢更大的存储(host RAM / 磁盘),降低运行时常驻物理内存。
 - **已有基础(经第一轮验证强化)**:`state_write_data`/`state_read_data`(:1969/:2187)可按 cell range 序列化 KV 字节;**`state_read_data` 已内置非连续 scatter 路径**(`:2241-2247`),可按 `sinfo.idxs` 将 cell 写回精确物理槽位("原位换入"已具底层能力);**搬运经 `ggml_backend_tensor_get/set` 后端无关**(`llama-context.cpp:2506-2535`);`update`(:742)为状态变更统一入口;backend offload 提供设备放置开关。
 - **缺少机制**:runtime swap-in/out 热路径、resident/swapped/dirty/swap_offset 状态、压力触发与回写策略、异步搬运;meta 编排层(`clear(true)`/`find_slot` 重分配)不适合直接复用,需重写。
-- **demo 最小切入点**:复用 state 搬运原语 + scatter 原位写回做"按 cell range 的换出/换入",在 `update` 或解码循环挂载触发点;**绕开 `state_read_meta` 的重分配**做纯增量换入(仍需验证)。
+- **demo 最小切入点**:复用 state 搬运原语 + scatter 原位写回做"按 cell range 的换出/换入",在 `update` 或解码循环挂载触发点;**绕开 `state_read_meta` 的重分配**做纯增量换入(**第二轮验证:数据路径已澄清,可绕开 meta,保持 cell pos/seq/shift 不动只搬字节**)。
 - **是否改 attention kernel**:**不需要**(原位换回到原张量偏移与连续 view 天然兼容,staging buffer 非必需)。
 - **偏系统 / 算法**:偏**系统**(贴近虚拟内存/换页),与赛题最契合。
-- **结论状态**:**值得继续验证**(非最终采用)。详见 [kv_runtime_swap_feasibility.md](kv_runtime_swap_feasibility.md)。
+- **结论状态**:**值得继续验证**(非最终采用);第二轮风险验证(find_slot 覆盖=高、K-shift=高、seq_cp/SWA=中高、V 转置=中可规避)均已定位并有 demo 规避路径。详见 [kv_runtime_swap_risk_validation.md](kv_runtime_swap_risk_validation.md)。
 
 ### 3. KV cache prefetch / I/O latency hiding
 - **解决问题**:用异步预取把换入 I/O 与计算重叠,掩盖 swap 延迟。
@@ -134,7 +134,8 @@
 > 仅"初步优先级",非最终方案。等级:A 必须深入 / B 有价值备选 / C 理论相关但工程风险大 / D 暂不深入。
 
 ### A 类(强相关,后续必须深入研究)
-- **方向 2 — KV runtime swap / offloading**:直击赛题"换出降低物理内存";**第一轮验证确认**可复用 `state_write_data`/`state_read_data`(:1969/:2187)的搬运原语与 scatter 原位写回(:2241-2247)、`update`(:742)触发点;不改 kernel;可演示峰值内存下降。**结论:值得继续验证(非最终采用)。**
+- **方向 2 — KV runtime swap / offloading**:直击赛题"换出降低物理内存";**两轮验证确认**可复用 `state_write_data`/`state_read_data`(:1969/:2187)的搬运原语与 scatter 原位写回(:2241-2247)、`update`(:742)触发点;纯增量换入数据路径已澄清(绕开 `state_read_meta`);不改 kernel;可演示峰值内存下降。**结论:值得继续验证(非最终采用)。**
+  - **最小 demo 边界(第二轮收敛)**:单 sequence、flash_attn=true、V 非转置、标准 attention、无 SWA/iSWA、无 K-shift、单 backend、同步 swap、固定窗口——恰好规避全部高/中风险项。
 - **方向 3 — prefetch / I/O 掩盖**:直击赛题"预取掩盖 I/O";KV 逐层顺序访问利于预取;预取主轴建议按 layer + `[0,n_kv)` 连续区间;与方向 2 天然组合成完整"换出 + 预取"故事。**依赖方向 2 先成立,且依赖后端异步拷贝能力(仍需验证)。**
 - **配套缺口 5(resident/swapped/dirty 状态)**:是方向 2/3 的前置数据结构基础,须随之深入(`llama-kv-cells.h`,现确认无任何换出态字段)。
 
@@ -161,10 +162,10 @@
 - **已确认**:数据搬运层可复用度高(后端无关 `ggml_backend_tensor_get/set`);`state_read_data` 已具非连续 scatter 原位写回(:2241-2247);`state_read_data` 止于 :2353;最小粒度为 per-stream 多 cell range,但层维度被绑定为"全层一次"(无单层入口);V 转置路径搬运碎片化。
 - **结论**:数据通道可复用,meta 编排与触发机制需重写;方向"值得继续验证"。
 
-### 1b. state 通道的纯增量换入与代价(第二轮验证任务 · 新增)
-- **读**:`state_read_meta`(:2068,`clear(true)` / `find_slot` 路径)、`state_read_data` 转置分支(:2293-2350)、`update`(:742)与解码循环的搬运时序。
-- **验证**:(i) 能否绕开 `state_read_meta` 的重分配做"原位、不重分配"的纯增量换入?(ii) V 转置(`v_trans=!flash_attn`)下单 cell 换出/换入的实测搬运次数与带宽;(iii) 连续 view 在稀疏占用下的换入放大量化;(iv) 后端异步拷贝 API 是否存在(预取重叠前提)。
-- **回填**:本文件缺口 4/12 难度与风险列;[kv_runtime_swap_feasibility.md](kv_runtime_swap_feasibility.md) 第五节风险消项。
+### 1b. state 通道的纯增量换入与代价 —— ✅ 已完成第二轮风险验证
+- **状态**:已完成,结论见 [kv_runtime_swap_risk_validation.md](kv_runtime_swap_risk_validation.md)。
+- **已确认**:纯增量原位换入数据路径可绕开 `state_read_meta`、复用 `state_read_data` scatter 写回(须保留物理映射、保持 pos/seq/shift 不动);V 转置=中风险(可由 flash_attn=true 规避);find_slot 覆盖语义=高风险、K-shift=高风险、seq_cp/SWA=中高风险;prefetch 插桩点首选 decode 主循环(`llama-context.cpp:1712`)。
+- **遗留(实验类)**:V 转置实测搬运耗时、`[0,n_kv)` 换入放大比例、后端异步能力、输出一致性、find_slot 协同正确性——见该文件第八节。
 
 ### 2. get_k/get_v 与 build_attn_mha 的连续读限制(对应缺口 7 边界)—— ✅ 已完成第一轮验证
 - **状态**:已完成,结论见 [kv_runtime_swap_feasibility.md](kv_runtime_swap_feasibility.md) 第三节。
@@ -203,7 +204,13 @@
 - 第六节任务 1、2:标记"已完成第一轮验证",新增任务 1b(纯增量换入与搬运代价的第二轮验证)。
 - `state_read_data` 结束行号确认 :2353。
 
+**回填修订二(基于 [kv_runtime_swap_risk_validation.md](kv_runtime_swap_risk_validation.md) 第二轮风险验证)**:
+- 缺口 4/12 风险列:补 find_slot 覆盖语义冲突=高、K-shift=高、seq_cp/SWA=中高、V 转置=中(可规避);难度列补"纯增量换入路径已澄清(绕开 meta)"。
+- 方向 2、A 类优先级:补两轮验证结论与最小 demo 边界(单 seq + flash_attn=true + V 非转置 + 无 SWA/K-shift + 单 backend + 同步 swap + 固定窗口);维持 A、维持"值得继续验证"。
+- 第六节任务 1b:标记"已完成第二轮风险验证"。
+- 未修改源码,未确定最终方案,**下一步可进入 minimal demo plan 设计**。
+
 ---
 
-> **下一轮触发条件**:执行第六节任务 1b、3、4、5 的源码验证后,回填两份文档并复核缺口 4/12 的难度与风险评级。
+> **下一轮触发条件**:可进入"最小 demo plan 设计"(在第二轮收敛的边界条件内),或先执行 [kv_runtime_swap_risk_validation.md](kv_runtime_swap_risk_validation.md) 第八节的实验类验证。
 
