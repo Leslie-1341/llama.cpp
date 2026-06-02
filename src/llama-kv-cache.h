@@ -284,6 +284,15 @@ private:
     uint64_t kv_swap_ensure_restored= 0; // total swapped cells found and restored by ensure_resident()
     bool     kv_swap_warned_in      = false; // emit the swap-in guard warning only once
 
+    // stage D3: debug-only poison. When kv_swap_enabled && LLAMA_KV_SWAP_POISON=1, swap_out_cell()
+    // overwrites the original K/V bytes with a poison pattern AFTER copying them to the backing
+    // store, so that a correct swap-in becomes load-bearing: if ensure_resident did not restore
+    // the cell, the read path would see poison and the output would diverge. Off by default; never
+    // used for performance / RSS evaluation (it does not free the pre-allocated buffer).
+    bool     kv_swap_poison        = false;
+    uint64_t kv_swap_poison_cells  = 0; // cells whose original bytes were poisoned after swap-out
+    uint64_t kv_swap_poison_bytes  = 0; // total bytes overwritten with the poison pattern
+
     // fixed-window synchronous swap-out: evict cells in stream 0 older than the most
     // recent kv_swap_window cells. No-op unless kv_swap_enabled.
     void swap_out_window();

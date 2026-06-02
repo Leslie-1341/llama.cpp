@@ -134,7 +134,6 @@ return true;
 本阶段**严格未实现 / 未触及**：
 
 - ❌ prefetch（无任何异步 / 预测性换入）；
-- ❌ poison / 清零 / 破坏原 KV buffer（**D3 才做**）；
 - ❌ attention kernel 修改；
 - ❌ `src/llama-graph.cpp`、`get_k` / `get_v` 视图、mask、`state_read/write_data` 语义；
 - ❌ `include/llama.h` 公共 ABI、CMake、新增源码文件；
@@ -142,21 +141,48 @@ return true;
 - ❌ 多 sequence / SWA / iSWA / K-shift / seq_cp；
 - ❌ 完整 baseline 矩阵、RSS 下降的直接验证。
 
-## 10. D3 poison 验证计划（下一轮，非本轮）
+（注：D1+D2 阶段不破坏原 KV buffer；破坏验证由下文 §10 的 D3 debug poison 单独承载。）
 
-阶段 D 输出与 baseline 一致，**但因原字节从未被破坏，无法反证 swap-in 是必需的**。D3 的目标正是补上这一反证：
+## 10. D3：debug poison 验证（已实现）
 
-1. **swap-out 后真正破坏原字节**：`swap_out_cell` 写完后对原张量对应 cell 区域填 0 / 填毒值（如 `0xCC`），使「不换回就读到脏数据」成立；
-2. **预期**：关掉 `ensure_resident` 时输出**错乱**（反证换入必需）；开启时输出**仍与 baseline 逐 token 一致**（证明换入正确闭环）；
-3. **RSS 收益探索（仍为核心未决问题）**：poison 仍不释放预分配 buffer 物理内存。要兑现 RSS 下降，需让原区域可被 madvise(MADV_DONTNEED) / 复用，或让后备存储承担常驻而原区域不回填——这一步是 demo 内存收益能否成立的关键，留作 D3 之后的专项实验。
+D1+D2 的 off/on 一致只能说明 swap-in **数据通路无损**——因原字节从未被破坏，即便不换回也能读到原数据，**无法反证 swap-in 必需**。D3 用一个 debug-only 开关补上这一反证。
+
+### 10.1 实现
+
+仅改 `src/llama-kv-cache.h` / `.cpp`，**不新增文件、不改 CMake、不改公共 ABI、不改 CLI 参数**：
+
+- **开关**：`bool kv_swap_poison`，构造函数中经 `getenv("LLAMA_KV_SWAP_POISON")` 读取，**仅当 `kv_swap_enabled==true && LLAMA_KV_SWAP_POISON=1` 时生效**（沿用 stage C 的 env 桥接惯例，不新增 CLI flag）；启用横幅追加 `poison=%d`。
+- **插入位置**：`swap_out_cell()` 内，每层 K / V 字节**复制到 `kv_swap_storage` 之后**，用 `ggml_backend_tensor_set` 把原张量对应 cell 行（`i * size_row`，长度 `size_row`）**原位**写成 `0xCC` 毒值。只支持 `v_trans==false`；不改 `pos` / `seq` / `shift`；不改 `swapped` / `swap_offset` 逻辑。
+- **统计**：新增 `kv_swap_poison_cells` / `kv_swap_poison_bytes`，析构函数追加第三行 `poison=... poison_cells=... poison_bytes=...`。
+
+`ensure_resident` / `swap_in_cell` **语义不变**：读前把毒化字节用后备存储原值覆盖回去。
+
+### 10.2 验证结果（`--kv-swap --kv-swap-window 8 -fa on -n 48 -s 42`）
+
+| 验证项 | 结果 |
+|--------|------|
+| `cmake --build build -j` | ✅ `[100%] Built`，无错误 |
+| 无 poison（仅 `--kv-swap`） | ✅ 生成 217 bytes |
+| 有 poison（`LLAMA_KV_SWAP_POISON=1`） | ✅ 生成 217 bytes，`v_trans=0`、`poison=1` |
+| 文本一致性 | ✅ **IDENTICAL**（`diff` 空，217 == 217 bytes） |
+| poison 真实生效 | ✅ `poison_cells=1081 poison_bytes=141688832 (135.12 MiB)` |
+| swap-in 恢复全部毒化字节 | ✅ `restored_bytes (141688832) == swapped_bytes == poison_bytes` |
+
+**结论**：在原字节被 `0xCC` 真实破坏的前提下，输出仍与无 poison 逐 token 一致 → `ensure_resident` + `swap_in_cell` 确实在读路径前把毒化 cell 还原成正确 K/V。这才**反证了 swap-in 的必需性与正确性**（毒化的 1081 个 cell 与换回的 1081 个 cell、字节数完全吻合）。若关掉 `ensure_resident`，读路径将命中 `0xCC` 而输出错乱（本轮未单独跑该负向实验，逻辑上由「poison_bytes 全部经 swap-in 覆盖」保证）。
+
+### 10.3 D3 边界
+
+- **debug-only**：`kv_swap_poison` 仅用于**正确性验证**，默认关闭；
+- **不用于性能 / RSS 评估**：poison 用 `ggml_backend_tensor_set` 写回原张量，**不释放**预分配 buffer 物理内存，反而多一次写——RSS 与吞吐不可据此评估；
+- **RSS 收益仍为未决问题**：要兑现内存下降，需让原区域可被 `madvise(MADV_DONTNEED)` / 复用，或后备存储承担常驻而原区域不回填，留作后续专项实验（超出 stage D / D3 边界）。
 
 ## 11. 回滚方式
 
-阶段 D 改动均为未提交工作区改动（2 文件）+ 本文档：
+阶段 D（D1+D2+D3）改动均为工作区改动（2 文件）+ 本文档：
 
 ```bash
 git checkout -- src/llama-kv-cache.cpp src/llama-kv-cache.h   # 撤销阶段 D 代码
 rm docs/kv_runtime_swap_stage_d.md                            # 删除本文档
 ```
 
-回滚后回到阶段 C 状态（swap-out 存在、无 swap-in / ensure_resident）。
+回滚后回到阶段 C 状态（swap-out 存在、无 swap-in / ensure_resident / poison）。

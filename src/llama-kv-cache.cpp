@@ -338,8 +338,12 @@ llama_kv_cache::llama_kv_cache(
         }
     }
     if (kv_swap_enabled) {
-        LLAMA_LOG_INFO("%s: runtime KV swap demo enabled (window = %u cells, v_trans = %d)\n",
-                __func__, kv_swap_window, (int) v_trans);
+        // stage D3: debug-only poison of the original bytes after swap-out (off by default).
+        const char * LLAMA_KV_SWAP_POISON = getenv("LLAMA_KV_SWAP_POISON");
+        kv_swap_poison = LLAMA_KV_SWAP_POISON ? (atoi(LLAMA_KV_SWAP_POISON) != 0) : false;
+
+        LLAMA_LOG_INFO("%s: runtime KV swap demo enabled (window = %u cells, v_trans = %d, poison = %d)\n",
+                __func__, kv_swap_window, (int) v_trans, (int) kv_swap_poison);
     }
 }
 
@@ -365,6 +369,11 @@ llama_kv_cache::~llama_kv_cache() {
                 (unsigned long long) kv_swap_ensure_calls,
                 (unsigned long long) kv_swap_ensure_checked,
                 (unsigned long long) kv_swap_ensure_restored);
+        LLAMA_LOG_INFO("%s: kv swap stats: poison=%d poison_cells=%llu poison_bytes=%llu (%.2f MiB)\n",
+                __func__, (int) kv_swap_poison,
+                (unsigned long long) kv_swap_poison_cells,
+                (unsigned long long) kv_swap_poison_bytes,
+                kv_swap_poison_bytes / (1024.0 * 1024.0));
     }
 }
 
@@ -1219,6 +1228,9 @@ uint64_t llama_kv_cache::swap_out_cell(uint32_t i) {
 
     uint64_t cell_bytes = 0;
 
+    // stage D3 debug-only: reusable poison buffer (0xCC pattern). Only filled when kv_swap_poison.
+    std::vector<uint8_t> poison;
+
     for (const auto & layer : layers) {
         const uint32_t il = layer.il;
 
@@ -1231,6 +1243,13 @@ uint64_t llama_kv_cache::swap_out_cell(uint32_t i) {
             kv_swap_storage.resize(dst + k_size_row);
             ggml_backend_tensor_get(k, kv_swap_storage.data() + dst, i * k_size_row, k_size_row);
             cell_bytes += k_size_row;
+
+            // stage D3: overwrite the original bytes so swap-in becomes load-bearing
+            if (kv_swap_poison) {
+                if (poison.size() < k_size_row) { poison.assign(k_size_row, 0xCC); }
+                ggml_backend_tensor_set(k, poison.data(), i * k_size_row, k_size_row);
+                kv_swap_poison_bytes += k_size_row;
+            }
         }
 
         if (v) {
@@ -1240,6 +1259,13 @@ uint64_t llama_kv_cache::swap_out_cell(uint32_t i) {
             kv_swap_storage.resize(dst + v_size_row);
             ggml_backend_tensor_get(v, kv_swap_storage.data() + dst, i * v_size_row, v_size_row);
             cell_bytes += v_size_row;
+
+            // stage D3: overwrite the original bytes so swap-in becomes load-bearing
+            if (kv_swap_poison) {
+                if (poison.size() < v_size_row) { poison.assign(v_size_row, 0xCC); }
+                ggml_backend_tensor_set(v, poison.data(), i * v_size_row, v_size_row);
+                kv_swap_poison_bytes += v_size_row;
+            }
         }
     }
 
@@ -1247,6 +1273,9 @@ uint64_t llama_kv_cache::swap_out_cell(uint32_t i) {
     cells.set_swapped(i, true);
 
     kv_swap_bytes += cell_bytes;
+    if (kv_swap_poison) {
+        kv_swap_poison_cells += 1;
+    }
 
     if (debug > 0) {
         LLAMA_LOG_INFO("%s: swapped out cell %u (pos %d), %llu bytes at offset %llu\n",
