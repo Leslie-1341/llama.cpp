@@ -325,6 +325,36 @@ llama_kv_cache::llama_kv_cache(
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
+
+    // runtime KV swap demo (stage C). Bridged via env vars exported by the --kv-swap /
+    // --kv-swap-window CLI options (see common/arg.cpp), to avoid touching the public ABI.
+    const char * LLAMA_ARG_KV_SWAP        = getenv("LLAMA_ARG_KV_SWAP");
+    const char * LLAMA_ARG_KV_SWAP_WINDOW = getenv("LLAMA_ARG_KV_SWAP_WINDOW");
+    kv_swap_enabled = LLAMA_ARG_KV_SWAP ? (atoi(LLAMA_ARG_KV_SWAP) != 0) : false;
+    if (LLAMA_ARG_KV_SWAP_WINDOW) {
+        const int w = atoi(LLAMA_ARG_KV_SWAP_WINDOW);
+        if (w > 0) {
+            kv_swap_window = (uint32_t) w;
+        }
+    }
+    if (kv_swap_enabled) {
+        LLAMA_LOG_INFO("%s: runtime KV swap demo enabled (window = %u cells, v_trans = %d)\n",
+                __func__, kv_swap_window, (int) v_trans);
+    }
+}
+
+llama_kv_cache::~llama_kv_cache() {
+    if (kv_swap_enabled) {
+        LLAMA_LOG_INFO("%s: kv swap stats: enabled=1 window=%u swap_out_count=%llu swapped_cells=%llu "
+                "swapped_bytes=%llu (%.2f MiB) swap_out_us=%llu (%.2f ms)\n", __func__,
+                kv_swap_window,
+                (unsigned long long) kv_swap_out_count,
+                (unsigned long long) kv_swap_cells,
+                (unsigned long long) kv_swap_bytes,
+                kv_swap_bytes / (1024.0 * 1024.0),
+                (unsigned long long) kv_swap_out_us,
+                kv_swap_out_us / 1000.0);
+    }
 }
 
 void llama_kv_cache::clear(bool data) {
@@ -1093,7 +1123,128 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
         head = sinfo.idxs[s].back() + 1;
     }
+
+    // runtime KV swap demo (stage C): fixed-window synchronous swap-out. No-op unless enabled.
+    swap_out_window();
 }
+
+void llama_kv_cache::swap_out_window() {
+    if (!kv_swap_enabled) {
+        return;
+    }
+
+    // demo boundary: stage C only supports the V non-transposed path (flash_attn=true).
+    // v_trans=true would require gathering scattered V elements (see state_write_data); we
+    // refuse rather than silently produce a wrong layout.
+    if (v_trans) {
+        if (!kv_swap_warned_vtrans) {
+            LLAMA_LOG_WARN("%s: --kv-swap requires the V non-transposed path (flash_attn=true / -fa); "
+                    "v_trans=true is out of scope for the stage C demo - skipping swap-out\n", __func__);
+            kv_swap_warned_vtrans = true;
+        }
+        return;
+    }
+
+    // demo boundary: single sequence / unified cache only (stream 0).
+    if (n_stream != 1) {
+        if (!kv_swap_warned_vtrans) {
+            LLAMA_LOG_WARN("%s: --kv-swap demo supports a single unified stream only (n_stream=%u) - skipping\n",
+                    __func__, n_stream);
+            kv_swap_warned_vtrans = true;
+        }
+        return;
+    }
+
+    auto & cells = v_cells[0];
+
+    const uint32_t n = cells.used_max_p1();
+    if (n == 0) {
+        return;
+    }
+
+    // find the most-recent position to anchor the resident window (single-sequence recency
+    // proxy, consistent with last_access = token position set in apply_ubatch).
+    llama_pos pos_max = -1;
+    for (uint32_t i = 0; i < n; ++i) {
+        if (!cells.is_empty(i)) {
+            pos_max = std::max(pos_max, cells.pos_get(i));
+        }
+    }
+    if (pos_max < 0) {
+        return;
+    }
+
+    const int64_t t_start = ggml_time_us();
+
+    // a cell is "in the window" (kept resident) if its position is within the last
+    // kv_swap_window positions; older cells are swapped out.
+    const llama_pos pos_keep_from = pos_max - (llama_pos) kv_swap_window + 1;
+
+    uint64_t moved_cells = 0;
+
+    for (uint32_t i = 0; i < n; ++i) {
+        if (cells.is_empty(i) || cells.is_swapped(i)) {
+            continue;
+        }
+        if (cells.pos_get(i) >= pos_keep_from) {
+            continue; // inside the resident window
+        }
+
+        moved_cells += swap_out_cell(i);
+    }
+
+    if (moved_cells > 0) {
+        kv_swap_out_count += 1;
+        kv_swap_cells     += moved_cells;
+    }
+    kv_swap_out_us += (uint64_t) (ggml_time_us() - t_start);
+}
+
+uint64_t llama_kv_cache::swap_out_cell(uint32_t i) {
+    auto & cells = v_cells[0];
+
+    // record the start offset in the backing store for this cell's bytes
+    const uint64_t offset = (uint64_t) kv_swap_storage.size();
+
+    uint64_t cell_bytes = 0;
+
+    for (const auto & layer : layers) {
+        const uint32_t il = layer.il;
+
+        ggml_tensor * k = layer.k_stream[0];
+        ggml_tensor * v = layer.v_stream[0];
+
+        if (k) {
+            const uint64_t k_size_row = ggml_row_size(k->type, hparams.n_embd_k_gqa(il));
+            const size_t   dst        = kv_swap_storage.size();
+            kv_swap_storage.resize(dst + k_size_row);
+            ggml_backend_tensor_get(k, kv_swap_storage.data() + dst, i * k_size_row, k_size_row);
+            cell_bytes += k_size_row;
+        }
+
+        if (v) {
+            // !v_trans path: cell i occupies a contiguous row at offset i * v_size_row
+            const uint64_t v_size_row = ggml_row_size(v->type, hparams.n_embd_v_gqa(il));
+            const size_t   dst        = kv_swap_storage.size();
+            kv_swap_storage.resize(dst + v_size_row);
+            ggml_backend_tensor_get(v, kv_swap_storage.data() + dst, i * v_size_row, v_size_row);
+            cell_bytes += v_size_row;
+        }
+    }
+
+    cells.set_swap_offset(i, offset);
+    cells.set_swapped(i, true);
+
+    kv_swap_bytes += cell_bytes;
+
+    if (debug > 0) {
+        LLAMA_LOG_INFO("%s: swapped out cell %u (pos %d), %llu bytes at offset %llu\n",
+                __func__, i, cells.pos_get(i), (unsigned long long) cell_bytes, (unsigned long long) offset);
+    }
+
+    return 1;
+}
+
 
 bool llama_kv_cache::get_can_shift() const {
     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.

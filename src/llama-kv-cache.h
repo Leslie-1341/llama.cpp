@@ -108,7 +108,7 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse);
 
-    ~llama_kv_cache() = default;
+    ~llama_kv_cache();
 
     //
     // llama_memory_i
@@ -249,6 +249,33 @@ private:
 
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
+
+    // runtime KV swap demo (stage C: fixed-window synchronous swap-out prototype).
+    // Configured via env vars LLAMA_ARG_KV_SWAP / LLAMA_ARG_KV_SWAP_WINDOW (see arg.cpp),
+    // so the public llama.h ABI is left untouched. This only copies K/V bytes to an
+    // in-process backing store and tags cells; it never frees or mutates the original
+    // KV buffer, and there is no swap-in yet. See docs/kv_runtime_swap_stage_c.md.
+    bool     kv_swap_enabled = false;
+    uint32_t kv_swap_window  = 256;
+
+    // minimal in-process backing store: swapped-out bytes are appended here and the
+    // start offset is recorded in cells.swap_offset(i). Offsets are not reused in stage C.
+    std::vector<uint8_t> kv_swap_storage;
+
+    // minimal swap-out statistics
+    uint64_t kv_swap_out_count   = 0; // number of swap_out_window() invocations that moved >0 cells
+    uint64_t kv_swap_cells       = 0; // total cells swapped out
+    uint64_t kv_swap_bytes       = 0; // total bytes copied to the backing store
+    uint64_t kv_swap_out_us      = 0; // cumulative time spent in swap-out
+    bool     kv_swap_warned_vtrans = false; // emit the v_trans fail-fast warning only once
+
+    // fixed-window synchronous swap-out: evict cells in stream 0 older than the most
+    // recent kv_swap_window cells. No-op unless kv_swap_enabled.
+    void swap_out_window();
+
+    // copy one cell's K/V bytes (all layers, stream 0) into the backing store and tag it.
+    // returns the number of cells moved (0 or 1). assumes !v_trans and n_stream == 1.
+    uint64_t swap_out_cell(uint32_t i);
 
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;

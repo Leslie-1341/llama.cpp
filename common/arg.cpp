@@ -1361,6 +1361,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("enable runtime KV cache swap / offloading demo (default: %s)", params.kv_swap ? "true" : "false"),
         [](common_params & params) {
             params.kv_swap = true;
+            // bridge to the library layer, which reads this env var in the llama_kv_cache
+            // constructor (see src/llama-kv-cache.cpp) to avoid touching the public ABI
+            setenv("LLAMA_ARG_KV_SWAP", "1", 1);
         }
     ).set_env("LLAMA_ARG_KV_SWAP").set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
@@ -1368,6 +1371,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("number of most-recent KV cells kept resident under --kv-swap (default: %d)", params.kv_swap_window),
         [](common_params & params, int value) {
             params.kv_swap_window = value;
+            // bridge to the library layer (see src/llama-kv-cache.cpp)
+            setenv("LLAMA_ARG_KV_SWAP_WINDOW", std::to_string(value).c_str(), 1);
         }
     ).set_env("LLAMA_ARG_KV_SWAP_WINDOW").set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
