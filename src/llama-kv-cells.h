@@ -37,6 +37,11 @@ public:
             ext[i].reset();
             shift[i] =  0;
             seq[i].reset();
+
+            // runtime KV swap demo metadata (parallel arrays; off by default)
+            swapped[i]     = 0;
+            swap_offset[i] = 0;
+            last_access[i] = 0;
         }
 
         has_shift = false;
@@ -66,6 +71,11 @@ public:
         shift.resize(n);
         seq.resize(n);
 
+        // runtime KV swap demo metadata (kept in lockstep with the cell arrays above)
+        swapped.resize(n);
+        swap_offset.resize(n);
+        last_access.resize(n);
+
         reset();
     }
 
@@ -94,6 +104,37 @@ public:
 
     bool get_has_shift() const {
         return has_shift;
+    }
+
+    // runtime KV swap demo accessors (parallel metadata; inert unless the swap demo is enabled)
+    bool is_swapped(uint32_t i) const {
+        assert(i < swapped.size());
+        return swapped[i] != 0;
+    }
+
+    void set_swapped(uint32_t i, bool v) {
+        assert(i < swapped.size());
+        swapped[i] = v ? 1 : 0;
+    }
+
+    uint64_t get_swap_offset(uint32_t i) const {
+        assert(i < swap_offset.size());
+        return swap_offset[i];
+    }
+
+    void set_swap_offset(uint32_t i, uint64_t offset) {
+        assert(i < swap_offset.size());
+        swap_offset[i] = offset;
+    }
+
+    uint64_t get_last_access(uint32_t i) const {
+        assert(i < last_access.size());
+        return last_access[i];
+    }
+
+    void set_last_access(uint32_t i, uint64_t value) {
+        assert(i < last_access.size());
+        last_access[i] = value;
     }
 
     // move cell isrc to idst (used during defrag)
@@ -487,6 +528,15 @@ private:
 
     // the bitset seq[i] tells us which sequences are currently occupying the i-th cell
     std::vector<seq_set_t> seq;
+
+    // runtime KV swap demo metadata (parallel to the cell arrays above; see
+    // docs/kv_runtime_swap_minimal_demo_plan.md). These are inert unless the swap
+    // demo is enabled: swapped[i] marks whether cell i's K/V bytes live in backing
+    // store, swap_offset[i] is that backing-store offset, last_access[i] is a coarse
+    // recency counter used by the fixed-window eviction policy.
+    std::vector<uint8_t>  swapped;
+    std::vector<uint64_t> swap_offset;
+    std::vector<uint64_t> last_access;
 
     // the set seq_pos[s][p] tells us how many times the position p is currently present for sequence s
     // if the position p is not present, seq_pos[s][p] is not set

@@ -544,6 +544,10 @@ struct common_params {
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
 
+    // runtime KV swap demo (off by default; see docs/kv_runtime_swap_minimal_demo_plan.md)
+    bool    kv_swap        = false; // enable runtime KV cache swap / offloading demo
+    int32_t kv_swap_window = 256;   // number of most-recent cells kept resident (fixed-window policy)
+
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool use_mmap          = true;  // enable mmap to use filesystem cache
     bool use_direct_io     = false; // read from disk without buffering

@@ -1357,6 +1357,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL}));
     add_opt(common_arg(
+        {"--kv-swap"},
+        string_format("enable runtime KV cache swap / offloading demo (default: %s)", params.kv_swap ? "true" : "false"),
+        [](common_params & params) {
+            params.kv_swap = true;
+        }
+    ).set_env("LLAMA_ARG_KV_SWAP").set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--kv-swap-window"}, "N",
+        string_format("number of most-recent KV cells kept resident under --kv-swap (default: %d)", params.kv_swap_window),
+        [](common_params & params, int value) {
+            params.kv_swap_window = value;
+        }
+    ).set_env("LLAMA_ARG_KV_SWAP_WINDOW").set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
         "save and clear idle slots on new task (default: enabled, requires unified KV and cache-ram)",

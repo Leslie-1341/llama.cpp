@@ -1045,6 +1045,14 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
             cells.pos_set(idx, ubatch.pos[i]);
 
+            // runtime KV swap demo: initialize the per-cell swap metadata for the freshly
+            // written cell. This is inert unless the swap demo is enabled. last_access is set
+            // to the token position, which is a monotonic recency proxy for the single-sequence
+            // demo and avoids threading a separate decode-step counter through this call path.
+            cells.set_swapped(idx, false);
+            cells.set_swap_offset(idx, 0);
+            cells.set_last_access(idx, (uint64_t) ubatch.pos[i]);
+
             if (ubatch.is_pos_2d()) {
                 llama_kv_cell_ext ext {
                     /*.x =*/ ubatch.pos[i + ubatch.n_tokens*2],
