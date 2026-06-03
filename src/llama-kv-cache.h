@@ -301,9 +301,26 @@ private:
     uint64_t kv_swap_poison_cells  = 0; // cells whose original bytes were poisoned after swap-out
     uint64_t kv_swap_poison_bytes  = 0; // total bytes overwritten with the poison pattern
 
+    // stage E1-lite: debug-only madvise(MADV_DONTNEED) probe. When kv_swap_enabled &&
+    // LLAMA_KV_SWAP_MADVISE=1, after swapping out a contiguous range of cells we advise the
+    // page-aligned interior of each layer's K/V row range as no-longer-needed, to observe
+    // whether RSS can drop. Off by default; a probe only, NOT a final memory-optimization
+    // path (it does not free the buffer, and the pages fault back in on swap-in / next write).
+    // See docs/kv_runtime_swap_stage_e1_lite.md.
+    bool     kv_swap_madvise        = false;
+    uint64_t kv_swap_madvise_calls    = 0; // madvise() invocations issued
+    uint64_t kv_swap_madvise_bytes    = 0; // total page-aligned bytes advised away
+    uint64_t kv_swap_madvise_failures = 0; // madvise() calls that returned non-zero
+    uint64_t kv_swap_madvise_us       = 0; // cumulative time spent in the madvise probe
+
     // fixed-window synchronous swap-out: evict cells in stream 0 older than the most
     // recent kv_swap_window cells. No-op unless kv_swap_enabled.
     void swap_out_window();
+
+    // stage E1-lite: advise the page-aligned interior of the byte range covered by the
+    // contiguous swapped cell range [lo, hi) (inclusive lo, exclusive hi) away via
+    // madvise(MADV_DONTNEED), for every layer's K and V tensor. No-op unless kv_swap_madvise.
+    void madvise_swapped_range(uint32_t lo, uint32_t hi);
 
     // copy one cell's K/V bytes (all layers, stream 0) into the backing store and tag it.
     // returns the number of cells moved (0 or 1). assumes !v_trans and n_stream == 1.

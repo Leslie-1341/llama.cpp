@@ -13,6 +13,11 @@
 #include <map>
 #include <stdexcept>
 
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
@@ -342,8 +347,12 @@ llama_kv_cache::llama_kv_cache(
         const char * LLAMA_KV_SWAP_POISON = getenv("LLAMA_KV_SWAP_POISON");
         kv_swap_poison = LLAMA_KV_SWAP_POISON ? (atoi(LLAMA_KV_SWAP_POISON) != 0) : false;
 
-        LLAMA_LOG_INFO("%s: runtime KV swap demo enabled (window = %u cells, v_trans = %d, poison = %d)\n",
-                __func__, kv_swap_window, (int) v_trans, (int) kv_swap_poison);
+        // stage E1-lite: debug-only madvise(MADV_DONTNEED) probe (off by default).
+        const char * LLAMA_KV_SWAP_MADVISE = getenv("LLAMA_KV_SWAP_MADVISE");
+        kv_swap_madvise = LLAMA_KV_SWAP_MADVISE ? (atoi(LLAMA_KV_SWAP_MADVISE) != 0) : false;
+
+        LLAMA_LOG_INFO("%s: runtime KV swap demo enabled (window = %u cells, v_trans = %d, poison = %d, madvise = %d)\n",
+                __func__, kv_swap_window, (int) v_trans, (int) kv_swap_poison, (int) kv_swap_madvise);
     }
 }
 
@@ -383,6 +392,16 @@ llama_kv_cache::~llama_kv_cache() {
                 (unsigned long long) kv_swap_storage.size(),
                 kv_swap_storage.size() / (1024.0 * 1024.0),
                 slots_allocated);
+        // stage E1-lite: madvise(MADV_DONTNEED) probe counters (debug-only, RSS variability check).
+        LLAMA_LOG_INFO("%s: kv swap stats: madvise=%d madvise_calls=%llu madvise_bytes=%llu (%.2f MiB) "
+                "madvise_failures=%llu madvise_us=%llu (%.2f ms)\n",
+                __func__, (int) kv_swap_madvise,
+                (unsigned long long) kv_swap_madvise_calls,
+                (unsigned long long) kv_swap_madvise_bytes,
+                kv_swap_madvise_bytes / (1024.0 * 1024.0),
+                (unsigned long long) kv_swap_madvise_failures,
+                (unsigned long long) kv_swap_madvise_us,
+                kv_swap_madvise_us / 1000.0);
     }
 }
 
@@ -1227,6 +1246,85 @@ void llama_kv_cache::swap_out_window() {
         kv_swap_cells     += moved_cells;
     }
     kv_swap_out_us += (uint64_t) (ggml_time_us() - t_start);
+
+    // stage E1-lite: after swapping out, advise the page-aligned interior of each maximal
+    // contiguous run of swapped cells away. Working on a contiguous range (not single cells)
+    // lets the page-alignment trim recover whole pages even though one cell row < one page.
+    if (kv_swap_madvise && moved_cells > 0) {
+        uint32_t run_lo = 0;
+        bool in_run = false;
+        for (uint32_t i = 0; i < n; ++i) {
+            const bool sw = !cells.is_empty(i) && cells.is_swapped(i);
+            if (sw && !in_run) { run_lo = i; in_run = true; }
+            if (!sw && in_run) { madvise_swapped_range(run_lo, i); in_run = false; }
+        }
+        if (in_run) { madvise_swapped_range(run_lo, n); }
+    }
+}
+
+void llama_kv_cache::madvise_swapped_range(uint32_t lo, uint32_t hi) {
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+    if (!kv_swap_madvise || hi <= lo) {
+        return;
+    }
+    // demo boundary: only the !v_trans / single-stream layout has contiguous per-cell rows.
+    if (v_trans || n_stream != 1) {
+        return;
+    }
+
+    const long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) {
+        return;
+    }
+    const uint64_t pg = (uint64_t) page;
+
+    const int64_t t_start = ggml_time_us();
+
+    for (const auto & layer : layers) {
+        const uint32_t il = layer.il;
+        ggml_tensor * k = layer.k_stream[0];
+        ggml_tensor * v = layer.v_stream[0];
+
+        // for each tensor, the swapped cells [lo, hi) occupy the byte interval
+        // [lo*row, hi*row); advise only its page-aligned interior so we never touch a page
+        // shared with a live (resident) neighbour cell outside the range.
+        auto advise = [&](ggml_tensor * t, uint64_t row) {
+            if (!t || row == 0) {
+                return;
+            }
+            char * base = (char *) t->data; // CPU backend: tensor data is a host pointer
+            if (!base) {
+                return;
+            }
+            // absolute byte range of the swapped cells in this tensor
+            const uintptr_t lo_a = (uintptr_t) base + (uintptr_t) lo * row;
+            const uintptr_t hi_a = (uintptr_t) base + (uintptr_t) hi * row;
+            // madvise needs a page-aligned start; round the absolute start up and the
+            // absolute end down so we only advise pages fully inside the swapped range and
+            // never a page shared with a live (resident) neighbour cell.
+            const uintptr_t a_start = (lo_a + pg - 1) & ~(uintptr_t) (pg - 1);
+            const uintptr_t a_end   = hi_a & ~(uintptr_t) (pg - 1);
+            if (a_end <= a_start) {
+                return; // range smaller than a page after trimming
+            }
+            const size_t len = (size_t) (a_end - a_start);
+            const int rc = madvise((void *) a_start, len, MADV_DONTNEED);
+            kv_swap_madvise_calls += 1;
+            if (rc != 0) {
+                kv_swap_madvise_failures += 1;
+            } else {
+                kv_swap_madvise_bytes += len;
+            }
+        };
+
+        advise(k, k ? ggml_row_size(k->type, hparams.n_embd_k_gqa(il)) : 0);
+        advise(v, v ? ggml_row_size(v->type, hparams.n_embd_v_gqa(il)) : 0);
+    }
+
+    kv_swap_madvise_us += (uint64_t) (ggml_time_us() - t_start);
+#else
+    (void) lo; (void) hi;
+#endif
 }
 
 uint64_t llama_kv_cache::swap_out_cell(uint32_t i) {
