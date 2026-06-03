@@ -186,3 +186,38 @@ rm docs/kv_runtime_swap_stage_d.md                            # 删除本文档
 ```
 
 回滚后回到阶段 C 状态（swap-out 存在、无 swap-in / ensure_resident / poison）。
+
+## 12. D4：后备存储 slot 复用（修复无界增长）
+
+### 12.1 问题
+
+E1-lite smaps 采样时长输出触发 `std::bad_alloc`，栈为
+`std::vector<uint8_t>::_M_default_append → llama_kv_cache::swap_out_cell`。
+根因：D1~D3 的 `swap_out_cell` **每次换出都 append** 新 K/V 字节到 `kv_swap_storage`。同一 cell 被 `ensure_resident` 换回后下一步又被换出时，旧偏移作废、再 append 一份——后备存储随 decode 步数**无界增长**（长测累计换出 4433 MiB）。
+
+### 12.2 修复
+
+让同一 cell 复用已分配的 storage slot：
+
+1. `swap_out_cell(i)` 先按 layers/types 计算该 cell 一次完整 K/V 备份的 `total_bytes`（固定值）。
+2. 新增 `kv_swap_slot_cap`（按 cell index 的 per-cell slot 容量，0 = 未分配）。
+3. 若 `kv_swap_slot_cap[i] >= total_bytes` 且非 0 → 复用 `cells.get_swap_offset(i)`，**覆盖原位**，不 append。
+4. 否则在尾部 append `total_bytes`，记录 `swap_offset` 与 slot 容量。
+5. **不改变** `swapped` / `swap_in` / `ensure_resident` / poison 语义；备份大小恒定，旧 slot 必然容得下后续备份。
+6. 析构统计新增 `backing_store_bytes`（= `kv_swap_storage.size()`）与 `slots_allocated`。
+
+### 12.3 验证
+
+| 测试 | 结果 |
+|---|---|
+| `cmake --build build -j` | ✅ 通过 |
+| 短测（poison，`-c512 -n64 -w8`） | ✅ 输出连贯；`swapped_bytes=244.12 MiB` 而 `backing_store_bytes=7.75 MiB`，`slots_allocated=62` |
+| 长测（`-c2048 -n256 -w8`） | ✅ exit 0，**无 `bad_alloc`**；累计 `swapped_bytes=4433 MiB` 而 `backing_store_bytes=33.25 MiB`，`slots_allocated=266` |
+
+关键对比：累计换出字节（4433 MiB）与后备存储实际大小（33.25 MiB）解耦——后者由**曾被换出的不同 cell 数**界定，不再随换出次数增长。`swapped_bytes`/`restored_bytes` 统计仍累计口径、仍逐字节相等。
+
+### 12.4 边界
+
+- 仍为 **in-process `std::vector` 后备存储**，未释放原张量、未做 madvise——RSS 收益仍是未决问题（留待 E1-lite）。
+- slot 复用基于「同一 cell 备份大小恒定」前提，在 demo 边界（固定 layers/type、`!v_trans`、单 stream）下成立。
+

@@ -264,9 +264,17 @@ private:
     bool     kv_swap_enabled = false;
     uint32_t kv_swap_window  = 256;
 
-    // minimal in-process backing store: swapped-out bytes are appended here and the
-    // start offset is recorded in cells.swap_offset(i). Offsets are not reused in stage C/D.
+    // minimal in-process backing store: swapped-out bytes are written here and the
+    // start offset is recorded in cells.swap_offset(i). Stage D4: a per-cell slot is
+    // allocated once (on the first swap-out of that cell) and reused on every subsequent
+    // swap-out of the same cell, so the store no longer grows without bound when a cell
+    // is repeatedly swapped out -> restored -> swapped out again.
     std::vector<uint8_t> kv_swap_storage;
+
+    // stage D4: per-cell backing-store slot capacity, indexed by cell index. 0 means the
+    // cell has no slot allocated yet. A cell's full K/V backup size is constant (fixed
+    // layers/types), so a slot, once allocated, always fits later backups of the same cell.
+    std::vector<uint64_t> kv_swap_slot_cap;
 
     // minimal swap-out statistics
     uint64_t kv_swap_out_count   = 0; // number of swap_out_window() invocations that moved >0 cells

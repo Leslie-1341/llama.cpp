@@ -374,6 +374,15 @@ llama_kv_cache::~llama_kv_cache() {
                 (unsigned long long) kv_swap_poison_cells,
                 (unsigned long long) kv_swap_poison_bytes,
                 kv_swap_poison_bytes / (1024.0 * 1024.0));
+        // stage D4: backing-store high-water mark. With slot reuse this stays bounded by
+        // the number of distinct cells ever swapped out, not the cumulative swap-out count.
+        size_t slots_allocated = 0;
+        for (uint64_t c : kv_swap_slot_cap) { if (c != 0) { slots_allocated += 1; } }
+        LLAMA_LOG_INFO("%s: kv swap stats: backing_store_bytes=%llu (%.2f MiB) slots_allocated=%zu\n",
+                __func__,
+                (unsigned long long) kv_swap_storage.size(),
+                kv_swap_storage.size() / (1024.0 * 1024.0),
+                slots_allocated);
     }
 }
 
@@ -1223,10 +1232,38 @@ void llama_kv_cache::swap_out_window() {
 uint64_t llama_kv_cache::swap_out_cell(uint32_t i) {
     auto & cells = v_cells[0];
 
-    // record the start offset in the backing store for this cell's bytes
-    const uint64_t offset = (uint64_t) kv_swap_storage.size();
+    // stage D4: a full K/V backup of one cell is a fixed size (constant layers/types),
+    // so compute it up front and reuse this cell's existing backing-store slot if it
+    // already owns one. This stops kv_swap_storage from growing every time the same cell
+    // is swapped out -> restored -> swapped out again.
+    uint64_t total_bytes = 0;
+    for (const auto & layer : layers) {
+        const uint32_t il = layer.il;
+        if (layer.k_stream[0]) {
+            total_bytes += ggml_row_size(layer.k_stream[0]->type, hparams.n_embd_k_gqa(il));
+        }
+        if (layer.v_stream[0]) {
+            total_bytes += ggml_row_size(layer.v_stream[0]->type, hparams.n_embd_v_gqa(il));
+        }
+    }
+
+    if (kv_swap_slot_cap.size() < cells.size()) {
+        kv_swap_slot_cap.resize(cells.size(), 0);
+    }
+
+    uint64_t offset;
+    if (kv_swap_slot_cap[i] >= total_bytes && kv_swap_slot_cap[i] != 0) {
+        // reuse the previously allocated slot (overwrite in place, no append)
+        offset = cells.get_swap_offset(i);
+    } else {
+        // first swap-out of this cell (or slot too small): allocate at the tail
+        offset = (uint64_t) kv_swap_storage.size();
+        kv_swap_storage.resize(offset + total_bytes);
+        kv_swap_slot_cap[i] = total_bytes;
+    }
 
     uint64_t cell_bytes = 0;
+    uint64_t cursor     = offset;
 
     // stage D3 debug-only: reusable poison buffer (0xCC pattern). Only filled when kv_swap_poison.
     std::vector<uint8_t> poison;
@@ -1239,9 +1276,8 @@ uint64_t llama_kv_cache::swap_out_cell(uint32_t i) {
 
         if (k) {
             const uint64_t k_size_row = ggml_row_size(k->type, hparams.n_embd_k_gqa(il));
-            const size_t   dst        = kv_swap_storage.size();
-            kv_swap_storage.resize(dst + k_size_row);
-            ggml_backend_tensor_get(k, kv_swap_storage.data() + dst, i * k_size_row, k_size_row);
+            ggml_backend_tensor_get(k, kv_swap_storage.data() + cursor, i * k_size_row, k_size_row);
+            cursor     += k_size_row;
             cell_bytes += k_size_row;
 
             // stage D3: overwrite the original bytes so swap-in becomes load-bearing
@@ -1255,9 +1291,8 @@ uint64_t llama_kv_cache::swap_out_cell(uint32_t i) {
         if (v) {
             // !v_trans path: cell i occupies a contiguous row at offset i * v_size_row
             const uint64_t v_size_row = ggml_row_size(v->type, hparams.n_embd_v_gqa(il));
-            const size_t   dst        = kv_swap_storage.size();
-            kv_swap_storage.resize(dst + v_size_row);
-            ggml_backend_tensor_get(v, kv_swap_storage.data() + dst, i * v_size_row, v_size_row);
+            ggml_backend_tensor_get(v, kv_swap_storage.data() + cursor, i * v_size_row, v_size_row);
+            cursor     += v_size_row;
             cell_bytes += v_size_row;
 
             // stage D3: overwrite the original bytes so swap-in becomes load-bearing
