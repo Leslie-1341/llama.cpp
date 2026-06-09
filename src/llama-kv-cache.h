@@ -307,6 +307,7 @@ public:
     // Not called from apply() in this stage.
     void ensure_resident(uint32_t n_kv);
     void swap_out_window(uint32_t n_kv);
+    void sample_swap_rss();
 
     // stage F1 / P1: advise the unused tail capacity [GGML_PAD(n_kv, 256), kv_size) away via
     // MADV_DONTNEED to lower current RSS. No-op unless LLAMA_KV_LAZY_TAIL=1 (and !v_trans &&
@@ -403,6 +404,11 @@ private:
     uint64_t kv_swap_window_calls = 0;
     uint64_t kv_swap_window_skipped = 0;
     uint64_t kv_swap_backend_failures = 0;
+    bool     kv_swap_rss_sample = false;
+    uint64_t kv_swap_rss_samples = 0;
+    uint64_t kv_swap_rss_min_kb = 0;
+    uint64_t kv_swap_rss_max_kb = 0;
+    uint64_t kv_swap_rss_last_kb = 0;
 
     void swap_out_cell(uint32_t cell);
     void swap_in_cell(uint32_t cell);
@@ -436,6 +442,8 @@ private:
 
     // current process RSS in KiB from /proc/self/statm (0 if unavailable).
     uint64_t get_current_rss_kb() const;
+    // peak process RSS in KiB from /proc/self/status VmHWM (0 if unavailable).
+    uint64_t get_peak_rss_kb() const;
 
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;

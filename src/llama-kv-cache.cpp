@@ -358,8 +358,10 @@ llama_kv_cache::llama_kv_cache(
     const char * LLAMA_KV_SWAP_MODE = std::getenv("LLAMA_KV_SWAP_MODE");
     const char * LLAMA_KV_SWAP_WINDOW = std::getenv("LLAMA_KV_SWAP_WINDOW");
     const char * LLAMA_KV_SWAP_SINK   = std::getenv("LLAMA_KV_SWAP_SINK");
+    const char * LLAMA_KV_SWAP_RSS_SAMPLE = std::getenv("LLAMA_KV_SWAP_RSS_SAMPLE");
     kv_swap_window = LLAMA_KV_SWAP_WINDOW ? std::max(0, std::atoi(LLAMA_KV_SWAP_WINDOW)) : 0;
     kv_swap_sink   = LLAMA_KV_SWAP_SINK   ? std::max(0, std::atoi(LLAMA_KV_SWAP_SINK))   : 0;
+    kv_swap_rss_sample = LLAMA_KV_SWAP_RSS_SAMPLE ? (std::atoi(LLAMA_KV_SWAP_RSS_SAMPLE) != 0) : false;
 
     const bool kv_swap_requested = LLAMA_KV_SWAP ? (std::atoi(LLAMA_KV_SWAP) != 0) : false;
     if (kv_swap_requested) {
@@ -664,7 +666,9 @@ llama_kv_cache::~llama_kv_cache() {
     LLAMA_LOG_INFO("%s: KV swap stats: enabled=%d mode=%s window=%u sink=%u "
             "swap_out_calls=%llu swap_in_calls=%llu ensure_calls=%llu window_calls=%llu "
             "window_skipped=%llu backend_failures=%llu bytes_written=%llu bytes_read=%llu "
-            "write_calls=%llu read_calls=%llu release_calls=%llu\n",
+            "write_calls=%llu read_calls=%llu release_calls=%llu "
+            "RSS peak_kb=%llu current_last_kb=%llu current_min_kb=%llu current_max_kb=%llu "
+            "rss_samples=%llu\n",
             __func__, kv_swap_enabled ? 1 : 0,
             kv_swap_mode_ == kv_swap_mode::exact ? "exact" : "off",
             kv_swap_window, kv_swap_sink,
@@ -678,7 +682,12 @@ llama_kv_cache::~llama_kv_cache() {
             (unsigned long long) kv_swap_stats.bytes_read,
             (unsigned long long) kv_swap_stats.write_calls,
             (unsigned long long) kv_swap_stats.read_calls,
-            (unsigned long long) kv_swap_stats.release_calls);
+            (unsigned long long) kv_swap_stats.release_calls,
+            (unsigned long long) get_peak_rss_kb(),
+            (unsigned long long) kv_swap_rss_last_kb,
+            (unsigned long long) kv_swap_rss_min_kb,
+            (unsigned long long) kv_swap_rss_max_kb,
+            (unsigned long long) kv_swap_rss_samples);
 
     if (kv_lazy_tail) {
         // stage F1 / P1: lazy-tail madvise counters (debug-only, current-RSS check).
@@ -1761,6 +1770,50 @@ uint64_t llama_kv_cache::get_current_rss_kb() const {
 #else
     return 0;
 #endif
+}
+
+uint64_t llama_kv_cache::get_peak_rss_kb() const {
+#if defined(__linux__)
+    FILE * f = fopen("/proc/self/status", "r");
+    if (!f) {
+        return 0;
+    }
+    char line[256];
+    uint64_t peak_kb = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (std::strncmp(line, "VmHWM:", 6) == 0) {
+            unsigned long long value = 0;
+            if (sscanf(line + 6, "%llu", &value) == 1) {
+                peak_kb = (uint64_t) value;
+            }
+            break;
+        }
+    }
+    fclose(f);
+    return peak_kb;
+#else
+    return 0;
+#endif
+}
+
+void llama_kv_cache::sample_swap_rss() {
+    if (!kv_swap_rss_sample) {
+        return;
+    }
+
+    const uint64_t rss_kb = get_current_rss_kb();
+    if (rss_kb == 0) {
+        return;
+    }
+
+    if (kv_swap_rss_samples == 0 || rss_kb < kv_swap_rss_min_kb) {
+        kv_swap_rss_min_kb = rss_kb;
+    }
+    if (rss_kb > kv_swap_rss_max_kb) {
+        kv_swap_rss_max_kb = rss_kb;
+    }
+    kv_swap_rss_last_kb = rss_kb;
+    kv_swap_rss_samples += 1;
 }
 
 void llama_kv_cache::madvise_tail(uint32_t n_kv) {
@@ -3229,6 +3282,7 @@ bool llama_kv_cache_context::apply() {
     // current RSS. Runs after n_kv is known but does not change it; targets only capacity
     // outside the [0, n_kv) read window. No-op unless LLAMA_KV_LAZY_TAIL=1.
     kv->madvise_tail(n_kv);
+    kv->sample_swap_rss();
 
     return true;
 }
