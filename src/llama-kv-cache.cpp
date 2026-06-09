@@ -356,6 +356,11 @@ llama_kv_cache::llama_kv_cache(
 
     const char * LLAMA_KV_SWAP      = std::getenv("LLAMA_KV_SWAP");
     const char * LLAMA_KV_SWAP_MODE = std::getenv("LLAMA_KV_SWAP_MODE");
+    const char * LLAMA_KV_SWAP_WINDOW = std::getenv("LLAMA_KV_SWAP_WINDOW");
+    const char * LLAMA_KV_SWAP_SINK   = std::getenv("LLAMA_KV_SWAP_SINK");
+    kv_swap_window = LLAMA_KV_SWAP_WINDOW ? std::max(0, std::atoi(LLAMA_KV_SWAP_WINDOW)) : 0;
+    kv_swap_sink   = LLAMA_KV_SWAP_SINK   ? std::max(0, std::atoi(LLAMA_KV_SWAP_SINK))   : 0;
+
     const bool kv_swap_requested = LLAMA_KV_SWAP ? (std::atoi(LLAMA_KV_SWAP) != 0) : false;
     if (kv_swap_requested) {
         if (!LLAMA_KV_SWAP_MODE || std::strcmp(LLAMA_KV_SWAP_MODE, "exact") != 0) {
@@ -375,7 +380,8 @@ llama_kv_cache::llama_kv_cache(
                 kv_swap_store   = std::move(store);
                 kv_swap_enabled = true;
                 kv_swap_mode_   = kv_swap_mode::exact;
-                LLAMA_LOG_INFO("%s: KV swap exact mode enabled (backend=file, no-op scaffold)\n", __func__);
+                LLAMA_LOG_INFO("%s: KV swap exact mode enabled (backend=file, window=%u, sink=%u)\n",
+                        __func__, kv_swap_window, kv_swap_sink);
             }
         }
     }
@@ -1584,6 +1590,29 @@ void llama_kv_cache::ensure_resident(uint32_t n_kv) {
         }
     }
     kv_swap_ensure_calls += 1;
+}
+
+void llama_kv_cache::swap_out_window(uint32_t n_kv) {
+    if (!kv_swap_enabled) {
+        return;
+    }
+
+    kv_swap_window_calls += 1;
+
+    if (kv_swap_mode_ != kv_swap_mode::exact) {
+        kv_swap_window_skipped += 1;
+        return;
+    }
+    if (kv_swap_window == 0) {
+        kv_swap_window_skipped += 1;
+        return;
+    }
+    if ((uint64_t) n_kv <= (uint64_t) kv_swap_window + kv_swap_sink) {
+        kv_swap_window_skipped += 1;
+        return;
+    }
+
+    // TODO(Stage2-exact-trigger1): choose cold cells and call swap_out_cell().
 }
 
 void llama_kv_cache::kv_swap_roundtrip_selftest() {

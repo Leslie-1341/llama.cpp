@@ -392,10 +392,15 @@ private:
     uint64_t kv_swap_out_calls = 0;
     uint64_t kv_swap_in_calls = 0;
     uint64_t kv_swap_ensure_calls = 0;
+    uint32_t kv_swap_window = 0;
+    uint32_t kv_swap_sink = 0;
+    uint64_t kv_swap_window_calls = 0;
+    uint64_t kv_swap_window_skipped = 0;
     uint64_t kv_swap_backend_failures = 0;
 
     void swap_out_cell(uint32_t cell);
     void swap_in_cell(uint32_t cell);
+    void swap_out_window(uint32_t n_kv);
     void kv_swap_roundtrip_selftest();
 
     // stage F1 / P1: KV Lazy-Block tail madvise. When LLAMA_KV_LAZY_TAIL=1, after n_kv is
