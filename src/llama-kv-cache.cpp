@@ -1727,8 +1727,18 @@ void llama_kv_cache::madvise_swapped_runs(uint32_t n_kv) {
                 const uintptr_t a_start = page_align_up(lo_byte);
                 const uintptr_t a_end = page_align_down(hi_byte);
                 if (a_end > a_start) {
-                    kv_swap_madvise_advised_runs += 1;
-                    kv_swap_madvise_advised_bytes += (uint64_t) (a_end - a_start);
+                    const size_t len = (size_t) (a_end - a_start);
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+                    if (madvise((void *) a_start, len, MADV_DONTNEED) == 0) {
+                        kv_swap_madvise_advised_runs += 1;
+                        kv_swap_madvise_advised_bytes += (uint64_t) len;
+                    } else {
+                        kv_swap_madvise_failures += 1;
+                    }
+#else
+                    (void) len;
+                    kv_swap_madvise_failures += 1;
+#endif
                 } else {
                     kv_swap_madvise_skipped_bytes += (uint64_t) (hi_byte - lo_byte);
                 }
