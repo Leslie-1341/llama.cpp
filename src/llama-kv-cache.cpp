@@ -1446,9 +1446,57 @@ void llama_kv_cache::swap_out_cell(uint32_t cell) {
         return;
     }
 
-    (void) cell;
-    // TODO(Stage2-exact-swapout1): copy this cell's K/V bytes to kv_swap_store and update
-    // per-cell swap_offset/swap_size/state. Deliberately no-op in exact-swapout0.
+    if (kv_swap_mode_ != kv_swap_mode::exact || !kv_swap_store || v_trans || n_stream != 1 || v_cells.empty()) {
+        return;
+    }
+
+    auto & cells = v_cells[0];
+    if (cell >= cells.size() || !cells.is_resident(cell)) {
+        return;
+    }
+
+    size_t total_size = 0;
+    for (const auto & layer : layers) {
+        if (!layer.k_stream.empty() && layer.k_stream[0]) {
+            total_size += layer.k_stream[0]->nb[1];
+        }
+        if (layer.v && !layer.v_stream.empty() && layer.v_stream[0]) {
+            total_size += layer.v_stream[0]->nb[1];
+        }
+    }
+    if (total_size == 0) {
+        return;
+    }
+
+    // Fixed staging layout: layer0 K, layer0 V, layer1 K, layer1 V, ...
+    std::vector<uint8_t> staging(total_size);
+    size_t cursor = 0;
+    for (const auto & layer : layers) {
+        if (!layer.k_stream.empty() && layer.k_stream[0]) {
+            auto * k = layer.k_stream[0];
+            const size_t row_size = k->nb[1];
+            ggml_backend_tensor_get(k, staging.data() + cursor, (size_t) cell * row_size, row_size);
+            cursor += row_size;
+        }
+        if (layer.v && !layer.v_stream.empty() && layer.v_stream[0]) {
+            auto * v = layer.v_stream[0];
+            const size_t row_size = v->nb[1];
+            ggml_backend_tensor_get(v, staging.data() + cursor, (size_t) cell * row_size, row_size);
+            cursor += row_size;
+        }
+    }
+
+    uint64_t offset = 0;
+    const auto status = kv_swap_store->write_cell(0, cell, staging.data(), staging.size(), offset);
+    if (status != llama_kv_backing_store_status::ok) {
+        kv_swap_backend_failures += 1;
+        return;
+    }
+
+    cells.set_swap_offset(cell, offset);
+    cells.set_swap_size(cell, staging.size());
+    cells.set_state(cell, llama_kv_cell_state::SWAPPED);
+    kv_swap_out_calls += 1;
 }
 
 void llama_kv_cache::swap_in_cell(uint32_t cell) {
