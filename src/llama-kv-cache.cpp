@@ -3160,6 +3160,8 @@ bool llama_kv_cache_context::apply() {
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv = kv->get_n_kv(sinfos[i_cur]);
 
+    kv->ensure_resident(n_kv);
+
     // stage P2: zero any rows that just entered the [0, n_kv) read window but were left
     // uncommitted at construction. Must run before madvise_tail so the cleared range and the
     // advised tail never overlap. No-op unless LLAMA_KV_LAZY_CLEAR=1.
