@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstdint>
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -297,6 +298,10 @@ public:
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
 
+    // Stage2-exact-swapout0: no-op scaffold for future exact swap-in before KV reads.
+    // Not called from apply() in this stage.
+    void ensure_resident(uint32_t n_kv);
+
     // stage F1 / P1: advise the unused tail capacity [GGML_PAD(n_kv, 256), kv_size) away via
     // MADV_DONTNEED to lower current RSS. No-op unless LLAMA_KV_LAZY_TAIL=1 (and !v_trans &&
     // n_stream==1). See docs/kv_lazy_block_stage_f1_design.md.
@@ -372,6 +377,25 @@ private:
 
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
+
+    // Stage2-exact-swapout0 scaffold. This only parses env, owns the file-backed backend
+    // when explicitly enabled, and defines counters/no-op hooks. It does not touch KV tensors,
+    // cell state, apply(), attention, madvise, or prefetch.
+    enum class kv_swap_mode {
+        off,
+        exact,
+    };
+
+    std::unique_ptr<llama_kv_backing_store_i> kv_swap_store;
+    bool kv_swap_enabled = false;
+    kv_swap_mode kv_swap_mode_ = kv_swap_mode::off;
+    uint64_t kv_swap_out_calls = 0;
+    uint64_t kv_swap_in_calls = 0;
+    uint64_t kv_swap_ensure_calls = 0;
+    uint64_t kv_swap_backend_failures = 0;
+
+    void swap_out_cell(uint32_t cell);
+    void swap_in_cell(uint32_t cell);
 
     // stage F1 / P1: KV Lazy-Block tail madvise. When LLAMA_KV_LAZY_TAIL=1, after n_kv is
     // known each step we advise the page-aligned interior of the *unused tail* capacity

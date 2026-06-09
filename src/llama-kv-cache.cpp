@@ -354,6 +354,32 @@ llama_kv_cache::llama_kv_cache(
 
     llama_kv_backing_store_selftest_once();
 
+    const char * LLAMA_KV_SWAP      = std::getenv("LLAMA_KV_SWAP");
+    const char * LLAMA_KV_SWAP_MODE = std::getenv("LLAMA_KV_SWAP_MODE");
+    const bool kv_swap_requested = LLAMA_KV_SWAP ? (std::atoi(LLAMA_KV_SWAP) != 0) : false;
+    if (kv_swap_requested) {
+        if (!LLAMA_KV_SWAP_MODE || std::strcmp(LLAMA_KV_SWAP_MODE, "exact") != 0) {
+            LLAMA_LOG_WARN("%s: KV swap requested but LLAMA_KV_SWAP_MODE=%s is unsupported "
+                    "(expected exact) - disabled\n", __func__, LLAMA_KV_SWAP_MODE ? LLAMA_KV_SWAP_MODE : "<unset>");
+        } else if (v_trans || n_stream != 1) {
+            LLAMA_LOG_WARN("%s: KV swap exact mode requires !v_trans && n_stream==1 "
+                    "(v_trans=%d, n_stream=%u) - disabled\n", __func__, (int) v_trans, n_stream);
+        } else {
+            auto store = std::make_unique<llama_kv_backing_store_file>();
+            if (!store->is_enabled()) {
+                const auto & stats = store->get_stats();
+                kv_swap_backend_failures += 1;
+                LLAMA_LOG_WARN("%s: KV swap exact mode disabled: file backing store unavailable "
+                        "(errno=%d)\n", __func__, stats.last_errno);
+            } else {
+                kv_swap_store   = std::move(store);
+                kv_swap_enabled = true;
+                kv_swap_mode_   = kv_swap_mode::exact;
+                LLAMA_LOG_INFO("%s: KV swap exact mode enabled (backend=file, no-op scaffold)\n", __func__);
+            }
+        }
+    }
+
     const uint32_t n_layer_kv = hparams.n_layer_kv();
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
@@ -1413,6 +1439,36 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
         head = sinfo.idxs[s].back() + 1;
     }
+}
+
+void llama_kv_cache::swap_out_cell(uint32_t cell) {
+    if (!kv_swap_enabled) {
+        return;
+    }
+
+    (void) cell;
+    // TODO(Stage2-exact-swapout1): copy this cell's K/V bytes to kv_swap_store and update
+    // per-cell swap_offset/swap_size/state. Deliberately no-op in exact-swapout0.
+}
+
+void llama_kv_cache::swap_in_cell(uint32_t cell) {
+    if (!kv_swap_enabled) {
+        return;
+    }
+
+    (void) cell;
+    // TODO(Stage2-exact-swapout1): read this cell's K/V bytes from kv_swap_store and restore
+    // them to the original KV tensor slot. Deliberately no-op in exact-swapout0.
+}
+
+void llama_kv_cache::ensure_resident(uint32_t n_kv) {
+    if (!kv_swap_enabled) {
+        return;
+    }
+
+    (void) n_kv;
+    // TODO(Stage2-exact-swapout1): ensure cells required by the exact attention read window are
+    // resident before graph reads K/V. Not called from apply() in exact-swapout0.
 }
 
 uint64_t llama_kv_cache::get_current_rss_kb() const {
