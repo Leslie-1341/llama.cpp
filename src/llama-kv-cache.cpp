@@ -1670,8 +1670,80 @@ void llama_kv_cache::madvise_swapped_runs(uint32_t n_kv) {
         return;
     }
 
-    (void) n_kv;
     kv_swap_madvise_calls += 1;
+
+    if (kv_swap_mode_ != kv_swap_mode::exact || v_trans || n_stream != 1 || v_cells.empty()) {
+        return;
+    }
+
+    const long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) {
+        kv_swap_madvise_failures += 1;
+        return;
+    }
+    const uintptr_t page_size = (uintptr_t) page;
+    const auto page_align_up = [page_size](uintptr_t p) {
+        return (p + page_size - 1) & ~(page_size - 1);
+    };
+    const auto page_align_down = [page_size](uintptr_t p) {
+        return p & ~(page_size - 1);
+    };
+
+    auto & cells = v_cells[0];
+    const uint32_t end = std::min<uint32_t>(n_kv, cells.size());
+    uint32_t c_lo = 0;
+    while (c_lo < end) {
+        while (c_lo < end && !cells.is_swapped(c_lo)) {
+            ++c_lo;
+        }
+        if (c_lo >= end) {
+            break;
+        }
+
+        uint32_t c_hi = c_lo + 1;
+        while (c_hi < end && cells.is_swapped(c_hi)) {
+            ++c_hi;
+        }
+
+        for (const auto & layer : layers) {
+            const auto dry_run_tensor = [&](ggml_tensor * t, uint32_t n_embd_gqa) {
+                if (!t || !t->data) {
+                    return;
+                }
+
+                kv_swap_madvise_candidate_runs += 1;
+
+                const size_t row = ggml_row_size(t->type, n_embd_gqa);
+                const uint64_t run_bytes = (uint64_t) (c_hi - c_lo) * (uint64_t) t->nb[1];
+                if (row != (size_t) t->nb[1]) {
+                    kv_swap_madvise_failures += 1;
+                    kv_swap_madvise_skipped_bytes += run_bytes;
+                    return;
+                }
+
+                const uintptr_t base = (uintptr_t) t->data;
+                const uintptr_t lo_byte = base + (uintptr_t) c_lo * (uintptr_t) row;
+                const uintptr_t hi_byte = base + (uintptr_t) c_hi * (uintptr_t) row;
+                const uintptr_t a_start = page_align_up(lo_byte);
+                const uintptr_t a_end = page_align_down(hi_byte);
+                if (a_end > a_start) {
+                    kv_swap_madvise_advised_runs += 1;
+                    kv_swap_madvise_advised_bytes += (uint64_t) (a_end - a_start);
+                } else {
+                    kv_swap_madvise_skipped_bytes += (uint64_t) (hi_byte - lo_byte);
+                }
+            };
+
+            if (!layer.k_stream.empty()) {
+                dry_run_tensor(layer.k_stream[0], hparams.n_embd_k_gqa(layer.il));
+            }
+            if (layer.v && !layer.v_stream.empty()) {
+                dry_run_tensor(layer.v_stream[0], hparams.n_embd_v_gqa(layer.il));
+            }
+        }
+
+        c_lo = c_hi;
+    }
 }
 
 void llama_kv_cache::kv_swap_roundtrip_selftest() {
