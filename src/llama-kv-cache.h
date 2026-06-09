@@ -409,9 +409,17 @@ private:
     uint64_t kv_swap_rss_min_kb = 0;
     uint64_t kv_swap_rss_max_kb = 0;
     uint64_t kv_swap_rss_last_kb = 0;
+    bool     kv_swap_madvise = false;
+    uint64_t kv_swap_madvise_calls = 0;
+    uint64_t kv_swap_madvise_candidate_runs = 0;
+    uint64_t kv_swap_madvise_advised_runs = 0;
+    uint64_t kv_swap_madvise_advised_bytes = 0;
+    uint64_t kv_swap_madvise_failures = 0;
+    uint64_t kv_swap_madvise_skipped_bytes = 0;
 
     void swap_out_cell(uint32_t cell);
     void swap_in_cell(uint32_t cell);
+    void madvise_swapped_runs(uint32_t n_kv);
     void kv_swap_roundtrip_selftest();
 
     // stage F1 / P1: KV Lazy-Block tail madvise. When LLAMA_KV_LAZY_TAIL=1, after n_kv is

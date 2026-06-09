@@ -359,9 +359,11 @@ llama_kv_cache::llama_kv_cache(
     const char * LLAMA_KV_SWAP_WINDOW = std::getenv("LLAMA_KV_SWAP_WINDOW");
     const char * LLAMA_KV_SWAP_SINK   = std::getenv("LLAMA_KV_SWAP_SINK");
     const char * LLAMA_KV_SWAP_RSS_SAMPLE = std::getenv("LLAMA_KV_SWAP_RSS_SAMPLE");
+    const char * LLAMA_KV_SWAP_MADVISE = std::getenv("LLAMA_KV_SWAP_MADVISE");
     kv_swap_window = LLAMA_KV_SWAP_WINDOW ? std::max(0, std::atoi(LLAMA_KV_SWAP_WINDOW)) : 0;
     kv_swap_sink   = LLAMA_KV_SWAP_SINK   ? std::max(0, std::atoi(LLAMA_KV_SWAP_SINK))   : 0;
     kv_swap_rss_sample = LLAMA_KV_SWAP_RSS_SAMPLE ? (std::atoi(LLAMA_KV_SWAP_RSS_SAMPLE) != 0) : false;
+    const bool kv_swap_madvise_requested = LLAMA_KV_SWAP_MADVISE ? (std::atoi(LLAMA_KV_SWAP_MADVISE) != 0) : false;
 
     const bool kv_swap_requested = LLAMA_KV_SWAP ? (std::atoi(LLAMA_KV_SWAP) != 0) : false;
     if (kv_swap_requested) {
@@ -382,6 +384,7 @@ llama_kv_cache::llama_kv_cache(
                 kv_swap_store   = std::move(store);
                 kv_swap_enabled = true;
                 kv_swap_mode_   = kv_swap_mode::exact;
+                kv_swap_madvise = kv_swap_madvise_requested;
                 LLAMA_LOG_INFO("%s: KV swap exact mode enabled (backend=file, window=%u, sink=%u)\n",
                         __func__, kv_swap_window, kv_swap_sink);
             }
@@ -668,7 +671,9 @@ llama_kv_cache::~llama_kv_cache() {
             "window_skipped=%llu backend_failures=%llu bytes_written=%llu bytes_read=%llu "
             "write_calls=%llu read_calls=%llu release_calls=%llu "
             "RSS peak_kb=%llu current_last_kb=%llu current_min_kb=%llu current_max_kb=%llu "
-            "rss_samples=%llu\n",
+            "rss_samples=%llu madvise_enabled=%d madvise_calls=%llu madvise_candidate_runs=%llu "
+            "madvise_advised_runs=%llu madvise_advised_bytes=%llu madvise_failures=%llu "
+            "madvise_skipped_bytes=%llu\n",
             __func__, kv_swap_enabled ? 1 : 0,
             kv_swap_mode_ == kv_swap_mode::exact ? "exact" : "off",
             kv_swap_window, kv_swap_sink,
@@ -687,7 +692,14 @@ llama_kv_cache::~llama_kv_cache() {
             (unsigned long long) kv_swap_rss_last_kb,
             (unsigned long long) kv_swap_rss_min_kb,
             (unsigned long long) kv_swap_rss_max_kb,
-            (unsigned long long) kv_swap_rss_samples);
+            (unsigned long long) kv_swap_rss_samples,
+            kv_swap_madvise ? 1 : 0,
+            (unsigned long long) kv_swap_madvise_calls,
+            (unsigned long long) kv_swap_madvise_candidate_runs,
+            (unsigned long long) kv_swap_madvise_advised_runs,
+            (unsigned long long) kv_swap_madvise_advised_bytes,
+            (unsigned long long) kv_swap_madvise_failures,
+            (unsigned long long) kv_swap_madvise_skipped_bytes);
 
     if (kv_lazy_tail) {
         // stage F1 / P1: lazy-tail madvise counters (debug-only, current-RSS check).
@@ -1650,6 +1662,16 @@ void llama_kv_cache::swap_out_window(uint32_t n_kv) {
             swap_out_cell(cell);
         }
     }
+    madvise_swapped_runs(n_kv);
+}
+
+void llama_kv_cache::madvise_swapped_runs(uint32_t n_kv) {
+    if (!kv_swap_madvise) {
+        return;
+    }
+
+    (void) n_kv;
+    kv_swap_madvise_calls += 1;
 }
 
 void llama_kv_cache::kv_swap_roundtrip_selftest() {
