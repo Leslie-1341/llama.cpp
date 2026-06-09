@@ -46,6 +46,8 @@ public:
             shift[i] =  0;
             seq[i].reset();
             state[i] = llama_kv_cell_state::UNTOUCHED;
+            swap_offset[i] = 0;
+            swap_size[i] = 0;
         }
 
         has_shift = false;
@@ -75,6 +77,8 @@ public:
         shift.resize(n);
         seq.resize(n);
         state.resize(n);
+        swap_offset.resize(n);
+        swap_size.resize(n);
 
         reset();
     }
@@ -126,6 +130,38 @@ public:
         return get_state(i) == llama_kv_cell_state::RESIDENT;
     }
 
+    uint64_t get_swap_offset(uint32_t i) const {
+        assert(i < swap_offset.size());
+
+        return swap_offset[i];
+    }
+
+    void set_swap_offset(uint32_t i, uint64_t offset) {
+        assert(i < swap_offset.size());
+
+        swap_offset[i] = offset;
+    }
+
+    uint64_t get_swap_size(uint32_t i) const {
+        assert(i < swap_size.size());
+
+        return swap_size[i];
+    }
+
+    void set_swap_size(uint32_t i, uint64_t size) {
+        assert(i < swap_size.size());
+
+        swap_size[i] = size;
+    }
+
+    void clear_swap_metadata(uint32_t i) {
+        assert(i < swap_offset.size());
+        assert(i < swap_size.size());
+
+        swap_offset[i] = 0;
+        swap_size[i] = 0;
+    }
+
     // move cell isrc to idst (used during defrag)
     //void mv(uint32_t isrc, uint32_t idst) {
     //    assert(isrc < pos.size());
@@ -161,6 +197,8 @@ public:
             res.ext[j] = ext[idx];
             res.seq[j] = seq[idx];
             res.state[j] = state[idx];
+            res.swap_offset[j] = swap_offset[idx];
+            res.swap_size[j] = swap_size[idx];
 
             assert(shift[idx] == 0);
         }
@@ -181,6 +219,8 @@ public:
             res.ext[j] = ext[idx];
             res.seq[j] = seq[idx];
             res.state[j] = state[idx];
+            res.swap_offset[j] = swap_offset[idx];
+            res.swap_size[j] = swap_size[idx];
 
             assert(shift[idx] == 0);
         }
@@ -211,6 +251,8 @@ public:
             ext[idx] = other.ext[j];
             seq[idx] = other.seq[j];
             state[idx] = other.state[j];
+            swap_offset[idx] = other.swap_offset[j];
+            swap_size[idx] = other.swap_size[j];
 
             if (pos[idx] != -1) {
                 seq_pos_add(i + j);
@@ -243,6 +285,8 @@ public:
             ext[idx] = other.ext[j];
             seq[idx] = other.seq[j];
             state[idx] = other.state[j];
+            swap_offset[idx] = other.swap_offset[j];
+            swap_size[idx] = other.swap_size[j];
 
             if (pos[idx] != -1) {
                 seq_pos_add(idx);
@@ -264,6 +308,7 @@ public:
         ext[i].reset();
         shift[i] = 0;
         state[i] = llama_kv_cell_state::UNTOUCHED;
+        clear_swap_metadata(i);
 
         used.erase(i);
     }
@@ -284,6 +329,7 @@ public:
             ext[i].reset();
             shift[i] = 0;
             state[i] = llama_kv_cell_state::UNTOUCHED;
+            clear_swap_metadata(i);
 
             used.erase(i);
 
@@ -315,6 +361,7 @@ public:
             ext[i].reset();
             shift[i] = 0;
             state[i] = llama_kv_cell_state::UNTOUCHED;
+            clear_swap_metadata(i);
 
             used.erase(i);
 
@@ -436,6 +483,7 @@ public:
 
         pos[i] = p;
         state[i] = llama_kv_cell_state::RESIDENT;
+        clear_swap_metadata(i);
 
         used.insert(i);
     }
@@ -464,6 +512,7 @@ public:
             pos[i] = -1;
             shift[i] = 0;
             state[i] = llama_kv_cell_state::UNTOUCHED;
+            clear_swap_metadata(i);
 
             used.erase(i);
 
@@ -527,12 +576,14 @@ private:
     // the bitset seq[i] tells us which sequences are currently occupying the i-th cell
     std::vector<seq_set_t> seq;
 
-    // Stage2-state0: per-cell runtime KV residency metadata.
+    // Stage2-state0/backend0: per-cell runtime KV swap metadata.
     //
-    // This is metadata only; no swap-out, swap-in, backing store, prefetch, or find_slot
+    // This is metadata only; no swap-out, swap-in, backing-store I/O, prefetch, or find_slot
     // semantics are enabled here. SWAPPED must not be interpreted as free by future code.
     // Future stages may extend the state machine with DIRTY, PREFETCHING, and READY.
     std::vector<llama_kv_cell_state> state;
+    std::vector<uint64_t> swap_offset;
+    std::vector<uint64_t> swap_size;
 
     // the set seq_pos[s][p] tells us how many times the position p is currently present for sequence s
     // if the position p is not present, seq_pos[s][p] is not set
