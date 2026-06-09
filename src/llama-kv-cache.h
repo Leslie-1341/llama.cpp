@@ -301,6 +301,7 @@ public:
     // Stage2-exact-swapout0: no-op scaffold for future exact swap-in before KV reads.
     // Not called from apply() in this stage.
     void ensure_resident(uint32_t n_kv);
+    void swap_out_window(uint32_t n_kv);
 
     // stage F1 / P1: advise the unused tail capacity [GGML_PAD(n_kv, 256), kv_size) away via
     // MADV_DONTNEED to lower current RSS. No-op unless LLAMA_KV_LAZY_TAIL=1 (and !v_trans &&
@@ -400,7 +401,6 @@ private:
 
     void swap_out_cell(uint32_t cell);
     void swap_in_cell(uint32_t cell);
-    void swap_out_window(uint32_t n_kv);
     void kv_swap_roundtrip_selftest();
 
     // stage F1 / P1: KV Lazy-Block tail madvise. When LLAMA_KV_LAZY_TAIL=1, after n_kv is

@@ -1599,7 +1599,7 @@ void llama_kv_cache::swap_out_window(uint32_t n_kv) {
 
     kv_swap_window_calls += 1;
 
-    if (kv_swap_mode_ != kv_swap_mode::exact) {
+    if (kv_swap_mode_ != kv_swap_mode::exact || v_trans || n_stream != 1 || v_cells.empty()) {
         kv_swap_window_skipped += 1;
         return;
     }
@@ -1612,7 +1612,14 @@ void llama_kv_cache::swap_out_window(uint32_t n_kv) {
         return;
     }
 
-    // TODO(Stage2-exact-trigger1): choose cold cells and call swap_out_cell().
+    auto & cells = v_cells[0];
+    const uint32_t begin = std::min<uint32_t>(kv_swap_sink, cells.size());
+    const uint32_t end = std::min<uint32_t>(n_kv - kv_swap_window, cells.size());
+    for (uint32_t cell = begin; cell < end; ++cell) {
+        if (cells.is_resident(cell)) {
+            swap_out_cell(cell);
+        }
+    }
 }
 
 void llama_kv_cache::kv_swap_roundtrip_selftest() {
@@ -3189,6 +3196,7 @@ bool llama_kv_cache_context::apply() {
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv = kv->get_n_kv(sinfos[i_cur]);
 
+    kv->swap_out_window(n_kv);
     kv->ensure_resident(n_kv);
 
     // stage P2: zero any rows that just entered the [0, n_kv) read window but were left
