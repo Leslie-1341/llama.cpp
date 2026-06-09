@@ -7,13 +7,17 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
 #include <stdexcept>
 
 #if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
@@ -79,6 +83,253 @@ static ggml_tensor * ggml_mul_mat_aux(
 }
 
 //
+// llama_kv_backing_store_file
+//
+
+static const char * llama_kv_backing_store_status_name(llama_kv_backing_store_status status) {
+    switch (status) {
+        case llama_kv_backing_store_status::ok:       return "ok";
+        case llama_kv_backing_store_status::disabled: return "disabled";
+        case llama_kv_backing_store_status::io_error: return "io_error";
+        case llama_kv_backing_store_status::bad_slot: return "bad_slot";
+    }
+
+    return "unknown";
+}
+
+llama_kv_backing_store_file::llama_kv_backing_store_file() {
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+#if defined(O_TMPFILE)
+    fd = open("/tmp", O_TMPFILE | O_RDWR | O_CLOEXEC, S_IRUSR | S_IWUSR);
+    if (fd >= 0) {
+        return;
+    }
+    stats.last_errno = errno;
+#endif
+
+    file = std::tmpfile();
+    if (!file) {
+        stats.last_errno = errno;
+        return;
+    }
+
+    fd = fileno(file);
+    if (fd < 0) {
+        stats.last_errno = errno;
+        std::fclose(file);
+        file = nullptr;
+    }
+#else
+    stats.last_errno = ENOSYS;
+#endif
+}
+
+llama_kv_backing_store_file::~llama_kv_backing_store_file() {
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+    if (file) {
+        std::fclose(file);
+        file = nullptr;
+        fd = -1;
+        return;
+    }
+
+    if (fd >= 0) {
+        close(fd);
+        fd = -1;
+    }
+#endif
+}
+
+llama_kv_backing_store_status llama_kv_backing_store_file::write_cell(
+        uint32_t   strm,
+        uint32_t   cell,
+        const void * data,
+        size_t     size,
+        uint64_t & offset_out) {
+    (void) strm;
+    (void) cell;
+
+    offset_out = 0;
+
+    if (fd < 0) {
+        return llama_kv_backing_store_status::disabled;
+    }
+    if (!data || size == 0) {
+        return llama_kv_backing_store_status::bad_slot;
+    }
+
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+    const uint64_t offset = file_len;
+    const char * ptr = static_cast<const char *>(data);
+    size_t written = 0;
+
+    while (written < size) {
+        const ssize_t ret = pwrite(fd, ptr + written, size - written, (off_t) (offset + written));
+        if (ret < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            stats.last_errno = errno;
+            return llama_kv_backing_store_status::io_error;
+        }
+        if (ret == 0) {
+            stats.last_errno = EIO;
+            return llama_kv_backing_store_status::io_error;
+        }
+        written += (size_t) ret;
+    }
+
+    offset_out = offset;
+    file_len += size;
+    stats.bytes_written += size;
+    stats.write_calls += 1;
+    stats.last_errno = 0;
+
+    return llama_kv_backing_store_status::ok;
+#else
+    stats.last_errno = ENOSYS;
+    return llama_kv_backing_store_status::disabled;
+#endif
+}
+
+llama_kv_backing_store_status llama_kv_backing_store_file::read_cell(
+        uint32_t strm,
+        uint32_t cell,
+        uint64_t offset,
+        void *   data,
+        size_t   size) {
+    (void) strm;
+    (void) cell;
+
+    if (fd < 0) {
+        return llama_kv_backing_store_status::disabled;
+    }
+    if (!data || size == 0 || offset > file_len || size > file_len - offset) {
+        return llama_kv_backing_store_status::bad_slot;
+    }
+
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+    char * ptr = static_cast<char *>(data);
+    size_t read = 0;
+
+    while (read < size) {
+        const ssize_t ret = pread(fd, ptr + read, size - read, (off_t) (offset + read));
+        if (ret < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            stats.last_errno = errno;
+            return llama_kv_backing_store_status::io_error;
+        }
+        if (ret == 0) {
+            stats.last_errno = EIO;
+            return llama_kv_backing_store_status::io_error;
+        }
+        read += (size_t) ret;
+    }
+
+    stats.bytes_read += size;
+    stats.read_calls += 1;
+    stats.last_errno = 0;
+
+    return llama_kv_backing_store_status::ok;
+#else
+    stats.last_errno = ENOSYS;
+    return llama_kv_backing_store_status::disabled;
+#endif
+}
+
+llama_kv_backing_store_status llama_kv_backing_store_file::release(uint64_t offset, size_t size) {
+    if (fd < 0) {
+        return llama_kv_backing_store_status::disabled;
+    }
+    if (size == 0 || offset > file_len || size > file_len - offset) {
+        return llama_kv_backing_store_status::bad_slot;
+    }
+
+    stats.bytes_released += size;
+    stats.release_calls += 1;
+    stats.last_errno = 0;
+
+    return llama_kv_backing_store_status::ok;
+}
+
+llama_kv_backing_store_status llama_kv_backing_store_file::reset() {
+    stats = {};
+
+    if (fd < 0) {
+        return llama_kv_backing_store_status::disabled;
+    }
+
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+    if (ftruncate(fd, 0) != 0) {
+        stats.last_errno = errno;
+        return llama_kv_backing_store_status::io_error;
+    }
+
+    file_len = 0;
+    return llama_kv_backing_store_status::ok;
+#else
+    stats.last_errno = ENOSYS;
+    return llama_kv_backing_store_status::disabled;
+#endif
+}
+
+static void llama_kv_backing_store_selftest_once() {
+    static bool checked = false;
+    if (checked) {
+        return;
+    }
+    checked = true;
+
+    const char * env = std::getenv("LLAMA_KV_SWAP_BACKEND_SELFTEST");
+    if (!env || std::atoi(env) == 0) {
+        return;
+    }
+
+    llama_kv_backing_store_file store;
+    if (!store.is_enabled()) {
+        const auto & stats = store.get_stats();
+        LLAMA_LOG_ERROR("KV_SWAP_BACKEND_SELFTEST: backing store selftest fail status=disabled errno=%d\n",
+                stats.last_errno);
+        return;
+    }
+
+    const char payload[] = "hello-kv";
+    char restored[sizeof(payload)] = {};
+    uint64_t offset = 0;
+
+    auto write_status = store.write_cell(0, 0, payload, sizeof(payload), offset);
+    auto read_status  = store.read_cell (0, 0, offset, restored, sizeof(restored));
+    const bool same = std::memcmp(payload, restored, sizeof(payload)) == 0;
+    auto release_status = store.release(offset, sizeof(payload));
+
+    const auto stats_before_reset = store.get_stats();
+    auto reset_status = store.reset();
+
+    const bool pass =
+        write_status   == llama_kv_backing_store_status::ok &&
+        read_status    == llama_kv_backing_store_status::ok &&
+        release_status == llama_kv_backing_store_status::ok &&
+        reset_status   == llama_kv_backing_store_status::ok &&
+        same;
+
+    LLAMA_LOG_INFO("KV_SWAP_BACKEND_SELFTEST: backing store selftest %s write=%s read=%s release=%s reset=%s "
+            "bytes_written=%llu bytes_read=%llu released_bytes=%llu write_calls=%llu read_calls=%llu release_calls=%llu\n",
+            pass ? "pass" : "fail",
+            llama_kv_backing_store_status_name(write_status),
+            llama_kv_backing_store_status_name(read_status),
+            llama_kv_backing_store_status_name(release_status),
+            llama_kv_backing_store_status_name(reset_status),
+            (unsigned long long) stats_before_reset.bytes_written,
+            (unsigned long long) stats_before_reset.bytes_read,
+            (unsigned long long) stats_before_reset.bytes_released,
+            (unsigned long long) stats_before_reset.write_calls,
+            (unsigned long long) stats_before_reset.read_calls,
+            (unsigned long long) stats_before_reset.release_calls);
+}
+
+//
 // llama_kv_cache
 //
 
@@ -100,6 +351,8 @@ llama_kv_cache::llama_kv_cache(
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type) {
 
     GGML_ASSERT(kv_size % n_pad == 0);
+
+    llama_kv_backing_store_selftest_once();
 
     const uint32_t n_layer_kv = hparams.n_layer_kv();
 

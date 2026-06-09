@@ -6,6 +6,7 @@
 #include "llama-memory.h"
 
 #include <cstddef>
+#include <cstdio>
 #include <cstdint>
 #include <unordered_map>
 #include <vector>
@@ -25,11 +26,28 @@ struct llama_context;
 // seam for future exact offload work, where a file-backed/tmpfile implementation can persist
 // cell or block bytes outside the anonymous KV tensor allocation. No file I/O, swap-out,
 // swap-in, ensure_resident, prefetch, or madvise behavior is implemented here.
+enum class llama_kv_backing_store_status : uint8_t {
+    ok = 0,
+    disabled,
+    io_error,
+    bad_slot,
+};
+
+struct llama_kv_backing_store_stats {
+    uint64_t bytes_written  = 0;
+    uint64_t bytes_read     = 0;
+    uint64_t bytes_released = 0;
+    uint64_t write_calls    = 0;
+    uint64_t read_calls     = 0;
+    uint64_t release_calls  = 0;
+    int      last_errno     = 0;
+};
+
 class llama_kv_backing_store_i {
 public:
     virtual ~llama_kv_backing_store_i() = default;
 
-    virtual bool write_cell(
+    virtual llama_kv_backing_store_status write_cell(
             uint32_t   strm,
             uint32_t   cell,
             const void * data,
@@ -40,10 +58,10 @@ public:
         (void) data;
         (void) size;
         offset_out = 0;
-        return false;
+        return llama_kv_backing_store_status::disabled;
     }
 
-    virtual bool read_cell(
+    virtual llama_kv_backing_store_status read_cell(
             uint32_t strm,
             uint32_t cell,
             uint64_t offset,
@@ -54,15 +72,59 @@ public:
         (void) offset;
         (void) data;
         (void) size;
-        return false;
+        return llama_kv_backing_store_status::disabled;
     }
 
-    virtual void release(uint64_t offset, size_t size) {
+    virtual llama_kv_backing_store_status release(uint64_t offset, size_t size) {
         (void) offset;
         (void) size;
+        return llama_kv_backing_store_status::disabled;
     }
 
-    virtual void reset() {}
+    virtual llama_kv_backing_store_status reset() {
+        return llama_kv_backing_store_status::disabled;
+    }
+};
+
+class llama_kv_backing_store_file : public llama_kv_backing_store_i {
+public:
+    llama_kv_backing_store_file();
+    ~llama_kv_backing_store_file() override;
+
+    llama_kv_backing_store_status write_cell(
+            uint32_t   strm,
+            uint32_t   cell,
+            const void * data,
+            size_t     size,
+            uint64_t & offset_out) override;
+
+    llama_kv_backing_store_status read_cell(
+            uint32_t strm,
+            uint32_t cell,
+            uint64_t offset,
+            void *   data,
+            size_t   size) override;
+
+    llama_kv_backing_store_status release(uint64_t offset, size_t size) override;
+    llama_kv_backing_store_status reset() override;
+
+    bool is_enabled() const {
+        return fd >= 0;
+    }
+
+    uint64_t get_file_len() const {
+        return file_len;
+    }
+
+    const llama_kv_backing_store_stats & get_stats() const {
+        return stats;
+    }
+
+private:
+    int fd = -1;
+    std::FILE * file = nullptr;
+    uint64_t file_len = 0;
+    llama_kv_backing_store_stats stats;
 };
 
 class llama_kv_cache : public llama_memory_i {
