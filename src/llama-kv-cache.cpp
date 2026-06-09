@@ -651,6 +651,8 @@ llama_kv_cache::llama_kv_cache(
 }
 
 llama_kv_cache::~llama_kv_cache() {
+    kv_swap_roundtrip_selftest();
+
     if (kv_lazy_tail) {
         // stage F1 / P1: lazy-tail madvise counters (debug-only, current-RSS check).
         LLAMA_LOG_INFO("%s: kv lazy-tail stats: enabled=1 calls=%llu bytes=%llu (%.2f MiB) failures=%llu "
@@ -1486,6 +1488,8 @@ void llama_kv_cache::swap_out_cell(uint32_t cell) {
         }
     }
 
+    GGML_ASSERT(cursor == total_size);
+
     uint64_t offset = 0;
     const auto status = kv_swap_store->write_cell(0, cell, staging.data(), staging.size(), offset);
     if (status != llama_kv_backing_store_status::ok) {
@@ -1504,9 +1508,63 @@ void llama_kv_cache::swap_in_cell(uint32_t cell) {
         return;
     }
 
-    (void) cell;
-    // TODO(Stage2-exact-swapout1): read this cell's K/V bytes from kv_swap_store and restore
-    // them to the original KV tensor slot. Deliberately no-op in exact-swapout0.
+    if (kv_swap_mode_ != kv_swap_mode::exact || !kv_swap_store || v_trans || n_stream != 1 || v_cells.empty()) {
+        return;
+    }
+
+    auto & cells = v_cells[0];
+    if (cell >= cells.size() || !cells.is_swapped(cell)) {
+        return;
+    }
+
+    const uint64_t offset = cells.get_swap_offset(cell);
+    const size_t swap_size = cells.get_swap_size(cell);
+    if (swap_size == 0) {
+        return;
+    }
+
+    size_t total_size = 0;
+    for (const auto & layer : layers) {
+        if (!layer.k_stream.empty() && layer.k_stream[0]) {
+            total_size += layer.k_stream[0]->nb[1];
+        }
+        if (layer.v && !layer.v_stream.empty() && layer.v_stream[0]) {
+            total_size += layer.v_stream[0]->nb[1];
+        }
+    }
+    if (total_size == 0 || total_size != swap_size) {
+        kv_swap_backend_failures += 1;
+        return;
+    }
+
+    std::vector<uint8_t> staging(total_size);
+    const auto status = kv_swap_store->read_cell(0, cell, offset, staging.data(), staging.size());
+    if (status != llama_kv_backing_store_status::ok) {
+        kv_swap_backend_failures += 1;
+        return;
+    }
+
+    // Fixed staging layout mirrors swap_out_cell(): layer0 K, layer0 V, layer1 K, layer1 V, ...
+    size_t cursor = 0;
+    for (const auto & layer : layers) {
+        if (!layer.k_stream.empty() && layer.k_stream[0]) {
+            auto * k = layer.k_stream[0];
+            const size_t row_size = k->nb[1];
+            ggml_backend_tensor_set(k, staging.data() + cursor, (size_t) cell * row_size, row_size);
+            cursor += row_size;
+        }
+        if (layer.v && !layer.v_stream.empty() && layer.v_stream[0]) {
+            auto * v = layer.v_stream[0];
+            const size_t row_size = v->nb[1];
+            ggml_backend_tensor_set(v, staging.data() + cursor, (size_t) cell * row_size, row_size);
+            cursor += row_size;
+        }
+    }
+
+    GGML_ASSERT(cursor == total_size);
+
+    cells.set_state(cell, llama_kv_cell_state::RESIDENT);
+    kv_swap_in_calls += 1;
 }
 
 void llama_kv_cache::ensure_resident(uint32_t n_kv) {
@@ -1514,9 +1572,115 @@ void llama_kv_cache::ensure_resident(uint32_t n_kv) {
         return;
     }
 
-    (void) n_kv;
-    // TODO(Stage2-exact-swapout1): ensure cells required by the exact attention read window are
-    // resident before graph reads K/V. Not called from apply() in exact-swapout0.
+    if (kv_swap_mode_ != kv_swap_mode::exact || v_cells.empty()) {
+        return;
+    }
+
+    auto & cells = v_cells[0];
+    const uint32_t end = std::min<uint32_t>(n_kv, cells.size());
+    for (uint32_t i = 0; i < end; ++i) {
+        if (cells.is_swapped(i)) {
+            swap_in_cell(i);
+        }
+    }
+    kv_swap_ensure_calls += 1;
+}
+
+void llama_kv_cache::kv_swap_roundtrip_selftest() {
+    const char * LLAMA_KV_SWAP_ROUNDTRIP_SELFTEST = std::getenv("LLAMA_KV_SWAP_ROUNDTRIP_SELFTEST");
+    if (!LLAMA_KV_SWAP_ROUNDTRIP_SELFTEST || std::atoi(LLAMA_KV_SWAP_ROUNDTRIP_SELFTEST) == 0) {
+        return;
+    }
+
+    static bool done = false;
+    if (done || !kv_swap_enabled || kv_swap_mode_ != kv_swap_mode::exact || !kv_swap_store ||
+            v_trans || n_stream != 1 || v_cells.empty()) {
+        return;
+    }
+
+    auto & cells = v_cells[0];
+    uint32_t cell = cells.size();
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (cells.is_resident(i)) {
+            cell = i;
+            break;
+        }
+    }
+    if (cell == cells.size()) {
+        return;
+    }
+
+    size_t total_size = 0;
+    for (const auto & layer : layers) {
+        if (!layer.k_stream.empty() && layer.k_stream[0]) {
+            total_size += layer.k_stream[0]->nb[1];
+        }
+        if (layer.v && !layer.v_stream.empty() && layer.v_stream[0]) {
+            total_size += layer.v_stream[0]->nb[1];
+        }
+    }
+    if (total_size == 0) {
+        return;
+    }
+
+    auto read_cell_bytes = [&](std::vector<uint8_t> & out) {
+        out.resize(total_size);
+        size_t cursor = 0;
+        for (const auto & layer : layers) {
+            if (!layer.k_stream.empty() && layer.k_stream[0]) {
+                auto * k = layer.k_stream[0];
+                const size_t row_size = k->nb[1];
+                ggml_backend_tensor_get(k, out.data() + cursor, (size_t) cell * row_size, row_size);
+                cursor += row_size;
+            }
+            if (layer.v && !layer.v_stream.empty() && layer.v_stream[0]) {
+                auto * v = layer.v_stream[0];
+                const size_t row_size = v->nb[1];
+                ggml_backend_tensor_get(v, out.data() + cursor, (size_t) cell * row_size, row_size);
+                cursor += row_size;
+            }
+        }
+        return cursor == total_size;
+    };
+
+    std::vector<uint8_t> before;
+    if (!read_cell_bytes(before)) {
+        done = true;
+        LLAMA_LOG_ERROR("%s: KV swap roundtrip selftest fail: snapshot layout mismatch\n", __func__);
+        return;
+    }
+
+    swap_out_cell(cell);
+    if (!cells.is_swapped(cell)) {
+        done = true;
+        LLAMA_LOG_ERROR("%s: KV swap roundtrip selftest fail: swap_out did not mark cell %u swapped\n",
+                __func__, cell);
+        return;
+    }
+
+    swap_in_cell(cell);
+    if (!cells.is_resident(cell)) {
+        done = true;
+        LLAMA_LOG_ERROR("%s: KV swap roundtrip selftest fail: swap_in did not restore cell %u resident\n",
+                __func__, cell);
+        return;
+    }
+
+    std::vector<uint8_t> after;
+    if (!read_cell_bytes(after)) {
+        done = true;
+        LLAMA_LOG_ERROR("%s: KV swap roundtrip selftest fail: restore layout mismatch\n", __func__);
+        return;
+    }
+
+    done = true;
+    if (before == after) {
+        LLAMA_LOG_INFO("%s: KV swap roundtrip selftest pass: cell=%u bytes=%zu\n",
+                __func__, cell, total_size);
+    } else {
+        LLAMA_LOG_ERROR("%s: KV swap roundtrip selftest fail: byte mismatch cell=%u bytes=%zu\n",
+                __func__, cell, total_size);
+    }
 }
 
 uint64_t llama_kv_cache::get_current_rss_kb() const {

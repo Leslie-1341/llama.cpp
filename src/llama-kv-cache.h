@@ -396,6 +396,7 @@ private:
 
     void swap_out_cell(uint32_t cell);
     void swap_in_cell(uint32_t cell);
+    void kv_swap_roundtrip_selftest();
 
     // stage F1 / P1: KV Lazy-Block tail madvise. When LLAMA_KV_LAZY_TAIL=1, after n_kv is
     // known each step we advise the page-aligned interior of the *unused tail* capacity
