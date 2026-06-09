@@ -13,6 +13,11 @@
 #include <map>
 #include <stdexcept>
 
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
@@ -250,6 +255,22 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    // stage P2: clear-frontier (debug-only, off by default). Read before the buffer clear so we
+    // can replace the full memset with a prefix-only clear. Only the !v_trans / single-stream
+    // layout is supported; otherwise warn once and fall back to the full clear.
+    const char * LLAMA_KV_LAZY_CLEAR = getenv("LLAMA_KV_LAZY_CLEAR");
+    kv_lazy_clear = LLAMA_KV_LAZY_CLEAR ? (atoi(LLAMA_KV_LAZY_CLEAR) != 0) : false;
+    if (kv_lazy_clear && (v_trans || n_stream != 1)) {
+        LLAMA_LOG_WARN("%s: KV lazy-clear requires !v_trans && n_stream==1 (v_trans=%d, n_stream=%u) "
+                "- falling back to full clear\n", __func__, (int) v_trans, n_stream);
+        kv_lazy_clear = false;
+    }
+    if (kv_lazy_clear) {
+        clear_frontier = std::min<uint32_t>(kv_size, 256u);
+        LLAMA_LOG_INFO("%s: KV lazy-clear enabled (clear_frontier = %u cells, kv_size = %u) -- "
+                "tail left uncommitted to lower peak RSS\n", __func__, clear_frontier, kv_size);
+    }
+
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
     for (auto & [buft, ctx] : ctx_map) {
         ggml_backend_buffer_t buf;
@@ -267,7 +288,21 @@ llama_kv_cache::llama_kv_cache(
 
         LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
 
-        ggml_backend_buffer_clear(buf, 0);
+        if (kv_lazy_clear && !model.hparams.no_alloc) {
+            // P2: only zero the [0, clear_frontier) prefix of each K/V tensor; leave the tail
+            // uncommitted. n_stream==1 so each tensor row stride is t->nb[1].
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                const size_t total  = ggml_nbytes(t);
+                const size_t prefix = std::min<size_t>(total, (size_t) clear_frontier * t->nb[1]);
+                if (prefix > 0) {
+                    ggml_backend_tensor_memset(t, 0, /*offset=*/0, /*size=*/prefix);
+                }
+                lazy_clear_init_bytes    += prefix;
+                lazy_clear_skipped_bytes += (total - prefix);
+            }
+        } else {
+            ggml_backend_buffer_clear(buf, 0);
+        }
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
@@ -325,6 +360,46 @@ llama_kv_cache::llama_kv_cache(
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
+
+    // stage F1 / P1: KV Lazy-Block tail madvise (debug-only, off by default).
+    // See docs/kv_lazy_block_stage_f1_design.md.
+    const char * LLAMA_KV_LAZY_TAIL = getenv("LLAMA_KV_LAZY_TAIL");
+    kv_lazy_tail = LLAMA_KV_LAZY_TAIL ? (atoi(LLAMA_KV_LAZY_TAIL) != 0) : false;
+    if (kv_lazy_tail) {
+        LLAMA_LOG_INFO("%s: KV lazy-tail madvise enabled (v_trans = %d, n_stream = %u) -- advises unused tail "
+                "[PAD(n_kv,256), %u) per step\n", __func__, (int) v_trans, n_stream, kv_size);
+    }
+}
+
+llama_kv_cache::~llama_kv_cache() {
+    if (kv_lazy_tail) {
+        // stage F1 / P1: lazy-tail madvise counters (debug-only, current-RSS check).
+        LLAMA_LOG_INFO("%s: kv lazy-tail stats: enabled=1 calls=%llu bytes=%llu (%.2f MiB) failures=%llu "
+                "us=%llu (%.2f ms) rss_before=%llu KiB rss_after=%llu KiB\n", __func__,
+                (unsigned long long) lazy_tail_madvise_calls,
+                (unsigned long long) lazy_tail_madvise_bytes,
+                lazy_tail_madvise_bytes / (1024.0 * 1024.0),
+                (unsigned long long) lazy_tail_madvise_failures,
+                (unsigned long long) lazy_tail_madvise_us,
+                lazy_tail_madvise_us / 1000.0,
+                (unsigned long long) lazy_tail_rss_before_kb,
+                (unsigned long long) lazy_tail_rss_after_kb);
+    }
+    if (kv_lazy_clear) {
+        // stage P2: clear-frontier counters (debug-only, peak-RSS path).
+        LLAMA_LOG_INFO("%s: kv lazy-clear stats: enabled=1 clear_frontier=%u init_bytes=%llu (%.2f MiB) "
+                "grow_bytes=%llu (%.2f MiB) skipped_bytes=%llu (%.2f MiB) calls=%llu us=%llu (%.2f ms)\n",
+                __func__, clear_frontier,
+                (unsigned long long) lazy_clear_init_bytes,
+                lazy_clear_init_bytes / (1024.0 * 1024.0),
+                (unsigned long long) lazy_clear_grow_bytes,
+                lazy_clear_grow_bytes / (1024.0 * 1024.0),
+                (unsigned long long) lazy_clear_skipped_bytes,
+                lazy_clear_skipped_bytes / (1024.0 * 1024.0),
+                (unsigned long long) lazy_clear_calls,
+                (unsigned long long) lazy_clear_us,
+                lazy_clear_us / 1000.0);
+    }
 }
 
 void llama_kv_cache::clear(bool data) {
@@ -1085,6 +1160,154 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
         head = sinfo.idxs[s].back() + 1;
     }
+}
+
+uint64_t llama_kv_cache::get_current_rss_kb() const {
+#if defined(__linux__)
+    FILE * f = fopen("/proc/self/statm", "r");
+    if (!f) {
+        return 0;
+    }
+    long pages_total = 0;
+    long pages_rss   = 0;
+    const int n = fscanf(f, "%ld %ld", &pages_total, &pages_rss);
+    fclose(f);
+    if (n != 2 || pages_rss < 0) {
+        return 0;
+    }
+    const long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) {
+        return 0;
+    }
+    return (uint64_t) pages_rss * (uint64_t) page / 1024u;
+#else
+    return 0;
+#endif
+}
+
+void llama_kv_cache::madvise_tail(uint32_t n_kv) {
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+    if (!kv_lazy_tail) {
+        return;
+    }
+    // boundary: only the !v_trans / single-stream layout has contiguous per-cell rows.
+    if (v_trans || n_stream != 1) {
+        if (!kv_lazy_tail_warned) {
+            LLAMA_LOG_WARN("%s: lazy-tail madvise skipped: requires !v_trans && n_stream==1 "
+                    "(v_trans=%d, n_stream=%u)\n", __func__, (int) v_trans, n_stream);
+            kv_lazy_tail_warned = true;
+        }
+        return;
+    }
+
+    const uint32_t kv_size = get_size();
+    // tail starts at the next 256-cell boundary at/above n_kv, so it can never overlap the
+    // [0, n_kv) read window even after n_kv grows by one pad step next step.
+    const uint32_t lo_cell = GGML_PAD(n_kv, 256);
+    if (lo_cell >= kv_size) {
+        return; // no unused tail capacity
+    }
+
+    const long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) {
+        return;
+    }
+    const uint64_t pg = (uint64_t) page;
+
+    const int64_t t_start = ggml_time_us();
+    if (lazy_tail_madvise_calls == 0) {
+        lazy_tail_rss_before_kb = get_current_rss_kb();
+    }
+
+    for (const auto & layer : layers) {
+        const uint32_t il = layer.il;
+        ggml_tensor * k = layer.k_stream[0];
+        ggml_tensor * v = layer.v_stream[0];
+
+        // advise only the page-aligned interior of the tail byte range [lo_cell*row, kv_size*row)
+        // (absolute-address aligned, never a relative offset -- see E1-lite), so we never touch
+        // a page shared with the last live cell below lo_cell.
+        auto advise = [&](ggml_tensor * t, uint64_t row) {
+            if (!t || row == 0) {
+                return;
+            }
+            char * base = (char *) t->data; // CPU backend: tensor data is a host pointer
+            if (!base) {
+                return;
+            }
+            const uintptr_t lo_a = (uintptr_t) base + (uintptr_t) lo_cell * row;
+            const uintptr_t hi_a = (uintptr_t) base + (uintptr_t) kv_size * row;
+            const uintptr_t a_start = (lo_a + pg - 1) & ~(uintptr_t) (pg - 1);
+            const uintptr_t a_end   = hi_a & ~(uintptr_t) (pg - 1);
+            if (a_end <= a_start) {
+                return; // tail smaller than a page after trimming
+            }
+            const size_t len = (size_t) (a_end - a_start);
+            const int rc = madvise((void *) a_start, len, MADV_DONTNEED);
+            lazy_tail_madvise_calls += 1;
+            if (rc != 0) {
+                lazy_tail_madvise_failures += 1;
+            } else {
+                lazy_tail_madvise_bytes += len;
+            }
+        };
+
+        advise(k, k ? ggml_row_size(k->type, hparams.n_embd_k_gqa(il)) : 0);
+        advise(v, v ? ggml_row_size(v->type, hparams.n_embd_v_gqa(il)) : 0);
+    }
+
+    lazy_tail_madvise_us += (uint64_t) (ggml_time_us() - t_start);
+    lazy_tail_rss_after_kb = get_current_rss_kb();
+#else
+    (void) n_kv;
+#endif
+}
+
+void llama_kv_cache::clear_frontier_advance(uint32_t n_kv) {
+    if (!kv_lazy_clear) {
+        return;
+    }
+    // boundary guard (should already hold: kv_lazy_clear is only set for this layout).
+    if (v_trans || n_stream != 1) {
+        if (!kv_lazy_clear_warned) {
+            LLAMA_LOG_WARN("%s: lazy-clear advance skipped: requires !v_trans && n_stream==1\n", __func__);
+            kv_lazy_clear_warned = true;
+        }
+        return;
+    }
+
+    const uint32_t kv_size = get_size();
+    const uint32_t target  = std::min<uint32_t>(kv_size, GGML_PAD(n_kv, 256));
+    if (target <= clear_frontier) {
+        return; // already zeroed up to here
+    }
+
+    const int64_t t_start = ggml_time_us();
+
+    // zero the newly-readable rows [clear_frontier, target) of every layer's K/V before the
+    // graph reads them, so any cell that enters the [0, n_kv) view has defined (zero) bytes.
+    for (const auto & layer : layers) {
+        ggml_tensor * k = layer.k_stream[0];
+        ggml_tensor * v = layer.v_stream[0];
+        auto zero_rows = [&](ggml_tensor * t) {
+            if (!t) {
+                return;
+            }
+            const size_t row    = t->nb[1];                       // n_stream==1: contiguous rows
+            const size_t offset = (size_t) clear_frontier * row;
+            const size_t size   = (size_t) (target - clear_frontier) * row;
+            if (size > 0) {
+                ggml_backend_tensor_memset(t, 0, offset, size);
+                lazy_clear_grow_bytes += size;
+            }
+        };
+        zero_rows(k);
+        zero_rows(v);
+    }
+
+    lazy_clear_calls += 1;
+    lazy_clear_us    += (uint64_t) (ggml_time_us() - t_start);
+    clear_frontier   = target;
 }
 
 bool llama_kv_cache::get_can_shift() const {
@@ -2415,6 +2638,16 @@ bool llama_kv_cache_context::apply() {
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv = kv->get_n_kv(sinfos[i_cur]);
+
+    // stage P2: zero any rows that just entered the [0, n_kv) read window but were left
+    // uncommitted at construction. Must run before madvise_tail so the cleared range and the
+    // advised tail never overlap. No-op unless LLAMA_KV_LAZY_CLEAR=1.
+    kv->clear_frontier_advance(n_kv);
+
+    // stage F1 / P1: advise the unused tail capacity [PAD(n_kv,256), kv_size) away to lower
+    // current RSS. Runs after n_kv is known but does not change it; targets only capacity
+    // outside the [0, n_kv) read window. No-op unless LLAMA_KV_LAZY_TAIL=1.
+    kv->madvise_tail(n_kv);
 
     return true;
 }

@@ -108,7 +108,7 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse);
 
-    ~llama_kv_cache() = default;
+    ~llama_kv_cache();
 
     //
     // llama_memory_i
@@ -187,6 +187,19 @@ public:
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
 
+    // stage F1 / P1: advise the unused tail capacity [GGML_PAD(n_kv, 256), kv_size) away via
+    // MADV_DONTNEED to lower current RSS. No-op unless LLAMA_KV_LAZY_TAIL=1 (and !v_trans &&
+    // n_stream==1). See docs/kv_lazy_block_stage_f1_design.md.
+    void madvise_tail(uint32_t n_kv);
+
+    // stage P2: clear-frontier. When LLAMA_KV_LAZY_CLEAR=1 (and !v_trans && n_stream==1),
+    // the construction-time full buffer clear is replaced by clearing only the [0, clear_frontier)
+    // prefix; the tail [clear_frontier, kv_size) is left untouched so it is never committed,
+    // lowering peak RSS. As n_kv grows past clear_frontier this advances the frontier, zeroing
+    // newly-readable rows before the graph reads K/V. No-op unless kv_lazy_clear.
+    // See docs/kv_lazy_block_stage_p2_read.md.
+    void clear_frontier_advance(uint32_t n_kv);
+
     //
     // input API
     //
@@ -249,6 +262,35 @@ private:
 
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
+
+    // stage F1 / P1: KV Lazy-Block tail madvise. When LLAMA_KV_LAZY_TAIL=1, after n_kv is
+    // known each step we advise the page-aligned interior of the *unused tail* capacity
+    // [GGML_PAD(n_kv, 256), kv_size) of every layer's K/V tensor away via MADV_DONTNEED.
+    // This targets capacity that is never inside the [0, n_kv) read window -> aims to lower
+    // *current* RSS (not peak; peak is pinned by the construction-time buffer clear). Off by
+    // default; requires !v_trans && n_stream==1. See docs/kv_lazy_block_stage_f1_design.md.
+    bool     kv_lazy_tail              = false;
+    bool     kv_lazy_tail_warned       = false; // unsupported-layout warning emitted once
+    uint64_t lazy_tail_madvise_calls    = 0; // madvise() invocations issued
+    uint64_t lazy_tail_madvise_bytes    = 0; // total page-aligned tail bytes advised away
+    uint64_t lazy_tail_madvise_failures = 0; // madvise() calls that returned non-zero
+    uint64_t lazy_tail_madvise_us       = 0; // cumulative time spent in the tail probe
+    uint64_t lazy_tail_rss_before_kb    = 0; // /proc/self/statm RSS before first tail advise
+    uint64_t lazy_tail_rss_after_kb     = 0; // /proc/self/statm RSS after most recent advise
+
+    // stage P2: clear-frontier state. When kv_lazy_clear, only [0, clear_frontier) is ever
+    // zeroed; the tail is left uncommitted to lower peak RSS. See docs/kv_lazy_block_stage_p2_read.md.
+    bool     kv_lazy_clear         = false;
+    bool     kv_lazy_clear_warned  = false; // unsupported-layout warning emitted once
+    uint32_t clear_frontier        = 0;     // cells in [0, clear_frontier) have been zeroed
+    uint64_t lazy_clear_init_bytes = 0;     // bytes zeroed at construction (prefix)
+    uint64_t lazy_clear_grow_bytes = 0;     // bytes zeroed by frontier advances
+    uint64_t lazy_clear_skipped_bytes = 0;  // tail bytes left uncleared at construction
+    uint64_t lazy_clear_calls      = 0;     // frontier-advance invocations that zeroed rows
+    uint64_t lazy_clear_us         = 0;     // cumulative time spent zeroing
+
+    // current process RSS in KiB from /proc/self/statm (0 if unavailable).
+    uint64_t get_current_rss_kb() const;
 
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
