@@ -659,6 +659,27 @@ llama_kv_cache::llama_kv_cache(
 llama_kv_cache::~llama_kv_cache() {
     kv_swap_roundtrip_selftest();
 
+    static const llama_kv_backing_store_stats kv_swap_empty_stats;
+    const auto & kv_swap_stats = kv_swap_store ? kv_swap_store->get_stats() : kv_swap_empty_stats;
+    LLAMA_LOG_INFO("%s: KV swap stats: enabled=%d mode=%s window=%u sink=%u "
+            "swap_out_calls=%llu swap_in_calls=%llu ensure_calls=%llu window_calls=%llu "
+            "window_skipped=%llu backend_failures=%llu bytes_written=%llu bytes_read=%llu "
+            "write_calls=%llu read_calls=%llu release_calls=%llu\n",
+            __func__, kv_swap_enabled ? 1 : 0,
+            kv_swap_mode_ == kv_swap_mode::exact ? "exact" : "off",
+            kv_swap_window, kv_swap_sink,
+            (unsigned long long) kv_swap_out_calls,
+            (unsigned long long) kv_swap_in_calls,
+            (unsigned long long) kv_swap_ensure_calls,
+            (unsigned long long) kv_swap_window_calls,
+            (unsigned long long) kv_swap_window_skipped,
+            (unsigned long long) kv_swap_backend_failures,
+            (unsigned long long) kv_swap_stats.bytes_written,
+            (unsigned long long) kv_swap_stats.bytes_read,
+            (unsigned long long) kv_swap_stats.write_calls,
+            (unsigned long long) kv_swap_stats.read_calls,
+            (unsigned long long) kv_swap_stats.release_calls);
+
     if (kv_lazy_tail) {
         // stage F1 / P1: lazy-tail madvise counters (debug-only, current-RSS check).
         LLAMA_LOG_INFO("%s: kv lazy-tail stats: enabled=1 calls=%llu bytes=%llu (%.2f MiB) failures=%llu "

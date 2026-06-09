@@ -85,6 +85,11 @@ public:
     virtual llama_kv_backing_store_status reset() {
         return llama_kv_backing_store_status::disabled;
     }
+
+    virtual const llama_kv_backing_store_stats & get_stats() const {
+        static const llama_kv_backing_store_stats empty;
+        return empty;
+    }
 };
 
 class llama_kv_backing_store_file : public llama_kv_backing_store_i {
@@ -117,7 +122,7 @@ public:
         return file_len;
     }
 
-    const llama_kv_backing_store_stats & get_stats() const {
+    const llama_kv_backing_store_stats & get_stats() const override {
         return stats;
     }
 
