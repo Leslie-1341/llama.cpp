@@ -5,6 +5,7 @@
 
 #include <bitset>
 #include <cassert>
+#include <cstdint>
 #include <cstring>
 #include <map>
 #include <set>
@@ -27,6 +28,13 @@ struct llama_kv_cell_ext {
     }
 };
 
+enum class llama_kv_cell_state : uint8_t {
+    UNTOUCHED = 0,
+    RESIDENT  = 1,
+    SWAPPED   = 2,
+    RELEASED  = 3,
+};
+
 // meta information about KV cells that can be part of multiple sequences at the same time
 // TODO: add unit tests
 class llama_kv_cells {
@@ -37,6 +45,7 @@ public:
             ext[i].reset();
             shift[i] =  0;
             seq[i].reset();
+            state[i] = llama_kv_cell_state::UNTOUCHED;
         }
 
         has_shift = false;
@@ -65,6 +74,7 @@ public:
         ext.resize(n);
         shift.resize(n);
         seq.resize(n);
+        state.resize(n);
 
         reset();
     }
@@ -94,6 +104,26 @@ public:
 
     bool get_has_shift() const {
         return has_shift;
+    }
+
+    llama_kv_cell_state get_state(uint32_t i) const {
+        assert(i < state.size());
+
+        return state[i];
+    }
+
+    void set_state(uint32_t i, llama_kv_cell_state value) {
+        assert(i < state.size());
+
+        state[i] = value;
+    }
+
+    bool is_swapped(uint32_t i) const {
+        return get_state(i) == llama_kv_cell_state::SWAPPED;
+    }
+
+    bool is_resident(uint32_t i) const {
+        return get_state(i) == llama_kv_cell_state::RESIDENT;
     }
 
     // move cell isrc to idst (used during defrag)
@@ -130,6 +160,7 @@ public:
             res.pos[j] = pos[idx];
             res.ext[j] = ext[idx];
             res.seq[j] = seq[idx];
+            res.state[j] = state[idx];
 
             assert(shift[idx] == 0);
         }
@@ -149,6 +180,7 @@ public:
             res.pos[j] = pos[idx];
             res.ext[j] = ext[idx];
             res.seq[j] = seq[idx];
+            res.state[j] = state[idx];
 
             assert(shift[idx] == 0);
         }
@@ -178,6 +210,7 @@ public:
             pos[idx] = other.pos[j];
             ext[idx] = other.ext[j];
             seq[idx] = other.seq[j];
+            state[idx] = other.state[j];
 
             if (pos[idx] != -1) {
                 seq_pos_add(i + j);
@@ -209,6 +242,7 @@ public:
             pos[idx] = other.pos[j];
             ext[idx] = other.ext[j];
             seq[idx] = other.seq[j];
+            state[idx] = other.state[j];
 
             if (pos[idx] != -1) {
                 seq_pos_add(idx);
@@ -229,6 +263,7 @@ public:
         pos[i] = -1;
         ext[i].reset();
         shift[i] = 0;
+        state[i] = llama_kv_cell_state::UNTOUCHED;
 
         used.erase(i);
     }
@@ -248,6 +283,7 @@ public:
             pos[i] = -1;
             ext[i].reset();
             shift[i] = 0;
+            state[i] = llama_kv_cell_state::UNTOUCHED;
 
             used.erase(i);
 
@@ -278,6 +314,7 @@ public:
             pos[i] = -1;
             ext[i].reset();
             shift[i] = 0;
+            state[i] = llama_kv_cell_state::UNTOUCHED;
 
             used.erase(i);
 
@@ -398,6 +435,7 @@ public:
         assert(seq[i].none());
 
         pos[i] = p;
+        state[i] = llama_kv_cell_state::RESIDENT;
 
         used.insert(i);
     }
@@ -425,6 +463,7 @@ public:
             seq[i].reset();
             pos[i] = -1;
             shift[i] = 0;
+            state[i] = llama_kv_cell_state::UNTOUCHED;
 
             used.erase(i);
 
@@ -487,6 +526,13 @@ private:
 
     // the bitset seq[i] tells us which sequences are currently occupying the i-th cell
     std::vector<seq_set_t> seq;
+
+    // Stage2-state0: per-cell runtime KV residency metadata.
+    //
+    // This is metadata only; no swap-out, swap-in, backing store, prefetch, or find_slot
+    // semantics are enabled here. SWAPPED must not be interpreted as free by future code.
+    // Future stages may extend the state machine with DIRTY, PREFETCHING, and READY.
+    std::vector<llama_kv_cell_state> state;
 
     // the set seq_pos[s][p] tells us how many times the position p is currently present for sequence s
     // if the position p is not present, seq_pos[s][p] is not set
