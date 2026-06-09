@@ -5,6 +5,8 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <cstddef>
+#include <cstdint>
 #include <unordered_map>
 #include <vector>
 
@@ -16,6 +18,52 @@ struct llama_context;
 //
 // llama_kv_cache
 //
+
+// Stage2-backend0: backing-store abstraction shell for runtime KV swap.
+//
+// This interface is intentionally not instantiated or called in backend0. It only fixes the
+// seam for future exact offload work, where a file-backed/tmpfile implementation can persist
+// cell or block bytes outside the anonymous KV tensor allocation. No file I/O, swap-out,
+// swap-in, ensure_resident, prefetch, or madvise behavior is implemented here.
+class llama_kv_backing_store_i {
+public:
+    virtual ~llama_kv_backing_store_i() = default;
+
+    virtual bool write_cell(
+            uint32_t   strm,
+            uint32_t   cell,
+            const void * data,
+            size_t     size,
+            uint64_t & offset_out) {
+        (void) strm;
+        (void) cell;
+        (void) data;
+        (void) size;
+        offset_out = 0;
+        return false;
+    }
+
+    virtual bool read_cell(
+            uint32_t strm,
+            uint32_t cell,
+            uint64_t offset,
+            void *   data,
+            size_t   size) {
+        (void) strm;
+        (void) cell;
+        (void) offset;
+        (void) data;
+        (void) size;
+        return false;
+    }
+
+    virtual void release(uint64_t offset, size_t size) {
+        (void) offset;
+        (void) size;
+    }
+
+    virtual void reset() {}
+};
 
 class llama_kv_cache : public llama_memory_i {
 public:
