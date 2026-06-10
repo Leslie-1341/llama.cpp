@@ -391,6 +391,7 @@ private:
     enum class kv_swap_mode {
         off,
         exact,
+        approx,
     };
 
     std::unique_ptr<llama_kv_backing_store_i> kv_swap_store;
@@ -404,6 +405,9 @@ private:
     uint64_t kv_swap_window_calls = 0;
     uint64_t kv_swap_window_skipped = 0;
     uint64_t kv_swap_backend_failures = 0;
+    uint64_t kv_approx_calls = 0;
+    uint64_t kv_approx_window = 0;
+    uint64_t kv_approx_released = 0;
     bool     kv_swap_rss_sample = false;
     uint64_t kv_swap_rss_samples = 0;
     uint64_t kv_swap_rss_min_kb = 0;

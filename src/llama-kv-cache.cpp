@@ -367,9 +367,24 @@ llama_kv_cache::llama_kv_cache(
 
     const bool kv_swap_requested = LLAMA_KV_SWAP ? (std::atoi(LLAMA_KV_SWAP) != 0) : false;
     if (kv_swap_requested) {
-        if (!LLAMA_KV_SWAP_MODE || std::strcmp(LLAMA_KV_SWAP_MODE, "exact") != 0) {
+        if (!LLAMA_KV_SWAP_MODE) {
             LLAMA_LOG_WARN("%s: KV swap requested but LLAMA_KV_SWAP_MODE=%s is unsupported "
-                    "(expected exact) - disabled\n", __func__, LLAMA_KV_SWAP_MODE ? LLAMA_KV_SWAP_MODE : "<unset>");
+                    "(expected exact or approx) - disabled\n", __func__, "<unset>");
+        } else if (std::strcmp(LLAMA_KV_SWAP_MODE, "approx") == 0) {
+            if (v_trans || n_stream != 1 || n_seq_max != 1) {
+                LLAMA_LOG_WARN("%s: KV swap approx mode requires single-seq, !v_trans, and n_stream==1 "
+                        "(n_seq_max=%u, v_trans=%d, n_stream=%u) - disabled\n",
+                        __func__, n_seq_max, (int) v_trans, n_stream);
+            } else {
+                kv_swap_enabled = true;
+                kv_swap_mode_   = kv_swap_mode::approx;
+                kv_approx_window = kv_swap_window;
+                LLAMA_LOG_INFO("%s: KV swap approx mode enabled (no-op scaffold, window=%u, sink=%u)\n",
+                        __func__, kv_swap_window, kv_swap_sink);
+            }
+        } else if (std::strcmp(LLAMA_KV_SWAP_MODE, "exact") != 0) {
+            LLAMA_LOG_WARN("%s: KV swap requested but LLAMA_KV_SWAP_MODE=%s is unsupported "
+                    "(expected exact or approx) - disabled\n", __func__, LLAMA_KV_SWAP_MODE);
         } else if (v_trans || n_stream != 1) {
             LLAMA_LOG_WARN("%s: KV swap exact mode requires !v_trans && n_stream==1 "
                     "(v_trans=%d, n_stream=%u) - disabled\n", __func__, (int) v_trans, n_stream);
@@ -666,6 +681,9 @@ llama_kv_cache::~llama_kv_cache() {
 
     static const llama_kv_backing_store_stats kv_swap_empty_stats;
     const auto & kv_swap_stats = kv_swap_store ? kv_swap_store->get_stats() : kv_swap_empty_stats;
+    const char * kv_swap_mode_name =
+        kv_swap_mode_ == kv_swap_mode::exact  ? "exact"  :
+        kv_swap_mode_ == kv_swap_mode::approx ? "approx" : "off";
     LLAMA_LOG_INFO("%s: KV swap stats: enabled=%d mode=%s window=%u sink=%u "
             "swap_out_calls=%llu swap_in_calls=%llu ensure_calls=%llu window_calls=%llu "
             "window_skipped=%llu backend_failures=%llu bytes_written=%llu bytes_read=%llu "
@@ -673,9 +691,9 @@ llama_kv_cache::~llama_kv_cache() {
             "RSS peak_kb=%llu current_last_kb=%llu current_min_kb=%llu current_max_kb=%llu "
             "rss_samples=%llu madvise_enabled=%d madvise_calls=%llu madvise_candidate_runs=%llu "
             "madvise_advised_runs=%llu madvise_advised_bytes=%llu madvise_failures=%llu "
-            "madvise_skipped_bytes=%llu\n",
+            "madvise_skipped_bytes=%llu approx_calls=%llu approx_window=%llu approx_released=%llu\n",
             __func__, kv_swap_enabled ? 1 : 0,
-            kv_swap_mode_ == kv_swap_mode::exact ? "exact" : "off",
+            kv_swap_mode_name,
             kv_swap_window, kv_swap_sink,
             (unsigned long long) kv_swap_out_calls,
             (unsigned long long) kv_swap_in_calls,
@@ -699,7 +717,10 @@ llama_kv_cache::~llama_kv_cache() {
             (unsigned long long) kv_swap_madvise_advised_runs,
             (unsigned long long) kv_swap_madvise_advised_bytes,
             (unsigned long long) kv_swap_madvise_failures,
-            (unsigned long long) kv_swap_madvise_skipped_bytes);
+            (unsigned long long) kv_swap_madvise_skipped_bytes,
+            (unsigned long long) kv_approx_calls,
+            (unsigned long long) kv_approx_window,
+            (unsigned long long) kv_approx_released);
 
     if (kv_lazy_tail) {
         // stage F1 / P1: lazy-tail madvise counters (debug-only, current-RSS check).
