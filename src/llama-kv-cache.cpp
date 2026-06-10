@@ -691,7 +691,7 @@ llama_kv_cache::~llama_kv_cache() {
             "RSS peak_kb=%llu current_last_kb=%llu current_min_kb=%llu current_max_kb=%llu "
             "rss_samples=%llu madvise_enabled=%d madvise_calls=%llu madvise_candidate_runs=%llu "
             "madvise_advised_runs=%llu madvise_advised_bytes=%llu madvise_failures=%llu "
-            "madvise_skipped_bytes=%llu approx_calls=%llu approx_window=%llu approx_released=%llu\n",
+            "madvise_skipped_bytes=%llu approx_calls=%llu approx_window=%llu approx_masked=%llu\n",
             __func__, kv_swap_enabled ? 1 : 0,
             kv_swap_mode_name,
             kv_swap_window, kv_swap_sink,
@@ -720,7 +720,7 @@ llama_kv_cache::~llama_kv_cache() {
             (unsigned long long) kv_swap_madvise_skipped_bytes,
             (unsigned long long) kv_approx_calls,
             (unsigned long long) kv_approx_window,
-            (unsigned long long) kv_approx_released);
+            (unsigned long long) kv_approx_masked);
 
     if (kv_lazy_tail) {
         // stage F1 / P1: lazy-tail madvise counters (debug-only, current-RSS check).
@@ -2407,6 +2407,10 @@ struct args_set_input_kq_mask {
     int64_t n_kv;
     int64_t n_stream;
     int64_t n_tps;
+
+    bool     approx_enabled;
+    int64_t  approx_keep_from;
+    uint64_t * approx_masked;
 };
 
 template<bool causal, bool swa, bool is_2d, bool alibi>
@@ -2494,6 +2498,13 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * 
 
                         j = idxs[jj];
                     }
+                }
+
+                if (args.approx_enabled && (int64_t) j < args.approx_keep_from) {
+                    if (args.approx_masked) {
+                        ++*args.approx_masked;
+                    }
+                    goto skip;
                 }
 
                 if (cells.is_empty(j)) {
@@ -2585,7 +2596,8 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * 
     }
 }
 
-void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+void llama_kv_cache::set_input_kq_mask(
+        ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, const slot_info & sinfo) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
@@ -2600,6 +2612,19 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     const int64_t n_tps = n_tokens/n_stream;
 
     //const int64_t t_start = ggml_time_us();
+    uint32_t used_max_p1 = 0;
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        used_max_p1 = std::max(used_max_p1, v_cells[sinfo.strm[s]].used_max_p1());
+    }
+
+    const bool approx_enabled =
+        kv_swap_enabled && kv_swap_mode_ == kv_swap_mode::approx && kv_swap_window > 0;
+    const int64_t approx_keep_from = approx_enabled && used_max_p1 > kv_swap_window ?
+        (int64_t) (used_max_p1 - kv_swap_window) : 0;
+
+    if (kv_swap_enabled && kv_swap_mode_ == kv_swap_mode::approx) {
+        ++kv_approx_calls;
+    }
 
     const args_set_input_kq_mask args = {
         /*.hparams          =*/ hparams,
@@ -2611,6 +2636,9 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_kv             =*/ n_kv,
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
+        /*.approx_enabled   =*/ approx_enabled,
+        /*.approx_keep_from =*/ approx_keep_from,
+        /*.approx_masked    =*/ &kv_approx_masked,
     };
 
     if (causal_attn) {
@@ -3479,7 +3507,7 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 }
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
-    kv->set_input_kq_mask(dst, ubatch, causal_attn);
+    kv->set_input_kq_mask(dst, ubatch, causal_attn, sinfos[i_cur]);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

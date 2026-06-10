@@ -337,7 +337,7 @@ public:
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, const slot_info & sinfo) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
@@ -405,9 +405,9 @@ private:
     uint64_t kv_swap_window_calls = 0;
     uint64_t kv_swap_window_skipped = 0;
     uint64_t kv_swap_backend_failures = 0;
-    uint64_t kv_approx_calls = 0;
+    mutable uint64_t kv_approx_calls = 0;
     uint64_t kv_approx_window = 0;
-    uint64_t kv_approx_released = 0;
+    mutable uint64_t kv_approx_masked = 0;
     bool     kv_swap_rss_sample = false;
     uint64_t kv_swap_rss_samples = 0;
     uint64_t kv_swap_rss_min_kb = 0;
