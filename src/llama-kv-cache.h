@@ -276,10 +276,13 @@ public:
     //
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
+    uint32_t get_visible_lo(const slot_info & sinfo) const;
+    uint32_t get_reserve_n_kv() const;
+    bool uses_approx_dynamic_view() const;
 
     // get views of the current state of the cache
-    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
-    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, uint32_t visible_lo, const slot_info & sinfo, bool causal_attn) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, uint32_t visible_lo, const slot_info & sinfo, bool causal_attn) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
@@ -337,7 +340,7 @@ public:
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, const slot_info & sinfo) const;
+    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t visible_lo, const slot_info & sinfo) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
@@ -408,6 +411,9 @@ private:
     mutable uint64_t kv_approx_calls = 0;
     uint64_t kv_approx_window = 0;
     mutable uint64_t kv_approx_masked = 0;
+    mutable uint64_t kv_approx_debug_get_k_visible_gt0_calls = 0;
+    mutable uint64_t kv_approx_debug_get_v_visible_gt0_calls = 0;
+    mutable bool     kv_approx_dynamic_warned = false;
     bool     kv_swap_rss_sample = false;
     uint64_t kv_swap_rss_samples = 0;
     uint64_t kv_swap_rss_min_kb = 0;
@@ -556,13 +562,15 @@ public:
     //
 
     uint32_t get_n_kv() const;
+    uint32_t get_visible_lo() const;
+    bool uses_approx_dynamic_view() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
 
     // get views of the current state of the cache
-    ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
-    ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il, bool causal_attn) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, bool causal_attn) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory
@@ -624,4 +632,5 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+    uint32_t visible_lo = 0;
 };

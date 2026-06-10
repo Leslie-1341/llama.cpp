@@ -691,7 +691,8 @@ llama_kv_cache::~llama_kv_cache() {
             "RSS peak_kb=%llu current_last_kb=%llu current_min_kb=%llu current_max_kb=%llu "
             "rss_samples=%llu madvise_enabled=%d madvise_calls=%llu madvise_candidate_runs=%llu "
             "madvise_advised_runs=%llu madvise_advised_bytes=%llu madvise_failures=%llu "
-            "madvise_skipped_bytes=%llu approx_calls=%llu approx_window=%llu approx_masked=%llu\n",
+            "madvise_skipped_bytes=%llu approx_calls=%llu approx_window=%llu approx_masked=%llu "
+            "approx_debug_get_k_visible_gt0_calls=%llu approx_debug_get_v_visible_gt0_calls=%llu\n",
             __func__, kv_swap_enabled ? 1 : 0,
             kv_swap_mode_name,
             kv_swap_window, kv_swap_sink,
@@ -720,7 +721,9 @@ llama_kv_cache::~llama_kv_cache() {
             (unsigned long long) kv_swap_madvise_skipped_bytes,
             (unsigned long long) kv_approx_calls,
             (unsigned long long) kv_approx_window,
-            (unsigned long long) kv_approx_masked);
+            (unsigned long long) kv_approx_masked,
+            (unsigned long long) kv_approx_debug_get_k_visible_gt0_calls,
+            (unsigned long long) kv_approx_debug_get_v_visible_gt0_calls);
 
     if (kv_lazy_tail) {
         // stage F1 / P1: lazy-tail madvise counters (debug-only, current-RSS check).
@@ -2106,6 +2109,10 @@ ggml_type llama_kv_cache::type_v() const {
 }
 
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
+    if (uses_approx_dynamic_view()) {
+        return get_reserve_n_kv();
+    }
+
     uint32_t result = 0;
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
@@ -2121,7 +2128,38 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     return result;
 }
 
-ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+uint32_t llama_kv_cache::get_visible_lo(const slot_info & sinfo) const {
+    if (!uses_approx_dynamic_view()) {
+        return 0;
+    }
+
+    uint32_t used_max_p1 = 0;
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        used_max_p1 = std::max(used_max_p1, v_cells[sinfo.strm[s]].used_max_p1());
+    }
+
+    const uint32_t n_kv = get_reserve_n_kv();
+    const uint32_t kv_size = get_size();
+    const uint32_t keep_from = used_max_p1 > kv_swap_window ? used_max_p1 - kv_swap_window : 0;
+    const uint32_t max_visible_lo = kv_size > n_kv ? kv_size - n_kv : 0;
+
+    return std::min(keep_from, max_visible_lo);
+}
+
+uint32_t llama_kv_cache::get_reserve_n_kv() const {
+    if (!uses_approx_dynamic_view()) {
+        return get_size();
+    }
+
+    return std::min<uint32_t>(GGML_PAD(kv_swap_window, 256), get_size());
+}
+
+bool llama_kv_cache::uses_approx_dynamic_view() const {
+    return kv_swap_enabled && kv_swap_mode_ == kv_swap_mode::approx &&
+        kv_swap_window > 0 && !v_trans && n_stream == 1 && n_seq_max == 1;
+}
+
+ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, uint32_t visible_lo, const slot_info & sinfo, bool causal_attn) const {
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * k = layers[ikv].k;
@@ -2132,16 +2170,28 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
     assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    const bool approx_dynamic = uses_approx_dynamic_view() && causal_attn && ns == 1;
+    const uint64_t row_size = ggml_row_size(k->type, n_embd_k_gqa);
+    const uint64_t byte_offset = row_size*visible_lo;
+
+    if (uses_approx_dynamic_view() && !approx_dynamic && !kv_approx_dynamic_warned) {
+        LLAMA_LOG_WARN("%s: KV swap approx dynamic view requires single-seq causal attention "
+                "with !v_trans and n_stream==1 - falling back to original K view\n", __func__);
+        kv_approx_dynamic_warned = true;
+    }
+    if (approx_dynamic && visible_lo > 0) {
+        ++kv_approx_debug_get_k_visible_gt0_calls;
+    }
 
     return ggml_view_4d(ctx, k,
             hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv, ns,
             ggml_row_size(k->type, hparams.n_embd_head_k(il)),
-            ggml_row_size(k->type, n_embd_k_gqa),
+            row_size,
             ggml_row_size(k->type, n_embd_k_gqa*kv_size),
-            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
+            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0 + (approx_dynamic ? byte_offset : 0));
 }
 
-ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, uint32_t visible_lo, const slot_info & sinfo, bool causal_attn) const {
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * v = layers[ikv].v;
@@ -2155,13 +2205,26 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
     if (!v_trans) {
+        const bool approx_dynamic = uses_approx_dynamic_view() && causal_attn && ns == 1;
+        const uint64_t row_size = ggml_row_size(v->type, n_embd_v_gqa);
+        const uint64_t byte_offset = row_size*visible_lo;
+
+        if (uses_approx_dynamic_view() && !approx_dynamic && !kv_approx_dynamic_warned) {
+            LLAMA_LOG_WARN("%s: KV swap approx dynamic view requires single-seq causal attention "
+                    "with !v_trans and n_stream==1 - falling back to original V view\n", __func__);
+            kv_approx_dynamic_warned = true;
+        }
+        if (approx_dynamic && visible_lo > 0) {
+            ++kv_approx_debug_get_v_visible_gt0_calls;
+        }
+
         // note: v->nb[1] <= v->nb[2]
         return ggml_view_4d(ctx, v,
                 hparams.n_embd_head_v(il), hparams.n_head_kv(il), n_kv, ns,
                 ggml_row_size(v->type, hparams.n_embd_head_v(il)),          // v->nb[1]
-                ggml_row_size(v->type, n_embd_v_gqa),                   // v->nb[2]
+                row_size,                                                // v->nb[2]
                 ggml_row_size(v->type, n_embd_v_gqa*kv_size),           // v->nb[3]
-                ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0);
+                ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0 + (approx_dynamic ? byte_offset : 0));
     }
 
     // note: v->nb[1] > v->nb[2]
@@ -2409,8 +2472,7 @@ struct args_set_input_kq_mask {
     int64_t n_tps;
 
     bool     approx_enabled;
-    int64_t  approx_keep_from;
-    uint64_t * approx_masked;
+    uint32_t visible_lo;
 };
 
 template<bool causal, bool swa, bool is_2d, bool alibi>
@@ -2500,23 +2562,18 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * 
                     }
                 }
 
-                if (args.approx_enabled && (int64_t) j < args.approx_keep_from) {
-                    if (args.approx_masked) {
-                        ++*args.approx_masked;
-                    }
-                    goto skip;
-                }
+                const uint32_t cell_idx = args.approx_enabled ? args.visible_lo + j : j;
 
-                if (cells.is_empty(j)) {
+                if (cells.is_empty(cell_idx)) {
                     goto skip;
                 }
 
                 // mask the token if not the same sequence
-                if (!cells.seq_has(j, seq_id)) {
+                if (!cells.seq_has(cell_idx, seq_id)) {
                     goto skip;
                 }
 
-                p0 = cells.pos_get(j);
+                p0 = cells.pos_get(cell_idx);
 
                 if (!alibi) {
                     if (!prev) {
@@ -2536,7 +2593,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * 
                     // M-RoPE causal mask
                     if (is_2d) {
                         if (p0 == p1) {
-                            const auto & p0_ext = cells.ext_get(j);
+                            const auto & p0_ext = cells.ext_get(cell_idx);
 
                             if (p0_ext.is_2d_gt(p1_x, p1_y)) {
                                 goto skip;
@@ -2597,7 +2654,9 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * 
 }
 
 void llama_kv_cache::set_input_kq_mask(
-        ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, const slot_info & sinfo) const {
+        ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t visible_lo, const slot_info & sinfo) const {
+    GGML_UNUSED(sinfo);
+
     const uint32_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
@@ -2611,19 +2670,14 @@ void llama_kv_cache::set_input_kq_mask(
     // n_tps == n_tokens_per_stream
     const int64_t n_tps = n_tokens/n_stream;
 
-    //const int64_t t_start = ggml_time_us();
-    uint32_t used_max_p1 = 0;
-    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-        used_max_p1 = std::max(used_max_p1, v_cells[sinfo.strm[s]].used_max_p1());
-    }
-
-    const bool approx_enabled =
-        kv_swap_enabled && kv_swap_mode_ == kv_swap_mode::approx && kv_swap_window > 0;
-    const int64_t approx_keep_from = approx_enabled && used_max_p1 > kv_swap_window ?
-        (int64_t) (used_max_p1 - kv_swap_window) : 0;
+    const bool approx_enabled = uses_approx_dynamic_view() && causal_attn && visible_lo > 0;
 
     if (kv_swap_enabled && kv_swap_mode_ == kv_swap_mode::approx) {
         ++kv_approx_calls;
+    }
+    if (approx_enabled) {
+        // Estimate cells hidden by the shifted physical read window; the mask tensor itself only spans [visible_lo, visible_hi).
+        kv_approx_masked += (uint64_t) visible_lo*n_tokens;
     }
 
     const args_set_input_kq_mask args = {
@@ -2637,8 +2691,7 @@ void llama_kv_cache::set_input_kq_mask(
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
         /*.approx_enabled   =*/ approx_enabled,
-        /*.approx_keep_from =*/ approx_keep_from,
-        /*.approx_masked    =*/ &kv_approx_masked,
+        /*.visible_lo       =*/ visible_lo,
     };
 
     if (causal_attn) {
@@ -3367,7 +3420,8 @@ llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : sta
 
 llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
-    n_kv = kv->get_size();
+    n_kv = kv->get_reserve_n_kv();
+    visible_lo = 0;
 
     const uint32_t n_stream = kv->get_n_stream();
 
@@ -3422,6 +3476,7 @@ bool llama_kv_cache_context::apply() {
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv = kv->get_n_kv(sinfos[i_cur]);
+    visible_lo = kv->get_visible_lo(sinfos[i_cur]);
 
     kv->swap_out_window(n_kv);
     kv->ensure_resident(n_kv);
@@ -3454,6 +3509,14 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
 }
 
+uint32_t llama_kv_cache_context::get_visible_lo() const {
+    return visible_lo;
+}
+
+bool llama_kv_cache_context::uses_approx_dynamic_view() const {
+    return kv->uses_approx_dynamic_view();
+}
+
 ggml_type llama_kv_cache_context::type_k() const {
     return kv->type_k();
 }
@@ -3462,12 +3525,12 @@ ggml_type llama_kv_cache_context::type_v() const {
     return kv->type_v();
 }
 
-ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
-    return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
+ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il, bool causal_attn) const {
+    return kv->get_k(ctx, il, n_kv, visible_lo, sinfos[i_cur], causal_attn);
 }
 
-ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
-    return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il, bool causal_attn) const {
+    return kv->get_v(ctx, il, n_kv, visible_lo, sinfos[i_cur], causal_attn);
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
@@ -3507,7 +3570,7 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 }
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
-    kv->set_input_kq_mask(dst, ubatch, causal_attn, sinfos[i_cur]);
+    kv->set_input_kq_mask(dst, ubatch, causal_attn, visible_lo, sinfos[i_cur]);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

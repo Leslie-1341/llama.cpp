@@ -76,14 +76,37 @@ approx_debug_get_v_visible_gt0_calls=0
 - RoPE / mask / graph shape 在 no-offset 场景下成立。
 - `approx_debug_get_k_visible_gt0_calls=0` 和 `approx_debug_get_v_visible_gt0_calls=0` 说明本次 fix-C 没有验证动态 offset。
 
-## 4. 阶段结论
+## 4. route-A dynamic-view 结果
+
+route-A 通过在 `visible_lo` 变化时禁止复用旧 graph，使 K/V physical view 的 byte offset 跟随 apply-time window。该路线只验证 correctness，不尝试降低 RSS。
+
+已观察结果：
+
+```text
+window=256: 输出与 baseline sha256 一致
+window=64: 输出允许不同，且与 approx1 mask-only 结果一致
+approx_debug_get_k_visible_gt0_calls=2240
+approx_debug_get_v_visible_gt0_calls=2240
+backend_failures=0
+default/no-env sha256 不变
+```
+
+解释：
+
+- `visible_lo` 由 `llama_kv_cache_context::apply()` 与 `n_kv` 同步刷新，并作为 K/V view、mask 和 graph reuse 判断的单一来源。
+- approx 下 reserve / dummy graph 的 physical read window 长度使用 `min(PAD(window, 256), kv_size)`。因此 `window=64` 时实际 K/V view 长度仍为 `256`，不是 `64`。
+- physical read window 内包含有效历史和 padded empty rows。empty rows 依赖 KV cache 零初始化，并由 attention mask 屏蔽；correctness probe 已覆盖该行为。
+- 对 approx3 / RSS 目标而言，`256` 是当前连续 physical read window 的最小粒度。要进一步降低粒度，需要后续 paged-read / block-table / gather 类设计，本阶段不进入。
+
+## 5. 阶段结论
 
 - approx1 证明 mask-only approximate-window 语义生效，但由于物理 K/V view 仍读连续 `[0,n_kv)`，不降低 RSS。
 - approx2-probe 暴露出 graph reserve / graph reuse 问题：K/V view 在 reserve 期固定，mask 在 apply 期动态变化，两者窗口参数不一致。
 - fix-C 证明 no-offset 场景下缩短 physical view length 可行，输出保持 bit-exact。
-- dynamic `visible_lo > 0` 仍未解决，当前不能进入 approx3 / `MADV_DONTNEED` / `RELEASED`。
+- route-A 证明 dynamic `visible_lo > 0` 可以通过 graph rebuild 进入 K/V physical view，并保持已测 correctness。
+- 当前仍不能声称获得 RSS 收益，也不进入 approx3 / `MADV_DONTNEED` / `RELEASED`。
 
-## 5. 后续方向
+## 6. 后续方向
 
 后续需要先解决 graph 与动态窗口的一致性问题，再讨论释放物理页或 RSS 收益。可选方向包括：
 
@@ -94,5 +117,5 @@ approx_debug_get_v_visible_gt0_calls=0
 当前禁止夸大结论：
 
 - 不声称 approx2 已经降低 RSS。
-- 不声称动态滑窗已经完成。
-- 不声称 view-offset 已经 fully solved。
+- 不声称 dynamic-view route-A 是性能路径。
+- 不声称当前连续 view 粒度已经满足 approx3 RSS 目标。
