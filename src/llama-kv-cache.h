@@ -282,8 +282,8 @@ public:
     bool uses_approx_dynamic_view() const;
 
     // get views of the current state of the cache
-    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, uint32_t visible_lo, const slot_info & sinfo, bool causal_attn) const;
-    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, uint32_t visible_lo, const slot_info & sinfo, bool causal_attn) const;
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, uint32_t visible_lo, const slot_info & sinfo, bool causal_attn, ggml_tensor * row_idx = nullptr) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, uint32_t visible_lo, const slot_info & sinfo, bool causal_attn, ggml_tensor * row_idx = nullptr) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
@@ -332,12 +332,14 @@ public:
 
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    ggml_tensor * build_input_paged_row_idx(ggml_context * ctx, uint32_t n_kv) const;
 
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
+    void set_input_paged_row_idx(ggml_tensor * dst) const;
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
@@ -444,6 +446,7 @@ private:
     uint32_t paged_write_resolve(uint32_t cell) const;
     void paged_assert_identity(const slot_info & sinfo);
     void paged_shadow_validate(const slot_info & sinfo, uint32_t n_kv) const;
+    bool paged_ingraph_gather_supported(int32_t il) const;
     void paged_log_stats() const;
 
     static constexpr uint32_t PAGED_BLOCK_INVALID = UINT32_MAX;
@@ -466,6 +469,10 @@ private:
     mutable uint64_t paged_shadow_gather_changed  = 0;
     mutable uint64_t paged_shadow_gather_mismatch = 0;
     mutable uint64_t paged_shadow_gather_fail     = 0;
+    mutable uint64_t paged_ingraph_gather_layers  = 0;
+    mutable uint64_t paged_row_idx_changed        = 0;
+    mutable uint64_t paged_row_idx_fail           = 0;
+    mutable bool     paged_ingraph_warned         = false;
 
     // stage F1 / P1: KV Lazy-Block tail madvise. When LLAMA_KV_LAZY_TAIL=1, after n_kv is
     // known each step we advise the page-aligned interior of the *unused tail* capacity
@@ -604,8 +611,8 @@ public:
     ggml_type type_v() const;
 
     // get views of the current state of the cache
-    ggml_tensor * get_k(ggml_context * ctx, int32_t il, bool causal_attn) const;
-    ggml_tensor * get_v(ggml_context * ctx, int32_t il, bool causal_attn) const;
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il, bool causal_attn, ggml_tensor * row_idx = nullptr) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, bool causal_attn, ggml_tensor * row_idx = nullptr) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory
@@ -621,12 +628,14 @@ public:
     //   helps understand the implementation logic of cpy_k and cpy_v
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    ggml_tensor * build_input_paged_row_idx(ggml_context * ctx) const;
 
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_paged_row_idx(ggml_tensor * dst) const;
 
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;

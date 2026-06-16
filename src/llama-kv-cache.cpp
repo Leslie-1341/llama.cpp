@@ -1742,6 +1742,30 @@ void llama_kv_cache::paged_shadow_validate(const slot_info & sinfo, uint32_t n_k
     }
 }
 
+bool llama_kv_cache::paged_ingraph_gather_supported(int32_t il) const {
+    if (!kv_paged_enabled) {
+        return false;
+    }
+
+    const int32_t ikv = map_layer_ids.at(il);
+    const auto & layer = layers[ikv];
+    const bool supported = n_stream == 1 && !v_trans &&
+        layer.k && layer.v &&
+        layer.k->type == GGML_TYPE_F32 &&
+        layer.v->type == GGML_TYPE_F32;
+
+    if (!supported && !paged_ingraph_warned) {
+        LLAMA_LOG_WARN("%s: KV paged in-graph gather requires n_stream==1, !v_trans, and F32 K/V cache "
+                "(n_stream=%u, v_trans=%d, k_type=%s, v_type=%s) - falling back to continuous K/V views\n",
+                __func__, n_stream, (int) v_trans,
+                layer.k ? ggml_type_name(layer.k->type) : "none",
+                layer.v ? ggml_type_name(layer.v->type) : "none");
+        paged_ingraph_warned = true;
+    }
+
+    return supported;
+}
+
 void llama_kv_cache::paged_log_stats() const {
     if (!kv_paged_enabled) {
         return;
@@ -1750,7 +1774,8 @@ void llama_kv_cache::paged_log_stats() const {
     LLAMA_LOG_INFO("%s: KV paged metadata stats: enabled=1 block_size=%u n_blocks=%u "
             "blocks_in_use=%llu free_blocks=%zu alloc_calls=%llu identity_checks=%llu identity_fail=%llu "
             "write_resolve_checks=%llu write_resolve_fail=%llu write_resolve_changed=%llu "
-            "shadow_gather_calls=%llu shadow_gather_changed=%llu shadow_gather_mismatch=%llu shadow_gather_fail=%llu\n",
+            "shadow_gather_calls=%llu shadow_gather_changed=%llu shadow_gather_mismatch=%llu shadow_gather_fail=%llu "
+            "ingraph_gather_layers=%llu row_idx_changed=%llu row_idx_fail=%llu\n",
             __func__, paged_block_size, paged_n_blocks,
             (unsigned long long) paged_blocks_in_use,
             paged_free_list.size(),
@@ -1763,7 +1788,10 @@ void llama_kv_cache::paged_log_stats() const {
             (unsigned long long) paged_shadow_gather_calls,
             (unsigned long long) paged_shadow_gather_changed,
             (unsigned long long) paged_shadow_gather_mismatch,
-            (unsigned long long) paged_shadow_gather_fail);
+            (unsigned long long) paged_shadow_gather_fail,
+            (unsigned long long) paged_ingraph_gather_layers,
+            (unsigned long long) paged_row_idx_changed,
+            (unsigned long long) paged_row_idx_fail);
 }
 
 void llama_kv_cache::swap_out_cell(uint32_t cell) {
@@ -2410,7 +2438,14 @@ bool llama_kv_cache::uses_approx_dynamic_view() const {
         kv_swap_window > 0 && !v_trans && n_stream == 1 && n_seq_max == 1;
 }
 
-ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, uint32_t visible_lo, const slot_info & sinfo, bool causal_attn) const {
+ggml_tensor * llama_kv_cache::get_k(
+        ggml_context * ctx,
+        int32_t il,
+        uint32_t n_kv,
+        uint32_t visible_lo,
+        const slot_info & sinfo,
+        bool causal_attn,
+        ggml_tensor * row_idx) const {
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * k = layers[ikv].k;
@@ -2434,6 +2469,15 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
         ++kv_approx_debug_get_k_visible_gt0_calls;
     }
 
+    if (row_idx && paged_ingraph_gather_supported(il) && ns == 1 && !approx_dynamic) {
+        ggml_tensor * k2d = ggml_reshape_2d(ctx, k, n_embd_k_gqa, kv_size);
+        ggml_tensor * rows = ggml_get_rows(ctx, k2d, row_idx);
+        paged_ingraph_gather_layers += 1;
+
+        return ggml_reshape_4d(ctx, rows,
+                hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv, 1);
+    }
+
     return ggml_view_4d(ctx, k,
             hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv, ns,
             ggml_row_size(k->type, hparams.n_embd_head_k(il)),
@@ -2442,7 +2486,14 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
             ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0 + (approx_dynamic ? byte_offset : 0));
 }
 
-ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, uint32_t visible_lo, const slot_info & sinfo, bool causal_attn) const {
+ggml_tensor * llama_kv_cache::get_v(
+        ggml_context * ctx,
+        int32_t il,
+        uint32_t n_kv,
+        uint32_t visible_lo,
+        const slot_info & sinfo,
+        bool causal_attn,
+        ggml_tensor * row_idx) const {
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * v = layers[ikv].v;
@@ -2467,6 +2518,15 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
         }
         if (approx_dynamic && visible_lo > 0) {
             ++kv_approx_debug_get_v_visible_gt0_calls;
+        }
+
+        if (row_idx && paged_ingraph_gather_supported(il) && ns == 1 && !approx_dynamic) {
+            ggml_tensor * v2d = ggml_reshape_2d(ctx, v, n_embd_v_gqa, kv_size);
+            ggml_tensor * rows = ggml_get_rows(ctx, v2d, row_idx);
+            paged_ingraph_gather_layers += 1;
+
+            return ggml_reshape_4d(ctx, rows,
+                    hparams.n_embd_head_v(il), hparams.n_head_kv(il), n_kv, 1);
         }
 
         // note: v->nb[1] <= v->nb[2]
@@ -2604,6 +2664,36 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
     return v_idxs;
 }
 
+ggml_tensor * llama_kv_cache::build_input_paged_row_idx(ggml_context * ctx, uint32_t n_kv) const {
+    if (!kv_paged_enabled) {
+        return nullptr;
+    }
+
+    bool supported = n_stream == 1 && !v_trans;
+    for (const auto & layer : layers) {
+        supported = supported &&
+            layer.k &&
+            layer.v &&
+            layer.k->type == GGML_TYPE_F32 &&
+            layer.v->type == GGML_TYPE_F32;
+    }
+
+    if (!supported) {
+        if (!paged_ingraph_warned) {
+            LLAMA_LOG_WARN("%s: KV paged in-graph gather requires n_stream==1, !v_trans, and F32 K/V cache "
+                    "(n_stream=%u, v_trans=%d) - falling back to continuous K/V views\n",
+                    __func__, n_stream, (int) v_trans);
+            paged_ingraph_warned = true;
+        }
+        return nullptr;
+    }
+
+    ggml_tensor * row_idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_kv);
+    ggml_set_input(row_idx);
+
+    return row_idx;
+}
+
 ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
@@ -2697,6 +2787,27 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
                 }
             }
         }
+    }
+}
+
+void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst) const {
+    if (!dst) {
+        return;
+    }
+
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    int32_t * data = (int32_t *) dst->data;
+
+    for (int64_t r = 0; r < dst->ne[0]; ++r) {
+        uint32_t phys = paged_resolve((uint32_t) r);
+        if (phys == PAGED_BLOCK_INVALID || phys > (uint32_t) std::numeric_limits<int32_t>::max()) {
+            paged_row_idx_fail += 1;
+            phys = (uint32_t) r;
+        }
+        if (phys != (uint32_t) r) {
+            paged_row_idx_changed += 1;
+        }
+        data[r] = (int32_t) phys;
     }
 }
 
@@ -3794,12 +3905,12 @@ ggml_type llama_kv_cache_context::type_v() const {
     return kv->type_v();
 }
 
-ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il, bool causal_attn) const {
-    return kv->get_k(ctx, il, n_kv, visible_lo, sinfos[i_cur], causal_attn);
+ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il, bool causal_attn, ggml_tensor * row_idx) const {
+    return kv->get_k(ctx, il, n_kv, visible_lo, sinfos[i_cur], causal_attn, row_idx);
 }
 
-ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il, bool causal_attn) const {
-    return kv->get_v(ctx, il, n_kv, visible_lo, sinfos[i_cur], causal_attn);
+ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il, bool causal_attn, ggml_tensor * row_idx) const {
+    return kv->get_v(ctx, il, n_kv, visible_lo, sinfos[i_cur], causal_attn, row_idx);
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
@@ -3816,6 +3927,10 @@ ggml_tensor * llama_kv_cache_context::build_input_k_idxs(ggml_context * ctx, con
 
 ggml_tensor * llama_kv_cache_context::build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
     return kv->build_input_v_idxs(ctx, ubatch);
+}
+
+ggml_tensor * llama_kv_cache_context::build_input_paged_row_idx(ggml_context * ctx) const {
+    return kv->build_input_paged_row_idx(ctx, n_kv);
 }
 
 ggml_tensor * llama_kv_cache_context::build_input_k_rot(ggml_context * ctx) const {
@@ -3836,6 +3951,10 @@ void llama_kv_cache_context::set_input_k_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     kv->set_input_v_idxs(dst, ubatch, sinfos[i_cur]);
+}
+
+void llama_kv_cache_context::set_input_paged_row_idx(ggml_tensor * dst) const {
+    kv->set_input_paged_row_idx(dst);
 }
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {

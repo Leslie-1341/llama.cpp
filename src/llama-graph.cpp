@@ -16,9 +16,12 @@
 #include <cstring>
 #include <numeric>
 #include <sstream>
+#include <unordered_map>
 #include <unordered_set>
 
 // dedup helpers
+
+static std::unordered_map<const llm_graph_input_attn_kv *, ggml_tensor *> g_paged_row_idx_kv;
 
 static ggml_tensor * build_attn_inp_kq_mask(
         ggml_context * ctx,
@@ -453,6 +456,11 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
 
+    auto it = g_paged_row_idx_kv.find(this);
+    if (it != g_paged_row_idx_kv.end() && it->second) {
+        mctx->set_input_paged_row_idx(it->second);
+    }
+
     mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
 
     if (self_k_rot) {
@@ -473,6 +481,11 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
 
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
+
+    auto it = g_paged_row_idx_kv.find(this);
+    if (it != g_paged_row_idx_kv.end() && it->second) {
+        res &= it->second->ne[0] == mctx->get_n_kv();
+    }
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
     if (mctx->uses_approx_dynamic_view() && params.cparams.causal_attn) {
@@ -2180,6 +2193,11 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
+        if (auto * row_idx = mctx_cur->build_input_paged_row_idx(ctx0)) {
+            g_paged_row_idx_kv[inp.get()] = row_idx;
+        } else {
+            g_paged_row_idx_kv.erase(inp.get());
+        }
 
         inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
         inp->self_kq_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp->self_kq_mask, GGML_TYPE_F16) : inp->self_kq_mask;
@@ -2242,10 +2260,17 @@ ggml_tensor * llm_graph_context::build_attn(
     }
 
     const auto & kq_mask = inp->get_kq_mask();
+    ggml_tensor * row_idx = nullptr;
+    {
+        auto it = g_paged_row_idx_kv.find(inp);
+        if (it != g_paged_row_idx_kv.end()) {
+            row_idx = it->second;
+        }
+    }
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il, cparams.causal_attn);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il, cparams.causal_attn);
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il, cparams.causal_attn, row_idx);
+    ggml_tensor * v = mctx_cur->get_v(ctx0, il, cparams.causal_attn, row_idx);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
