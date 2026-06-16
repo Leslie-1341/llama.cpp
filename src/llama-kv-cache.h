@@ -441,6 +441,7 @@ private:
     void paged_reset();
     void paged_note_cells(const slot_info & sinfo);
     uint32_t paged_resolve(uint32_t cell) const;
+    uint32_t paged_write_resolve(uint32_t cell) const;
     void paged_assert_identity(const slot_info & sinfo);
     void paged_log_stats() const;
 
@@ -457,6 +458,9 @@ private:
     uint64_t paged_blocks_in_use   = 0;
     uint64_t paged_identity_checks = 0;
     uint64_t paged_identity_fail   = 0;
+    mutable uint64_t paged_write_resolve_checks  = 0;
+    mutable uint64_t paged_write_resolve_fail    = 0;
+    mutable uint64_t paged_write_resolve_changed = 0;
 
     // stage F1 / P1: KV Lazy-Block tail madvise. When LLAMA_KV_LAZY_TAIL=1, after n_kv is
     // known each step we advise the page-aligned interior of the *unused tail* capacity

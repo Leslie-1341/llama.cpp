@@ -1633,6 +1633,24 @@ uint32_t llama_kv_cache::paged_resolve(uint32_t cell) const {
     return physical_block * paged_block_size + offset;
 }
 
+uint32_t llama_kv_cache::paged_write_resolve(uint32_t cell) const {
+    if (!kv_paged_enabled) {
+        return cell;
+    }
+
+    const uint32_t phys = paged_resolve(cell);
+    paged_write_resolve_checks += 1;
+    if (phys == PAGED_BLOCK_INVALID) {
+        paged_write_resolve_fail += 1;
+        return cell;
+    }
+    if (phys != cell) {
+        paged_write_resolve_changed += 1;
+    }
+
+    return phys;
+}
+
 void llama_kv_cache::paged_assert_identity(const slot_info & sinfo) {
     if (!kv_paged_enabled) {
         return;
@@ -1657,13 +1675,17 @@ void llama_kv_cache::paged_log_stats() const {
     }
 
     LLAMA_LOG_INFO("%s: KV paged metadata stats: enabled=1 block_size=%u n_blocks=%u "
-            "blocks_in_use=%llu free_blocks=%zu alloc_calls=%llu identity_checks=%llu identity_fail=%llu\n",
+            "blocks_in_use=%llu free_blocks=%zu alloc_calls=%llu identity_checks=%llu identity_fail=%llu "
+            "write_resolve_checks=%llu write_resolve_fail=%llu write_resolve_changed=%llu\n",
             __func__, paged_block_size, paged_n_blocks,
             (unsigned long long) paged_blocks_in_use,
             paged_free_list.size(),
             (unsigned long long) paged_alloc_calls,
             (unsigned long long) paged_identity_checks,
-            (unsigned long long) paged_identity_fail);
+            (unsigned long long) paged_identity_fail,
+            (unsigned long long) paged_write_resolve_checks,
+            (unsigned long long) paged_write_resolve_fail,
+            (unsigned long long) paged_write_resolve_changed);
 }
 
 void llama_kv_cache::swap_out_cell(uint32_t cell) {
@@ -2556,7 +2578,9 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
         const int64_t offs = sinfo.strm[s]*get_size();
 
         for (uint32_t i = 0; i < sinfo.size(); ++i) {
-            data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
+            const uint32_t cell = sinfo.idxs[s][i];
+            const uint32_t phys = paged_write_resolve(cell);
+            data[s*sinfo.size() + i] = offs + phys;
         }
     }
 }
@@ -2573,7 +2597,9 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
             const int64_t offs = sinfo.strm[s]*get_size();
 
             for (uint32_t i = 0; i < sinfo.size(); ++i) {
-                data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
+                const uint32_t cell = sinfo.idxs[s][i];
+                const uint32_t phys = paged_write_resolve(cell);
+                data[s*sinfo.size() + i] = offs + phys;
             }
         }
     } else {
@@ -2586,8 +2612,10 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
             const int64_t offs = sinfo.strm[s]*kv_size*n_embd_v_gqa;
 
             for (uint32_t i = 0; i < sinfo.size(); ++i) {
+                const uint32_t cell = sinfo.idxs[s][i];
+                const uint32_t phys = paged_write_resolve(cell);
                 for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
-                    data[s*sinfo.size()*n_embd_v_gqa + i*n_embd_v_gqa + j] = offs + j*kv_size + sinfo.idxs[s][i];
+                    data[s*sinfo.size()*n_embd_v_gqa + i*n_embd_v_gqa + j] = offs + j*kv_size + phys;
                 }
             }
         }
