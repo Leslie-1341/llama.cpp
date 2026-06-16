@@ -410,7 +410,9 @@ llama_kv_cache::llama_kv_cache(
     const bool kv_paged_requested = LLAMA_KV_PAGED && std::strcmp(LLAMA_KV_PAGED, "1") == 0;
     if (kv_paged_requested) {
         const char * LLAMA_KV_PAGED_BLOCK_SIZE = std::getenv("LLAMA_KV_PAGED_BLOCK_SIZE");
+        const char * LLAMA_KV_PAGED_SHIFT      = std::getenv("LLAMA_KV_PAGED_SHIFT");
         const int block_size_env = LLAMA_KV_PAGED_BLOCK_SIZE ? std::atoi(LLAMA_KV_PAGED_BLOCK_SIZE) : 16;
+        const int shift_env      = LLAMA_KV_PAGED_SHIFT      ? std::atoi(LLAMA_KV_PAGED_SHIFT)      : 0;
 
         if (block_size_env <= 0 ||
                 !ggml_is_power_of_2(block_size_env) ||
@@ -428,9 +430,20 @@ llama_kv_cache::llama_kv_cache(
         } else {
             kv_paged_enabled = true;
             paged_block_size = (uint32_t) block_size_env;
+            if (shift_env > 0 && (type_k != GGML_TYPE_F32 || type_v != GGML_TYPE_F32)) {
+                LLAMA_LOG_WARN("%s: KV paged non-identity mapping requires F32 K/V cache "
+                        "(type_k=%s, type_v=%s) - using identity mapping\n",
+                        __func__, ggml_type_name(type_k), ggml_type_name(type_v));
+                paged_shift = 0;
+            } else {
+                paged_shift = shift_env > 0 ? (uint32_t) shift_env : 0;
+            }
             paged_init(kv_size);
-            LLAMA_LOG_INFO("%s: KV paged metadata enabled (identity mapping, block_size=%u, n_blocks=%u)\n",
-                    __func__, paged_block_size, paged_n_blocks);
+            LLAMA_LOG_INFO("%s: KV paged metadata enabled (block_size=%u, n_blocks=%u, shift=%u, "
+                    "non_identity=%d, mapping_changed=%llu)\n",
+                    __func__, paged_block_size, paged_n_blocks, paged_shift,
+                    paged_non_identity_enabled ? 1 : 0,
+                    (unsigned long long) paged_block_mapping_changed);
         }
     }
 
@@ -698,6 +711,11 @@ llama_kv_cache::llama_kv_cache(
     // See docs/kv_lazy_block_stage_f1_design.md.
     const char * LLAMA_KV_LAZY_TAIL = getenv("LLAMA_KV_LAZY_TAIL");
     kv_lazy_tail = LLAMA_KV_LAZY_TAIL ? (atoi(LLAMA_KV_LAZY_TAIL) != 0) : false;
+    if (kv_lazy_tail && paged_non_identity_enabled) {
+        LLAMA_LOG_WARN("%s: KV lazy-tail disabled because paged non-identity mapping breaks "
+                "physical-prefix assumption\n", __func__);
+        kv_lazy_tail = false;
+    }
     if (kv_lazy_tail) {
         LLAMA_LOG_INFO("%s: KV lazy-tail madvise enabled (v_trans = %d, n_stream = %u) -- advises unused tail "
                 "[PAD(n_kv,256), %u) per step\n", __func__, (int) v_trans, n_stream, kv_size);
@@ -1550,15 +1568,13 @@ void llama_kv_cache::paged_init(uint32_t kv_size) {
         return;
     }
 
+    paged_kv_size = kv_size;
     paged_n_blocks = (kv_size + paged_block_size - 1) / paged_block_size;
     paged_block_table.resize(paged_n_blocks);
     paged_block_used.assign(paged_n_blocks, 0);
     paged_free_list.resize(paged_n_blocks);
 
-    for (uint32_t i = 0; i < paged_n_blocks; ++i) {
-        paged_block_table[i] = i;
-        paged_free_list[paged_n_blocks - 1 - i] = i;
-    }
+    paged_build_block_table();
 
     paged_alloc_calls     = 0;
     paged_blocks_in_use   = 0;
@@ -1577,11 +1593,58 @@ void llama_kv_cache::paged_reset() {
 
     paged_block_used.assign(paged_n_blocks, 0);
     paged_free_list.resize(paged_n_blocks);
+    paged_build_block_table();
+    paged_blocks_in_use = 0;
+}
+
+void llama_kv_cache::paged_build_block_table() {
+    if (!kv_paged_enabled) {
+        return;
+    }
+
+    paged_block_mapping_changed = 0;
+    paged_mapping_oob_fail = 0;
+    paged_non_identity_enabled = false;
+
+    if (paged_n_blocks == 0) {
+        return;
+    }
+
     for (uint32_t i = 0; i < paged_n_blocks; ++i) {
         paged_block_table[i] = i;
         paged_free_list[paged_n_blocks - 1 - i] = i;
     }
-    paged_blocks_in_use = 0;
+
+    if (paged_n_blocks <= 1 || paged_shift == 0 || paged_kv_size % paged_block_size != 0) {
+        return;
+    }
+
+    const uint32_t span = paged_n_blocks - 1;
+    const uint32_t shift = paged_shift % span;
+    if (shift == 0) {
+        return;
+    }
+
+    paged_block_table[0] = 0;
+    for (uint32_t i = 1; i < paged_n_blocks; ++i) {
+        paged_block_table[i] = 1 + ((i - 1 + shift) % span);
+    }
+
+    std::vector<uint8_t> seen(paged_n_blocks, 0);
+    for (uint32_t i = 0; i < paged_n_blocks; ++i) {
+        const uint32_t phys = paged_block_table[i];
+        if (phys >= paged_n_blocks || seen[phys]) {
+            paged_mapping_oob_fail += 1;
+            paged_block_table[i] = i;
+            continue;
+        }
+        seen[phys] = 1;
+        if (phys != i) {
+            paged_block_mapping_changed += 1;
+        }
+    }
+
+    paged_non_identity_enabled = paged_mapping_oob_fail == 0 && paged_block_mapping_changed > 0;
 }
 
 void llama_kv_cache::paged_note_cells(const slot_info & sinfo) {
@@ -1619,18 +1682,28 @@ uint32_t llama_kv_cache::paged_resolve(uint32_t cell) const {
         return cell;
     }
 
+    paged_logical_to_physical_checks += 1;
+
     const uint32_t logical_block = cell / paged_block_size;
     const uint32_t offset        = cell % paged_block_size;
     if (logical_block >= paged_block_table.size()) {
+        paged_logical_to_physical_fail += 1;
         return PAGED_BLOCK_INVALID;
     }
 
     const uint32_t physical_block = paged_block_table[logical_block];
     if (physical_block == PAGED_BLOCK_INVALID || physical_block >= paged_n_blocks) {
+        paged_logical_to_physical_fail += 1;
         return PAGED_BLOCK_INVALID;
     }
 
-    return physical_block * paged_block_size + offset;
+    const uint32_t phys_cell = physical_block * paged_block_size + offset;
+    if (phys_cell >= paged_kv_size) {
+        paged_logical_to_physical_fail += 1;
+        return PAGED_BLOCK_INVALID;
+    }
+
+    return phys_cell;
 }
 
 uint32_t llama_kv_cache::paged_write_resolve(uint32_t cell) const {
@@ -1660,7 +1733,12 @@ void llama_kv_cache::paged_assert_identity(const slot_info & sinfo) {
         for (const uint32_t cell : sinfo.idxs[s]) {
             const uint32_t phys_cell = paged_resolve(cell);
             paged_identity_checks += 1;
-            if (phys_cell != cell) {
+            if (phys_cell == PAGED_BLOCK_INVALID) {
+                paged_identity_fail += paged_non_identity_enabled ? 0 : 1;
+                paged_mapping_oob_fail += paged_non_identity_enabled ? 1 : 0;
+                LLAMA_LOG_WARN("%s: KV paged mapping check failed: cell=%u phys_cell=INVALID block_size=%u\n",
+                        __func__, cell, paged_block_size);
+            } else if (!paged_non_identity_enabled && phys_cell != cell) {
                 paged_identity_fail += 1;
                 LLAMA_LOG_WARN("%s: KV paged identity check failed: cell=%u phys_cell=%u block_size=%u\n",
                         __func__, cell, phys_cell, paged_block_size);
@@ -1705,7 +1783,9 @@ void llama_kv_cache::paged_shadow_validate(const slot_info & sinfo, uint32_t n_k
                     }
 
                     std::memcpy(shadow.data(), base + (size_t) phys * row_size, row_size);
-                    if (std::memcmp(shadow.data(), base + (size_t) r * row_size, row_size) != 0) {
+                    if (paged_non_identity_enabled) {
+                        paged_shadow_skipped_non_identity += 1;
+                    } else if (std::memcmp(shadow.data(), base + (size_t) r * row_size, row_size) != 0) {
                         paged_shadow_gather_mismatch += 1;
                     }
                 }
@@ -1733,7 +1813,9 @@ void llama_kv_cache::paged_shadow_validate(const slot_info & sinfo, uint32_t n_k
                     }
 
                     std::memcpy(shadow.data(), base + (size_t) phys * row_size, row_size);
-                    if (std::memcmp(shadow.data(), base + (size_t) r * row_size, row_size) != 0) {
+                    if (paged_non_identity_enabled) {
+                        paged_shadow_skipped_non_identity += 1;
+                    } else if (std::memcmp(shadow.data(), base + (size_t) r * row_size, row_size) != 0) {
                         paged_shadow_gather_mismatch += 1;
                     }
                 }
@@ -1775,7 +1857,9 @@ void llama_kv_cache::paged_log_stats() const {
             "blocks_in_use=%llu free_blocks=%zu alloc_calls=%llu identity_checks=%llu identity_fail=%llu "
             "write_resolve_checks=%llu write_resolve_fail=%llu write_resolve_changed=%llu "
             "shadow_gather_calls=%llu shadow_gather_changed=%llu shadow_gather_mismatch=%llu shadow_gather_fail=%llu "
-            "ingraph_gather_layers=%llu row_idx_changed=%llu row_idx_fail=%llu\n",
+            "shadow_skipped_non_identity=%llu ingraph_gather_layers=%llu row_idx_changed=%llu row_idx_fail=%llu "
+            "non_identity_enabled=%d block_mapping_changed=%llu mapping_oob_fail=%llu "
+            "logical_to_physical_checks=%llu logical_to_physical_fail=%llu\n",
             __func__, paged_block_size, paged_n_blocks,
             (unsigned long long) paged_blocks_in_use,
             paged_free_list.size(),
@@ -1789,9 +1873,15 @@ void llama_kv_cache::paged_log_stats() const {
             (unsigned long long) paged_shadow_gather_changed,
             (unsigned long long) paged_shadow_gather_mismatch,
             (unsigned long long) paged_shadow_gather_fail,
+            (unsigned long long) paged_shadow_skipped_non_identity,
             (unsigned long long) paged_ingraph_gather_layers,
             (unsigned long long) paged_row_idx_changed,
-            (unsigned long long) paged_row_idx_fail);
+            (unsigned long long) paged_row_idx_fail,
+            paged_non_identity_enabled ? 1 : 0,
+            (unsigned long long) paged_block_mapping_changed,
+            (unsigned long long) paged_mapping_oob_fail,
+            (unsigned long long) paged_logical_to_physical_checks,
+            (unsigned long long) paged_logical_to_physical_fail);
 }
 
 void llama_kv_cache::swap_out_cell(uint32_t cell) {
@@ -2226,6 +2316,14 @@ void llama_kv_cache::sample_swap_rss() {
 void llama_kv_cache::madvise_tail(uint32_t n_kv) {
 #if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
     if (!kv_lazy_tail) {
+        return;
+    }
+    if (paged_non_identity_enabled) {
+        if (!kv_lazy_tail_warned) {
+            LLAMA_LOG_WARN("%s: KV lazy-tail disabled because paged non-identity mapping breaks "
+                    "physical-prefix assumption\n", __func__);
+            kv_lazy_tail_warned = true;
+        }
         return;
     }
     // boundary: only the !v_trans / single-stream layout has contiguous per-cell rows.

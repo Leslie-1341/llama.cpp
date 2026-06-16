@@ -441,6 +441,7 @@ private:
     // identity block table for internal accounting; it is not consumed by KV read/write paths.
     void paged_init(uint32_t kv_size);
     void paged_reset();
+    void paged_build_block_table();
     void paged_note_cells(const slot_info & sinfo);
     uint32_t paged_resolve(uint32_t cell) const;
     uint32_t paged_write_resolve(uint32_t cell) const;
@@ -455,6 +456,9 @@ private:
     bool     kv_paged_warned   = false;
     uint32_t paged_block_size  = 16;
     uint32_t paged_n_blocks    = 0;
+    uint32_t paged_kv_size     = 0;
+    uint32_t paged_shift       = 0;
+    bool     paged_non_identity_enabled = false;
     std::vector<uint32_t> paged_block_table;
     std::vector<uint8_t>  paged_block_used;
     std::vector<uint32_t> paged_free_list;
@@ -469,10 +473,15 @@ private:
     mutable uint64_t paged_shadow_gather_changed  = 0;
     mutable uint64_t paged_shadow_gather_mismatch = 0;
     mutable uint64_t paged_shadow_gather_fail     = 0;
+    mutable uint64_t paged_shadow_skipped_non_identity = 0;
     mutable uint64_t paged_ingraph_gather_layers  = 0;
     mutable uint64_t paged_row_idx_changed        = 0;
     mutable uint64_t paged_row_idx_fail           = 0;
     mutable bool     paged_ingraph_warned         = false;
+    uint64_t paged_block_mapping_changed = 0;
+    uint64_t paged_mapping_oob_fail = 0;
+    mutable uint64_t paged_logical_to_physical_checks = 0;
+    mutable uint64_t paged_logical_to_physical_fail = 0;
 
     // stage F1 / P1: KV Lazy-Block tail madvise. When LLAMA_KV_LAZY_TAIL=1, after n_kv is
     // known each step we advise the page-aligned interior of the *unused tail* capacity
