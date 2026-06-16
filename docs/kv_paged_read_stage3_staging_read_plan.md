@@ -1,5 +1,21 @@
 # Stage 3 — staging paged-read 设计计划
 
+> ## ⚠️ Timing update / 时序修正（2026-06-16，源码核实后）
+>
+> 详见 [docs/kv_paged_read_stage3_timing_analysis.md](kv_paged_read_stage3_timing_analysis.md)。
+>
+> 本文 §6/§7/§8 推荐的**方案 B「graph 外 CPU staging copy 作为真实读路径」已被源码时序证伪**：
+> - `get_k/get_v`、`cpy_k/cpy_v` 均为构图期函数，只 emit ggml 节点；
+> - 真实 K/V 写入（`ggml_set_rows`）与 attention 读（view→FA）**同在一次 `graph_compute` 内**；
+> - graph 外 CPU copy 只能在 compute **前**执行，会**漏掉本 step 刚写入的 K/V**（读到旧 KV）；
+> - cpy 写节点与 attention 读节点之间**没有干净的 CPU hook**。
+>
+> **因此推荐方案修正为：**
+> - **Stage 3A-shadow**：方案 B 降级为「仅做 shadow gather 验证」—— compute 后 gather 物理行到独立 shadow buffer，与连续 `[0,n_kv)` reference 逐字节比对，**绝不接管 attention**；
+> - **Stage 3B**：**graph 内 gather 才是真实读路径候选**（在 `cpy_k/cpy_v` 之后、`get_k/get_v` 之前插入 gather 节点）。
+>
+> **下方 §3–§11 保留为历史设计草案；不要直接按原方案 B（真实 graph 外 staging read）编码。** 真实读端接管以 timing analysis 文档与 Stage 3B 为准。
+
 前置：
 
 - [docs/kv_paged_read_stage0_source_read.md](kv_paged_read_stage0_source_read.md)
