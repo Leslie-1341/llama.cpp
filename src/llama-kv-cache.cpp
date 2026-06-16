@@ -1669,6 +1669,79 @@ void llama_kv_cache::paged_assert_identity(const slot_info & sinfo) {
     }
 }
 
+void llama_kv_cache::paged_shadow_validate(const slot_info & sinfo, uint32_t n_kv) const {
+    if (!kv_paged_enabled) {
+        return;
+    }
+
+    if (n_stream != 1 || v_trans || sinfo.n_stream() != 1 || sinfo.s0 != 0 || sinfo.s1 != 0) {
+        paged_shadow_gather_fail += 1;
+        return;
+    }
+
+    paged_shadow_gather_calls += 1;
+
+    for (const auto & layer : layers) {
+        const uint32_t il = layer.il;
+
+        if (!layer.k_stream.empty() && layer.k_stream[0]) {
+            const ggml_tensor * k = layer.k_stream[0];
+            if (!k->data) {
+                paged_shadow_gather_fail += 1;
+            } else {
+                const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
+                const size_t row_size = ggml_row_size(k->type, n_embd_k_gqa);
+                const uint8_t * base = static_cast<const uint8_t *>(k->data);
+                std::vector<uint8_t> shadow(row_size);
+
+                for (uint32_t r = 0; r < n_kv; ++r) {
+                    uint32_t phys = paged_resolve(r);
+                    if (phys == PAGED_BLOCK_INVALID) {
+                        paged_shadow_gather_fail += 1;
+                        phys = r;
+                    }
+                    if (phys != r) {
+                        paged_shadow_gather_changed += 1;
+                    }
+
+                    std::memcpy(shadow.data(), base + (size_t) phys * row_size, row_size);
+                    if (std::memcmp(shadow.data(), base + (size_t) r * row_size, row_size) != 0) {
+                        paged_shadow_gather_mismatch += 1;
+                    }
+                }
+            }
+        }
+
+        if (!layer.v_stream.empty() && layer.v_stream[0]) {
+            const ggml_tensor * v = layer.v_stream[0];
+            if (!v->data) {
+                paged_shadow_gather_fail += 1;
+            } else {
+                const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
+                const size_t row_size = ggml_row_size(v->type, n_embd_v_gqa);
+                const uint8_t * base = static_cast<const uint8_t *>(v->data);
+                std::vector<uint8_t> shadow(row_size);
+
+                for (uint32_t r = 0; r < n_kv; ++r) {
+                    uint32_t phys = paged_resolve(r);
+                    if (phys == PAGED_BLOCK_INVALID) {
+                        paged_shadow_gather_fail += 1;
+                        phys = r;
+                    }
+                    if (phys != r) {
+                        paged_shadow_gather_changed += 1;
+                    }
+
+                    std::memcpy(shadow.data(), base + (size_t) phys * row_size, row_size);
+                    if (std::memcmp(shadow.data(), base + (size_t) r * row_size, row_size) != 0) {
+                        paged_shadow_gather_mismatch += 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
 void llama_kv_cache::paged_log_stats() const {
     if (!kv_paged_enabled) {
         return;
@@ -1676,7 +1749,8 @@ void llama_kv_cache::paged_log_stats() const {
 
     LLAMA_LOG_INFO("%s: KV paged metadata stats: enabled=1 block_size=%u n_blocks=%u "
             "blocks_in_use=%llu free_blocks=%zu alloc_calls=%llu identity_checks=%llu identity_fail=%llu "
-            "write_resolve_checks=%llu write_resolve_fail=%llu write_resolve_changed=%llu\n",
+            "write_resolve_checks=%llu write_resolve_fail=%llu write_resolve_changed=%llu "
+            "shadow_gather_calls=%llu shadow_gather_changed=%llu shadow_gather_mismatch=%llu shadow_gather_fail=%llu\n",
             __func__, paged_block_size, paged_n_blocks,
             (unsigned long long) paged_blocks_in_use,
             paged_free_list.size(),
@@ -1685,7 +1759,11 @@ void llama_kv_cache::paged_log_stats() const {
             (unsigned long long) paged_identity_fail,
             (unsigned long long) paged_write_resolve_checks,
             (unsigned long long) paged_write_resolve_fail,
-            (unsigned long long) paged_write_resolve_changed);
+            (unsigned long long) paged_write_resolve_changed,
+            (unsigned long long) paged_shadow_gather_calls,
+            (unsigned long long) paged_shadow_gather_changed,
+            (unsigned long long) paged_shadow_gather_mismatch,
+            (unsigned long long) paged_shadow_gather_fail);
 }
 
 void llama_kv_cache::swap_out_cell(uint32_t cell) {
@@ -3638,6 +3716,11 @@ llama_kv_cache_context::~llama_kv_cache_context() = default;
 bool llama_kv_cache_context::next() {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 
+    if (paged_shadow_pending) {
+        kv->paged_shadow_validate(sinfos[i_cur], paged_shadow_n_kv);
+        paged_shadow_pending = false;
+    }
+
     if (++i_cur >= ubatches.size()) {
         return false;
     }
@@ -3661,6 +3744,8 @@ bool llama_kv_cache_context::apply() {
 
     n_kv = kv->get_n_kv(sinfos[i_cur]);
     visible_lo = kv->get_visible_lo(sinfos[i_cur]);
+    paged_shadow_n_kv = n_kv;
+    paged_shadow_pending = true;
 
     kv->swap_out_window(n_kv);
     kv->ensure_resident(n_kv);

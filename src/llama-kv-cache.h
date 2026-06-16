@@ -443,6 +443,7 @@ private:
     uint32_t paged_resolve(uint32_t cell) const;
     uint32_t paged_write_resolve(uint32_t cell) const;
     void paged_assert_identity(const slot_info & sinfo);
+    void paged_shadow_validate(const slot_info & sinfo, uint32_t n_kv) const;
     void paged_log_stats() const;
 
     static constexpr uint32_t PAGED_BLOCK_INVALID = UINT32_MAX;
@@ -461,6 +462,10 @@ private:
     mutable uint64_t paged_write_resolve_checks  = 0;
     mutable uint64_t paged_write_resolve_fail    = 0;
     mutable uint64_t paged_write_resolve_changed = 0;
+    mutable uint64_t paged_shadow_gather_calls    = 0;
+    mutable uint64_t paged_shadow_gather_changed  = 0;
+    mutable uint64_t paged_shadow_gather_mismatch = 0;
+    mutable uint64_t paged_shadow_gather_fail     = 0;
 
     // stage F1 / P1: KV Lazy-Block tail madvise. When LLAMA_KV_LAZY_TAIL=1, after n_kv is
     // known each step we advise the page-aligned interior of the *unused tail* capacity
@@ -663,4 +668,7 @@ private:
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
     uint32_t visible_lo = 0;
+
+    bool     paged_shadow_pending = false;
+    uint32_t paged_shadow_n_kv    = 0;
 };
