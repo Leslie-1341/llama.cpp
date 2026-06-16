@@ -406,6 +406,34 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    const char * LLAMA_KV_PAGED = std::getenv("LLAMA_KV_PAGED");
+    const bool kv_paged_requested = LLAMA_KV_PAGED && std::strcmp(LLAMA_KV_PAGED, "1") == 0;
+    if (kv_paged_requested) {
+        const char * LLAMA_KV_PAGED_BLOCK_SIZE = std::getenv("LLAMA_KV_PAGED_BLOCK_SIZE");
+        const int block_size_env = LLAMA_KV_PAGED_BLOCK_SIZE ? std::atoi(LLAMA_KV_PAGED_BLOCK_SIZE) : 16;
+
+        if (block_size_env <= 0 ||
+                !ggml_is_power_of_2(block_size_env) ||
+                (uint32_t) block_size_env > kv_size) {
+            LLAMA_LOG_WARN("%s: KV paged metadata requested but LLAMA_KV_PAGED_BLOCK_SIZE=%d is invalid "
+                    "(expected power of 2 in [1, %u]) - disabled\n",
+                    __func__, block_size_env, kv_size);
+        } else if (n_stream != 1 || v_trans) {
+            if (!kv_paged_warned) {
+                LLAMA_LOG_WARN("%s: KV paged metadata requires n_stream==1 && !v_trans "
+                        "(n_stream=%u, v_trans=%d) - disabled\n",
+                        __func__, n_stream, (int) v_trans);
+                kv_paged_warned = true;
+            }
+        } else {
+            kv_paged_enabled = true;
+            paged_block_size = (uint32_t) block_size_env;
+            paged_init(kv_size);
+            LLAMA_LOG_INFO("%s: KV paged metadata enabled (identity mapping, block_size=%u, n_blocks=%u)\n",
+                    __func__, paged_block_size, paged_n_blocks);
+        }
+    }
+
     const uint32_t n_layer_kv = hparams.n_layer_kv();
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
@@ -753,6 +781,7 @@ llama_kv_cache::~llama_kv_cache() {
                 (unsigned long long) lazy_clear_us,
                 lazy_clear_us / 1000.0);
     }
+    paged_log_stats();
 }
 
 void llama_kv_cache::clear(bool data) {
@@ -760,6 +789,7 @@ void llama_kv_cache::clear(bool data) {
         v_cells[s].reset();
         v_heads[s] = 0;
     }
+    paged_reset();
 
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
@@ -1513,6 +1543,127 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
         head = sinfo.idxs[s].back() + 1;
     }
+}
+
+void llama_kv_cache::paged_init(uint32_t kv_size) {
+    if (!kv_paged_enabled) {
+        return;
+    }
+
+    paged_n_blocks = (kv_size + paged_block_size - 1) / paged_block_size;
+    paged_block_table.resize(paged_n_blocks);
+    paged_block_used.assign(paged_n_blocks, 0);
+    paged_free_list.resize(paged_n_blocks);
+
+    for (uint32_t i = 0; i < paged_n_blocks; ++i) {
+        paged_block_table[i] = i;
+        paged_free_list[paged_n_blocks - 1 - i] = i;
+    }
+
+    paged_alloc_calls     = 0;
+    paged_blocks_in_use   = 0;
+    paged_identity_checks = 0;
+    paged_identity_fail   = 0;
+}
+
+void llama_kv_cache::paged_reset() {
+    if (!kv_paged_enabled) {
+        return;
+    }
+
+    if (paged_n_blocks == 0) {
+        return;
+    }
+
+    paged_block_used.assign(paged_n_blocks, 0);
+    paged_free_list.resize(paged_n_blocks);
+    for (uint32_t i = 0; i < paged_n_blocks; ++i) {
+        paged_block_table[i] = i;
+        paged_free_list[paged_n_blocks - 1 - i] = i;
+    }
+    paged_blocks_in_use = 0;
+}
+
+void llama_kv_cache::paged_note_cells(const slot_info & sinfo) {
+    if (!kv_paged_enabled) {
+        return;
+    }
+
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        for (const uint32_t cell : sinfo.idxs[s]) {
+            const uint32_t logical_block = cell / paged_block_size;
+            if (logical_block >= paged_n_blocks) {
+                continue;
+            }
+
+            const uint32_t physical_block = paged_block_table[logical_block];
+            if (physical_block == PAGED_BLOCK_INVALID || physical_block >= paged_n_blocks) {
+                continue;
+            }
+
+            if (!paged_block_used[physical_block]) {
+                paged_block_used[physical_block] = 1;
+                paged_blocks_in_use += 1;
+                paged_alloc_calls += 1;
+                auto it = std::find(paged_free_list.begin(), paged_free_list.end(), physical_block);
+                if (it != paged_free_list.end()) {
+                    paged_free_list.erase(it);
+                }
+            }
+        }
+    }
+}
+
+uint32_t llama_kv_cache::paged_resolve(uint32_t cell) const {
+    if (!kv_paged_enabled || paged_block_size == 0) {
+        return cell;
+    }
+
+    const uint32_t logical_block = cell / paged_block_size;
+    const uint32_t offset        = cell % paged_block_size;
+    if (logical_block >= paged_block_table.size()) {
+        return PAGED_BLOCK_INVALID;
+    }
+
+    const uint32_t physical_block = paged_block_table[logical_block];
+    if (physical_block == PAGED_BLOCK_INVALID || physical_block >= paged_n_blocks) {
+        return PAGED_BLOCK_INVALID;
+    }
+
+    return physical_block * paged_block_size + offset;
+}
+
+void llama_kv_cache::paged_assert_identity(const slot_info & sinfo) {
+    if (!kv_paged_enabled) {
+        return;
+    }
+
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        for (const uint32_t cell : sinfo.idxs[s]) {
+            const uint32_t phys_cell = paged_resolve(cell);
+            paged_identity_checks += 1;
+            if (phys_cell != cell) {
+                paged_identity_fail += 1;
+                LLAMA_LOG_WARN("%s: KV paged identity check failed: cell=%u phys_cell=%u block_size=%u\n",
+                        __func__, cell, phys_cell, paged_block_size);
+            }
+        }
+    }
+}
+
+void llama_kv_cache::paged_log_stats() const {
+    if (!kv_paged_enabled) {
+        return;
+    }
+
+    LLAMA_LOG_INFO("%s: KV paged metadata stats: enabled=1 block_size=%u n_blocks=%u "
+            "blocks_in_use=%llu free_blocks=%zu alloc_calls=%llu identity_checks=%llu identity_fail=%llu\n",
+            __func__, paged_block_size, paged_n_blocks,
+            (unsigned long long) paged_blocks_in_use,
+            paged_free_list.size(),
+            (unsigned long long) paged_alloc_calls,
+            (unsigned long long) paged_identity_checks,
+            (unsigned long long) paged_identity_fail);
 }
 
 void llama_kv_cache::swap_out_cell(uint32_t cell) {
@@ -3179,6 +3330,8 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
         // TODO: we cannot yet restore llama_kv_cell_ext as the apply_ubatch() does not support it yet
         //       see: https://github.com/ggml-org/llama.cpp/pull/16825#issuecomment-3460868350
         apply_ubatch(sinfo, ubatch);
+        paged_note_cells(sinfo);
+        paged_assert_identity(sinfo);
 
         LLAMA_LOG_DEBUG("%s: cell_count = %d, dest_seq_id = %d\n", __func__, cell_count, dest_seq_id);
 
@@ -3475,6 +3628,9 @@ bool llama_kv_cache_context::apply() {
     }
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
+    kv->paged_note_cells(sinfos[i_cur]);
+    kv->paged_assert_identity(sinfos[i_cur]);
+
     n_kv = kv->get_n_kv(sinfos[i_cur]);
     visible_lo = kv->get_visible_lo(sinfos[i_cur]);
 

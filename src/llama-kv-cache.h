@@ -16,6 +16,7 @@ struct llama_cparams;
 struct llama_hparams;
 struct llama_model;
 struct llama_context;
+class llama_kv_cache_context;
 
 //
 // llama_kv_cache
@@ -347,6 +348,8 @@ public:
     void set_input_v_rot(ggml_tensor * dst) const;
 
 private:
+    friend class llama_kv_cache_context;
+
     const llama_model & model;
     const llama_hparams & hparams;
 
@@ -431,6 +434,29 @@ private:
     void swap_in_cell(uint32_t cell);
     void madvise_swapped_runs(uint32_t n_kv);
     void kv_swap_roundtrip_selftest();
+
+    // Stage 1 paged KV metadata scaffold. Off unless LLAMA_KV_PAGED=1 and only maintains an
+    // identity block table for internal accounting; it is not consumed by KV read/write paths.
+    void paged_init(uint32_t kv_size);
+    void paged_reset();
+    void paged_note_cells(const slot_info & sinfo);
+    uint32_t paged_resolve(uint32_t cell) const;
+    void paged_assert_identity(const slot_info & sinfo);
+    void paged_log_stats() const;
+
+    static constexpr uint32_t PAGED_BLOCK_INVALID = UINT32_MAX;
+
+    bool     kv_paged_enabled  = false;
+    bool     kv_paged_warned   = false;
+    uint32_t paged_block_size  = 16;
+    uint32_t paged_n_blocks    = 0;
+    std::vector<uint32_t> paged_block_table;
+    std::vector<uint8_t>  paged_block_used;
+    std::vector<uint32_t> paged_free_list;
+    uint64_t paged_alloc_calls     = 0;
+    uint64_t paged_blocks_in_use   = 0;
+    uint64_t paged_identity_checks = 0;
+    uint64_t paged_identity_fail   = 0;
 
     // stage F1 / P1: KV Lazy-Block tail madvise. When LLAMA_KV_LAZY_TAIL=1, after n_kv is
     // known each step we advise the page-aligned interior of the *unused tail* capacity
