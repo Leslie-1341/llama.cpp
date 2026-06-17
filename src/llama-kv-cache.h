@@ -317,6 +317,7 @@ public:
     // MADV_DONTNEED to lower current RSS. No-op unless LLAMA_KV_LAZY_TAIL=1 (and !v_trans &&
     // n_stream==1). See docs/kv_lazy_block_stage_f1_design.md.
     void madvise_tail(uint32_t n_kv);
+    void paged_release_blocks(uint32_t n_kv);
 
     // stage P2: clear-frontier. When LLAMA_KV_LAZY_CLEAR=1 (and !v_trans && n_stream==1),
     // the construction-time full buffer clear is replaced by clearing only the [0, clear_frontier)
@@ -445,12 +446,21 @@ private:
     void paged_note_cells(const slot_info & sinfo);
     uint32_t paged_resolve(uint32_t cell) const;
     uint32_t paged_write_resolve(uint32_t cell) const;
+    void paged_ensure_write_resident(uint32_t phys_cell) const;
+    void paged_check_read_resident(uint32_t phys_cell) const;
     void paged_assert_identity(const slot_info & sinfo);
     void paged_shadow_validate(const slot_info & sinfo, uint32_t n_kv) const;
     bool paged_ingraph_gather_supported(int32_t il) const;
     void paged_log_stats() const;
 
     static constexpr uint32_t PAGED_BLOCK_INVALID = UINT32_MAX;
+
+    enum class paged_block_state : uint8_t {
+        UNUSED   = 0,
+        RESIDENT = 1,
+        RELEASED = 2,
+        SWAPPED  = 3,
+    };
 
     bool     kv_paged_enabled  = false;
     bool     kv_paged_warned   = false;
@@ -461,6 +471,7 @@ private:
     bool     paged_non_identity_enabled = false;
     std::vector<uint32_t> paged_block_table;
     std::vector<uint8_t>  paged_block_used;
+    mutable std::vector<paged_block_state> paged_block_states;
     std::vector<uint32_t> paged_free_list;
     uint64_t paged_alloc_calls     = 0;
     uint64_t paged_blocks_in_use   = 0;
@@ -482,6 +493,26 @@ private:
     uint64_t paged_mapping_oob_fail = 0;
     mutable uint64_t paged_logical_to_physical_checks = 0;
     mutable uint64_t paged_logical_to_physical_fail = 0;
+    bool     paged_block_release_enabled = false;
+    uint64_t paged_block_release_calls = 0;
+    uint64_t paged_blocks_released = 0;
+    uint64_t paged_blocks_released_unused = 0;
+    uint64_t paged_block_release_bytes = 0;
+    uint64_t paged_block_release_blocks_last = 0;
+    uint64_t paged_block_release_bytes_last = 0;
+    uint64_t paged_block_release_skip_live = 0;
+    uint64_t paged_block_release_skip_unaligned = 0;
+    uint64_t paged_block_release_fail = 0;
+    uint64_t paged_block_release_rss_samples = 0;
+    uint64_t paged_block_release_rss_before_last_kb = 0;
+    uint64_t paged_block_release_rss_after_last_kb = 0;
+    uint64_t paged_block_release_rss_before_max_kb = 0;
+    uint64_t paged_block_release_rss_after_min_kb = 0;
+    uint64_t paged_block_release_rss_drop_last_kb = 0;
+    uint64_t paged_block_release_rss_drop_max_kb = 0;
+    mutable uint64_t paged_block_ensure_calls = 0;
+    mutable uint64_t paged_block_ensure_released = 0;
+    mutable uint64_t paged_release_violation = 0;
 
     // stage F1 / P1: KV Lazy-Block tail madvise. When LLAMA_KV_LAZY_TAIL=1, after n_kv is
     // known each step we advise the page-aligned interior of the *unused tail* capacity
