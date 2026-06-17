@@ -450,7 +450,13 @@ private:
     void paged_ensure_write_resident(uint32_t phys_cell) const;
     void paged_check_read_resident(uint32_t phys_cell) const;
     void paged_swap_out_block(uint32_t physical_block);
-    void paged_swap_in_block(uint32_t physical_block) const;
+    bool paged_swap_in_block(uint32_t physical_block) const;
+    uint64_t paged_madvise_block(
+            uint32_t physical_block,
+            const std::vector<uint8_t> * active,
+            uint64_t & failures,
+            uint64_t & skipped,
+            uint64_t & skip_live) const;
     void paged_assert_identity(const slot_info & sinfo);
     void paged_shadow_validate(const slot_info & sinfo, uint32_t n_kv) const;
     bool paged_ingraph_gather_supported(int32_t il) const;
@@ -475,6 +481,8 @@ private:
     std::vector<uint32_t> paged_block_table;
     std::vector<uint8_t>  paged_block_used;
     mutable std::vector<paged_block_state> paged_block_states;
+    std::vector<uint64_t> paged_swap_offsets;
+    std::vector<size_t>   paged_swap_sizes;
     std::vector<uint32_t> paged_free_list;
     uint64_t paged_alloc_calls     = 0;
     uint64_t paged_blocks_in_use   = 0;
@@ -525,6 +533,29 @@ private:
     mutable uint64_t paged_swap_bytes_in = 0;
     mutable uint64_t paged_swap_backend_failures = 0;
     mutable uint64_t paged_swap_window_skipped = 0;
+    mutable uint64_t paged_swap_read_swapped_hits = 0;
+    mutable uint64_t paged_swap_read_swap_in_calls = 0;
+    mutable uint64_t paged_swap_read_swap_in_failures = 0;
+    mutable uint64_t paged_swap_write_swapped_hits = 0;
+    mutable uint64_t paged_swap_write_swap_in_calls = 0;
+    mutable uint64_t paged_swap_write_swap_in_failures = 0;
+    mutable uint64_t paged_swap_in_fail_no_offset = 0;
+    mutable uint64_t paged_swap_in_fail_bad_size = 0;
+    mutable uint64_t paged_swap_in_fail_read_cell = 0;
+    mutable uint64_t paged_swap_in_fail_tensor_set = 0;
+    mutable uint64_t paged_swap_madvise_calls = 0;
+    mutable uint64_t paged_swap_madvise_bytes = 0;
+    mutable uint64_t paged_swap_madvise_failures = 0;
+    mutable uint64_t paged_swap_madvise_skipped = 0;
+    mutable uint64_t paged_swap_madvise_skip_no_full_page = 0;
+    mutable uint64_t paged_swap_madvise_skip_neighbor = 0;
+    mutable uint64_t paged_swap_rss_samples = 0;
+    mutable uint64_t paged_swap_rss_before_last_kb = 0;
+    mutable uint64_t paged_swap_rss_after_last_kb = 0;
+    mutable uint64_t paged_swap_rss_drop_last_kb = 0;
+    mutable uint64_t paged_swap_rss_drop_max_kb = 0;
+    bool     paged_swap_pending = false;
+    uint32_t paged_swap_pending_n_kv = 0;
 
     // stage F1 / P1: KV Lazy-Block tail madvise. When LLAMA_KV_LAZY_TAIL=1, after n_kv is
     // known each step we advise the page-aligned interior of the *unused tail* capacity

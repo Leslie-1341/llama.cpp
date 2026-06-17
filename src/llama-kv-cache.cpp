@@ -1597,6 +1597,8 @@ void llama_kv_cache::paged_init(uint32_t kv_size) {
     paged_block_table.resize(paged_n_blocks);
     paged_block_used.assign(paged_n_blocks, 0);
     paged_block_states.assign(paged_n_blocks, paged_block_state::UNUSED);
+    paged_swap_offsets.assign(kv_size, 0);
+    paged_swap_sizes.assign(kv_size, 0);
     paged_free_list.resize(paged_n_blocks);
 
     paged_build_block_table();
@@ -1618,9 +1620,13 @@ void llama_kv_cache::paged_reset() {
 
     paged_block_used.assign(paged_n_blocks, 0);
     paged_block_states.assign(paged_n_blocks, paged_block_state::UNUSED);
+    paged_swap_offsets.assign(paged_kv_size, 0);
+    paged_swap_sizes.assign(paged_kv_size, 0);
     paged_free_list.resize(paged_n_blocks);
     paged_build_block_table();
     paged_blocks_in_use = 0;
+    paged_swap_pending = false;
+    paged_swap_pending_n_kv = 0;
 }
 
 void llama_kv_cache::paged_build_block_table() {
@@ -1773,7 +1779,15 @@ void llama_kv_cache::paged_ensure_write_resident(uint32_t phys_cell) const {
         paged_block_states[physical_block] = paged_block_state::RESIDENT;
         paged_block_ensure_released += 1;
     } else if (paged_block_states[physical_block] == paged_block_state::SWAPPED) {
-        paged_block_states[physical_block] = paged_block_state::RESIDENT;
+        paged_swap_write_swapped_hits += 1;
+        if (paged_swap_in_block(physical_block) &&
+                paged_block_states[physical_block] == paged_block_state::RESIDENT) {
+            paged_swap_write_swap_in_calls += 1;
+        } else {
+            paged_swap_write_swap_in_failures += 1;
+            LLAMA_LOG_ERROR("%s: KV paged swap write swap-in failed: block=%u cell=%u state=%d\n",
+                    __func__, physical_block, phys_cell, (int) paged_block_states[physical_block]);
+        }
     }
 }
 
@@ -1791,7 +1805,22 @@ void llama_kv_cache::paged_check_read_resident(uint32_t phys_cell) const {
     if (paged_block_states[physical_block] == paged_block_state::RELEASED) {
         paged_release_violation += 1;
     } else if (paged_block_states[physical_block] == paged_block_state::SWAPPED) {
-        paged_swap_in_block(physical_block);
+        paged_swap_read_swapped_hits += 1;
+        if (paged_swap_in_block(physical_block) &&
+                paged_block_states[physical_block] == paged_block_state::RESIDENT) {
+            paged_swap_read_swap_in_calls += 1;
+        } else {
+            paged_swap_read_swap_in_failures += 1;
+            LLAMA_LOG_ERROR("%s: KV paged swap read swap-in failed: block=%u cell=%u state=%d "
+                    "fail_no_offset=%llu fail_bad_size=%llu fail_read_cell=%llu "
+                    "fail_tensor_set=%llu backend_failures=%llu\n",
+                    __func__, physical_block, phys_cell, (int) paged_block_states[physical_block],
+                    (unsigned long long) paged_swap_in_fail_no_offset,
+                    (unsigned long long) paged_swap_in_fail_bad_size,
+                    (unsigned long long) paged_swap_in_fail_read_cell,
+                    (unsigned long long) paged_swap_in_fail_tensor_set,
+                    (unsigned long long) paged_swap_backend_failures);
+        }
     }
 }
 
@@ -1821,12 +1850,30 @@ void llama_kv_cache::paged_swap_out_block(uint32_t physical_block) {
     auto & cells = v_cells[0];
     const uint32_t begin = physical_block * paged_block_size;
     const uint32_t end = std::min<uint32_t>(begin + paged_block_size, paged_kv_size);
+    if (end > paged_swap_offsets.size() || end > paged_swap_sizes.size()) {
+        paged_swap_backend_failures += 1;
+        return;
+    }
+
+    for (uint32_t cell = begin; cell < end; ++cell) {
+        paged_swap_offsets[cell] = 0;
+        paged_swap_sizes[cell] = 0;
+    }
+
+    auto clear_block_entries = [&]() {
+        for (uint32_t cell = begin; cell < end; ++cell) {
+            paged_swap_offsets[cell] = 0;
+            paged_swap_sizes[cell] = 0;
+        }
+    };
+
     std::vector<uint8_t> staging(total_size);
     uint64_t block_bytes = 0;
 
     for (uint32_t cell = begin; cell < end; ++cell) {
         if (cell >= cells.size()) {
             paged_swap_backend_failures += 1;
+            clear_block_entries();
             return;
         }
 
@@ -1851,28 +1898,69 @@ void llama_kv_cache::paged_swap_out_block(uint32_t physical_block) {
         const auto status = kv_swap_store->write_cell(0, cell, staging.data(), staging.size(), offset);
         if (status != llama_kv_backing_store_status::ok) {
             paged_swap_backend_failures += 1;
+            clear_block_entries();
             return;
         }
 
-        cells.set_swap_offset(cell, offset);
-        cells.set_swap_size(cell, staging.size());
+        paged_swap_offsets[cell] = offset;
+        paged_swap_sizes[cell] = staging.size();
         block_bytes += staging.size();
+    }
+
+    for (uint32_t cell = begin; cell < end; ++cell) {
+        if (paged_swap_sizes[cell] != total_size) {
+            paged_swap_backend_failures += 1;
+            clear_block_entries();
+            return;
+        }
     }
 
     paged_block_states[physical_block] = paged_block_state::SWAPPED;
     paged_swap_out_calls += 1;
     paged_blocks_swapped_out += 1;
     paged_swap_bytes_out += block_bytes;
+
+    const uint64_t rss_before_kb = get_current_rss_kb();
+    const uint64_t skip_no_full_before = paged_swap_madvise_skip_no_full_page;
+    const uint64_t skip_neighbor_before = paged_swap_madvise_skip_neighbor;
+    const uint64_t advised_bytes = paged_madvise_block(
+            physical_block, nullptr,
+            paged_swap_madvise_failures,
+            paged_swap_madvise_skip_no_full_page,
+            paged_swap_madvise_skip_neighbor);
+    paged_swap_madvise_skipped +=
+        (paged_swap_madvise_skip_no_full_page - skip_no_full_before) +
+        (paged_swap_madvise_skip_neighbor - skip_neighbor_before);
+    if (advised_bytes > 0) {
+        const uint64_t rss_after_kb = get_current_rss_kb();
+        const uint64_t rss_drop_kb = rss_before_kb > rss_after_kb ? rss_before_kb - rss_after_kb : 0;
+
+        paged_swap_madvise_calls += 1;
+        paged_swap_madvise_bytes += advised_bytes;
+        paged_swap_rss_samples += 1;
+        paged_swap_rss_before_last_kb = rss_before_kb;
+        paged_swap_rss_after_last_kb = rss_after_kb;
+        paged_swap_rss_drop_last_kb = rss_drop_kb;
+        if (rss_drop_kb > paged_swap_rss_drop_max_kb) {
+            paged_swap_rss_drop_max_kb = rss_drop_kb;
+        }
+    }
 }
 
-void llama_kv_cache::paged_swap_in_block(uint32_t physical_block) const {
+bool llama_kv_cache::paged_swap_in_block(uint32_t physical_block) const {
     if (!kv_paged_enabled || !paged_swap_enabled || !kv_swap_store || v_trans || n_stream != 1 ||
             paged_block_size == 0 || v_cells.empty()) {
-        return;
+        LLAMA_LOG_ERROR("%s: KV paged swap-in unavailable: block=%u enabled=%d store=%d v_trans=%d n_stream=%u block_size=%u v_cells=%zu\n",
+                __func__, physical_block, paged_swap_enabled ? 1 : 0, kv_swap_store ? 1 : 0,
+                (int) v_trans, n_stream, paged_block_size, v_cells.size());
+        return false;
     }
     if (physical_block >= paged_block_states.size() ||
             paged_block_states[physical_block] != paged_block_state::SWAPPED) {
-        return;
+        LLAMA_LOG_ERROR("%s: KV paged swap-in bad state: block=%u n_states=%zu state=%d\n",
+                __func__, physical_block, paged_block_states.size(),
+                physical_block < paged_block_states.size() ? (int) paged_block_states[physical_block] : -1);
+        return false;
     }
 
     size_t total_size = 0;
@@ -1885,7 +1973,11 @@ void llama_kv_cache::paged_swap_in_block(uint32_t physical_block) const {
         }
     }
     if (total_size == 0) {
-        return;
+        paged_swap_in_fail_bad_size += 1;
+        paged_swap_backend_failures += 1;
+        LLAMA_LOG_ERROR("%s: KV paged swap-in bad expected size: block=%u expected=0 state=%d\n",
+                __func__, physical_block, (int) paged_block_states[physical_block]);
+        return false;
     }
 
     const auto & cells = v_cells[0];
@@ -1895,22 +1987,56 @@ void llama_kv_cache::paged_swap_in_block(uint32_t physical_block) const {
     uint64_t block_bytes = 0;
 
     for (uint32_t cell = begin; cell < end; ++cell) {
+        const uint32_t cell_in_block = cell - begin;
         if (cell >= cells.size()) {
+            paged_swap_in_fail_bad_size += 1;
             paged_swap_backend_failures += 1;
-            return;
+            LLAMA_LOG_ERROR("%s: KV paged swap-in cell OOB: block=%u cell=%u cell_in_block=%u cells=%zu expected=%zu state=%d\n",
+                    __func__, physical_block, cell, cell_in_block, cells.size(), total_size,
+                    (int) paged_block_states[physical_block]);
+            return false;
         }
 
-        const uint64_t offset = cells.get_swap_offset(cell);
-        const size_t swap_size = cells.get_swap_size(cell);
-        if (swap_size == 0 || swap_size != total_size) {
+        if (cell >= paged_swap_offsets.size() || cell >= paged_swap_sizes.size()) {
+            paged_swap_in_fail_no_offset += 1;
             paged_swap_backend_failures += 1;
-            return;
+            LLAMA_LOG_ERROR("%s: KV paged swap-in missing backing entry: block=%u cell=%u cell_in_block=%u metadata_cells=%zu/%zu expected=%zu state=%d\n",
+                    __func__, physical_block, cell, cell_in_block,
+                    paged_swap_offsets.size(), paged_swap_sizes.size(), total_size,
+                    (int) paged_block_states[physical_block]);
+            return false;
+        }
+
+        const uint64_t offset = paged_swap_offsets[cell];
+        const size_t swap_size = paged_swap_sizes[cell];
+        if (swap_size == 0) {
+            paged_swap_in_fail_no_offset += 1;
+            paged_swap_backend_failures += 1;
+            LLAMA_LOG_ERROR("%s: KV paged swap-in missing backing entry: block=%u cell=%u cell_in_block=%u offset=%llu swap_size=%zu expected=%zu state=%d\n",
+                    __func__, physical_block, cell, cell_in_block,
+                    (unsigned long long) offset, swap_size, total_size,
+                    (int) paged_block_states[physical_block]);
+            return false;
+        }
+        if (swap_size != total_size) {
+            paged_swap_in_fail_bad_size += 1;
+            paged_swap_backend_failures += 1;
+            LLAMA_LOG_ERROR("%s: KV paged swap-in bad backing size: block=%u cell=%u cell_in_block=%u offset=%llu swap_size=%zu expected=%zu state=%d\n",
+                    __func__, physical_block, cell, cell_in_block,
+                    (unsigned long long) offset, swap_size, total_size,
+                    (int) paged_block_states[physical_block]);
+            return false;
         }
 
         const auto status = kv_swap_store->read_cell(0, cell, offset, staging.data(), staging.size());
         if (status != llama_kv_backing_store_status::ok) {
+            paged_swap_in_fail_read_cell += 1;
             paged_swap_backend_failures += 1;
-            return;
+            LLAMA_LOG_ERROR("%s: KV paged swap-in read_cell failed: block=%u cell=%u cell_in_block=%u offset=%llu swap_size=%zu expected=%zu status=%d state=%d\n",
+                    __func__, physical_block, cell, cell_in_block,
+                    (unsigned long long) offset, swap_size, total_size, (int) status,
+                    (int) paged_block_states[physical_block]);
+            return false;
         }
 
         size_t cursor = 0;
@@ -1918,17 +2044,43 @@ void llama_kv_cache::paged_swap_in_block(uint32_t physical_block) const {
             if (!layer.k_stream.empty() && layer.k_stream[0]) {
                 auto * k = layer.k_stream[0];
                 const size_t row_size = k->nb[1];
+                if (!k->data || cursor + row_size > staging.size()) {
+                    paged_swap_in_fail_tensor_set += 1;
+                    paged_swap_backend_failures += 1;
+                    LLAMA_LOG_ERROR("%s: KV paged swap-in tensor_set precheck failed: block=%u cell=%u cell_in_block=%u layer=%u tensor=K offset=%llu swap_size=%zu expected=%zu row_size=%zu cursor=%zu state=%d\n",
+                            __func__, physical_block, cell, cell_in_block, layer.il,
+                            (unsigned long long) offset, swap_size, total_size, row_size, cursor,
+                            (int) paged_block_states[physical_block]);
+                    return false;
+                }
                 ggml_backend_tensor_set(k, staging.data() + cursor, (size_t) cell * row_size, row_size);
                 cursor += row_size;
             }
             if (layer.v && !layer.v_stream.empty() && layer.v_stream[0]) {
                 auto * v = layer.v_stream[0];
                 const size_t row_size = v->nb[1];
+                if (!v->data || cursor + row_size > staging.size()) {
+                    paged_swap_in_fail_tensor_set += 1;
+                    paged_swap_backend_failures += 1;
+                    LLAMA_LOG_ERROR("%s: KV paged swap-in tensor_set precheck failed: block=%u cell=%u cell_in_block=%u layer=%u tensor=V offset=%llu swap_size=%zu expected=%zu row_size=%zu cursor=%zu state=%d\n",
+                            __func__, physical_block, cell, cell_in_block, layer.il,
+                            (unsigned long long) offset, swap_size, total_size, row_size, cursor,
+                            (int) paged_block_states[physical_block]);
+                    return false;
+                }
                 ggml_backend_tensor_set(v, staging.data() + cursor, (size_t) cell * row_size, row_size);
                 cursor += row_size;
             }
         }
-        GGML_ASSERT(cursor == total_size);
+        if (cursor != total_size) {
+            paged_swap_in_fail_tensor_set += 1;
+            paged_swap_backend_failures += 1;
+            LLAMA_LOG_ERROR("%s: KV paged swap-in layout mismatch: block=%u cell=%u cell_in_block=%u offset=%llu swap_size=%zu expected=%zu cursor=%zu state=%d\n",
+                    __func__, physical_block, cell, cell_in_block,
+                    (unsigned long long) offset, swap_size, total_size, cursor,
+                    (int) paged_block_states[physical_block]);
+            return false;
+        }
         block_bytes += staging.size();
     }
 
@@ -1936,6 +2088,101 @@ void llama_kv_cache::paged_swap_in_block(uint32_t physical_block) const {
     paged_swap_in_calls += 1;
     paged_blocks_swapped_in += 1;
     paged_swap_bytes_in += block_bytes;
+    return true;
+}
+
+uint64_t llama_kv_cache::paged_madvise_block(
+        uint32_t physical_block,
+        const std::vector<uint8_t> * active,
+        uint64_t & failures,
+        uint64_t & skipped,
+        uint64_t & skip_live) const {
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+    if (!kv_paged_enabled || v_trans || n_stream != 1 || paged_block_size == 0 ||
+            physical_block >= paged_n_blocks || physical_block >= paged_block_states.size()) {
+        return 0;
+    }
+
+    const long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) {
+        return 0;
+    }
+    const uint64_t pg = (uint64_t) page;
+
+    auto protected_neighbor = [&](uint32_t block) {
+        if (block >= paged_n_blocks) {
+            return false;
+        }
+        if (active) {
+            return block < active->size() && (*active)[block];
+        }
+
+        if (block >= paged_block_states.size()) {
+            return true;
+        }
+        const paged_block_state state = paged_block_states[block];
+        return state != paged_block_state::SWAPPED && state != paged_block_state::RELEASED;
+    };
+
+    uint64_t advised_bytes = 0;
+    for (const auto & layer : layers) {
+        const uint32_t il = layer.il;
+
+        auto advise_tensor = [&](ggml_tensor * t, uint64_t row) {
+            if (!t || row == 0 || !t->data) {
+                return;
+            }
+
+            char * base = (char *) t->data;
+            const uint64_t lo_cell = (uint64_t) physical_block * paged_block_size;
+            const uint64_t hi_cell = std::min<uint64_t>(lo_cell + paged_block_size, paged_kv_size);
+            const uintptr_t lo_a = (uintptr_t) base + (uintptr_t) lo_cell * row;
+            const uintptr_t hi_a = (uintptr_t) base + (uintptr_t) hi_cell * row;
+            if (hi_a <= lo_a) {
+                skipped += 1;
+                return;
+            }
+
+            const uintptr_t a_start = (lo_a + pg - 1) & ~(uintptr_t) (pg - 1);
+            const uintptr_t a_end   = hi_a & ~(uintptr_t) (pg - 1);
+            if (a_end <= a_start) {
+                skipped += 1;
+                return;
+            }
+
+            if ((lo_a & (uintptr_t) (pg - 1)) != 0 && physical_block > 0 &&
+                    protected_neighbor(physical_block - 1)) {
+                skip_live += 1;
+            }
+            if ((hi_a & (uintptr_t) (pg - 1)) != 0 && physical_block + 1 < paged_n_blocks &&
+                    protected_neighbor(physical_block + 1)) {
+                skip_live += 1;
+            }
+
+            const size_t len = (size_t) (a_end - a_start);
+            const int rc = madvise((void *) a_start, len, MADV_DONTNEED);
+            if (rc != 0) {
+                failures += 1;
+            } else {
+                advised_bytes += len;
+            }
+        };
+
+        ggml_tensor * k = layer.k_stream.empty() ? nullptr : layer.k_stream[0];
+        ggml_tensor * v = layer.v_stream.empty() ? nullptr : layer.v_stream[0];
+        advise_tensor(k, k ? ggml_row_size(k->type, hparams.n_embd_k_gqa(il)) : 0);
+        advise_tensor(v, v ? ggml_row_size(v->type, hparams.n_embd_v_gqa(il)) : 0);
+    }
+
+    return advised_bytes;
+#else
+    (void) physical_block;
+    (void) active;
+    (void) failures;
+    (void) skipped;
+    (void) skip_live;
+    return 0;
+#endif
 }
 
 void llama_kv_cache::paged_assert_identity(const slot_info & sinfo) {
@@ -2086,7 +2333,17 @@ void llama_kv_cache::paged_log_stats() const {
             "paged_swap_enabled=%d paged_swap_out_calls=%llu paged_swap_in_calls=%llu "
             "paged_blocks_swapped_out=%llu paged_blocks_swapped_in=%llu "
             "paged_swap_bytes_out=%llu paged_swap_bytes_in=%llu "
-            "paged_swap_backend_failures=%llu paged_swap_window_skipped=%llu\n",
+            "paged_swap_backend_failures=%llu paged_swap_window_skipped=%llu "
+            "paged_swap_read_swapped_hits=%llu paged_swap_read_swap_in_calls=%llu paged_swap_read_swap_in_failures=%llu "
+            "paged_swap_write_swapped_hits=%llu paged_swap_write_swap_in_calls=%llu paged_swap_write_swap_in_failures=%llu "
+            "paged_swap_in_fail_no_offset=%llu paged_swap_in_fail_bad_size=%llu "
+            "paged_swap_in_fail_read_cell=%llu paged_swap_in_fail_tensor_set=%llu "
+            "paged_swap_madvise_calls=%llu paged_swap_madvise_bytes=%llu "
+            "paged_swap_madvise_failures=%llu paged_swap_madvise_skipped=%llu "
+            "paged_swap_madvise_skip_no_full_page=%llu paged_swap_madvise_skip_neighbor=%llu "
+            "paged_swap_rss_samples=%llu paged_swap_rss_before_last_kb=%llu "
+            "paged_swap_rss_after_last_kb=%llu paged_swap_rss_drop_last_kb=%llu "
+            "paged_swap_rss_drop_max_kb=%llu\n",
             __func__, paged_block_size, paged_n_blocks,
             (unsigned long long) paged_blocks_in_use,
             paged_free_list.size(),
@@ -2137,7 +2394,28 @@ void llama_kv_cache::paged_log_stats() const {
             (unsigned long long) paged_swap_bytes_out,
             (unsigned long long) paged_swap_bytes_in,
             (unsigned long long) paged_swap_backend_failures,
-            (unsigned long long) paged_swap_window_skipped);
+            (unsigned long long) paged_swap_window_skipped,
+            (unsigned long long) paged_swap_read_swapped_hits,
+            (unsigned long long) paged_swap_read_swap_in_calls,
+            (unsigned long long) paged_swap_read_swap_in_failures,
+            (unsigned long long) paged_swap_write_swapped_hits,
+            (unsigned long long) paged_swap_write_swap_in_calls,
+            (unsigned long long) paged_swap_write_swap_in_failures,
+            (unsigned long long) paged_swap_in_fail_no_offset,
+            (unsigned long long) paged_swap_in_fail_bad_size,
+            (unsigned long long) paged_swap_in_fail_read_cell,
+            (unsigned long long) paged_swap_in_fail_tensor_set,
+            (unsigned long long) paged_swap_madvise_calls,
+            (unsigned long long) paged_swap_madvise_bytes,
+            (unsigned long long) paged_swap_madvise_failures,
+            (unsigned long long) paged_swap_madvise_skipped,
+            (unsigned long long) paged_swap_madvise_skip_no_full_page,
+            (unsigned long long) paged_swap_madvise_skip_neighbor,
+            (unsigned long long) paged_swap_rss_samples,
+            (unsigned long long) paged_swap_rss_before_last_kb,
+            (unsigned long long) paged_swap_rss_after_last_kb,
+            (unsigned long long) paged_swap_rss_drop_last_kb,
+            (unsigned long long) paged_swap_rss_drop_max_kb);
 }
 
 void llama_kv_cache::swap_out_cell(uint32_t cell) {
@@ -2708,11 +2986,6 @@ void llama_kv_cache::paged_release_blocks(uint32_t n_kv) {
         }
     }
 
-    const long page = sysconf(_SC_PAGESIZE);
-    if (page <= 0) {
-        return;
-    }
-    const uint64_t pg = (uint64_t) page;
     const uint64_t blocks_before = paged_blocks_released;
     const uint64_t bytes_before = paged_block_release_bytes;
     const uint64_t rss_before_kb = get_current_rss_kb();
@@ -2727,60 +3000,14 @@ void llama_kv_cache::paged_release_blocks(uint32_t n_kv) {
             continue;
         }
 
-        bool advised = false;
+        const uint64_t advised_bytes = paged_madvise_block(
+                physical_block, &active,
+                paged_block_release_fail,
+                paged_block_release_skip_unaligned,
+                paged_block_release_skip_live);
 
-        for (const auto & layer : layers) {
-            const uint32_t il = layer.il;
-
-            auto advise_block = [&](ggml_tensor * t, uint64_t row) {
-                if (!t || row == 0 || !t->data) {
-                    return;
-                }
-
-                char * base = (char *) t->data;
-                const uint64_t lo_cell = (uint64_t) physical_block * paged_block_size;
-                const uint64_t hi_cell = std::min<uint64_t>(lo_cell + paged_block_size, paged_kv_size);
-                const uintptr_t lo_a = (uintptr_t) base + (uintptr_t) lo_cell * row;
-                const uintptr_t hi_a = (uintptr_t) base + (uintptr_t) hi_cell * row;
-                if (hi_a <= lo_a) {
-                    paged_block_release_skip_unaligned += 1;
-                    return;
-                }
-
-                if ((lo_a & (uintptr_t) (pg - 1)) != 0 && physical_block > 0 && active[physical_block - 1]) {
-                    paged_block_release_skip_live += 1;
-                    return;
-                }
-                if ((hi_a & (uintptr_t) (pg - 1)) != 0 && physical_block + 1 < paged_n_blocks &&
-                        active[physical_block + 1]) {
-                    paged_block_release_skip_live += 1;
-                    return;
-                }
-
-                const uintptr_t a_start = (lo_a + pg - 1) & ~(uintptr_t) (pg - 1);
-                const uintptr_t a_end   = hi_a & ~(uintptr_t) (pg - 1);
-                if (a_end <= a_start) {
-                    paged_block_release_skip_unaligned += 1;
-                    return;
-                }
-
-                const size_t len = (size_t) (a_end - a_start);
-                const int rc = madvise((void *) a_start, len, MADV_DONTNEED);
-                if (rc != 0) {
-                    paged_block_release_fail += 1;
-                } else {
-                    paged_block_release_bytes += len;
-                    advised = true;
-                }
-            };
-
-            ggml_tensor * k = layer.k_stream.empty() ? nullptr : layer.k_stream[0];
-            ggml_tensor * v = layer.v_stream.empty() ? nullptr : layer.v_stream[0];
-            advise_block(k, k ? ggml_row_size(k->type, hparams.n_embd_k_gqa(il)) : 0);
-            advise_block(v, v ? ggml_row_size(v->type, hparams.n_embd_v_gqa(il)) : 0);
-        }
-
-        if (advised) {
+        if (advised_bytes > 0) {
+            paged_block_release_bytes += advised_bytes;
             paged_block_states[physical_block] = paged_block_state::RELEASED;
             paged_blocks_released += 1;
             if (state == paged_block_state::UNUSED) {
@@ -4370,6 +4597,13 @@ bool llama_kv_cache_context::apply() {
         return true;
     }
 
+    if (kv->paged_swap_pending) {
+        const uint32_t pending_n_kv = kv->paged_swap_pending_n_kv;
+        kv->paged_swap_pending = false;
+        kv->paged_swap_pending_n_kv = 0;
+        kv->paged_swap_out_window(pending_n_kv);
+    }
+
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     kv->paged_note_cells(sinfos[i_cur]);
     kv->paged_assert_identity(sinfos[i_cur]);
@@ -4395,7 +4629,8 @@ bool llama_kv_cache_context::apply() {
     // Stage 4A: block-aware madvise-only release. This does not assume a physical tail; it
     // releases only RESIDENT physical blocks that are absent from the current row_idx mapping.
     kv->paged_release_blocks(n_kv);
-    kv->paged_swap_out_window(n_kv);
+    kv->paged_swap_pending = kv->paged_swap_enabled;
+    kv->paged_swap_pending_n_kv = n_kv;
     kv->sample_swap_rss();
 
     return true;
