@@ -13,6 +13,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <set>
 #include <stdexcept>
 
 #if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
@@ -413,6 +414,7 @@ llama_kv_cache::llama_kv_cache(
         const char * LLAMA_KV_PAGED_SHIFT      = std::getenv("LLAMA_KV_PAGED_SHIFT");
         const char * LLAMA_KV_PAGED_RELEASE    = std::getenv("LLAMA_KV_PAGED_RELEASE");
         const char * LLAMA_KV_PAGED_SWAP       = std::getenv("LLAMA_KV_PAGED_SWAP");
+        const char * LLAMA_KV_PAGED_TRACE      = std::getenv("LLAMA_KV_PAGED_TRACE");
         const int block_size_env = LLAMA_KV_PAGED_BLOCK_SIZE ? std::atoi(LLAMA_KV_PAGED_BLOCK_SIZE) : 16;
         const int shift_env      = LLAMA_KV_PAGED_SHIFT      ? std::atoi(LLAMA_KV_PAGED_SHIFT)      : 0;
         const bool release_env   = LLAMA_KV_PAGED_RELEASE && std::strcmp(LLAMA_KV_PAGED_RELEASE, "1") == 0;
@@ -444,6 +446,7 @@ llama_kv_cache::llama_kv_cache(
             }
             paged_init(kv_size);
             paged_swap_enabled = paged_swap_env;
+            paged_trace_enabled = LLAMA_KV_PAGED_TRACE && std::strcmp(LLAMA_KV_PAGED_TRACE, "1") == 0;
             paged_block_release_enabled = release_env && !paged_swap_enabled;
             if (paged_swap_enabled && !kv_swap_store) {
                 auto store = std::make_unique<llama_kv_backing_store_file>();
@@ -467,6 +470,9 @@ llama_kv_cache::llama_kv_cache(
             }
             if (paged_block_release_enabled) {
                 LLAMA_LOG_INFO("%s: KV paged block release enabled (madvise-only)\n", __func__);
+            }
+            if (paged_trace_enabled) {
+                LLAMA_LOG_INFO("%s: KV paged block access trace enabled (telemetry only, stderr)\n", __func__);
             }
         }
     }
@@ -3493,6 +3499,7 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
             const uint32_t cell = sinfo.idxs[s][i];
             const uint32_t phys = paged_write_resolve(cell);
             paged_ensure_write_resident(phys);
+            paged_trace_note_write_block(phys);
             data[s*sinfo.size() + i] = offs + phys;
         }
     }
@@ -3545,6 +3552,8 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst) const {
     GGML_ASSERT(dst->type == GGML_TYPE_I32);
     int32_t * data = (int32_t *) dst->data;
 
+    std::set<uint32_t> trace_read_blocks;
+
     for (int64_t r = 0; r < dst->ne[0]; ++r) {
         uint32_t phys = paged_resolve((uint32_t) r);
         if (phys == PAGED_BLOCK_INVALID || phys > (uint32_t) std::numeric_limits<int32_t>::max()) {
@@ -3555,8 +3564,105 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst) const {
         if (phys != (uint32_t) r) {
             paged_row_idx_changed += 1;
         }
+        if (paged_trace_enabled && paged_block_size != 0) {
+            trace_read_blocks.insert(phys / paged_block_size);
+        }
         data[r] = (int32_t) phys;
     }
+
+    if (paged_trace_enabled) {
+        // Build the *active* read set: only logical cells inside the real attention-visible
+        // KV range that are actually populated. dst->ne[0] is the padded graph row_idx width
+        // (GGML_PAD(used_max_p1, n_pad)), so it over-counts padding/reserve cells; the true
+        // active length is v_cells[0].used_max_p1() (paged requires n_stream==1). Empty cells
+        // inside that range are skipped so unwritten/free blocks are not counted.
+        std::set<uint32_t> trace_active_read_blocks;
+        uint32_t active_n_kv = 0;
+        if (paged_block_size != 0 && !v_cells.empty()) {
+            const auto & cells = v_cells[0];
+            active_n_kv = std::min<uint32_t>(cells.used_max_p1(), (uint32_t) dst->ne[0]);
+            for (uint32_t r = 0; r < active_n_kv; ++r) {
+                if (cells.is_empty(r)) {
+                    continue;
+                }
+                uint32_t phys = paged_resolve(r);
+                if (phys == PAGED_BLOCK_INVALID) {
+                    phys = r;
+                }
+                trace_active_read_blocks.insert(phys / paged_block_size);
+            }
+        }
+        paged_trace_emit_step(trace_read_blocks, trace_active_read_blocks,
+                (uint32_t) dst->ne[0], active_n_kv);
+    }
+}
+
+void llama_kv_cache::paged_trace_note_write_block(uint32_t physical_block) const {
+    if (!paged_trace_enabled || physical_block == PAGED_BLOCK_INVALID || paged_block_size == 0) {
+        return;
+    }
+    paged_trace_write_blocks.insert(physical_block / paged_block_size);
+}
+
+void llama_kv_cache::paged_trace_emit_step(
+        const std::set<uint32_t> & read_blocks,
+        const std::set<uint32_t> & active_read_blocks,
+        uint32_t n_kv,
+        uint32_t active_n_kv) const {
+    // Telemetry only. Emit a single grep/Python-friendly line per decode step describing the
+    // physical blocks touched this step and the current block-state population. The write-block
+    // set is populated by set_input_k/v_idxs earlier in the same step (k_idxs -> v_idxs ->
+    // paged_row_idx ordering in llm_graph_input_attn_kv::set_input); it is cleared here so the
+    // next step starts fresh. Step id == count of paged_row_idx fills (one per decode step on
+    // the paged in-graph gather path).
+    //
+    // read_blocks       = physical blocks covered by the padded row_idx tensor (n_kv wide).
+    // active_read_blocks = physical blocks of the real, populated KV range (active_n_kv wide),
+    //                      with padding/free/unwritten cells excluded.
+    const uint64_t step = paged_trace_step++;
+
+    uint32_t resident = 0;
+    uint32_t swapped  = 0;
+    uint32_t released = 0;
+    uint32_t free_b   = 0;
+    for (uint32_t b = 0; b < paged_n_blocks && b < paged_block_states.size(); ++b) {
+        switch (paged_block_states[b]) {
+            case paged_block_state::RESIDENT: resident += 1; break;
+            case paged_block_state::SWAPPED:  swapped  += 1; break;
+            case paged_block_state::RELEASED: released += 1; break;
+            case paged_block_state::UNUSED:   free_b   += 1; break;
+        }
+    }
+
+    auto to_csv = [](const std::set<uint32_t> & blocks) {
+        std::string csv;
+        for (uint32_t b : blocks) {
+            if (!csv.empty()) {
+                csv += ',';
+            }
+            csv += std::to_string(b);
+        }
+        return csv;
+    };
+
+    const std::string read_csv        = to_csv(read_blocks);
+    const std::string active_read_csv = to_csv(active_read_blocks);
+    const std::string write_csv       = to_csv(paged_trace_write_blocks);
+
+    fprintf(stderr,
+            "KV_PAGED_TRACE step=%llu n_kv=%u active_n_kv=%u "
+            "read_block_count=%zu read_blocks=%s "
+            "active_read_block_count=%zu active_read_blocks=%s "
+            "write_block_count=%zu write_block=%s blocks_in_use=%llu "
+            "resident_blocks=%u swapped_blocks=%u released_blocks=%u free_blocks=%u\n",
+            (unsigned long long) step, n_kv, active_n_kv,
+            read_blocks.size(), read_csv.empty() ? "-" : read_csv.c_str(),
+            active_read_blocks.size(), active_read_csv.empty() ? "-" : active_read_csv.c_str(),
+            paged_trace_write_blocks.size(), write_csv.empty() ? "-" : write_csv.c_str(),
+            (unsigned long long) paged_blocks_in_use,
+            resident, swapped, released, free_b);
+
+    paged_trace_write_blocks.clear();
 }
 
 void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {

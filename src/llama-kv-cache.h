@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <memory>
+#include <set>
 #include <unordered_map>
 #include <vector>
 
@@ -556,6 +557,23 @@ private:
     mutable uint64_t paged_swap_rss_drop_max_kb = 0;
     bool     paged_swap_pending = false;
     uint32_t paged_swap_pending_n_kv = 0;
+
+    // Stage 4C-0: KV block access trace. When LLAMA_KV_PAGED_TRACE=1, emit one line per
+    // decode step (per set_input_paged_row_idx call) to stderr describing the physical
+    // blocks read/written this step plus current block-state population counts. Telemetry
+    // only: it does not change paged_resolve / write paths / swap / release behavior and the
+    // collection is gated behind paged_trace_enabled so the default path is untouched.
+    bool     paged_trace_enabled = false;
+    mutable uint64_t paged_trace_step = 0;
+    // physical blocks written during the current step, collected by set_input_k/v_idxs and
+    // consumed (and cleared) by the trace emit in set_input_paged_row_idx.
+    mutable std::set<uint32_t> paged_trace_write_blocks;
+    void paged_trace_note_write_block(uint32_t physical_block) const;
+    void paged_trace_emit_step(
+            const std::set<uint32_t> & read_blocks,
+            const std::set<uint32_t> & active_read_blocks,
+            uint32_t n_kv,
+            uint32_t active_n_kv) const;
 
     // stage F1 / P1: KV Lazy-Block tail madvise. When LLAMA_KV_LAZY_TAIL=1, after n_kv is
     // known each step we advise the page-aligned interior of the *unused tail* capacity
