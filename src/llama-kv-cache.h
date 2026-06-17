@@ -318,6 +318,7 @@ public:
     // n_stream==1). See docs/kv_lazy_block_stage_f1_design.md.
     void madvise_tail(uint32_t n_kv);
     void paged_release_blocks(uint32_t n_kv);
+    void paged_swap_out_window(uint32_t n_kv);
 
     // stage P2: clear-frontier. When LLAMA_KV_LAZY_CLEAR=1 (and !v_trans && n_stream==1),
     // the construction-time full buffer clear is replaced by clearing only the [0, clear_frontier)
@@ -448,6 +449,8 @@ private:
     uint32_t paged_write_resolve(uint32_t cell) const;
     void paged_ensure_write_resident(uint32_t phys_cell) const;
     void paged_check_read_resident(uint32_t phys_cell) const;
+    void paged_swap_out_block(uint32_t physical_block);
+    void paged_swap_in_block(uint32_t physical_block) const;
     void paged_assert_identity(const slot_info & sinfo);
     void paged_shadow_validate(const slot_info & sinfo, uint32_t n_kv) const;
     bool paged_ingraph_gather_supported(int32_t il) const;
@@ -513,6 +516,15 @@ private:
     mutable uint64_t paged_block_ensure_calls = 0;
     mutable uint64_t paged_block_ensure_released = 0;
     mutable uint64_t paged_release_violation = 0;
+    bool     paged_swap_enabled = false;
+    mutable uint64_t paged_swap_out_calls = 0;
+    mutable uint64_t paged_swap_in_calls = 0;
+    mutable uint64_t paged_blocks_swapped_out = 0;
+    mutable uint64_t paged_blocks_swapped_in = 0;
+    mutable uint64_t paged_swap_bytes_out = 0;
+    mutable uint64_t paged_swap_bytes_in = 0;
+    mutable uint64_t paged_swap_backend_failures = 0;
+    mutable uint64_t paged_swap_window_skipped = 0;
 
     // stage F1 / P1: KV Lazy-Block tail madvise. When LLAMA_KV_LAZY_TAIL=1, after n_kv is
     // known each step we advise the page-aligned interior of the *unused tail* capacity
