@@ -449,7 +449,7 @@ private:
     uint32_t paged_resolve(uint32_t cell) const;
     uint32_t paged_write_resolve(uint32_t cell) const;
     void paged_ensure_write_resident(uint32_t phys_cell) const;
-    void paged_check_read_resident(uint32_t phys_cell) const;
+    void paged_check_read_resident(uint32_t phys_cell, bool active) const;
     void paged_swap_out_block(uint32_t physical_block);
     bool paged_swap_in_block(uint32_t physical_block) const;
     uint64_t paged_madvise_block(
@@ -525,6 +525,8 @@ private:
     mutable uint64_t paged_block_ensure_calls = 0;
     mutable uint64_t paged_block_ensure_released = 0;
     mutable uint64_t paged_release_violation = 0;
+    mutable uint64_t paged_active_release_violation = 0;
+    mutable uint64_t paged_padded_release_violation = 0;
     bool     paged_swap_enabled = false;
     mutable uint64_t paged_swap_out_calls = 0;
     mutable uint64_t paged_swap_in_calls = 0;

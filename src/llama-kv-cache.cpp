@@ -1797,7 +1797,7 @@ void llama_kv_cache::paged_ensure_write_resident(uint32_t phys_cell) const {
     }
 }
 
-void llama_kv_cache::paged_check_read_resident(uint32_t phys_cell) const {
+void llama_kv_cache::paged_check_read_resident(uint32_t phys_cell, bool active) const {
     if (!kv_paged_enabled || (!paged_block_release_enabled && !paged_swap_enabled) ||
             phys_cell == PAGED_BLOCK_INVALID || paged_block_size == 0) {
         return;
@@ -1810,6 +1810,11 @@ void llama_kv_cache::paged_check_read_resident(uint32_t phys_cell) const {
 
     if (paged_block_states[physical_block] == paged_block_state::RELEASED) {
         paged_release_violation += 1;
+        if (active) {
+            paged_active_release_violation += 1;
+        } else {
+            paged_padded_release_violation += 1;
+        }
     } else if (paged_block_states[physical_block] == paged_block_state::SWAPPED) {
         paged_swap_read_swapped_hits += 1;
         if (paged_swap_in_block(physical_block) &&
@@ -2336,6 +2341,7 @@ void llama_kv_cache::paged_log_stats() const {
             "paged_block_release_rss_after_min_kb=%llu paged_block_release_rss_drop_last_kb=%llu "
             "paged_block_release_rss_drop_max_kb=%llu "
             "paged_block_ensure_calls=%llu paged_block_ensure_released=%llu paged_release_violation=%llu "
+            "paged_active_release_violation=%llu paged_padded_release_violation=%llu "
             "paged_swap_enabled=%d paged_swap_out_calls=%llu paged_swap_in_calls=%llu "
             "paged_blocks_swapped_out=%llu paged_blocks_swapped_in=%llu "
             "paged_swap_bytes_out=%llu paged_swap_bytes_in=%llu "
@@ -2392,6 +2398,8 @@ void llama_kv_cache::paged_log_stats() const {
             (unsigned long long) paged_block_ensure_calls,
             (unsigned long long) paged_block_ensure_released,
             (unsigned long long) paged_release_violation,
+            (unsigned long long) paged_active_release_violation,
+            (unsigned long long) paged_padded_release_violation,
             paged_swap_enabled ? 1 : 0,
             (unsigned long long) paged_swap_out_calls,
             (unsigned long long) paged_swap_in_calls,
@@ -3554,13 +3562,19 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst) const {
 
     std::set<uint32_t> trace_read_blocks;
 
+    uint32_t active_n_kv = 0;
+    if (!v_cells.empty()) {
+        active_n_kv = std::min<uint32_t>(v_cells[0].used_max_p1(), (uint32_t) dst->ne[0]);
+    }
+
     for (int64_t r = 0; r < dst->ne[0]; ++r) {
         uint32_t phys = paged_resolve((uint32_t) r);
         if (phys == PAGED_BLOCK_INVALID || phys > (uint32_t) std::numeric_limits<int32_t>::max()) {
             paged_row_idx_fail += 1;
             phys = (uint32_t) r;
         }
-        paged_check_read_resident(phys);
+        const bool active = (uint32_t) r < active_n_kv && !v_cells[0].is_empty((uint32_t) r);
+        paged_check_read_resident(phys, active);
         if (phys != (uint32_t) r) {
             paged_row_idx_changed += 1;
         }
@@ -3577,10 +3591,8 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst) const {
         // active length is v_cells[0].used_max_p1() (paged requires n_stream==1). Empty cells
         // inside that range are skipped so unwritten/free blocks are not counted.
         std::set<uint32_t> trace_active_read_blocks;
-        uint32_t active_n_kv = 0;
         if (paged_block_size != 0 && !v_cells.empty()) {
             const auto & cells = v_cells[0];
-            active_n_kv = std::min<uint32_t>(cells.used_max_p1(), (uint32_t) dst->ne[0]);
             for (uint32_t r = 0; r < active_n_kv; ++r) {
                 if (cells.is_empty(r)) {
                     continue;
