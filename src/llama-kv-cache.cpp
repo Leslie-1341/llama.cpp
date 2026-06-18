@@ -2348,8 +2348,12 @@ void llama_kv_cache::paged_log_stats() const {
             "paged_block_ensure_calls=%llu paged_block_ensure_released=%llu paged_release_violation=%llu "
             "paged_active_release_violation=%llu paged_padded_release_violation=%llu "
             "paged_idle_trace_enabled=%d paged_idle_active_seq_steps=%llu "
-            "paged_idle_active_seq_empty=%llu paged_idle_active_seq_count_last=%llu "
-            "paged_idle_active_seq_count_max=%llu paged_idle_cold_candidates=%llu "
+            "paged_idle_active_seq_empty=%llu paged_idle_seq_seen_count=%llu "
+            "paged_idle_active_seq_count_last=%llu paged_idle_idle_seq_count_last=%llu "
+            "paged_idle_active_seq_count_max=%llu paged_idle_non_empty_blocks=%llu "
+            "paged_idle_single_seq_blocks=%llu paged_idle_multi_seq_blocks=%llu "
+            "paged_idle_blocks_with_active_seq=%llu paged_idle_blocks_without_active_seq=%llu "
+            "paged_idle_cold_candidates=%llu "
             "paged_idle_read_window_blocks=%llu paged_idle_cold_in_read_window=%llu "
             "paged_idle_cold_not_in_read_window=%llu paged_idle_skip_mixed_active=%llu "
             "paged_idle_safe_swap_candidates=%llu "
@@ -2414,8 +2418,15 @@ void llama_kv_cache::paged_log_stats() const {
             paged_idle_trace_enabled ? 1 : 0,
             (unsigned long long) paged_idle_active_seq_steps,
             (unsigned long long) paged_idle_active_seq_empty,
+            (unsigned long long) paged_idle_seq_seen_count,
             (unsigned long long) paged_idle_active_seq_count_last,
+            (unsigned long long) paged_idle_idle_seq_count_last,
             (unsigned long long) paged_idle_active_seq_count_max,
+            (unsigned long long) paged_idle_non_empty_blocks,
+            (unsigned long long) paged_idle_single_seq_blocks,
+            (unsigned long long) paged_idle_multi_seq_blocks,
+            (unsigned long long) paged_idle_blocks_with_active_seq,
+            (unsigned long long) paged_idle_blocks_without_active_seq,
             (unsigned long long) paged_idle_cold_candidates,
             (unsigned long long) paged_idle_read_window_blocks,
             (unsigned long long) paged_idle_cold_in_read_window,
@@ -3624,8 +3635,20 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
 
         const uint64_t idle_step = paged_idle_active_seq_steps;
         const uint64_t active_seq_count = active_seq.count();
+        for (llama_seq_id seq_id = 0; seq_id < LLAMA_MAX_SEQ; ++seq_id) {
+            if (!active_seq.test(seq_id)) {
+                continue;
+            }
+            paged_idle_seq_seen.set(seq_id);
+            paged_idle_seq_last_active_step[seq_id] = idle_step;
+        }
+
+        const uint64_t seen_seq_count = paged_idle_seq_seen.count();
+        const uint64_t idle_seq_count = seen_seq_count >= active_seq_count ? seen_seq_count - active_seq_count : 0;
         paged_idle_active_seq_steps += 1;
+        paged_idle_seq_seen_count = seen_seq_count;
         paged_idle_active_seq_count_last = active_seq_count;
+        paged_idle_idle_seq_count_last = idle_seq_count;
         if (active_seq_count == 0) {
             paged_idle_active_seq_empty += 1;
         }
@@ -3644,12 +3667,96 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
             active_seq_csv += std::to_string(seq_id);
         }
 
+        std::string last_active_csv;
+        for (llama_seq_id seq_id = 0; seq_id < LLAMA_MAX_SEQ; ++seq_id) {
+            if (!paged_idle_seq_seen.test(seq_id)) {
+                continue;
+            }
+            if (!last_active_csv.empty()) {
+                last_active_csv += ',';
+            }
+            last_active_csv += std::to_string(seq_id);
+            last_active_csv += ':';
+            last_active_csv += std::to_string(paged_idle_seq_last_active_step[seq_id]);
+        }
+
+        uint64_t non_empty_blocks = 0;
+        uint64_t single_seq_blocks = 0;
+        uint64_t multi_seq_blocks = 0;
+        uint64_t blocks_with_active_seq = 0;
+        uint64_t blocks_without_active_seq = 0;
+        if (paged_block_size != 0 && paged_n_blocks != 0 && !v_cells.empty()) {
+            const auto & cells = v_cells[0];
+            std::vector<std::bitset<LLAMA_MAX_SEQ>> block_seq((size_t) paged_n_blocks);
+            for (uint32_t cell = 0; cell < cells.used_max_p1(); ++cell) {
+                if (cells.is_empty(cell)) {
+                    continue;
+                }
+
+                const uint32_t phys = paged_resolve(cell);
+                if (phys == PAGED_BLOCK_INVALID) {
+                    continue;
+                }
+
+                const uint32_t block = phys / paged_block_size;
+                if (block >= paged_n_blocks) {
+                    continue;
+                }
+
+                auto & owner = block_seq[block];
+                for (llama_seq_id seq_id = 0; seq_id < LLAMA_MAX_SEQ; ++seq_id) {
+                    if (cells.seq_has(cell, seq_id)) {
+                        owner.set(seq_id);
+                    }
+                }
+            }
+
+            for (const auto & owner : block_seq) {
+                if (owner.none()) {
+                    continue;
+                }
+
+                non_empty_blocks += 1;
+                const uint64_t owner_count = owner.count();
+                if (owner_count == 1) {
+                    single_seq_blocks += 1;
+                } else if (owner_count > 1) {
+                    multi_seq_blocks += 1;
+                }
+
+                if ((owner & active_seq).any()) {
+                    blocks_with_active_seq += 1;
+                } else {
+                    blocks_without_active_seq += 1;
+                }
+            }
+        }
+        paged_idle_non_empty_blocks = non_empty_blocks;
+        paged_idle_single_seq_blocks = single_seq_blocks;
+        paged_idle_multi_seq_blocks = multi_seq_blocks;
+        paged_idle_blocks_with_active_seq = blocks_with_active_seq;
+        paged_idle_blocks_without_active_seq = blocks_without_active_seq;
+
         fprintf(stderr,
-                "KV_PAGED_IDLE_TRACE step=%llu active_seq_source=%s active_seq_count=%llu active_seq=%s\n",
+                "KV_PAGED_IDLE_TRACE step=%llu active_seq_source=%s active_seq_count=%llu "
+                "idle_seq_count=%llu seen_seq_count=%llu active_seq=%s seq_last_active=%s "
+                "non_empty_blocks=%llu single_seq_blocks=%llu multi_seq_blocks=%llu "
+                "blocks_with_active_seq=%llu blocks_without_active_seq=%llu "
+                "cold_candidates=%llu safe_swap_candidates=%llu\n",
                 (unsigned long long) idle_step,
                 active_seq_source,
                 (unsigned long long) active_seq_count,
-                active_seq_csv.empty() ? "-" : active_seq_csv.c_str());
+                (unsigned long long) idle_seq_count,
+                (unsigned long long) seen_seq_count,
+                active_seq_csv.empty() ? "-" : active_seq_csv.c_str(),
+                last_active_csv.empty() ? "-" : last_active_csv.c_str(),
+                (unsigned long long) non_empty_blocks,
+                (unsigned long long) single_seq_blocks,
+                (unsigned long long) multi_seq_blocks,
+                (unsigned long long) blocks_with_active_seq,
+                (unsigned long long) blocks_without_active_seq,
+                (unsigned long long) paged_idle_cold_candidates,
+                (unsigned long long) paged_idle_safe_swap_candidates);
     }
 
     if (paged_trace_enabled) {

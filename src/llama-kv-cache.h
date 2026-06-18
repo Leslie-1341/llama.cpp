@@ -8,6 +8,8 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstdint>
+#include <array>
+#include <bitset>
 #include <memory>
 #include <set>
 #include <unordered_map>
@@ -560,13 +562,21 @@ private:
     bool     paged_swap_pending = false;
     uint32_t paged_swap_pending_n_kv = 0;
 
-    // Stage 4C-3A: idle-seq telemetry scaffold. Counters are wired into stats output only;
-    // ownership/read-window computation is intentionally left for the next stage.
+    // Stage 4C-3: idle-seq and block-ownership telemetry only.
     bool     paged_idle_trace_enabled = false;
+    mutable std::array<uint64_t, LLAMA_MAX_SEQ> paged_idle_seq_last_active_step = {};
+    mutable std::bitset<LLAMA_MAX_SEQ> paged_idle_seq_seen;
     mutable uint64_t paged_idle_active_seq_steps = 0;
     mutable uint64_t paged_idle_active_seq_empty = 0;
+    mutable uint64_t paged_idle_seq_seen_count = 0;
     mutable uint64_t paged_idle_active_seq_count_last = 0;
+    mutable uint64_t paged_idle_idle_seq_count_last = 0;
     mutable uint64_t paged_idle_active_seq_count_max = 0;
+    mutable uint64_t paged_idle_non_empty_blocks = 0;
+    mutable uint64_t paged_idle_single_seq_blocks = 0;
+    mutable uint64_t paged_idle_multi_seq_blocks = 0;
+    mutable uint64_t paged_idle_blocks_with_active_seq = 0;
+    mutable uint64_t paged_idle_blocks_without_active_seq = 0;
     mutable uint64_t paged_idle_cold_candidates = 0;
     mutable uint64_t paged_idle_read_window_blocks = 0;
     mutable uint64_t paged_idle_cold_in_read_window = 0;
