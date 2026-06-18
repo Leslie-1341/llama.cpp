@@ -583,6 +583,15 @@ private:
     mutable uint64_t paged_idle_cold_not_in_read_window = 0;
     mutable uint64_t paged_idle_skip_mixed_active = 0;
     mutable uint64_t paged_idle_safe_swap_candidates = 0;
+    mutable bool     paged_nonidentity_probe_enabled = false;
+    mutable uint64_t paged_nonidentity_remap_rows = 0;
+    mutable uint64_t paged_nonidentity_remap_blocks = 0;
+    mutable uint64_t paged_nonidentity_skip_no_dummy = 0;
+    mutable uint64_t paged_nonidentity_skip_not_masked = 0;
+    mutable uint64_t paged_nonidentity_skip_not_resident = 0;
+    mutable uint64_t paged_nonidentity_cold_in_read_window_before = 0;
+    mutable uint64_t paged_nonidentity_cold_in_read_window_after = 0;
+    mutable uint64_t paged_nonidentity_safe_candidates_after = 0;
 
     // Stage 4C-0: KV block access trace. When LLAMA_KV_PAGED_TRACE=1, emit one line per
     // decode step (per set_input_paged_row_idx call) to stderr describing the physical
