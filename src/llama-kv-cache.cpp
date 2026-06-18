@@ -3460,6 +3460,11 @@ ggml_tensor * llama_kv_cache::build_input_paged_row_idx(ggml_context * ctx, uint
         return nullptr;
     }
 
+    const char * LLAMA_KV_PAGED_INGRAPH = std::getenv("LLAMA_KV_PAGED_INGRAPH");
+    if (LLAMA_KV_PAGED_INGRAPH && std::strcmp(LLAMA_KV_PAGED_INGRAPH, "0") == 0) {
+        return nullptr;
+    }
+
     bool supported = n_stream == 1 && !v_trans;
     for (const auto & layer : layers) {
         supported = supported &&
