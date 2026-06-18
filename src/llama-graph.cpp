@@ -458,7 +458,7 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
 
     auto it = g_paged_row_idx_kv.find(this);
     if (it != g_paged_row_idx_kv.end() && it->second) {
-        mctx->set_input_paged_row_idx(it->second);
+        mctx->set_input_paged_row_idx(it->second, ubatch);
     }
 
     mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);

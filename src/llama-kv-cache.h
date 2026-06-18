@@ -342,7 +342,7 @@ public:
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
-    void set_input_paged_row_idx(ggml_tensor * dst) const;
+    void set_input_paged_row_idx(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
@@ -560,6 +560,20 @@ private:
     bool     paged_swap_pending = false;
     uint32_t paged_swap_pending_n_kv = 0;
 
+    // Stage 4C-3A: idle-seq telemetry scaffold. Counters are wired into stats output only;
+    // ownership/read-window computation is intentionally left for the next stage.
+    bool     paged_idle_trace_enabled = false;
+    mutable uint64_t paged_idle_active_seq_steps = 0;
+    mutable uint64_t paged_idle_active_seq_empty = 0;
+    mutable uint64_t paged_idle_active_seq_count_last = 0;
+    mutable uint64_t paged_idle_active_seq_count_max = 0;
+    mutable uint64_t paged_idle_cold_candidates = 0;
+    mutable uint64_t paged_idle_read_window_blocks = 0;
+    mutable uint64_t paged_idle_cold_in_read_window = 0;
+    mutable uint64_t paged_idle_cold_not_in_read_window = 0;
+    mutable uint64_t paged_idle_skip_mixed_active = 0;
+    mutable uint64_t paged_idle_safe_swap_candidates = 0;
+
     // Stage 4C-0: KV block access trace. When LLAMA_KV_PAGED_TRACE=1, emit one line per
     // decode step (per set_input_paged_row_idx call) to stderr describing the physical
     // blocks read/written this step plus current block-state population counts. Telemetry
@@ -738,7 +752,7 @@ public:
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
-    void set_input_paged_row_idx(ggml_tensor * dst) const;
+    void set_input_paged_row_idx(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
