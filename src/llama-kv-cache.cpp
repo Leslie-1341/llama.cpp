@@ -3611,7 +3611,7 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
         if (phys != (uint32_t) r) {
             paged_row_idx_changed += 1;
         }
-        if (paged_trace_enabled && paged_block_size != 0) {
+        if ((paged_trace_enabled || paged_idle_trace_enabled) && paged_block_size != 0) {
             trace_read_blocks.insert(phys / paged_block_size);
         }
         data[r] = (int32_t) phys;
@@ -3685,6 +3685,11 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
         uint64_t multi_seq_blocks = 0;
         uint64_t blocks_with_active_seq = 0;
         uint64_t blocks_without_active_seq = 0;
+        uint64_t cold_candidates = 0;
+        uint64_t cold_in_read_window = 0;
+        uint64_t cold_not_in_read_window = 0;
+        uint64_t skip_mixed_active = 0;
+        uint64_t safe_swap_candidates = 0;
         if (paged_block_size != 0 && paged_n_blocks != 0 && !v_cells.empty()) {
             const auto & cells = v_cells[0];
             std::vector<std::bitset<LLAMA_MAX_SEQ>> block_seq((size_t) paged_n_blocks);
@@ -3711,23 +3716,49 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                 }
             }
 
-            for (const auto & owner : block_seq) {
+            for (uint32_t block = 0; block < block_seq.size(); ++block) {
+                const auto & owner = block_seq[block];
                 if (owner.none()) {
                     continue;
                 }
 
                 non_empty_blocks += 1;
                 const uint64_t owner_count = owner.count();
+                const bool has_active_seq = (owner & active_seq).any();
                 if (owner_count == 1) {
                     single_seq_blocks += 1;
                 } else if (owner_count > 1) {
                     multi_seq_blocks += 1;
                 }
 
-                if ((owner & active_seq).any()) {
+                if (has_active_seq) {
                     blocks_with_active_seq += 1;
                 } else {
                     blocks_without_active_seq += 1;
+                }
+
+                if (owner_count > 1 && has_active_seq) {
+                    skip_mixed_active += 1;
+                }
+
+                const bool mixed = owner_count != 1;
+                const bool only_seen_idle_seq = ((owner & paged_idle_seq_seen) == owner) && !has_active_seq;
+                if (mixed || !only_seen_idle_seq) {
+                    continue;
+                }
+
+                cold_candidates += 1;
+
+                const bool in_read_window = trace_read_blocks.find(block) != trace_read_blocks.end();
+                if (in_read_window) {
+                    cold_in_read_window += 1;
+                    continue;
+                }
+
+                cold_not_in_read_window += 1;
+                if (block < paged_block_states.size() &&
+                        paged_block_states[block] == paged_block_state::RESIDENT) {
+                    safe_swap_candidates += 1;
                 }
             }
         }
@@ -3736,13 +3767,20 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
         paged_idle_multi_seq_blocks = multi_seq_blocks;
         paged_idle_blocks_with_active_seq = blocks_with_active_seq;
         paged_idle_blocks_without_active_seq = blocks_without_active_seq;
+        paged_idle_cold_candidates = cold_candidates;
+        paged_idle_read_window_blocks = trace_read_blocks.size();
+        paged_idle_cold_in_read_window = cold_in_read_window;
+        paged_idle_cold_not_in_read_window = cold_not_in_read_window;
+        paged_idle_skip_mixed_active = skip_mixed_active;
+        paged_idle_safe_swap_candidates = safe_swap_candidates;
 
         fprintf(stderr,
                 "KV_PAGED_IDLE_TRACE step=%llu active_seq_source=%s active_seq_count=%llu "
                 "idle_seq_count=%llu seen_seq_count=%llu active_seq=%s seq_last_active=%s "
                 "non_empty_blocks=%llu single_seq_blocks=%llu multi_seq_blocks=%llu "
                 "blocks_with_active_seq=%llu blocks_without_active_seq=%llu "
-                "cold_candidates=%llu safe_swap_candidates=%llu\n",
+                "cold_candidates=%llu read_window_blocks=%llu cold_in_read_window=%llu "
+                "cold_not_in_read_window=%llu skip_mixed_active=%llu safe_swap_candidates=%llu\n",
                 (unsigned long long) idle_step,
                 active_seq_source,
                 (unsigned long long) active_seq_count,
@@ -3756,6 +3794,10 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                 (unsigned long long) blocks_with_active_seq,
                 (unsigned long long) blocks_without_active_seq,
                 (unsigned long long) paged_idle_cold_candidates,
+                (unsigned long long) paged_idle_read_window_blocks,
+                (unsigned long long) paged_idle_cold_in_read_window,
+                (unsigned long long) paged_idle_cold_not_in_read_window,
+                (unsigned long long) paged_idle_skip_mixed_active,
                 (unsigned long long) paged_idle_safe_swap_candidates);
     }
 
