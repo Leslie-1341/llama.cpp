@@ -560,6 +560,14 @@ private:
     mutable uint64_t paged_swap_rss_after_last_kb = 0;
     mutable uint64_t paged_swap_rss_drop_last_kb = 0;
     mutable uint64_t paged_swap_rss_drop_max_kb = 0;
+    // cumulative RSS telemetry across the whole idle-swap madvise window (Stage 5C-scale-B).
+    // before_first: RSS before the FIRST madvise sample (recorded once, never overwritten).
+    // total_drop:   max(0, before_first - after_last) — net RSS change over the window.
+    // drop_sum:     sum of per-call max(0, before - after) — accumulated local positive drops.
+    mutable uint64_t paged_swap_rss_before_first_kb = 0;
+    mutable bool     paged_swap_rss_before_first_set = false;
+    mutable uint64_t paged_swap_rss_total_drop_kb = 0;
+    mutable uint64_t paged_swap_rss_drop_sum_kb = 0;
     bool     paged_swap_pending = false;
     uint32_t paged_swap_pending_n_kv = 0;
 

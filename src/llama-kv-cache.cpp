@@ -1973,6 +1973,16 @@ void llama_kv_cache::paged_swap_out_block(uint32_t physical_block, bool do_madvi
         if (rss_drop_kb > paged_swap_rss_drop_max_kb) {
             paged_swap_rss_drop_max_kb = rss_drop_kb;
         }
+        // cumulative window telemetry (Stage 5C-scale-B)
+        if (!paged_swap_rss_before_first_set) {
+            paged_swap_rss_before_first_kb = rss_before_kb;
+            paged_swap_rss_before_first_set = true;
+        }
+        paged_swap_rss_drop_sum_kb += rss_drop_kb;
+        paged_swap_rss_total_drop_kb =
+            paged_swap_rss_before_first_kb > paged_swap_rss_after_last_kb
+                ? paged_swap_rss_before_first_kb - paged_swap_rss_after_last_kb
+                : 0;
     }
 }
 
@@ -2393,7 +2403,8 @@ void llama_kv_cache::paged_log_stats() const {
             "paged_swap_madvise_skip_no_full_page=%llu paged_swap_madvise_skip_neighbor=%llu "
             "paged_swap_rss_samples=%llu paged_swap_rss_before_last_kb=%llu "
             "paged_swap_rss_after_last_kb=%llu paged_swap_rss_drop_last_kb=%llu "
-            "paged_swap_rss_drop_max_kb=%llu\n",
+            "paged_swap_rss_drop_max_kb=%llu paged_swap_rss_before_first_kb=%llu "
+            "paged_swap_rss_total_drop_kb=%llu paged_swap_rss_drop_sum_kb=%llu\n",
             __func__, paged_block_size, paged_n_blocks,
             (unsigned long long) paged_blocks_in_use,
             paged_free_list.size(),
@@ -2500,7 +2511,10 @@ void llama_kv_cache::paged_log_stats() const {
             (unsigned long long) paged_swap_rss_before_last_kb,
             (unsigned long long) paged_swap_rss_after_last_kb,
             (unsigned long long) paged_swap_rss_drop_last_kb,
-            (unsigned long long) paged_swap_rss_drop_max_kb);
+            (unsigned long long) paged_swap_rss_drop_max_kb,
+            (unsigned long long) paged_swap_rss_before_first_kb,
+            (unsigned long long) paged_swap_rss_total_drop_kb,
+            (unsigned long long) paged_swap_rss_drop_sum_kb);
 }
 
 void llama_kv_cache::swap_out_cell(uint32_t cell) {
@@ -4016,7 +4030,9 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                 "paged_swap_madvise_bytes=%llu paged_swap_madvise_failures=%llu "
                 "paged_swap_madvise_skip_no_full_page=%llu paged_swap_madvise_skip_neighbor=%llu "
                 "paged_swap_rss_before_last_kb=%llu paged_swap_rss_after_last_kb=%llu "
-                "paged_swap_rss_drop_last_kb=%llu paged_swap_rss_drop_max_kb=%llu\n",
+                "paged_swap_rss_drop_last_kb=%llu paged_swap_rss_drop_max_kb=%llu "
+                "paged_swap_rss_before_first_kb=%llu paged_swap_rss_total_drop_kb=%llu "
+                "paged_swap_rss_drop_sum_kb=%llu\n",
                 (unsigned long long) idle_step,
                 active_seq_source,
                 (unsigned long long) active_seq_count,
@@ -4058,7 +4074,10 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                 (unsigned long long) paged_swap_rss_before_last_kb,
                 (unsigned long long) paged_swap_rss_after_last_kb,
                 (unsigned long long) paged_swap_rss_drop_last_kb,
-                (unsigned long long) paged_swap_rss_drop_max_kb);
+                (unsigned long long) paged_swap_rss_drop_max_kb,
+                (unsigned long long) paged_swap_rss_before_first_kb,
+                (unsigned long long) paged_swap_rss_total_drop_kb,
+                (unsigned long long) paged_swap_rss_drop_sum_kb);
     }
 
     if (paged_trace_enabled) {
