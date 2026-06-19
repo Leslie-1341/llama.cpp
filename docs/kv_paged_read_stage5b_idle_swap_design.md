@@ -160,6 +160,19 @@ block 被 swap-out **必须同时满足**：
 
 条件 5 是核心安全不变量：只有当一个 block 的全部引用行都已被重定向到 resident dummy cell 之后，才允许把它 swap-out，从而保证本 step 的 attention 永远不会读到 SWAPPED block（与条件 4、8 等价/互证）。
 
+### 5.1 SWAPPED idle block 必须继续 remap（跨 step 不变量）
+
+实现中 `set_input_paged_row_idx()` 的 non-identity remap 逻辑在 `idle_swap_ready` 时，**允许已经处于 `SWAPPED` 状态的 idle block 继续被 remap 到 dummy cell**（不只 remap RESIDENT block）。这**不是 bug，而是正确性必要条件**：
+
+- step N：idle cold block 被 remap 后执行 swap-out，状态 `RESIDENT → SWAPPED`；
+- step N+1：该 idle block 仍不属于 active seq；
+- 若**不**继续 remap，它的 row_idx 会重新指向真实的 SWAPPED physical block；
+- 于是 `paged_check_read_resident()` 检测到 SWAPPED 并触发 swap-in——**每一步都 swap-in**，idle swap 失去意义，且引入对刚 swap-out 的 block 的读取；
+- 因此 SWAPPED idle block **必须持续 remap 到 resident dummy cell**，直到该 seq resume；
+- seq resume 后该 block 重新含 active seq，remap 前提（`only_seen_idle_seq && !has_active_seq`）失效，remap 自动撤销，row_idx 指回真实 physical block，再由 `paged_check_read_resident()` 触发**一次** swap-in（见 §8）。
+
+换言之，「block 是否被 remap 到 dummy」与「block 是否保持 swapped」是同一个开关：只要它仍是 idle-only，就持续 remap、持续 swapped；一旦 resume 变为 active，remap 撤销、swap-in 复活。swap-out 本身（§5 条件 6）只在 RESIDENT 时触发一次，SWAPPED 状态下不会重复 swap-out。
+
 ---
 
 ## 6. madvise gate 设计
@@ -191,8 +204,9 @@ block 被 swap-out **必须同时满足**：
 
 ## 8. swap-in / resume 设计
 
+- idle 阶段（resume 之前）：只要 seq0 仍是 idle-only，它的 block 即便已是 SWAPPED 也会**持续被 remap 到 resident dummy cell**（见 §5.1），从而保持 swapped、不触发逐步 swap-in。
 - seq0 resume 后成为 **active**（出现在 `ubatch` 中，`active_seq.test(0)==true`）。
-- Stage 5A remap 对含 active seq 的 block 不做 remap（remap 的前提是 `only_seen_idle_seq && !has_active_seq`），因此 **seq0 的 block 不再被 remap**。
+- Stage 5A remap 对含 active seq 的 block 不做 remap（remap 的前提是 `only_seen_idle_seq && !has_active_seq`），因此 **seq0 的 block 不再被 remap**——这是 §5.1 跨 step remap 不变量的自然终止：resume 这一步 remap 前提失效，remap 被自动撤销。
 - row_idx 因此解析回真实 physical block（而非 dummy cell）。
 - 读路径：`paged_check_read_resident(phys, active)`（`src/llama-kv-cache.cpp:3770`）检测到该 block 为 SWAPPED，调用 `paged_swap_in_block` 完成 `SWAPPED → RESIDENT`。
 - 写路径：seq0 resume 后向曾被 swap-out 的 block 追加新 token 时，写解析路径上的 `paged_ensure_write_resident`（`src/llama-kv-cache.cpp:1776`）同样会在 SWAPPED 时触发 swap-in。
@@ -279,6 +293,39 @@ diff <(sed -n '/active_text_begin/,/active_text_end/p' base.txt) \
 | bytes_written != bytes_read | `paged_swap_in_block` 逐 cell 校验 `swap_size == total_size`；验证断言 `bytes_out == bytes_in` |
 | 同一 block 多次 swap-out/in 状态不一致 | 状态守卫：out 仅 RESIDENT、in 仅 SWAPPED，幂等；offsets 每次 swap-out 重写 |
 | dummy remap 与 SWAPPED 状态不一致 | `paged_check_read_resident` 作用于 **post-remap** 的 `phys`（=dummy，resident），不会误触发 swap-in，SWAPPED block 本 step 无 live reader |
+| SWAPPED idle block 逐步 swap-in（抖动） | SWAPPED idle block 持续 remap 到 dummy，row_idx 不指向真实 SWAPPED block，避免每步 swap-in（§5.1）；swap-out 仅在 RESIDENT 时发生一次，不重复写盘 |
+
+> 不变量小结：对一个 idle-only block，「remap 到 dummy」与「保持 swapped」同生同灭——idle 期间两者同时成立，resume 时两者同时撤销。真实物理 SWAPPED block 在整个 idle 期间没有任何 live row_idx 指向它。
+
+---
+
+## 11.1 telemetry 解释：safe candidate vs swapped block
+
+Stage 5B-1 末态出现以下组合时，**不是失败**：
+
+```text
+safe_swap_candidates=0
+paged_nonidentity_safe_candidates_after=0
+swapped_blocks=1
+paged_idle_swap_candidates=1
+paged_idle_swap_out_calls=1
+```
+
+原因——两个概念必须区分：
+
+- **safe candidate**：当前仍为 `RESIDENT`、且本 step 满足全部安全条件、**可以被 swap** 的 block。计数 `safe_swap_candidates` / `paged_nonidentity_safe_candidates_after` 只在 block 处于 `RESIDENT` 分支时累加。
+- **swapped block**：已被 safe-candidate policy **消费**、写入 backing store、状态变为 `SWAPPED` 的 block。
+
+Stage 5A-2 的 safe candidate 表示"仍 RESIDENT、可 swap"；Stage 5B-1 中该 candidate 已被 swap-out **消费**，状态 `RESIDENT → SWAPPED`，于是它不再是"待 swap 的 safe candidate"，而是"已 swap 的 block"。因此末态 `safe_swap_candidates=0` 与 `swapped_blocks=1` 同时出现，恰是成功签名，而非回归。
+
+**Stage 5B-1 成功指标**应看：
+
+- `paged_idle_swap_candidates > 0`（本 step 识别出 idle swap 候选）；
+- `paged_idle_swap_out_calls > 0`（候选确实被成功 swap-out，该计数以 `paged_swap_out_calls` 实际增长为门槛）；
+- `swapped_blocks > 0`（`paged_blocks_swapped_out`）；
+- `swap_in` / `madvise` / `backend_failures` **不出现**（`paged_swap_in_calls=0`、`paged_swap_madvise_calls=0`、`paged_swap_backend_failures=0`）。
+
+> 注意：由于"消费"语义，`safe_swap_candidates` 在 swap 打开后会被 swap-out 拉低甚至归零，**不能**再用它作为 swap-out 成功指标；应改用上面三个 `paged_idle_swap_*` / `swapped_blocks` 计数。
 
 ---
 

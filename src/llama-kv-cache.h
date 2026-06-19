@@ -452,7 +452,7 @@ private:
     uint32_t paged_write_resolve(uint32_t cell) const;
     void paged_ensure_write_resident(uint32_t phys_cell) const;
     void paged_check_read_resident(uint32_t phys_cell, bool active) const;
-    void paged_swap_out_block(uint32_t physical_block);
+    void paged_swap_out_block(uint32_t physical_block, bool do_madvise = true) const;
     bool paged_swap_in_block(uint32_t physical_block) const;
     uint64_t paged_madvise_block(
             uint32_t physical_block,
@@ -484,8 +484,8 @@ private:
     std::vector<uint32_t> paged_block_table;
     std::vector<uint8_t>  paged_block_used;
     mutable std::vector<paged_block_state> paged_block_states;
-    std::vector<uint64_t> paged_swap_offsets;
-    std::vector<size_t>   paged_swap_sizes;
+    mutable std::vector<uint64_t> paged_swap_offsets;
+    mutable std::vector<size_t>   paged_swap_sizes;
     std::vector<uint32_t> paged_free_list;
     uint64_t paged_alloc_calls     = 0;
     uint64_t paged_blocks_in_use   = 0;
@@ -583,6 +583,13 @@ private:
     mutable uint64_t paged_idle_cold_not_in_read_window = 0;
     mutable uint64_t paged_idle_skip_mixed_active = 0;
     mutable uint64_t paged_idle_safe_swap_candidates = 0;
+    bool     paged_idle_swap_requested = false;
+    mutable bool     paged_idle_swap_enabled = false;
+    mutable bool     paged_idle_swap_warned = false;
+    mutable uint64_t paged_idle_swap_candidates = 0;
+    mutable uint64_t paged_idle_swap_out_calls = 0;
+    mutable uint64_t paged_idle_swap_skip_not_remapped = 0;
+    mutable uint64_t paged_idle_swap_skip_not_resident = 0;
     mutable bool     paged_nonidentity_probe_enabled = false;
     mutable uint64_t paged_nonidentity_remap_rows = 0;
     mutable uint64_t paged_nonidentity_remap_blocks = 0;

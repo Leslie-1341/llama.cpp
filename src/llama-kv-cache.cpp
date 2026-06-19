@@ -416,10 +416,12 @@ llama_kv_cache::llama_kv_cache(
         const char * LLAMA_KV_PAGED_SWAP       = std::getenv("LLAMA_KV_PAGED_SWAP");
         const char * LLAMA_KV_PAGED_TRACE      = std::getenv("LLAMA_KV_PAGED_TRACE");
         const char * LLAMA_KV_PAGED_IDLE_TRACE = std::getenv("LLAMA_KV_PAGED_IDLE_TRACE");
+        const char * LLAMA_KV_PAGED_IDLE_SWAP  = std::getenv("LLAMA_KV_PAGED_IDLE_SWAP");
         const int block_size_env = LLAMA_KV_PAGED_BLOCK_SIZE ? std::atoi(LLAMA_KV_PAGED_BLOCK_SIZE) : 16;
         const int shift_env      = LLAMA_KV_PAGED_SHIFT      ? std::atoi(LLAMA_KV_PAGED_SHIFT)      : 0;
         const bool release_env   = LLAMA_KV_PAGED_RELEASE && std::strcmp(LLAMA_KV_PAGED_RELEASE, "1") == 0;
         const bool paged_swap_env = LLAMA_KV_PAGED_SWAP && std::strcmp(LLAMA_KV_PAGED_SWAP, "1") == 0;
+        const bool idle_swap_env  = LLAMA_KV_PAGED_IDLE_SWAP && std::strcmp(LLAMA_KV_PAGED_IDLE_SWAP, "1") == 0;
 
         if (block_size_env <= 0 ||
                 !ggml_is_power_of_2(block_size_env) ||
@@ -447,6 +449,7 @@ llama_kv_cache::llama_kv_cache(
             }
             paged_init(kv_size);
             paged_swap_enabled = paged_swap_env;
+            paged_idle_swap_requested = idle_swap_env;
             paged_trace_enabled = LLAMA_KV_PAGED_TRACE && std::strcmp(LLAMA_KV_PAGED_TRACE, "1") == 0;
             paged_idle_trace_enabled = LLAMA_KV_PAGED_IDLE_TRACE && std::strcmp(LLAMA_KV_PAGED_IDLE_TRACE, "1") == 0;
             paged_block_release_enabled = release_env && !paged_swap_enabled;
@@ -478,6 +481,9 @@ llama_kv_cache::llama_kv_cache(
             }
             if (paged_idle_trace_enabled) {
                 LLAMA_LOG_INFO("%s: KV paged idle trace enabled (telemetry only)\n", __func__);
+            }
+            if (paged_idle_swap_requested) {
+                LLAMA_LOG_INFO("%s: KV paged idle swap requested (safe-candidate probe only)\n", __func__);
             }
         }
     }
@@ -1840,7 +1846,7 @@ void llama_kv_cache::paged_check_read_resident(uint32_t phys_cell, bool active) 
     }
 }
 
-void llama_kv_cache::paged_swap_out_block(uint32_t physical_block) {
+void llama_kv_cache::paged_swap_out_block(uint32_t physical_block, bool do_madvise) const {
     if (!kv_paged_enabled || !paged_swap_enabled || !kv_swap_store || v_trans || n_stream != 1 ||
             paged_block_size == 0 || v_cells.empty()) {
         return;
@@ -1935,6 +1941,10 @@ void llama_kv_cache::paged_swap_out_block(uint32_t physical_block) {
     paged_swap_out_calls += 1;
     paged_blocks_swapped_out += 1;
     paged_swap_bytes_out += block_bytes;
+
+    if (!do_madvise) {
+        return;
+    }
 
     const uint64_t rss_before_kb = get_current_rss_kb();
     const uint64_t skip_no_full_before = paged_swap_madvise_skip_no_full_page;
@@ -2357,6 +2367,9 @@ void llama_kv_cache::paged_log_stats() const {
             "paged_idle_read_window_blocks=%llu paged_idle_cold_in_read_window=%llu "
             "paged_idle_cold_not_in_read_window=%llu paged_idle_skip_mixed_active=%llu "
             "paged_idle_safe_swap_candidates=%llu "
+            "paged_idle_swap_enabled=%d paged_idle_swap_candidates=%llu "
+            "paged_idle_swap_out_calls=%llu paged_idle_swap_skip_not_remapped=%llu "
+            "paged_idle_swap_skip_not_resident=%llu "
             "paged_nonidentity_enabled=%d paged_nonidentity_remap_rows=%llu "
             "paged_nonidentity_remap_blocks=%llu paged_nonidentity_skip_no_dummy=%llu "
             "paged_nonidentity_skip_not_masked=%llu paged_nonidentity_skip_not_resident=%llu "
@@ -2439,6 +2452,11 @@ void llama_kv_cache::paged_log_stats() const {
             (unsigned long long) paged_idle_cold_not_in_read_window,
             (unsigned long long) paged_idle_skip_mixed_active,
             (unsigned long long) paged_idle_safe_swap_candidates,
+            paged_idle_swap_enabled ? 1 : 0,
+            (unsigned long long) paged_idle_swap_candidates,
+            (unsigned long long) paged_idle_swap_out_calls,
+            (unsigned long long) paged_idle_swap_skip_not_remapped,
+            (unsigned long long) paged_idle_swap_skip_not_resident,
             paged_nonidentity_probe_enabled ? 1 : 0,
             (unsigned long long) paged_nonidentity_remap_rows,
             (unsigned long long) paged_nonidentity_remap_blocks,
@@ -2656,6 +2674,10 @@ void llama_kv_cache::swap_out_window(uint32_t n_kv) {
 
 void llama_kv_cache::paged_swap_out_window(uint32_t n_kv) {
     if (!kv_paged_enabled || !paged_swap_enabled) {
+        return;
+    }
+    if (paged_idle_swap_requested) {
+        paged_swap_window_skipped += 1;
         return;
     }
 
@@ -3641,6 +3663,20 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
         std::strcmp(LLAMA_KV_PAGED_GATHER_NONIDENTITY, "1") == 0;
     paged_nonidentity_probe_enabled = nonidentity_probe;
 
+    const bool idle_swap_ready =
+        paged_idle_swap_requested &&
+        paged_swap_enabled &&
+        kv_swap_store &&
+        nonidentity_probe &&
+        paged_idle_trace_enabled;
+    paged_idle_swap_enabled = idle_swap_ready;
+    if (paged_idle_swap_requested && !idle_swap_ready && !paged_idle_swap_warned) {
+        LLAMA_LOG_WARN("%s: LLAMA_KV_PAGED_IDLE_SWAP=1 requires LLAMA_KV_PAGED_SWAP=1, "
+                "LLAMA_KV_PAGED_GATHER_NONIDENTITY=1, LLAMA_KV_PAGED_IDLE_TRACE=1, and a backing store; "
+                "idle swap disabled for this run\n", __func__);
+        paged_idle_swap_warned = true;
+    }
+
     uint32_t dummy_phys = PAGED_BLOCK_INVALID;
     std::vector<uint8_t> nonidentity_cold_blocks;
     if (nonidentity_probe &&
@@ -3753,7 +3789,8 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                 if (!masked) {
                     paged_nonidentity_skip_not_masked += 1;
                 } else if (block >= paged_block_states.size() ||
-                        paged_block_states[block] != paged_block_state::RESIDENT) {
+                        (paged_block_states[block] != paged_block_state::RESIDENT &&
+                         !(idle_swap_ready && paged_block_states[block] == paged_block_state::SWAPPED))) {
                     paged_nonidentity_skip_not_resident += 1;
                 } else if (dummy_phys == PAGED_BLOCK_INVALID ||
                         dummy_phys > (uint32_t) std::numeric_limits<int32_t>::max()) {
@@ -3911,6 +3948,21 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                 if (block < paged_block_states.size() &&
                         paged_block_states[block] == paged_block_state::RESIDENT) {
                     safe_swap_candidates += 1;
+                    if (paged_idle_swap_requested) {
+                        paged_idle_swap_candidates += 1;
+                        if (!idle_swap_ready ||
+                                nonidentity_remapped_blocks.find(block) == nonidentity_remapped_blocks.end()) {
+                            paged_idle_swap_skip_not_remapped += 1;
+                        } else if (paged_block_states[block] != paged_block_state::RESIDENT) {
+                            paged_idle_swap_skip_not_resident += 1;
+                        } else {
+                            const uint64_t before = paged_swap_out_calls;
+                            paged_swap_out_block(block, false);
+                            if (paged_swap_out_calls > before) {
+                                paged_idle_swap_out_calls += 1;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -3936,6 +3988,9 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                 "blocks_with_active_seq=%llu blocks_without_active_seq=%llu "
                 "cold_candidates=%llu read_window_blocks=%llu cold_in_read_window=%llu "
                 "cold_not_in_read_window=%llu skip_mixed_active=%llu safe_swap_candidates=%llu "
+                "paged_idle_swap_enabled=%d paged_idle_swap_candidates=%llu "
+                "paged_idle_swap_out_calls=%llu paged_idle_swap_skip_not_remapped=%llu "
+                "paged_idle_swap_skip_not_resident=%llu "
                 "paged_nonidentity_enabled=%d paged_nonidentity_remap_rows=%llu "
                 "paged_nonidentity_remap_blocks=%llu paged_nonidentity_skip_no_dummy=%llu "
                 "paged_nonidentity_skip_not_masked=%llu paged_nonidentity_skip_not_resident=%llu "
@@ -3960,6 +4015,11 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                 (unsigned long long) paged_idle_cold_not_in_read_window,
                 (unsigned long long) paged_idle_skip_mixed_active,
                 (unsigned long long) paged_idle_safe_swap_candidates,
+                paged_idle_swap_enabled ? 1 : 0,
+                (unsigned long long) paged_idle_swap_candidates,
+                (unsigned long long) paged_idle_swap_out_calls,
+                (unsigned long long) paged_idle_swap_skip_not_remapped,
+                (unsigned long long) paged_idle_swap_skip_not_resident,
                 paged_nonidentity_probe_enabled ? 1 : 0,
                 (unsigned long long) paged_nonidentity_remap_rows,
                 (unsigned long long) paged_nonidentity_remap_blocks,
@@ -5134,7 +5194,7 @@ bool llama_kv_cache_context::apply() {
     // Stage 4A: block-aware madvise-only release. This does not assume a physical tail; it
     // releases only RESIDENT physical blocks that are absent from the current row_idx mapping.
     kv->paged_release_blocks(n_kv);
-    kv->paged_swap_pending = kv->paged_swap_enabled;
+    kv->paged_swap_pending = kv->paged_swap_enabled && !kv->paged_idle_swap_requested;
     kv->paged_swap_pending_n_kv = n_kv;
     kv->sample_swap_rss();
 
