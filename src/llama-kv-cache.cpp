@@ -418,6 +418,7 @@ llama_kv_cache::llama_kv_cache(
         const char * LLAMA_KV_PAGED_IDLE_TRACE = std::getenv("LLAMA_KV_PAGED_IDLE_TRACE");
         const char * LLAMA_KV_PAGED_IDLE_SWAP  = std::getenv("LLAMA_KV_PAGED_IDLE_SWAP");
         const char * LLAMA_KV_PAGED_IDLE_SWAP_MADVISE = std::getenv("LLAMA_KV_PAGED_IDLE_SWAP_MADVISE");
+        const char * LLAMA_KV_PAGED_MINCORE = std::getenv("LLAMA_KV_PAGED_MINCORE");
         const int block_size_env = LLAMA_KV_PAGED_BLOCK_SIZE ? std::atoi(LLAMA_KV_PAGED_BLOCK_SIZE) : 16;
         const int shift_env      = LLAMA_KV_PAGED_SHIFT      ? std::atoi(LLAMA_KV_PAGED_SHIFT)      : 0;
         const bool release_env   = LLAMA_KV_PAGED_RELEASE && std::strcmp(LLAMA_KV_PAGED_RELEASE, "1") == 0;
@@ -453,6 +454,20 @@ llama_kv_cache::llama_kv_cache(
             paged_swap_enabled = paged_swap_env;
             paged_idle_swap_requested = idle_swap_env;
             paged_idle_swap_madvise_requested = idle_swap_madvise_env;
+            paged_mincore_requested = LLAMA_KV_PAGED_MINCORE && std::strcmp(LLAMA_KV_PAGED_MINCORE, "1") == 0;
+#if defined(__linux__)
+            // kv_paged_enabled already implies n_stream==1 && !v_trans (checked above). CPU host
+            // pointers are mincore-able; non-CPU backends never reach this branch in this driver.
+            paged_mincore_enabled = paged_mincore_requested;
+#else
+            paged_mincore_enabled = false;
+#endif
+            if (paged_mincore_requested && !paged_mincore_enabled && !paged_mincore_warned) {
+                LLAMA_LOG_WARN("%s: LLAMA_KV_PAGED_MINCORE=1 requires Linux + CPU KV path "
+                        "(kv_paged_enabled, n_stream==1, !v_trans); KV mincore telemetry disabled\n",
+                        __func__);
+                paged_mincore_warned = true;
+            }
             paged_trace_enabled = LLAMA_KV_PAGED_TRACE && std::strcmp(LLAMA_KV_PAGED_TRACE, "1") == 0;
             paged_idle_trace_enabled = LLAMA_KV_PAGED_IDLE_TRACE && std::strcmp(LLAMA_KV_PAGED_IDLE_TRACE, "1") == 0;
             paged_block_release_enabled = release_env && !paged_swap_enabled;
@@ -1834,6 +1849,11 @@ void llama_kv_cache::paged_check_read_resident(uint32_t phys_cell, bool active) 
         if (paged_swap_in_block(physical_block) &&
                 paged_block_states[physical_block] == paged_block_state::RESIDENT) {
             paged_swap_read_swap_in_calls += 1;
+            // Stage 5E-1: resume swap-in just made this block resident again; resample KV
+            // resident so after_resume reflects the most recent swap-in.
+            if (paged_mincore_enabled) {
+                paged_mincore_after_resume_resident_bytes = paged_sample_mincore();
+            }
         } else {
             paged_swap_read_swap_in_failures += 1;
             LLAMA_LOG_ERROR("%s: KV paged swap read swap-in failed: block=%u cell=%u state=%d "
@@ -2225,6 +2245,90 @@ uint64_t llama_kv_cache::paged_madvise_block(
 #endif
 }
 
+uint64_t llama_kv_cache::paged_sample_mincore() const {
+#if defined(__linux__)
+    if (!paged_mincore_enabled) {
+        return 0;
+    }
+
+    const long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) {
+        return 0;
+    }
+    const uintptr_t pg = (uintptr_t) page;
+
+    uint64_t total_bytes      = 0;
+    uint64_t resident_bytes   = 0;
+    uint64_t total_pages      = 0;
+    uint64_t resident_pages   = 0;
+    uint64_t k_total_bytes    = 0;
+    uint64_t k_resident_bytes = 0;
+    uint64_t v_total_bytes    = 0;
+    uint64_t v_resident_bytes = 0;
+
+    // Read-only residency probe for one tensor's host interval, page-aligned with the same
+    // round-up-start / round-down-end rule as paged_madvise_block so the sampled region is a
+    // page-aligned subset of what madvise could advise. Accumulates into the per-kind totals.
+    auto sample_tensor = [&](ggml_tensor * t, uint64_t & kind_total, uint64_t & kind_resident) {
+        if (!t || !t->data) {
+            return;
+        }
+        const uintptr_t lo_a = (uintptr_t) t->data;
+        const uintptr_t hi_a = lo_a + (uintptr_t) ggml_nbytes(t);
+        const uintptr_t a_start = (lo_a + pg - 1) & ~(pg - 1);
+        const uintptr_t a_end   = hi_a & ~(pg - 1);
+        if (a_end <= a_start) {
+            return;
+        }
+
+        const size_t len = (size_t) (a_end - a_start);
+        const uint64_t n_pages = (uint64_t) (len / pg);
+        std::vector<unsigned char> vec(n_pages);
+        if (mincore((void *) a_start, len, vec.data()) != 0) {
+            paged_mincore_failures += 1;
+            return;
+        }
+
+        uint64_t res = 0;
+        for (uint64_t i = 0; i < n_pages; ++i) {
+            if (vec[i] & 1u) {
+                res += 1;
+            }
+        }
+
+        total_pages    += n_pages;
+        resident_pages += res;
+        const uint64_t tb = n_pages * (uint64_t) pg;
+        const uint64_t rb = res * (uint64_t) pg;
+        total_bytes    += tb;
+        resident_bytes += rb;
+        kind_total     += tb;
+        kind_resident  += rb;
+    };
+
+    for (const auto & layer : layers) {
+        ggml_tensor * k = layer.k_stream.empty() ? nullptr : layer.k_stream[0];
+        ggml_tensor * v = layer.v_stream.empty() ? nullptr : layer.v_stream[0];
+        sample_tensor(k, k_total_bytes, k_resident_bytes);
+        sample_tensor(v, v_total_bytes, v_resident_bytes);
+    }
+
+    paged_mincore_sample_calls += 1;
+    paged_mincore_total_bytes      = total_bytes;
+    paged_mincore_resident_bytes   = resident_bytes;
+    paged_mincore_total_pages      = total_pages;
+    paged_mincore_resident_pages   = resident_pages;
+    paged_mincore_k_total_bytes    = k_total_bytes;
+    paged_mincore_k_resident_bytes = k_resident_bytes;
+    paged_mincore_v_total_bytes    = v_total_bytes;
+    paged_mincore_v_resident_bytes = v_resident_bytes;
+
+    return resident_bytes;
+#else
+    return 0;
+#endif
+}
+
 void llama_kv_cache::paged_assert_identity(const slot_info & sinfo) {
     if (!kv_paged_enabled) {
         return;
@@ -2404,7 +2508,16 @@ void llama_kv_cache::paged_log_stats() const {
             "paged_swap_rss_samples=%llu paged_swap_rss_before_last_kb=%llu "
             "paged_swap_rss_after_last_kb=%llu paged_swap_rss_drop_last_kb=%llu "
             "paged_swap_rss_drop_max_kb=%llu paged_swap_rss_before_first_kb=%llu "
-            "paged_swap_rss_total_drop_kb=%llu paged_swap_rss_drop_sum_kb=%llu\n",
+            "paged_swap_rss_total_drop_kb=%llu paged_swap_rss_drop_sum_kb=%llu "
+            "kv_mincore_enabled=%d kv_mincore_sample_calls=%llu kv_mincore_failures=%llu "
+            "kv_mincore_total_bytes=%llu kv_mincore_resident_bytes=%llu "
+            "kv_mincore_total_pages=%llu kv_mincore_resident_pages=%llu "
+            "kv_mincore_resident_ratio_permille=%llu "
+            "kv_mincore_k_total_bytes=%llu kv_mincore_k_resident_bytes=%llu "
+            "kv_mincore_v_total_bytes=%llu kv_mincore_v_resident_bytes=%llu "
+            "kv_mincore_prefill_resident_bytes=%llu kv_mincore_before_madvise_resident_bytes=%llu "
+            "kv_mincore_after_madvise_resident_bytes=%llu kv_mincore_after_resume_resident_bytes=%llu "
+            "kv_mincore_madvise_drop_bytes=%llu kv_mincore_resume_recover_bytes=%llu\n",
             __func__, paged_block_size, paged_n_blocks,
             (unsigned long long) paged_blocks_in_use,
             paged_free_list.size(),
@@ -2514,7 +2627,28 @@ void llama_kv_cache::paged_log_stats() const {
             (unsigned long long) paged_swap_rss_drop_max_kb,
             (unsigned long long) paged_swap_rss_before_first_kb,
             (unsigned long long) paged_swap_rss_total_drop_kb,
-            (unsigned long long) paged_swap_rss_drop_sum_kb);
+            (unsigned long long) paged_swap_rss_drop_sum_kb,
+            paged_mincore_enabled ? 1 : 0,
+            (unsigned long long) paged_mincore_sample_calls,
+            (unsigned long long) paged_mincore_failures,
+            (unsigned long long) paged_mincore_total_bytes,
+            (unsigned long long) paged_mincore_resident_bytes,
+            (unsigned long long) paged_mincore_total_pages,
+            (unsigned long long) paged_mincore_resident_pages,
+            (unsigned long long) (paged_mincore_total_pages > 0
+                ? paged_mincore_resident_pages * 1000ull / paged_mincore_total_pages : 0),
+            (unsigned long long) paged_mincore_k_total_bytes,
+            (unsigned long long) paged_mincore_k_resident_bytes,
+            (unsigned long long) paged_mincore_v_total_bytes,
+            (unsigned long long) paged_mincore_v_resident_bytes,
+            (unsigned long long) paged_mincore_prefill_resident_bytes,
+            (unsigned long long) paged_mincore_before_madvise_resident_bytes,
+            (unsigned long long) paged_mincore_after_madvise_resident_bytes,
+            (unsigned long long) paged_mincore_after_resume_resident_bytes,
+            (unsigned long long) (paged_mincore_before_madvise_resident_bytes > paged_mincore_after_madvise_resident_bytes
+                ? paged_mincore_before_madvise_resident_bytes - paged_mincore_after_madvise_resident_bytes : 0),
+            (unsigned long long) (paged_mincore_after_resume_resident_bytes > paged_mincore_after_madvise_resident_bytes
+                ? paged_mincore_after_resume_resident_bytes - paged_mincore_after_madvise_resident_bytes : 0));
 }
 
 void llama_kv_cache::swap_out_cell(uint32_t cell) {
@@ -3903,6 +4037,9 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
         uint64_t cold_not_in_read_window = 0;
         uint64_t skip_mixed_active = 0;
         uint64_t safe_swap_candidates = 0;
+        // Stage 5E-1: mincore window locals, hoisted so the post-loop latch can read them.
+        uint64_t mincore_resident_before_loop = 0;
+        uint64_t mincore_madvise_calls_before = paged_swap_madvise_calls;
         if (paged_block_size != 0 && paged_n_blocks != 0 && !v_cells.empty()) {
             const auto & cells = v_cells[0];
             std::vector<std::bitset<LLAMA_MAX_SEQ>> block_seq((size_t) paged_n_blocks);
@@ -3926,6 +4063,20 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                     if (cells.seq_has(cell, seq_id)) {
                         owner.set(seq_id);
                     }
+                }
+            }
+
+            // Stage 5E-1: read-only KV resident sampling. prefill snapshot is recorded once at
+            // the first idle-trace step that reaches here. before_madvise/after_madvise latch the
+            // resident level around the step that actually performs idle swap-out + madvise (gated
+            // on paged_swap_madvise_calls growing), so the printed window reflects a real madvise
+            // drop rather than a later step where no block was advised.
+            mincore_madvise_calls_before = paged_swap_madvise_calls;
+            if (paged_mincore_enabled) {
+                mincore_resident_before_loop = paged_sample_mincore();
+                if (!paged_mincore_prefill_set) {
+                    paged_mincore_prefill_resident_bytes = mincore_resident_before_loop;
+                    paged_mincore_prefill_set = true;
                 }
             }
 
@@ -3995,6 +4146,14 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                 }
             }
         }
+        // Stage 5E-1: if this step actually advised any block away (madvise_calls grew), latch the
+        // before/after resident snapshots for the madvise window. Steps that swapped nothing leave
+        // the prior window intact, so the printed madvise_drop reflects a real release.
+        if (paged_mincore_enabled && paged_swap_madvise_calls > mincore_madvise_calls_before) {
+            paged_mincore_before_madvise_resident_bytes = mincore_resident_before_loop;
+            paged_mincore_before_madvise_set = true;
+            paged_mincore_after_madvise_resident_bytes = paged_sample_mincore();
+        }
         paged_idle_non_empty_blocks = non_empty_blocks;
         paged_idle_single_seq_blocks = single_seq_blocks;
         paged_idle_multi_seq_blocks = multi_seq_blocks;
@@ -4032,7 +4191,16 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                 "paged_swap_rss_before_last_kb=%llu paged_swap_rss_after_last_kb=%llu "
                 "paged_swap_rss_drop_last_kb=%llu paged_swap_rss_drop_max_kb=%llu "
                 "paged_swap_rss_before_first_kb=%llu paged_swap_rss_total_drop_kb=%llu "
-                "paged_swap_rss_drop_sum_kb=%llu\n",
+                "paged_swap_rss_drop_sum_kb=%llu "
+                "kv_mincore_enabled=%d kv_mincore_sample_calls=%llu kv_mincore_failures=%llu "
+                "kv_mincore_total_bytes=%llu kv_mincore_resident_bytes=%llu "
+                "kv_mincore_total_pages=%llu kv_mincore_resident_pages=%llu "
+                "kv_mincore_resident_ratio_permille=%llu "
+                "kv_mincore_k_total_bytes=%llu kv_mincore_k_resident_bytes=%llu "
+                "kv_mincore_v_total_bytes=%llu kv_mincore_v_resident_bytes=%llu "
+                "kv_mincore_prefill_resident_bytes=%llu kv_mincore_before_madvise_resident_bytes=%llu "
+                "kv_mincore_after_madvise_resident_bytes=%llu kv_mincore_after_resume_resident_bytes=%llu "
+                "kv_mincore_madvise_drop_bytes=%llu kv_mincore_resume_recover_bytes=%llu\n",
                 (unsigned long long) idle_step,
                 active_seq_source,
                 (unsigned long long) active_seq_count,
@@ -4077,7 +4245,28 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                 (unsigned long long) paged_swap_rss_drop_max_kb,
                 (unsigned long long) paged_swap_rss_before_first_kb,
                 (unsigned long long) paged_swap_rss_total_drop_kb,
-                (unsigned long long) paged_swap_rss_drop_sum_kb);
+                (unsigned long long) paged_swap_rss_drop_sum_kb,
+                paged_mincore_enabled ? 1 : 0,
+                (unsigned long long) paged_mincore_sample_calls,
+                (unsigned long long) paged_mincore_failures,
+                (unsigned long long) paged_mincore_total_bytes,
+                (unsigned long long) paged_mincore_resident_bytes,
+                (unsigned long long) paged_mincore_total_pages,
+                (unsigned long long) paged_mincore_resident_pages,
+                (unsigned long long) (paged_mincore_total_pages > 0
+                    ? paged_mincore_resident_pages * 1000ull / paged_mincore_total_pages : 0),
+                (unsigned long long) paged_mincore_k_total_bytes,
+                (unsigned long long) paged_mincore_k_resident_bytes,
+                (unsigned long long) paged_mincore_v_total_bytes,
+                (unsigned long long) paged_mincore_v_resident_bytes,
+                (unsigned long long) paged_mincore_prefill_resident_bytes,
+                (unsigned long long) paged_mincore_before_madvise_resident_bytes,
+                (unsigned long long) paged_mincore_after_madvise_resident_bytes,
+                (unsigned long long) paged_mincore_after_resume_resident_bytes,
+                (unsigned long long) (paged_mincore_before_madvise_resident_bytes > paged_mincore_after_madvise_resident_bytes
+                    ? paged_mincore_before_madvise_resident_bytes - paged_mincore_after_madvise_resident_bytes : 0),
+                (unsigned long long) (paged_mincore_after_resume_resident_bytes > paged_mincore_after_madvise_resident_bytes
+                    ? paged_mincore_after_resume_resident_bytes - paged_mincore_after_madvise_resident_bytes : 0));
     }
 
     if (paged_trace_enabled) {

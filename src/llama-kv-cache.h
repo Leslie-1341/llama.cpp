@@ -460,6 +460,12 @@ private:
             uint64_t & failures,
             uint64_t & skipped,
             uint64_t & skip_live) const;
+    // Stage 5E-1: read-only KV resident page sampling via mincore(2). Walks every KV layer's
+    // K/V tensor, page-aligns each tensor's [data, data+nbytes) interval (same align rule as
+    // paged_madvise_block), and counts resident pages. Updates the kv_mincore_* counters and
+    // returns total resident bytes across all KV tensors. No-op (returns 0) unless
+    // paged_mincore_enabled. Does not touch tensor contents or block state.
+    uint64_t paged_sample_mincore() const;
     void paged_assert_identity(const slot_info & sinfo);
     void paged_shadow_validate(const slot_info & sinfo, uint32_t n_kv) const;
     bool paged_ingraph_gather_supported(int32_t il) const;
@@ -568,6 +574,31 @@ private:
     mutable bool     paged_swap_rss_before_first_set = false;
     mutable uint64_t paged_swap_rss_total_drop_kb = 0;
     mutable uint64_t paged_swap_rss_drop_sum_kb = 0;
+
+    // Stage 5E-1: read-only KV resident page telemetry via mincore(2). Off unless
+    // LLAMA_KV_PAGED_MINCORE=1 (Linux + CPU + kv_paged_enabled && !v_trans && n_stream==1).
+    // These counters never feed back into swap/madvise/state-machine decisions.
+    bool     paged_mincore_requested = false;
+    mutable bool     paged_mincore_enabled = false;
+    mutable bool     paged_mincore_warned  = false;
+    mutable uint64_t paged_mincore_sample_calls = 0;
+    mutable uint64_t paged_mincore_failures = 0;
+    // last-sample aggregate (overwritten each sample)
+    mutable uint64_t paged_mincore_total_bytes = 0;
+    mutable uint64_t paged_mincore_resident_bytes = 0;
+    mutable uint64_t paged_mincore_total_pages = 0;
+    mutable uint64_t paged_mincore_resident_pages = 0;
+    mutable uint64_t paged_mincore_k_total_bytes = 0;
+    mutable uint64_t paged_mincore_k_resident_bytes = 0;
+    mutable uint64_t paged_mincore_v_total_bytes = 0;
+    mutable uint64_t paged_mincore_v_resident_bytes = 0;
+    // snapshots at the four sample points (0 if that point never fired)
+    mutable uint64_t paged_mincore_prefill_resident_bytes = 0;
+    mutable bool     paged_mincore_prefill_set = false;
+    mutable uint64_t paged_mincore_before_madvise_resident_bytes = 0;
+    mutable bool     paged_mincore_before_madvise_set = false;
+    mutable uint64_t paged_mincore_after_madvise_resident_bytes = 0;
+    mutable uint64_t paged_mincore_after_resume_resident_bytes = 0;
     bool     paged_swap_pending = false;
     uint32_t paged_swap_pending_n_kv = 0;
 
