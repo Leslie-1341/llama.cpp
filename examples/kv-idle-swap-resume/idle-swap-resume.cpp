@@ -4,10 +4,17 @@
 #include "sampling.h"
 
 #include <algorithm>
+#include <chrono>
 #include <clocale>
 #include <cstdio>
 #include <string>
 #include <vector>
+
+using perf_clock = std::chrono::steady_clock;
+
+static double elapsed_ms(perf_clock::time_point t0, perf_clock::time_point t1) {
+    return std::chrono::duration<double, std::milli>(t1 - t0).count();
+}
 
 static void print_usage(int, char ** argv) {
     fprintf(stderr, "\nexample usage:\n");
@@ -121,15 +128,24 @@ int main(int argc, char ** argv) {
     common_sampler * seq1_smpl = common_sampler_init(model, params.sampling);
     llama_batch batch = llama_batch_init((int32_t) max_prompt_tokens, 0, 2);
 
+    const auto total_t0 = perf_clock::now();
+    double seq0_prefill_ms = 0.0;
+    double seq1_active_ms = 0.0;
+    double seq1_prefill_ms = 0.0;
+    double seq0_resume_first_token_ms = 0.0;
+    double seq0_resume_total_ms = 0.0;
+
     common_batch_clear(batch);
     for (size_t i = 0; i < idle_tokens.size(); ++i) {
         common_batch_add(batch, idle_tokens[i], (llama_pos) i, { 0 }, false);
     }
     batch.logits[batch.n_tokens - 1] = true;
+    const auto seq0_prefill_t0 = perf_clock::now();
     if (!decode_batch(ctx, batch, "seq0-idle-prefill")) {
         cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
         return 1;
     }
+    seq0_prefill_ms = elapsed_ms(seq0_prefill_t0, perf_clock::now());
 
     const llama_token seq0_resume_first = common_sampler_sample(seq0_smpl, ctx, batch.n_tokens - 1);
     common_sampler_accept(seq0_smpl, seq0_resume_first, true);
@@ -144,10 +160,13 @@ int main(int argc, char ** argv) {
         common_batch_add(batch, active_tokens[i], (llama_pos) i, { 1 }, false);
     }
     batch.logits[batch.n_tokens - 1] = true;
+    const auto seq1_active_t0 = perf_clock::now();
+    const auto seq1_prefill_t0 = perf_clock::now();
     if (!decode_batch(ctx, batch, "seq1-active-prefill")) {
         cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
         return 1;
     }
+    seq1_prefill_ms = elapsed_ms(seq1_prefill_t0, perf_clock::now());
 
     std::string seq1_generated;
     int32_t sample_idx = batch.n_tokens - 1;
@@ -172,18 +191,22 @@ int main(int argc, char ** argv) {
             return 1;
         }
     }
+    seq1_active_ms = elapsed_ms(seq1_active_t0, perf_clock::now());
 
     std::string seq0_resume_generated;
     llama_token seq0_token = seq0_resume_first;
     llama_pos seq0_pos = (llama_pos) idle_tokens.size();
     int32_t seq0_resume_decoded = 0;
 
+    const auto seq0_resume_total_t0 = perf_clock::now();
     for (; seq0_resume_decoded < n_decode; ++seq0_resume_decoded) {
         if (llama_vocab_is_eog(vocab, seq0_token)) {
             break;
         }
 
         seq0_resume_generated += common_token_to_piece(ctx, seq0_token);
+
+        const auto seq0_resume_step_t0 = seq0_resume_decoded == 0 ? perf_clock::now() : perf_clock::time_point{};
 
         common_batch_clear(batch);
         common_batch_add(batch, seq0_token, seq0_pos++, { 0 }, true);
@@ -196,7 +219,11 @@ int main(int argc, char ** argv) {
 
         seq0_token = common_sampler_sample(seq0_smpl, ctx, sample_idx);
         common_sampler_accept(seq0_smpl, seq0_token, true);
+        if (seq0_resume_decoded == 0) {
+            seq0_resume_first_token_ms = elapsed_ms(seq0_resume_step_t0, perf_clock::now());
+        }
     }
+    seq0_resume_total_ms = elapsed_ms(seq0_resume_total_t0, perf_clock::now());
 
     printf("idle_seq=0\n");
     printf("active_seq=1\n");
@@ -210,6 +237,25 @@ int main(int argc, char ** argv) {
     printf("===SEQ0_RESUME_BEGIN===\n");
     printf("%s\n", seq0_resume_generated.c_str());
     printf("===SEQ0_RESUME_END===\n");
+    fflush(stdout);
+
+    const double total_wall_ms = elapsed_ms(total_t0, perf_clock::now());
+    const int32_t seq1_active_tokens = seq1_decoded;
+    const int32_t seq0_resume_tokens = seq0_resume_decoded;
+    const int32_t total_measured_tokens = seq1_active_tokens + seq0_resume_tokens;
+    const double measured_generation_ms = seq1_active_ms + seq0_resume_total_ms;
+    const double tokens_per_second = measured_generation_ms > 0.0 ?
+        1000.0 * (double) total_measured_tokens / measured_generation_ms : 0.0;
+
+    fprintf(stderr,
+            "KV_IDLE_SWAP_RESUME_PERF total_wall_ms=%.3f seq1_active_ms=%.3f "
+            "seq0_resume_first_token_ms=%.3f seq0_resume_total_ms=%.3f "
+            "seq1_active_tokens=%d seq0_resume_tokens=%d total_measured_tokens=%d "
+            "tokens_per_second=%.6f seq0_prefill_ms=%.3f seq1_prefill_ms=%.3f\n",
+            total_wall_ms, seq1_active_ms,
+            seq0_resume_first_token_ms, seq0_resume_total_ms,
+            seq1_active_tokens, seq0_resume_tokens, total_measured_tokens,
+            tokens_per_second, seq0_prefill_ms, seq1_prefill_ms);
 
     cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
     return 0;
