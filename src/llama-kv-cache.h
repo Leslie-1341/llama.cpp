@@ -585,8 +585,11 @@ private:
     mutable uint64_t paged_idle_skip_mixed_active = 0;
     mutable uint64_t paged_idle_safe_swap_candidates = 0;
     bool     paged_idle_swap_requested = false;
+    bool     paged_idle_swap_madvise_requested = false;
     mutable bool     paged_idle_swap_enabled = false;
+    mutable bool     paged_idle_swap_madvise_enabled = false;
     mutable bool     paged_idle_swap_warned = false;
+    mutable bool     paged_idle_swap_madvise_warned = false;
     mutable uint64_t paged_idle_swap_candidates = 0;
     mutable uint64_t paged_idle_swap_out_calls = 0;
     mutable uint64_t paged_idle_swap_skip_not_remapped = 0;
