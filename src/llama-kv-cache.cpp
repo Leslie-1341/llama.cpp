@@ -2114,6 +2114,7 @@ bool llama_kv_cache::paged_swap_in_block(uint32_t physical_block) const {
     paged_swap_in_calls += 1;
     paged_blocks_swapped_in += 1;
     paged_swap_bytes_in += block_bytes;
+    paged_swap_in_last_block = physical_block;
     return true;
 }
 
@@ -2378,7 +2379,7 @@ void llama_kv_cache::paged_log_stats() const {
             "paged_nonidentity_safe_candidates_after=%llu "
             "paged_swap_enabled=%d paged_swap_out_calls=%llu paged_swap_in_calls=%llu "
             "paged_blocks_swapped_out=%llu paged_blocks_swapped_in=%llu "
-            "paged_swap_bytes_out=%llu paged_swap_bytes_in=%llu "
+            "paged_swap_bytes_out=%llu paged_swap_bytes_in=%llu paged_swap_in_last_block=%u "
             "paged_swap_backend_failures=%llu paged_swap_window_skipped=%llu "
             "paged_swap_read_swapped_hits=%llu paged_swap_read_swap_in_calls=%llu paged_swap_read_swap_in_failures=%llu "
             "paged_swap_write_swapped_hits=%llu paged_swap_write_swap_in_calls=%llu paged_swap_write_swap_in_failures=%llu "
@@ -2473,6 +2474,7 @@ void llama_kv_cache::paged_log_stats() const {
             (unsigned long long) paged_blocks_swapped_in,
             (unsigned long long) paged_swap_bytes_out,
             (unsigned long long) paged_swap_bytes_in,
+            paged_swap_in_last_block,
             (unsigned long long) paged_swap_backend_failures,
             (unsigned long long) paged_swap_window_skipped,
             (unsigned long long) paged_swap_read_swapped_hits,
@@ -4113,13 +4115,17 @@ void llama_kv_cache::paged_trace_emit_step(
             "read_block_count=%zu read_blocks=%s "
             "active_read_block_count=%zu active_read_blocks=%s "
             "write_block_count=%zu write_block=%s blocks_in_use=%llu "
-            "resident_blocks=%u swapped_blocks=%u released_blocks=%u free_blocks=%u\n",
+            "resident_blocks=%u swapped_blocks=%u released_blocks=%u free_blocks=%u "
+            "paged_swap_in_calls=%llu paged_swap_bytes_in=%llu paged_swap_in_last_block=%u\n",
             (unsigned long long) step, n_kv, active_n_kv,
             read_blocks.size(), read_csv.empty() ? "-" : read_csv.c_str(),
             active_read_blocks.size(), active_read_csv.empty() ? "-" : active_read_csv.c_str(),
             paged_trace_write_blocks.size(), write_csv.empty() ? "-" : write_csv.c_str(),
             (unsigned long long) paged_blocks_in_use,
-            resident, swapped, released, free_b);
+            resident, swapped, released, free_b,
+            (unsigned long long) paged_swap_in_calls,
+            (unsigned long long) paged_swap_bytes_in,
+            paged_swap_in_last_block);
 
     paged_trace_write_blocks.clear();
 }

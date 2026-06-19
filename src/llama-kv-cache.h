@@ -536,6 +536,7 @@ private:
     mutable uint64_t paged_blocks_swapped_in = 0;
     mutable uint64_t paged_swap_bytes_out = 0;
     mutable uint64_t paged_swap_bytes_in = 0;
+    mutable uint32_t paged_swap_in_last_block = PAGED_BLOCK_INVALID;
     mutable uint64_t paged_swap_backend_failures = 0;
     mutable uint64_t paged_swap_window_skipped = 0;
     mutable uint64_t paged_swap_read_swapped_hits = 0;
