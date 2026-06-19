@@ -2494,6 +2494,11 @@ void llama_kv_cache::paged_log_stats() const {
             "paged_nonidentity_cold_in_read_window_before=%llu "
             "paged_nonidentity_cold_in_read_window_after=%llu "
             "paged_nonidentity_safe_candidates_after=%llu "
+            "paged_cov_idle_owned_blocks=%llu paged_cov_in_read_window_blocks=%llu "
+            "paged_cov_not_in_read_window_blocks=%llu paged_cov_resident_safe_blocks=%llu "
+            "paged_cov_nonidentity_remapped_blocks=%llu "
+            "paged_cov_idle_owned_bytes=%llu paged_cov_in_read_window_bytes=%llu "
+            "paged_cov_resident_safe_bytes=%llu paged_cov_nonidentity_remapped_bytes=%llu "
             "paged_swap_enabled=%d paged_swap_out_calls=%llu paged_swap_in_calls=%llu "
             "paged_blocks_swapped_out=%llu paged_blocks_swapped_in=%llu "
             "paged_swap_bytes_out=%llu paged_swap_bytes_in=%llu paged_swap_in_last_block=%u "
@@ -2594,6 +2599,15 @@ void llama_kv_cache::paged_log_stats() const {
             (unsigned long long) paged_nonidentity_cold_in_read_window_before,
             (unsigned long long) paged_nonidentity_cold_in_read_window_after,
             (unsigned long long) paged_nonidentity_safe_candidates_after,
+            (unsigned long long) paged_cov_idle_owned_blocks,
+            (unsigned long long) paged_cov_in_read_window_blocks,
+            (unsigned long long) paged_cov_not_in_read_window_blocks,
+            (unsigned long long) paged_cov_resident_safe_blocks,
+            (unsigned long long) paged_cov_nonidentity_remapped_blocks,
+            (unsigned long long) paged_cov_idle_owned_bytes,
+            (unsigned long long) paged_cov_in_read_window_bytes,
+            (unsigned long long) paged_cov_resident_safe_bytes,
+            (unsigned long long) paged_cov_nonidentity_remapped_bytes,
             paged_swap_enabled ? 1 : 0,
             (unsigned long long) paged_swap_out_calls,
             (unsigned long long) paged_swap_in_calls,
@@ -4037,10 +4051,23 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
         uint64_t cold_not_in_read_window = 0;
         uint64_t skip_mixed_active = 0;
         uint64_t safe_swap_candidates = 0;
+        uint64_t nonidentity_remapped_this_round = 0;
+        uint64_t per_block_bytes = 0;
+        const uint64_t madvise_calls_before_cov = paged_swap_madvise_calls;
         // Stage 5E-1: mincore window locals, hoisted so the post-loop latch can read them.
         uint64_t mincore_resident_before_loop = 0;
         uint64_t mincore_madvise_calls_before = paged_swap_madvise_calls;
         if (paged_block_size != 0 && paged_n_blocks != 0 && !v_cells.empty()) {
+            for (const auto & layer : layers) {
+                if (!layer.k_stream.empty() && layer.k_stream[0]) {
+                    per_block_bytes += (uint64_t) layer.k_stream[0]->nb[1];
+                }
+                if (layer.v && !layer.v_stream.empty() && layer.v_stream[0]) {
+                    per_block_bytes += (uint64_t) layer.v_stream[0]->nb[1];
+                }
+            }
+            per_block_bytes *= paged_block_size;
+
             const auto & cells = v_cells[0];
             std::vector<std::bitset<LLAMA_MAX_SEQ>> block_seq((size_t) paged_n_blocks);
             for (uint32_t cell = 0; cell < cells.used_max_p1(); ++cell) {
@@ -4128,6 +4155,9 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                 if (block < paged_block_states.size() &&
                         paged_block_states[block] == paged_block_state::RESIDENT) {
                     safe_swap_candidates += 1;
+                    if (nonidentity_remapped_blocks.find(block) != nonidentity_remapped_blocks.end()) {
+                        nonidentity_remapped_this_round += 1;
+                    }
                     if (paged_idle_swap_requested) {
                         paged_idle_swap_candidates += 1;
                         if (!idle_swap_ready ||
@@ -4165,6 +4195,17 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
         paged_idle_cold_not_in_read_window = cold_not_in_read_window;
         paged_idle_skip_mixed_active = skip_mixed_active;
         paged_idle_safe_swap_candidates = safe_swap_candidates;
+        if (paged_swap_madvise_calls > madvise_calls_before_cov) {
+            paged_cov_idle_owned_blocks = cold_candidates;
+            paged_cov_in_read_window_blocks = cold_in_read_window;
+            paged_cov_not_in_read_window_blocks = cold_not_in_read_window;
+            paged_cov_resident_safe_blocks = safe_swap_candidates;
+            paged_cov_nonidentity_remapped_blocks = nonidentity_remapped_this_round;
+            paged_cov_idle_owned_bytes = cold_candidates * per_block_bytes;
+            paged_cov_in_read_window_bytes = cold_in_read_window * per_block_bytes;
+            paged_cov_resident_safe_bytes = safe_swap_candidates * per_block_bytes;
+            paged_cov_nonidentity_remapped_bytes = nonidentity_remapped_this_round * per_block_bytes;
+        }
         paged_nonidentity_cold_in_read_window_before = cold_in_read_window_before;
         paged_nonidentity_cold_in_read_window_after = cold_in_read_window;
         paged_nonidentity_safe_candidates_after = safe_swap_candidates;
@@ -4185,6 +4226,11 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                 "paged_nonidentity_cold_in_read_window_before=%llu "
                 "paged_nonidentity_cold_in_read_window_after=%llu "
                 "paged_nonidentity_safe_candidates_after=%llu "
+                "paged_cov_idle_owned_blocks=%llu paged_cov_in_read_window_blocks=%llu "
+                "paged_cov_not_in_read_window_blocks=%llu paged_cov_resident_safe_blocks=%llu "
+                "paged_cov_nonidentity_remapped_blocks=%llu "
+                "paged_cov_idle_owned_bytes=%llu paged_cov_in_read_window_bytes=%llu "
+                "paged_cov_resident_safe_bytes=%llu paged_cov_nonidentity_remapped_bytes=%llu "
                 "paged_idle_swap_madvise_enabled=%d paged_swap_madvise_calls=%llu "
                 "paged_swap_madvise_bytes=%llu paged_swap_madvise_failures=%llu "
                 "paged_swap_madvise_skip_no_full_page=%llu paged_swap_madvise_skip_neighbor=%llu "
@@ -4233,6 +4279,15 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                 (unsigned long long) paged_nonidentity_cold_in_read_window_before,
                 (unsigned long long) paged_nonidentity_cold_in_read_window_after,
                 (unsigned long long) paged_nonidentity_safe_candidates_after,
+                (unsigned long long) paged_cov_idle_owned_blocks,
+                (unsigned long long) paged_cov_in_read_window_blocks,
+                (unsigned long long) paged_cov_not_in_read_window_blocks,
+                (unsigned long long) paged_cov_resident_safe_blocks,
+                (unsigned long long) paged_cov_nonidentity_remapped_blocks,
+                (unsigned long long) paged_cov_idle_owned_bytes,
+                (unsigned long long) paged_cov_in_read_window_bytes,
+                (unsigned long long) paged_cov_resident_safe_bytes,
+                (unsigned long long) paged_cov_nonidentity_remapped_bytes,
                 paged_idle_swap_madvise_enabled ? 1 : 0,
                 (unsigned long long) paged_swap_madvise_calls,
                 (unsigned long long) paged_swap_madvise_bytes,

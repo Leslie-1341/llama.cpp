@@ -623,6 +623,15 @@ private:
     mutable uint64_t paged_idle_cold_not_in_read_window = 0;
     mutable uint64_t paged_idle_skip_mixed_active = 0;
     mutable uint64_t paged_idle_safe_swap_candidates = 0;
+    mutable uint64_t paged_cov_idle_owned_blocks = 0;
+    mutable uint64_t paged_cov_in_read_window_blocks = 0;
+    mutable uint64_t paged_cov_not_in_read_window_blocks = 0;
+    mutable uint64_t paged_cov_resident_safe_blocks = 0;
+    mutable uint64_t paged_cov_nonidentity_remapped_blocks = 0;
+    mutable uint64_t paged_cov_idle_owned_bytes = 0;
+    mutable uint64_t paged_cov_in_read_window_bytes = 0;
+    mutable uint64_t paged_cov_resident_safe_bytes = 0;
+    mutable uint64_t paged_cov_nonidentity_remapped_bytes = 0;
     bool     paged_idle_swap_requested = false;
     bool     paged_idle_swap_madvise_requested = false;
     mutable bool     paged_idle_swap_enabled = false;
