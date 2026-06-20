@@ -199,6 +199,7 @@ int main(int argc, char ** argv) {
     const char * prefetch_auto_every_tokens_env = std::getenv("LLAMA_KV_PAGED_PREFETCH_AUTO_EVERY_TOKENS");
     const char * prefetch_auto_blocks_per_step_env = std::getenv("LLAMA_KV_PAGED_PREFETCH_AUTO_BLOCKS_PER_STEP");
     const char * prefetch_auto_safety_tokens_env = std::getenv("LLAMA_KV_PAGED_PREFETCH_AUTO_SAFETY_TOKENS");
+    const char * resume_pending_token_env = std::getenv("LLAMA_KV_PAGED_RESUME_PENDING_TOKEN");
     if (const char * env = std::getenv("LLAMA_KV_PAGED_PREFETCH_AFTER_ACTIVE_TOKENS")) {
         prefetch_after_active_tokens = std::atoi(env);
     }
@@ -220,15 +221,21 @@ int main(int argc, char ** argv) {
     prefetch_auto_every_tokens = std::max<int32_t>(1, prefetch_auto_every_tokens);
     prefetch_auto_blocks_per_step = std::max<int32_t>(1, prefetch_auto_blocks_per_step);
     prefetch_auto_safety_tokens = std::max<int32_t>(0, prefetch_auto_safety_tokens);
+    const int32_t resume_pending_token = resume_pending_token_env ? std::atoi(resume_pending_token_env) : 0;
     int32_t prefetch_auto_active_total_tokens = 0;
     uint64_t prefetch_auto_remaining_blocks = 0;
     uint64_t prefetch_auto_need_steps = 0;
     int32_t prefetch_auto_start_token = 0;
     int32_t prefetch_auto_window_ok = 1;
+    int32_t resume_pending_started = 0;
+    int32_t active_window_remaining = 0;
+    int32_t effective_start_token = 0;
+    int32_t resume_pending_window_ok = 1;
     double prefetch_ms = 0.0;
     int32_t prefetch_blocks = 0;
     int32_t prefetch_during_active_calls = 0;
     int32_t prefetch_during_active_blocks = 0;
+    int32_t prefetch_protect_enabled = 0;
     double prefetch_during_active_ms_total = 0.0;
     double prefetch_during_active_ms_max = 0.0;
     uint64_t prefetch_remaining_blocks_before_resume = 0;
@@ -299,13 +306,20 @@ int main(int argc, char ** argv) {
     }
     seq1_prefill_ms = elapsed_ms(seq1_prefill_t0, perf_clock::now());
 
-    bool prefetch_during_active_schedule_enabled = prefetch_during_active;
-    if (prefetch_during_active && prefetch_auto_delayed) {
+    bool prefetch_during_active_schedule_enabled = prefetch_during_active && !prefetch_auto_delayed;
+    const auto start_resume_pending = [&]() -> bool {
+        if (resume_pending_started) {
+            return true;
+        }
+
+        resume_pending_started = 1;
+        llama_kv_cache_set_seq_prefetch_protected(llama_get_memory(ctx), 0, true);
+        prefetch_protect_enabled = 1;
+
         const int32_t prefetch_auto_probe_blocks = llama_memory_prefetch_seq_step(llama_get_memory(ctx), 0, 0);
         if (prefetch_auto_probe_blocks < 0) {
             fprintf(stderr, "%s: llama_memory_prefetch_seq_step() auto probe failed for seq0\n", __func__);
-            cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
-            return 1;
+            return false;
         }
 
         uint64_t prefetch_auto_owned_blocks = 0;
@@ -323,37 +337,54 @@ int main(int argc, char ** argv) {
                 &prefetch_auto_failures);
 
         prefetch_auto_active_total_tokens = n_decode;
+        active_window_remaining = std::max<int32_t>(0, n_decode - resume_pending_token);
         if (prefetch_auto_remaining_blocks == 0) {
             prefetch_auto_need_steps = 0;
-            prefetch_auto_start_token = prefetch_auto_active_total_tokens;
+            effective_start_token = resume_pending_token;
+            prefetch_auto_start_token = effective_start_token;
             prefetch_auto_window_ok = 1;
+            resume_pending_window_ok = 1;
             prefetch_during_active_schedule_enabled = false;
         } else {
             prefetch_auto_need_steps =
                 (prefetch_auto_remaining_blocks + (uint64_t) prefetch_auto_blocks_per_step - 1) /
                 (uint64_t) prefetch_auto_blocks_per_step;
-            int64_t auto_start_token =
-                (int64_t) prefetch_auto_active_total_tokens -
-                (int64_t) (prefetch_auto_need_steps - 1) * (int64_t) prefetch_auto_every_tokens -
+            const int64_t need_span =
+                (int64_t) (prefetch_auto_need_steps - 1) * (int64_t) prefetch_auto_every_tokens +
                 (int64_t) prefetch_auto_safety_tokens;
-            if (auto_start_token < 0) {
-                auto_start_token = 0;
-                prefetch_auto_window_ok = 0;
-            } else {
+            if (need_span <= (int64_t) active_window_remaining) {
+                effective_start_token =
+                    resume_pending_token + (active_window_remaining - (int32_t) need_span);
                 prefetch_auto_window_ok = 1;
+                resume_pending_window_ok = 1;
+            } else {
+                effective_start_token = resume_pending_token;
+                prefetch_auto_window_ok = 0;
+                resume_pending_window_ok = 0;
             }
-            prefetch_auto_start_token = (int32_t) auto_start_token;
+            prefetch_auto_start_token = effective_start_token;
+            prefetch_during_active_schedule_enabled = true;
         }
 
         prefetch_after_active_tokens = prefetch_auto_start_token;
         prefetch_every_tokens = prefetch_auto_every_tokens;
         prefetch_blocks_per_step = prefetch_auto_blocks_per_step;
+
+        return true;
+    };
+
+    if (prefetch_during_active && prefetch_auto_delayed &&
+            resume_pending_token == 0 &&
+            !start_resume_pending()) {
+        cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
+        return 1;
     }
 
     // Stage 6C-1A: while interleaving prefetch for seq0 during seq1 active decode, mark seq0
     // resume-pending so the idle swap-out gate does not re-evict the blocks we just prefetched.
-    if (prefetch_during_active) {
+    if (prefetch_during_active && !prefetch_auto_delayed) {
         llama_kv_cache_set_seq_prefetch_protected(llama_get_memory(ctx), 0, true);
+        prefetch_protect_enabled = 1;
     }
 
     std::string seq1_generated;
@@ -380,7 +411,16 @@ int main(int argc, char ** argv) {
         }
 
         const int32_t seq1_decoded_done = seq1_decoded + 1;
+        if (prefetch_during_active && prefetch_auto_delayed &&
+                resume_pending_token > 0 &&
+                seq1_decoded_done >= resume_pending_token &&
+                !start_resume_pending()) {
+            cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
+            return 1;
+        }
+
         if (prefetch_during_active_schedule_enabled &&
+                (!prefetch_auto_delayed || resume_pending_started) &&
                 seq1_decoded_done >= prefetch_after_active_tokens &&
                 ((seq1_decoded_done - prefetch_after_active_tokens) % prefetch_every_tokens) == 0) {
             if (prefetch_during_active_calls == 0) {
@@ -458,6 +498,7 @@ int main(int argc, char ** argv) {
     const int32_t prefetch_auto_completed =
         prefetch_remaining_blocks_before_resume == 0 ? 1 : 0;
     const uint64_t prefetch_auto_fallback_blocks = prefetch_remaining_blocks_before_resume;
+    const uint64_t resume_pending_fallback_blocks = prefetch_remaining_blocks_before_resume;
 
     rss_before_resume_kb = current_rss_kb();
     const auto seq0_resume_total_t0 = perf_clock::now();
@@ -490,7 +531,7 @@ int main(int argc, char ** argv) {
 
     // Stage 6C-1A: seq0 has resumed; drop the resume-pending protection so the default idle
     // swap-out policy applies again to seq0-owned blocks.
-    if (prefetch_during_active) {
+    if (prefetch_protect_enabled) {
         llama_kv_cache_set_seq_prefetch_protected(llama_get_memory(ctx), 0, false);
     }
 
@@ -536,6 +577,9 @@ int main(int argc, char ** argv) {
             "prefetch_auto_blocks_per_step=%d prefetch_auto_safety_tokens=%d "
             "prefetch_auto_window_ok=%d prefetch_auto_started=%d "
             "prefetch_auto_completed=%d prefetch_auto_fallback_blocks=%llu "
+            "resume_pending_token=%d resume_pending_started=%d "
+            "active_window_remaining=%d effective_start_token=%d "
+            "resume_pending_window_ok=%d resume_pending_fallback_blocks=%llu "
             "rss_before_active_prefetch_kb=%llu rss_after_active_prefetch_kb=%llu "
             "rss_before_prefetch_kb=%llu rss_after_prefetch_kb=%llu "
             "rss_before_resume_kb=%llu rss_after_resume_kb=%llu\n",
@@ -547,7 +591,7 @@ int main(int argc, char ** argv) {
             prefetch_enabled ? 1 : 0, prefetch_ms, prefetch_blocks,
             prefetch_during_active ? 1 : 0,
             prefetch_during_active_calls,
-            prefetch_during_active ? 1 : 0,
+            prefetch_protect_enabled,
             prefetch_during_active_blocks,
             prefetch_during_active_ms_total,
             prefetch_during_active_ms_max,
@@ -570,6 +614,12 @@ int main(int argc, char ** argv) {
             prefetch_auto_delayed && prefetch_during_active_calls > 0 ? 1 : 0,
             prefetch_auto_completed,
             (unsigned long long) prefetch_auto_fallback_blocks,
+            resume_pending_token,
+            resume_pending_started,
+            active_window_remaining,
+            effective_start_token,
+            resume_pending_window_ok,
+            (unsigned long long) resume_pending_fallback_blocks,
             (unsigned long long) rss_before_active_prefetch_kb,
             (unsigned long long) rss_after_active_prefetch_kb,
             (unsigned long long) rss_before_prefetch_kb,
