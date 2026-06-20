@@ -173,6 +173,34 @@ int main(int argc, char ** argv) {
     params.sampling.backend_sampling = false;
 
     const int n_decode = params.n_predict < 0 ? 32 : params.n_predict;
+    const llama_seq_id active_seq = 1;
+
+    const char * num_idle_seqs_env = std::getenv("LLAMA_KV_IDLE_NUM_IDLE_SEQS");
+    int32_t num_idle_seqs_requested = num_idle_seqs_env ? std::atoi(num_idle_seqs_env) : 1;
+    num_idle_seqs_requested = std::max<int32_t>(1, num_idle_seqs_requested);
+    const int32_t max_idle_seqs = std::max<int32_t>(1, params.n_parallel - 1);
+    const int32_t num_idle_seqs = std::min<int32_t>(num_idle_seqs_requested, max_idle_seqs);
+    if (num_idle_seqs_requested != num_idle_seqs) {
+        fprintf(stderr,
+                "KV_IDLE_SWAP_RESUME_MULTI_IDLE_CLAMP requested_num_idle_seqs=%d "
+                "num_idle_seqs=%d n_parallel=%d\n",
+                num_idle_seqs_requested, num_idle_seqs, params.n_parallel);
+    }
+
+    std::vector<llama_seq_id> idle_seqs;
+    idle_seqs.reserve(num_idle_seqs);
+    idle_seqs.push_back(0);
+    for (int32_t i = 1; i < num_idle_seqs; ++i) {
+        idle_seqs.push_back((llama_seq_id) (i + 1));
+    }
+
+    std::string idle_seqs_csv;
+    for (size_t i = 0; i < idle_seqs.size(); ++i) {
+        if (!idle_seqs_csv.empty()) {
+            idle_seqs_csv += ",";
+        }
+        idle_seqs_csv += std::to_string(idle_seqs[i]);
+    }
 
     llama_backend_init();
     llama_numa_init(params.numa);
@@ -214,16 +242,15 @@ int main(int argc, char ** argv) {
 
     llama_context_params ctx_params = common_context_params_to_llama(params);
     const int32_t n_kv_req =
-        (int32_t) idle_tokens.size() +
+        num_idle_seqs * ((int32_t) idle_tokens.size() + seq0_warmup) +
         (int32_t) active_tokens.size() +
-        seq0_warmup +
         2 * n_decode +
         32;
     const size_t max_prompt_tokens = std::max(idle_tokens.size(), active_tokens.size());
     ctx_params.n_ctx     = std::max<int32_t>(ctx_params.n_ctx, n_kv_req);
     ctx_params.n_batch   = std::max<int32_t>(ctx_params.n_batch,  (int32_t) max_prompt_tokens);
     ctx_params.n_ubatch  = std::max<int32_t>(ctx_params.n_ubatch, (int32_t) max_prompt_tokens);
-    ctx_params.n_seq_max = std::max<uint32_t>(ctx_params.n_seq_max, 2);
+    ctx_params.n_seq_max = std::max<uint32_t>(ctx_params.n_seq_max, (uint32_t) params.n_parallel);
     ctx_params.kv_unified = true;
 
     llama_context * ctx = llama_init_from_model(model, ctx_params);
@@ -236,7 +263,7 @@ int main(int argc, char ** argv) {
 
     common_sampler * seq0_smpl = common_sampler_init(model, params.sampling);
     common_sampler * seq1_smpl = common_sampler_init(model, params.sampling);
-    llama_batch batch = llama_batch_init((int32_t) max_prompt_tokens, 0, 2);
+    llama_batch batch = llama_batch_init((int32_t) max_prompt_tokens, 0, (int32_t) ctx_params.n_seq_max);
 
     const auto total_t0 = perf_clock::now();
     double seq0_prefill_ms = 0.0;
@@ -314,51 +341,88 @@ int main(int argc, char ** argv) {
     uint64_t prefetch_released_blocks = 0;
     uint64_t prefetch_invalid_cells = 0;
     uint64_t prefetch_failures = 0;
-
-    common_batch_clear(batch);
-    for (size_t i = 0; i < idle_tokens.size(); ++i) {
-        common_batch_add(batch, idle_tokens[i], (llama_pos) i, { 0 }, false);
-    }
-    batch.logits[batch.n_tokens - 1] = true;
-    const auto seq0_prefill_t0 = perf_clock::now();
-    if (!decode_batch(ctx, batch, "seq0-idle-prefill")) {
-        cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
-        return 1;
-    }
-    seq0_prefill_ms = elapsed_ms(seq0_prefill_t0, perf_clock::now());
-
-    const llama_token seq0_resume_first = common_sampler_sample(seq0_smpl, ctx, batch.n_tokens - 1);
-    common_sampler_accept(seq0_smpl, seq0_resume_first, true);
-    if (llama_vocab_is_eog(vocab, seq0_resume_first)) {
-        fprintf(stderr, "%s: seq0 prefill sampled EOG; choose a different prompt/model for this driver\n", __func__);
-        cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
-        return 1;
-    }
-
-    llama_token seq0_warm_token = seq0_resume_first;
-    llama_pos seq0_warm_pos = (llama_pos) idle_tokens.size();
+    llama_token seq0_resume_first = LLAMA_TOKEN_NULL;
+    llama_token seq0_warm_token = LLAMA_TOKEN_NULL;
     int seq0_warmed = 0;
-    for (int w = 0; w < seq0_warmup; ++w) {
-        if (llama_vocab_is_eog(vocab, seq0_warm_token)) {
-            break;
-        }
+
+    const auto warmup_idle_seq = [&](llama_seq_id seq_id) -> bool {
+        common_sampler * smpl = seq_id == 0 ? seq0_smpl : common_sampler_init(model, params.sampling);
+        double prefill_ms = 0.0;
 
         common_batch_clear(batch);
-        common_batch_add(batch, seq0_warm_token, seq0_warm_pos++, { 0 }, true);
+        for (size_t i = 0; i < idle_tokens.size(); ++i) {
+            common_batch_add(batch, idle_tokens[i], (llama_pos) i, { seq_id }, false);
+        }
+        batch.logits[batch.n_tokens - 1] = true;
 
-        if (!decode_batch(ctx, batch, "seq0-idle-warmup")) {
+        const auto prefill_t0 = perf_clock::now();
+        if (!decode_batch(ctx, batch, seq_id == 0 ? "seq0-idle-prefill" : "multi-idle-prefill")) {
+            if (seq_id != 0) {
+                common_sampler_free(smpl);
+            }
+            return false;
+        }
+        prefill_ms = elapsed_ms(prefill_t0, perf_clock::now());
+        if (seq_id == 0) {
+            seq0_prefill_ms = prefill_ms;
+        }
+
+        llama_token warm_token = common_sampler_sample(smpl, ctx, batch.n_tokens - 1);
+        common_sampler_accept(smpl, warm_token, true);
+        if (llama_vocab_is_eog(vocab, warm_token)) {
+            fprintf(stderr,
+                    "%s: seq%d prefill sampled EOG; choose a different prompt/model for this driver\n",
+                    __func__, (int) seq_id);
+            if (seq_id != 0) {
+                common_sampler_free(smpl);
+            }
+            return false;
+        }
+        const llama_token first_token = warm_token;
+
+        llama_pos warm_pos = (llama_pos) idle_tokens.size();
+        int warmed = 0;
+        for (int w = 0; w < seq0_warmup; ++w) {
+            if (llama_vocab_is_eog(vocab, warm_token)) {
+                break;
+            }
+
+            common_batch_clear(batch);
+            common_batch_add(batch, warm_token, warm_pos++, { seq_id }, true);
+
+            if (!decode_batch(ctx, batch, seq_id == 0 ? "seq0-idle-warmup" : "multi-idle-warmup")) {
+                if (seq_id != 0) {
+                    common_sampler_free(smpl);
+                }
+                return false;
+            }
+
+            warmed += 1;
+            warm_token = common_sampler_sample(smpl, ctx, batch.n_tokens - 1);
+            common_sampler_accept(smpl, warm_token, true);
+        }
+
+        if (seq_id == 0) {
+            seq0_resume_first = first_token;
+            seq0_warm_token = warm_token;
+            seq0_warmed = warmed;
+        } else {
+            common_sampler_free(smpl);
+        }
+
+        return true;
+    };
+
+    for (llama_seq_id idle_seq : idle_seqs) {
+        if (!warmup_idle_seq(idle_seq)) {
             cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
             return 1;
         }
-
-        seq0_warmed += 1;
-        seq0_warm_token = common_sampler_sample(seq0_smpl, ctx, batch.n_tokens - 1);
-        common_sampler_accept(seq0_smpl, seq0_warm_token, true);
     }
 
     common_batch_clear(batch);
     for (size_t i = 0; i < active_tokens.size(); ++i) {
-        common_batch_add(batch, active_tokens[i], (llama_pos) i, { 1 }, false);
+        common_batch_add(batch, active_tokens[i], (llama_pos) i, { active_seq }, false);
     }
     batch.logits[batch.n_tokens - 1] = true;
     const auto seq1_active_t0 = perf_clock::now();
@@ -467,7 +531,7 @@ int main(int argc, char ** argv) {
         seq1_generated += common_token_to_piece(ctx, token);
 
         common_batch_clear(batch);
-        common_batch_add(batch, token, seq1_pos++, { 1 }, true);
+        common_batch_add(batch, token, seq1_pos++, { active_seq }, true);
         sample_idx = batch.n_tokens - 1;
 
         if (!decode_batch(ctx, batch, "seq1-active-decode")) {
@@ -616,7 +680,10 @@ int main(int argc, char ** argv) {
     }
 
     printf("idle_seq=0\n");
-    printf("active_seq=1\n");
+    printf("active_seq=%d\n", (int) active_seq);
+    printf("multi_idle_enabled=%d\n", num_idle_seqs > 1 ? 1 : 0);
+    printf("num_idle_seqs=%d\n", num_idle_seqs);
+    printf("idle_seqs=%s\n", idle_seqs_csv.c_str());
     printf("idle_prompt_tokens=%zu\n", idle_tokens.size());
     printf("active_prompt_tokens=%zu\n", active_tokens.size());
     printf("seq1_decoded_tokens=%d\n", seq1_decoded);
@@ -639,6 +706,7 @@ int main(int argc, char ** argv) {
 
     fprintf(stderr,
             "KV_IDLE_SWAP_RESUME_PERF total_wall_ms=%.3f seq1_active_ms=%.3f "
+            "multi_idle_enabled=%d num_idle_seqs=%d active_seq=%d idle_seqs=%s "
             "seq0_resume_first_token_ms=%.3f seq0_resume_total_ms=%.3f "
             "seq1_active_tokens=%d seq0_resume_tokens=%d total_measured_tokens=%d "
             "tokens_per_second=%.6f seq0_prefill_ms=%.3f seq1_prefill_ms=%.3f "
@@ -665,6 +733,10 @@ int main(int argc, char ** argv) {
             "rss_before_prefetch_kb=%llu rss_after_prefetch_kb=%llu "
             "rss_before_resume_kb=%llu rss_after_resume_kb=%llu\n",
             total_wall_ms, seq1_active_ms,
+            num_idle_seqs > 1 ? 1 : 0,
+            num_idle_seqs,
+            (int) active_seq,
+            idle_seqs_csv.c_str(),
             seq0_resume_first_token_ms, seq0_resume_total_ms,
             seq1_active_tokens, seq0_resume_tokens, total_measured_tokens,
             tokens_per_second, seq0_prefill_ms, seq1_prefill_ms,
