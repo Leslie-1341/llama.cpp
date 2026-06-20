@@ -193,6 +193,12 @@ int main(int argc, char ** argv) {
     int32_t prefetch_after_active_tokens = 64;
     int32_t prefetch_every_tokens = 8;
     int32_t prefetch_blocks_per_step = 1;
+    const char * prefetch_auto_delayed_env = std::getenv("LLAMA_KV_PAGED_PREFETCH_AUTO_DELAYED");
+    const bool prefetch_auto_delayed =
+        prefetch_auto_delayed_env != nullptr && std::atoi(prefetch_auto_delayed_env) != 0;
+    const char * prefetch_auto_every_tokens_env = std::getenv("LLAMA_KV_PAGED_PREFETCH_AUTO_EVERY_TOKENS");
+    const char * prefetch_auto_blocks_per_step_env = std::getenv("LLAMA_KV_PAGED_PREFETCH_AUTO_BLOCKS_PER_STEP");
+    const char * prefetch_auto_safety_tokens_env = std::getenv("LLAMA_KV_PAGED_PREFETCH_AUTO_SAFETY_TOKENS");
     if (const char * env = std::getenv("LLAMA_KV_PAGED_PREFETCH_AFTER_ACTIVE_TOKENS")) {
         prefetch_after_active_tokens = std::atoi(env);
     }
@@ -205,6 +211,20 @@ int main(int argc, char ** argv) {
     prefetch_after_active_tokens = std::max<int32_t>(0, prefetch_after_active_tokens);
     prefetch_every_tokens = std::max<int32_t>(1, prefetch_every_tokens);
     prefetch_blocks_per_step = std::max<int32_t>(1, prefetch_blocks_per_step);
+    int32_t prefetch_auto_every_tokens = prefetch_auto_every_tokens_env ?
+        std::atoi(prefetch_auto_every_tokens_env) : prefetch_every_tokens;
+    int32_t prefetch_auto_blocks_per_step = prefetch_auto_blocks_per_step_env ?
+        std::atoi(prefetch_auto_blocks_per_step_env) : prefetch_blocks_per_step;
+    int32_t prefetch_auto_safety_tokens = prefetch_auto_safety_tokens_env ?
+        std::atoi(prefetch_auto_safety_tokens_env) : 0;
+    prefetch_auto_every_tokens = std::max<int32_t>(1, prefetch_auto_every_tokens);
+    prefetch_auto_blocks_per_step = std::max<int32_t>(1, prefetch_auto_blocks_per_step);
+    prefetch_auto_safety_tokens = std::max<int32_t>(0, prefetch_auto_safety_tokens);
+    int32_t prefetch_auto_active_total_tokens = 0;
+    uint64_t prefetch_auto_remaining_blocks = 0;
+    uint64_t prefetch_auto_need_steps = 0;
+    int32_t prefetch_auto_start_token = 0;
+    int32_t prefetch_auto_window_ok = 1;
     double prefetch_ms = 0.0;
     int32_t prefetch_blocks = 0;
     int32_t prefetch_during_active_calls = 0;
@@ -279,6 +299,57 @@ int main(int argc, char ** argv) {
     }
     seq1_prefill_ms = elapsed_ms(seq1_prefill_t0, perf_clock::now());
 
+    bool prefetch_during_active_schedule_enabled = prefetch_during_active;
+    if (prefetch_during_active && prefetch_auto_delayed) {
+        const int32_t prefetch_auto_probe_blocks = llama_memory_prefetch_seq_step(llama_get_memory(ctx), 0, 0);
+        if (prefetch_auto_probe_blocks < 0) {
+            fprintf(stderr, "%s: llama_memory_prefetch_seq_step() auto probe failed for seq0\n", __func__);
+            cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
+            return 1;
+        }
+
+        uint64_t prefetch_auto_owned_blocks = 0;
+        uint64_t prefetch_auto_resident_blocks = 0;
+        uint64_t prefetch_auto_released_blocks = 0;
+        uint64_t prefetch_auto_invalid_cells = 0;
+        uint64_t prefetch_auto_failures = 0;
+        llama_kv_cache_prefetch_seq_last_stats(
+                llama_get_memory(ctx),
+                &prefetch_auto_owned_blocks,
+                &prefetch_auto_remaining_blocks,
+                &prefetch_auto_resident_blocks,
+                &prefetch_auto_released_blocks,
+                &prefetch_auto_invalid_cells,
+                &prefetch_auto_failures);
+
+        prefetch_auto_active_total_tokens = n_decode;
+        if (prefetch_auto_remaining_blocks == 0) {
+            prefetch_auto_need_steps = 0;
+            prefetch_auto_start_token = prefetch_auto_active_total_tokens;
+            prefetch_auto_window_ok = 1;
+            prefetch_during_active_schedule_enabled = false;
+        } else {
+            prefetch_auto_need_steps =
+                (prefetch_auto_remaining_blocks + (uint64_t) prefetch_auto_blocks_per_step - 1) /
+                (uint64_t) prefetch_auto_blocks_per_step;
+            int64_t auto_start_token =
+                (int64_t) prefetch_auto_active_total_tokens -
+                (int64_t) (prefetch_auto_need_steps - 1) * (int64_t) prefetch_auto_every_tokens -
+                (int64_t) prefetch_auto_safety_tokens;
+            if (auto_start_token < 0) {
+                auto_start_token = 0;
+                prefetch_auto_window_ok = 0;
+            } else {
+                prefetch_auto_window_ok = 1;
+            }
+            prefetch_auto_start_token = (int32_t) auto_start_token;
+        }
+
+        prefetch_after_active_tokens = prefetch_auto_start_token;
+        prefetch_every_tokens = prefetch_auto_every_tokens;
+        prefetch_blocks_per_step = prefetch_auto_blocks_per_step;
+    }
+
     // Stage 6C-1A: while interleaving prefetch for seq0 during seq1 active decode, mark seq0
     // resume-pending so the idle swap-out gate does not re-evict the blocks we just prefetched.
     if (prefetch_during_active) {
@@ -309,7 +380,7 @@ int main(int argc, char ** argv) {
         }
 
         const int32_t seq1_decoded_done = seq1_decoded + 1;
-        if (prefetch_during_active &&
+        if (prefetch_during_active_schedule_enabled &&
                 seq1_decoded_done >= prefetch_after_active_tokens &&
                 ((seq1_decoded_done - prefetch_after_active_tokens) % prefetch_every_tokens) == 0) {
             if (prefetch_during_active_calls == 0) {
@@ -384,6 +455,9 @@ int main(int argc, char ** argv) {
     } else {
         rss_after_prefetch_kb = rss_before_prefetch_kb;
     }
+    const int32_t prefetch_auto_completed =
+        prefetch_remaining_blocks_before_resume == 0 ? 1 : 0;
+    const uint64_t prefetch_auto_fallback_blocks = prefetch_remaining_blocks_before_resume;
 
     rss_before_resume_kb = current_rss_kb();
     const auto seq0_resume_total_t0 = perf_clock::now();
@@ -456,6 +530,12 @@ int main(int argc, char ** argv) {
             "prefetch_owned_blocks=%llu prefetch_swapped_blocks=%llu "
             "prefetch_resident_blocks=%llu prefetch_released_blocks=%llu "
             "prefetch_invalid_cells=%llu prefetch_failures=%llu "
+            "prefetch_auto_enabled=%d prefetch_auto_active_total_tokens=%d "
+            "prefetch_auto_remaining_blocks=%llu prefetch_auto_need_steps=%llu "
+            "prefetch_auto_start_token=%d prefetch_auto_every_tokens=%d "
+            "prefetch_auto_blocks_per_step=%d prefetch_auto_safety_tokens=%d "
+            "prefetch_auto_window_ok=%d prefetch_auto_started=%d "
+            "prefetch_auto_completed=%d prefetch_auto_fallback_blocks=%llu "
             "rss_before_active_prefetch_kb=%llu rss_after_active_prefetch_kb=%llu "
             "rss_before_prefetch_kb=%llu rss_after_prefetch_kb=%llu "
             "rss_before_resume_kb=%llu rss_after_resume_kb=%llu\n",
@@ -478,6 +558,18 @@ int main(int argc, char ** argv) {
             (unsigned long long) prefetch_released_blocks,
             (unsigned long long) prefetch_invalid_cells,
             (unsigned long long) prefetch_failures,
+            prefetch_auto_delayed ? 1 : 0,
+            prefetch_auto_active_total_tokens,
+            (unsigned long long) prefetch_auto_remaining_blocks,
+            (unsigned long long) prefetch_auto_need_steps,
+            prefetch_auto_start_token,
+            prefetch_auto_every_tokens,
+            prefetch_auto_blocks_per_step,
+            prefetch_auto_safety_tokens,
+            prefetch_auto_window_ok,
+            prefetch_auto_delayed && prefetch_during_active_calls > 0 ? 1 : 0,
+            prefetch_auto_completed,
+            (unsigned long long) prefetch_auto_fallback_blocks,
             (unsigned long long) rss_before_active_prefetch_kb,
             (unsigned long long) rss_after_active_prefetch_kb,
             (unsigned long long) rss_before_prefetch_kb,
