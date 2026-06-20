@@ -768,6 +768,12 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
+    // Prefetch sequence-owned memory, if supported by the memory backend.
+    // Returns the number of prefetched blocks, 0 for unsupported backends, or a negative value on failure.
+    LLAMA_API int32_t llama_memory_prefetch_seq(
+            llama_memory_t mem,
+              llama_seq_id seq_id);
+
     //
     // State / sessions
     //

@@ -256,6 +256,15 @@ public:
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
+    int32_t prefetch_seq(llama_seq_id seq_id) override;
+    void prefetch_seq_last_stats(
+            uint64_t & owned_blocks,
+            uint64_t & swapped_blocks,
+            uint64_t & resident_blocks,
+            uint64_t & released_blocks,
+            uint64_t & invalid_cells,
+            uint64_t & failures) const;
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
     // state write/load
@@ -574,6 +583,18 @@ private:
     mutable bool     paged_swap_rss_before_first_set = false;
     mutable uint64_t paged_swap_rss_total_drop_kb = 0;
     mutable uint64_t paged_swap_rss_drop_sum_kb = 0;
+    mutable uint64_t paged_prefetch_seq_calls = 0;
+    mutable uint64_t paged_prefetch_seq_blocks = 0;
+    mutable uint64_t paged_prefetch_seq_bytes = 0;
+    mutable uint64_t paged_prefetch_seq_skip_resident = 0;
+    mutable uint64_t paged_prefetch_seq_skip_released = 0;
+    mutable uint64_t paged_prefetch_seq_failures = 0;
+    mutable uint64_t paged_prefetch_seq_last_owned_blocks = 0;
+    mutable uint64_t paged_prefetch_seq_last_swapped_blocks = 0;
+    mutable uint64_t paged_prefetch_seq_last_resident_blocks = 0;
+    mutable uint64_t paged_prefetch_seq_last_released_blocks = 0;
+    mutable uint64_t paged_prefetch_seq_last_invalid_cells = 0;
+    mutable uint64_t paged_prefetch_seq_last_failures = 0;
 
     // Stage 5E-1: read-only KV resident page telemetry via mincore(2). Off unless
     // LLAMA_KV_PAGED_MINCORE=1 (Linux + CPU + kv_paged_enabled && !v_trans && n_stream==1).

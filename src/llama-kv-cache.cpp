@@ -1142,6 +1142,130 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
     return cells.seq_pos_max(seq_id);
 }
 
+int32_t llama_kv_cache::prefetch_seq(llama_seq_id seq_id) {
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    paged_prefetch_seq_last_owned_blocks = 0;
+    paged_prefetch_seq_last_swapped_blocks = 0;
+    paged_prefetch_seq_last_resident_blocks = 0;
+    paged_prefetch_seq_last_released_blocks = 0;
+    paged_prefetch_seq_last_invalid_cells = 0;
+    paged_prefetch_seq_last_failures = 0;
+
+    if (!kv_paged_enabled) {
+        return 0;
+    }
+
+    paged_prefetch_seq_calls += 1;
+
+    if (!paged_swap_enabled) {
+        return 0;
+    }
+    if (!kv_swap_store || v_trans || n_stream != 1 || paged_block_size == 0 || paged_n_blocks == 0 ||
+            v_cells.empty() || paged_block_states.size() != paged_n_blocks) {
+        paged_prefetch_seq_last_failures += 1;
+        paged_prefetch_seq_failures += 1;
+        return -1;
+    }
+
+    const auto & cells = v_cells[0];
+    std::set<uint32_t> blocks;
+    for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+        if (!cells.seq_has(cell, seq_id)) {
+            continue;
+        }
+
+        const uint32_t phys_cell = paged_resolve(cell);
+        if (phys_cell == PAGED_BLOCK_INVALID) {
+            paged_prefetch_seq_last_invalid_cells += 1;
+            continue;
+        }
+
+        const uint32_t physical_block = phys_cell / paged_block_size;
+        if (physical_block < paged_n_blocks) {
+            blocks.insert(physical_block);
+        }
+    }
+    paged_prefetch_seq_last_owned_blocks = blocks.size();
+
+    uint64_t bytes_per_cell = 0;
+    for (const auto & layer : layers) {
+        if (!layer.k_stream.empty() && layer.k_stream[0]) {
+            bytes_per_cell += layer.k_stream[0]->nb[1];
+        }
+        if (layer.v && !layer.v_stream.empty() && layer.v_stream[0]) {
+            bytes_per_cell += layer.v_stream[0]->nb[1];
+        }
+    }
+
+    int32_t n_prefetched = 0;
+    for (const uint32_t physical_block : blocks) {
+        const paged_block_state state = paged_block_states[physical_block];
+        if (state == paged_block_state::SWAPPED) {
+            paged_prefetch_seq_last_swapped_blocks += 1;
+            if (!paged_swap_in_block(physical_block)) {
+                paged_prefetch_seq_last_failures += 1;
+                paged_prefetch_seq_failures += 1;
+                return -1;
+            }
+            n_prefetched += 1;
+            paged_prefetch_seq_blocks += 1;
+            const uint32_t begin = physical_block * paged_block_size;
+            const uint32_t end = std::min<uint32_t>(begin + paged_block_size, paged_kv_size);
+            paged_prefetch_seq_bytes += bytes_per_cell * (end - begin);
+        } else if (state == paged_block_state::RESIDENT) {
+            paged_prefetch_seq_last_resident_blocks += 1;
+            paged_prefetch_seq_skip_resident += 1;
+        } else if (state == paged_block_state::RELEASED) {
+            paged_prefetch_seq_last_released_blocks += 1;
+            paged_prefetch_seq_skip_released += 1;
+        } else {
+            paged_prefetch_seq_last_failures += 1;
+        }
+    }
+
+    return n_prefetched;
+}
+
+void llama_kv_cache::prefetch_seq_last_stats(
+        uint64_t & owned_blocks,
+        uint64_t & swapped_blocks,
+        uint64_t & resident_blocks,
+        uint64_t & released_blocks,
+        uint64_t & invalid_cells,
+        uint64_t & failures) const {
+    owned_blocks    = paged_prefetch_seq_last_owned_blocks;
+    swapped_blocks  = paged_prefetch_seq_last_swapped_blocks;
+    resident_blocks = paged_prefetch_seq_last_resident_blocks;
+    released_blocks = paged_prefetch_seq_last_released_blocks;
+    invalid_cells   = paged_prefetch_seq_last_invalid_cells;
+    failures        = paged_prefetch_seq_last_failures;
+}
+
+extern "C" bool llama_kv_cache_prefetch_seq_last_stats(
+        llama_memory_t mem,
+        uint64_t * owned_blocks,
+        uint64_t * swapped_blocks,
+        uint64_t * resident_blocks,
+        uint64_t * released_blocks,
+        uint64_t * invalid_cells,
+        uint64_t * failures) {
+    auto * kv = dynamic_cast<llama_kv_cache *>(mem);
+    if (!kv || !owned_blocks || !swapped_blocks || !resident_blocks ||
+            !released_blocks || !invalid_cells || !failures) {
+        return false;
+    }
+
+    kv->prefetch_seq_last_stats(
+            *owned_blocks,
+            *swapped_blocks,
+            *resident_blocks,
+            *released_blocks,
+            *invalid_cells,
+            *failures);
+    return true;
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [ctx, buf] : ctxs_bufs) {
@@ -2514,6 +2638,9 @@ void llama_kv_cache::paged_log_stats() const {
             "paged_swap_rss_after_last_kb=%llu paged_swap_rss_drop_last_kb=%llu "
             "paged_swap_rss_drop_max_kb=%llu paged_swap_rss_before_first_kb=%llu "
             "paged_swap_rss_total_drop_kb=%llu paged_swap_rss_drop_sum_kb=%llu "
+            "paged_prefetch_seq_calls=%llu paged_prefetch_seq_blocks=%llu "
+            "paged_prefetch_seq_bytes=%llu paged_prefetch_seq_skip_resident=%llu "
+            "paged_prefetch_seq_skip_released=%llu paged_prefetch_seq_failures=%llu "
             "kv_mincore_enabled=%d kv_mincore_sample_calls=%llu kv_mincore_failures=%llu "
             "kv_mincore_total_bytes=%llu kv_mincore_resident_bytes=%llu "
             "kv_mincore_total_pages=%llu kv_mincore_resident_pages=%llu "
@@ -2642,6 +2769,12 @@ void llama_kv_cache::paged_log_stats() const {
             (unsigned long long) paged_swap_rss_before_first_kb,
             (unsigned long long) paged_swap_rss_total_drop_kb,
             (unsigned long long) paged_swap_rss_drop_sum_kb,
+            (unsigned long long) paged_prefetch_seq_calls,
+            (unsigned long long) paged_prefetch_seq_blocks,
+            (unsigned long long) paged_prefetch_seq_bytes,
+            (unsigned long long) paged_prefetch_seq_skip_resident,
+            (unsigned long long) paged_prefetch_seq_skip_released,
+            (unsigned long long) paged_prefetch_seq_failures,
             paged_mincore_enabled ? 1 : 0,
             (unsigned long long) paged_mincore_sample_calls,
             (unsigned long long) paged_mincore_failures,
