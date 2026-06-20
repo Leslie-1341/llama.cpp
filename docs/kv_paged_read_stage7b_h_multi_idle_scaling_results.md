@@ -144,7 +144,10 @@ LLAMA_KV_IDLE_NUM_IDLE_SEQS = 1 / 2 / 3
 | net_rss_drop_before_resume_mib |      62.441 MiB |     123.965 MiB |     185.668 MiB |
 | seq1_decoded_tokens            |             128 |             128 |             128 |
 | resume_decoded_tokens          |             128 |             128 |             128 |
-| correctness_status             |         partial |         partial |         partial |
+| seq1_active_equal              |               0 |               0 |               0 |
+| seq0_resume_equal              |               0 |               0 |               0 |
+| base_vs_swap_equal             |               0 |               0 |               0 |
+| correctness_status             |           green |           green |           green |
 | real_abnormal_matches          |               0 |               0 |               0 |
 
 ---
@@ -377,39 +380,65 @@ tokens/s decreases as the controlled multi-idle workload becomes larger, but thi
 
 ---
 
-## 13. Correctness 状态
+## 13. Correctness equality 验证
 
-三组实验均满足：
+Stage 7B-H 初始 matrix 只运行了 swap+madvise 单路径，因此当时 correctness 状态只能标记为 `partial`。随后 Stage 7B-I 通过外部脚本补充了 baseline-vs-swap/madvise 输出等价验证。
 
-```text
-real_abnormal_matches=0
-madvise_failures=0
-seq1_decoded_tokens=128
-resume_decoded_tokens=128
-```
+验证方式为：
 
-但当前仍未产出 token-level equality 字段：
+1. 对每个 `NUM_IDLE_SEQS=1/2/3`，分别运行 baseline 路径和 swap+madvise 路径；
+2. 保持相同模型、相同 seed、相同 prompt、相同 ctx/parallel/warmup、相同 `NUM_IDLE_SEQS`；
+3. 从 stdout 中抽取 `SEQ1_ACTIVE` 和 `SEQ0_RESUME` 定界区块；
+4. 使用 `cmp` 比较 baseline 与 swap+madvise 输出区块。
 
-```text
-base_vs_swap_equal
-seq0_resume_equal
-seq1_active_equal
-```
+验证结果如下：
 
-因此本阶段 correctness 状态只能标记为：
+| workload   | NUM_IDLE_SEQS | seq1_active_equal | seq0_resume_equal | base_vs_swap_equal | seq1_base_tokens | seq1_madv_tokens | seq0_base_tokens | seq0_madv_tokens | base_real_abnormal | madv_real_abnormal | correctness_status |
+| ---------- | ------------: | ----------------: | ----------------: | -----------------: | ---------------: | ---------------: | ---------------: | ---------------: | -----------------: | -----------------: | ------------------ |
+| i_numidle1 |             1 |                 0 |                 0 |                  0 |              128 |              128 |              128 |              128 |                  0 |                  0 | green              |
+| i_numidle2 |             2 |                 0 |                 0 |                  0 |              128 |              128 |              128 |              128 |                  0 |                  0 | green              |
+| i_numidle3 |             3 |                 0 |                 0 |                  0 |              128 |              128 |              128 |              128 |                  0 |                  0 | green              |
 
-```text
-correctness_status=partial
-```
-
-含义是：
+其中：
 
 ```text
-当前没有发现真实异常，decode 数量正常；
-但还没有完成 baseline/token-level equality 验证。
+seq1_active_equal=0
 ```
 
-正式 results 或最终提交前，需要补充 baseline 对照或 token-level diff，不能直接写作 correctness 全绿。
+表示 baseline 与 swap+madvise 路径的 `seq1 active decode` 输出完全一致。
+
+```text
+seq0_resume_equal=0
+```
+
+表示 baseline 与 swap+madvise 路径的 `seq0 resume decode` 输出完全一致。
+
+```text
+base_vs_swap_equal=0
+```
+
+表示抽取后的 `SEQ1_ACTIVE + SEQ0_RESUME` 组合输出完全一致。
+
+因此，Stage 7B-H 的 correctness 状态可以从 `partial` 更新为：
+
+```text
+correctness_status=green
+```
+
+需要说明的是，本次 equality 验证覆盖的是：
+
+```text
+seq1 active decode
+seq0 resume decode
+```
+
+不覆盖：
+
+```text
+seq2 / seq3 resume decode
+```
+
+原因是 Stage 7B-H 的 release-scaling workload 只 resume `seq0`，而 `seq2/seq3` 仅用于扩大 idle-owned KV 规模、触发 swap/madvise 和 RSS release，并未在本阶段被恢复生成。
 
 ---
 
@@ -434,7 +463,31 @@ idle-owned KV 规模可以线性放大；
 当前 block-level idle swap/madvise 机制可以随 idle KV 体量放大 RSS 下降收益。
 ```
 
-同时，`real_abnormal_matches=0`、`madvise_failures=0`，说明 release path 在该 matrix 下运行稳定。
+同时，Stage 7B-I 已经补充 baseline-vs-swap/madvise 输出等价验证：
+
+```text
+seq1_active_equal=0
+seq0_resume_equal=0
+base_vs_swap_equal=0
+```
+
+三组 `NUM_IDLE_SEQS=1/2/3` 均满足：
+
+```text
+seq1_base_tokens=128
+seq1_madv_tokens=128
+seq0_base_tokens=128
+seq0_madv_tokens=128
+base_real_abnormal=0
+madv_real_abnormal=0
+correctness_status=green
+```
+
+因此，本阶段可以表述为：
+
+```text
+在 controlled multi-idle workload 下，block-level idle swap/madvise 能够随 idle seq 数量放大 RSS 下降收益，并保持 seq1 active decode 与 seq0 resume decode 输出等价。
+```
 
 ---
 
@@ -486,14 +539,19 @@ rss_drop≈64 MiB
 
 通过 `NUM_IDLE_SEQS=1/2/3` matrix 证明：多 idle seq 数量增加后，RSS drop 近似线性放大。
 
+### Stage 7B-I
+
+通过外部 baseline-vs-swap/madvise 对照脚本，验证 `seq1 active decode` 与 `seq0 resume decode` 输出等价，三组 `NUM_IDLE_SEQS=1/2/3` 均为 `correctness_status=green`。
+
 ---
 
 ## 16. 当前限制
 
 本阶段仍有三个限制：
 
-1. **correctness 仍是 partial**
-   当前只确认 `real_abnormal=0` 和 decode token 数正常；还没有 baseline/token-level equality。
+1. **correctness equality 的覆盖范围有限**
+   Stage 7B-I 已经验证 `seq1 active decode` 和 `seq0 resume decode` 在 baseline 与 swap+madvise 路径下输出一致，`correctness_status=green`。
+   但当前 workload 只 resume `seq0`，没有 resume `seq2/seq3`，因此 equality 结论不覆盖 `seq2/seq3` 的后续 resume 输出。
 
 2. **workload 是 controlled microbenchmark**
    本阶段人为控制 idle seq 数量和 warmup 长度，用于验证机制 scaling，不应表述为真实生产 trace。
@@ -507,26 +565,7 @@ rss_drop≈64 MiB
 
 建议下一步按以下顺序推进：
 
-### 17.1 补 correctness equality
-
-目标：
-
-```text
-同一模型、同一 seed、同一 prompt、同一 workload 下，
-比较 baseline 与 swap/madvise 路径输出。
-```
-
-需要恢复或新增以下字段：
-
-```text
-base_vs_swap_equal=0
-seq0_resume_equal=0
-seq1_active_equal=0
-```
-
-正式结果前必须补这一项。
-
-### 17.2 运行 3-run median
+### 17.1 运行 3-run median
 
 对 Stage 7B-H matrix 进行 3-run median：
 
@@ -547,11 +586,14 @@ release_ratio_capacity_pct
 resume_first_ms
 tokens_per_second
 real_abnormal_matches
+correctness_status
 ```
 
-### 17.3 可选：all-idle resume 代价评估
+当前 single-run matrix 已经证明 scaling 成立；3-run median 的目标是降低偶然抖动，提高结果可信度。
 
-当前只 resume seq0。后续可以新增实验：
+### 17.2 可选：all-idle resume 代价评估
+
+当前 Stage 7B-H 只 resume `seq0`。后续可以新增实验：
 
 ```text
 依次 resume seq0 / seq2 / seq3
@@ -561,6 +603,35 @@ real_abnormal_matches
 
 ```text
 释放多个 idle seq 后，如果所有 idle seq 都恢复，总恢复代价是多少。
+```
+
+这应作为单独实验，不应与当前 release-scaling matrix 混在一起。
+
+### 17.3 Stage 7D：prefetch trade-off 评估
+
+当前 matrix 使用：
+
+```text
+pressure_mode=high
+```
+
+即不主动 prefetch，优先保留 RSS 下降收益。后续需要比较：
+
+```text
+high:
+  不预取，RSS 保留多，但 resume latency 高。
+
+medium:
+  部分预取，在 RSS 与 latency 之间折中。
+
+low:
+  完整预取，resume latency 低，但 RSS 会提前回升。
+```
+
+该阶段用于回答：
+
+```text
+在获得 RSS 下降收益后，prefetch 能在多大程度上降低 resume latency，以及会吃回多少 RSS 收益。
 ```
 
 ### 17.4 Stage 7C-A：KV footprint / residency audit
@@ -582,9 +653,11 @@ madvise 后实际 RSS drop 达到理论上限的多少？
 ```text
 我们在 llama.cpp 的连续 KV cache 结构上实现了 controlled multi-idle workload，用于验证 block-level idle KV swap/madvise 的可扩展性。
 
-在 ctx=2048、parallel=4、warmup=256 的配置下，idle seq 数量从 1 增加到 3 时，idle-owned blocks 从 17 增至 51，RSS drop 从 63.7 MiB 增至 185.7 MiB，进程 RSS 下降比例从 0.75% 增至 2.20%，且 real_abnormal_matches=0。
+在 ctx=2048、parallel=4、warmup=256 的配置下，idle seq 数量从 1 增加到 3 时，idle-owned blocks 从 17 增至 51，RSS drop 从 63.7 MiB 增至 185.7 MiB，进程 RSS 下降比例从 0.75% 增至 2.20%。
 
-这说明多 idle request 场景下，RSS 下降收益可以随 idle KV 体量近似线性放大。
+同时，我们通过 baseline-vs-swap/madvise 输出对比验证了 seq1 active decode 与 seq0 resume decode 的输出一致性：seq1_active_equal=0，seq0_resume_equal=0，base_vs_swap_equal=0，real_abnormal_matches=0。
+
+这说明在 controlled multi-idle 场景下，RSS 下降收益可以随 idle KV 体量近似线性放大，并且当前验证覆盖的 active/resume 输出保持一致。
 ```
 
 需要避免的表述：
@@ -593,5 +666,6 @@ madvise 后实际 RSS drop 达到理论上限的多少？
 不要说实现了完整 vLLM PagedAttention。
 不要直接对标 vLLM throughput 2-4x。
 不要把 controlled workload 说成真实生产 workload。
-不要在 correctness partial 的情况下写 correctness 全绿。
+不要说已验证所有 idle seq 的 resume correctness；当前只验证了 seq1 active 与 seq0 resume。
+不要把 high-pressure/no-prefetch 下的 tokens/s 当作最终 serving throughput。
 ```
