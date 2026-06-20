@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -61,6 +62,64 @@ static uint64_t current_rss_kb() {
 #else
     return 0;
 #endif
+}
+
+enum class prefetch_pressure_mode {
+    off,
+    low,
+    medium,
+    high,
+};
+
+static const char * prefetch_pressure_mode_name(prefetch_pressure_mode mode) {
+    switch (mode) {
+        case prefetch_pressure_mode::off:
+            return "off";
+        case prefetch_pressure_mode::low:
+            return "low";
+        case prefetch_pressure_mode::medium:
+            return "medium";
+        case prefetch_pressure_mode::high:
+            return "high";
+    }
+
+    return "off";
+}
+
+static prefetch_pressure_mode parse_prefetch_pressure_mode(const char * env) {
+    if (env == nullptr || std::strcmp(env, "off") == 0) {
+        return prefetch_pressure_mode::off;
+    }
+    if (std::strcmp(env, "low") == 0) {
+        return prefetch_pressure_mode::low;
+    }
+    if (std::strcmp(env, "medium") == 0) {
+        return prefetch_pressure_mode::medium;
+    }
+    if (std::strcmp(env, "high") == 0) {
+        return prefetch_pressure_mode::high;
+    }
+
+    fprintf(stderr,
+            "%s: warning: invalid LLAMA_KV_PAGED_PREFETCH_PRESSURE_MODE=%s; using off\n",
+            __func__, env);
+    return prefetch_pressure_mode::off;
+}
+
+static uint64_t clamp_prefetch_target_by_pressure(
+        uint64_t remaining_blocks,
+        prefetch_pressure_mode mode) {
+    switch (mode) {
+        case prefetch_pressure_mode::off:
+        case prefetch_pressure_mode::low:
+            return remaining_blocks;
+        case prefetch_pressure_mode::medium:
+            return std::min<uint64_t>(remaining_blocks, 3);
+        case prefetch_pressure_mode::high:
+            return 0;
+    }
+
+    return remaining_blocks;
 }
 
 static void print_usage(int, char ** argv) {
@@ -200,6 +259,8 @@ int main(int argc, char ** argv) {
     const char * prefetch_auto_blocks_per_step_env = std::getenv("LLAMA_KV_PAGED_PREFETCH_AUTO_BLOCKS_PER_STEP");
     const char * prefetch_auto_safety_tokens_env = std::getenv("LLAMA_KV_PAGED_PREFETCH_AUTO_SAFETY_TOKENS");
     const char * resume_pending_token_env = std::getenv("LLAMA_KV_PAGED_RESUME_PENDING_TOKEN");
+    const prefetch_pressure_mode pressure_mode =
+        parse_prefetch_pressure_mode(std::getenv("LLAMA_KV_PAGED_PREFETCH_PRESSURE_MODE"));
     if (const char * env = std::getenv("LLAMA_KV_PAGED_PREFETCH_AFTER_ACTIVE_TOKENS")) {
         prefetch_after_active_tokens = std::atoi(env);
     }
@@ -224,10 +285,12 @@ int main(int argc, char ** argv) {
     const int32_t resume_pending_token = resume_pending_token_env ? std::atoi(resume_pending_token_env) : 0;
     int32_t prefetch_auto_active_total_tokens = 0;
     uint64_t prefetch_auto_remaining_blocks = 0;
+    uint64_t target_restore_blocks = 0;
     uint64_t prefetch_auto_need_steps = 0;
     int32_t prefetch_auto_start_token = 0;
     int32_t prefetch_auto_window_ok = 1;
     int32_t resume_pending_started = 0;
+    int32_t resume_pending_target_limited = 0;
     int32_t active_window_remaining = 0;
     int32_t effective_start_token = 0;
     int32_t resume_pending_window_ok = 1;
@@ -338,7 +401,9 @@ int main(int argc, char ** argv) {
 
         prefetch_auto_active_total_tokens = n_decode;
         active_window_remaining = std::max<int32_t>(0, n_decode - resume_pending_token);
-        if (prefetch_auto_remaining_blocks == 0) {
+        target_restore_blocks = clamp_prefetch_target_by_pressure(prefetch_auto_remaining_blocks, pressure_mode);
+        resume_pending_target_limited = 1;
+        if (target_restore_blocks == 0) {
             prefetch_auto_need_steps = 0;
             effective_start_token = resume_pending_token;
             prefetch_auto_start_token = effective_start_token;
@@ -347,7 +412,7 @@ int main(int argc, char ** argv) {
             prefetch_during_active_schedule_enabled = false;
         } else {
             prefetch_auto_need_steps =
-                (prefetch_auto_remaining_blocks + (uint64_t) prefetch_auto_blocks_per_step - 1) /
+                (target_restore_blocks + (uint64_t) prefetch_auto_blocks_per_step - 1) /
                 (uint64_t) prefetch_auto_blocks_per_step;
             const int64_t need_span =
                 (int64_t) (prefetch_auto_need_steps - 1) * (int64_t) prefetch_auto_every_tokens +
@@ -421,22 +486,37 @@ int main(int argc, char ** argv) {
 
         if (prefetch_during_active_schedule_enabled &&
                 (!prefetch_auto_delayed || resume_pending_started) &&
+                (!resume_pending_target_limited ||
+                 (uint64_t) prefetch_during_active_blocks < target_restore_blocks) &&
                 seq1_decoded_done >= prefetch_after_active_tokens &&
                 ((seq1_decoded_done - prefetch_after_active_tokens) % prefetch_every_tokens) == 0) {
             if (prefetch_during_active_calls == 0) {
                 rss_before_active_prefetch_kb = current_rss_kb();
             }
 
+            uint32_t blocks_this_step = (uint32_t) prefetch_blocks_per_step;
+            if (resume_pending_target_limited) {
+                const uint64_t target_remaining =
+                    target_restore_blocks - (uint64_t) prefetch_during_active_blocks;
+                blocks_this_step = (uint32_t) std::min<uint64_t>(target_remaining, blocks_this_step);
+            }
+
             const auto active_prefetch_t0 = perf_clock::now();
             const int32_t restored = llama_memory_prefetch_seq_step(
-                    llama_get_memory(ctx), 0, (uint32_t) prefetch_blocks_per_step);
+                    llama_get_memory(ctx), 0, blocks_this_step);
             const double active_prefetch_ms = elapsed_ms(active_prefetch_t0, perf_clock::now());
 
             prefetch_during_active_calls += 1;
             prefetch_during_active_ms_total += active_prefetch_ms;
             prefetch_during_active_ms_max = std::max(prefetch_during_active_ms_max, active_prefetch_ms);
             if (restored > 0) {
-                prefetch_during_active_blocks += restored;
+                int32_t restored_capped = restored;
+                if (resume_pending_target_limited) {
+                    const uint64_t target_remaining =
+                        target_restore_blocks - (uint64_t) prefetch_during_active_blocks;
+                    restored_capped = (int32_t) std::min<uint64_t>((uint64_t) restored, target_remaining);
+                }
+                prefetch_during_active_blocks += restored_capped;
             }
             rss_after_active_prefetch_kb = current_rss_kb();
 
@@ -573,6 +653,7 @@ int main(int argc, char ** argv) {
             "prefetch_invalid_cells=%llu prefetch_failures=%llu "
             "prefetch_auto_enabled=%d prefetch_auto_active_total_tokens=%d "
             "prefetch_auto_remaining_blocks=%llu prefetch_auto_need_steps=%llu "
+            "pressure_mode=%s target_restore_blocks=%llu "
             "prefetch_auto_start_token=%d prefetch_auto_every_tokens=%d "
             "prefetch_auto_blocks_per_step=%d prefetch_auto_safety_tokens=%d "
             "prefetch_auto_window_ok=%d prefetch_auto_started=%d "
@@ -606,6 +687,8 @@ int main(int argc, char ** argv) {
             prefetch_auto_active_total_tokens,
             (unsigned long long) prefetch_auto_remaining_blocks,
             (unsigned long long) prefetch_auto_need_steps,
+            prefetch_pressure_mode_name(pressure_mode),
+            (unsigned long long) target_restore_blocks,
             prefetch_auto_start_token,
             prefetch_auto_every_tokens,
             prefetch_auto_blocks_per_step,
