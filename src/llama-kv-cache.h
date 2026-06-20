@@ -257,6 +257,8 @@ public:
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
     int32_t prefetch_seq(llama_seq_id seq_id) override;
+    int32_t prefetch_seq_step(llama_seq_id seq_id, uint32_t max_blocks) override;
+    void set_seq_prefetch_protected(llama_seq_id seq_id, bool enabled) override;
     void prefetch_seq_last_stats(
             uint64_t & owned_blocks,
             uint64_t & swapped_blocks,
@@ -627,6 +629,11 @@ private:
     bool     paged_idle_trace_enabled = false;
     mutable std::array<uint64_t, LLAMA_MAX_SEQ> paged_idle_seq_last_active_step = {};
     mutable std::bitset<LLAMA_MAX_SEQ> paged_idle_seq_seen;
+    // Stage 6C-1A: seqs marked prefetch-protected (resume-pending) are excluded from idle
+    // swap-out victim selection so interleaved prefetch is not undone by the same-step idle
+    // gate. Does not change read-window / nonidentity / state-machine semantics.
+    std::bitset<LLAMA_MAX_SEQ> paged_prefetch_protected_seq;
+    mutable uint64_t paged_idle_swap_skip_protected = 0;
     mutable uint64_t paged_idle_active_seq_steps = 0;
     mutable uint64_t paged_idle_active_seq_empty = 0;
     mutable uint64_t paged_idle_seq_seen_count = 0;

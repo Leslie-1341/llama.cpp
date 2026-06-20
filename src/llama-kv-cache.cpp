@@ -1143,6 +1143,10 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
 }
 
 int32_t llama_kv_cache::prefetch_seq(llama_seq_id seq_id) {
+    return this->prefetch_seq_step(seq_id, std::numeric_limits<uint32_t>::max());
+}
+
+int32_t llama_kv_cache::prefetch_seq_step(llama_seq_id seq_id, uint32_t max_blocks) {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
     paged_prefetch_seq_last_owned_blocks = 0;
@@ -1198,11 +1202,27 @@ int32_t llama_kv_cache::prefetch_seq(llama_seq_id seq_id) {
         }
     }
 
-    int32_t n_prefetched = 0;
     for (const uint32_t physical_block : blocks) {
         const paged_block_state state = paged_block_states[physical_block];
         if (state == paged_block_state::SWAPPED) {
             paged_prefetch_seq_last_swapped_blocks += 1;
+        } else if (state == paged_block_state::RESIDENT) {
+            paged_prefetch_seq_last_resident_blocks += 1;
+            paged_prefetch_seq_skip_resident += 1;
+        } else if (state == paged_block_state::RELEASED) {
+            paged_prefetch_seq_last_released_blocks += 1;
+            paged_prefetch_seq_skip_released += 1;
+        }
+    }
+
+    if (max_blocks == 0) {
+        return 0;
+    }
+
+    int32_t n_prefetched = 0;
+    for (const uint32_t physical_block : blocks) {
+        const paged_block_state state = paged_block_states[physical_block];
+        if (state == paged_block_state::SWAPPED) {
             if (!paged_swap_in_block(physical_block)) {
                 paged_prefetch_seq_last_failures += 1;
                 paged_prefetch_seq_failures += 1;
@@ -1213,14 +1233,9 @@ int32_t llama_kv_cache::prefetch_seq(llama_seq_id seq_id) {
             const uint32_t begin = physical_block * paged_block_size;
             const uint32_t end = std::min<uint32_t>(begin + paged_block_size, paged_kv_size);
             paged_prefetch_seq_bytes += bytes_per_cell * (end - begin);
-        } else if (state == paged_block_state::RESIDENT) {
-            paged_prefetch_seq_last_resident_blocks += 1;
-            paged_prefetch_seq_skip_resident += 1;
-        } else if (state == paged_block_state::RELEASED) {
-            paged_prefetch_seq_last_released_blocks += 1;
-            paged_prefetch_seq_skip_released += 1;
-        } else {
-            paged_prefetch_seq_last_failures += 1;
+            if ((uint32_t) n_prefetched >= max_blocks) {
+                break;
+            }
         }
     }
 
@@ -1263,6 +1278,25 @@ extern "C" bool llama_kv_cache_prefetch_seq_last_stats(
             *released_blocks,
             *invalid_cells,
             *failures);
+    return true;
+}
+
+void llama_kv_cache::set_seq_prefetch_protected(llama_seq_id seq_id, bool enabled) {
+    if (seq_id < 0 || (size_t) seq_id >= LLAMA_MAX_SEQ) {
+        return;
+    }
+    paged_prefetch_protected_seq.set(seq_id, enabled);
+}
+
+extern "C" bool llama_kv_cache_set_seq_prefetch_protected(
+        llama_memory_t mem,
+        llama_seq_id   seq_id,
+        bool           enabled) {
+    auto * kv = dynamic_cast<llama_kv_cache *>(mem);
+    if (!kv) {
+        return false;
+    }
+    kv->set_seq_prefetch_protected(seq_id, enabled);
     return true;
 }
 
@@ -2611,7 +2645,7 @@ void llama_kv_cache::paged_log_stats() const {
             "paged_idle_safe_swap_candidates=%llu "
             "paged_idle_swap_enabled=%d paged_idle_swap_candidates=%llu "
             "paged_idle_swap_out_calls=%llu paged_idle_swap_skip_not_remapped=%llu "
-            "paged_idle_swap_skip_not_resident=%llu "
+            "paged_idle_swap_skip_not_resident=%llu paged_idle_swap_skip_protected=%llu "
             "paged_nonidentity_enabled=%d paged_nonidentity_remap_rows=%llu "
             "paged_nonidentity_remap_blocks=%llu paged_nonidentity_skip_no_dummy=%llu "
             "paged_nonidentity_skip_not_masked=%llu paged_nonidentity_skip_not_resident=%llu "
@@ -2717,6 +2751,7 @@ void llama_kv_cache::paged_log_stats() const {
             (unsigned long long) paged_idle_swap_out_calls,
             (unsigned long long) paged_idle_swap_skip_not_remapped,
             (unsigned long long) paged_idle_swap_skip_not_resident,
+            (unsigned long long) paged_idle_swap_skip_protected,
             paged_nonidentity_probe_enabled ? 1 : 0,
             (unsigned long long) paged_nonidentity_remap_rows,
             (unsigned long long) paged_nonidentity_remap_blocks,
@@ -4293,7 +4328,12 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                     }
                     if (paged_idle_swap_requested) {
                         paged_idle_swap_candidates += 1;
-                        if (!idle_swap_ready ||
+                        // Stage 6C-1A: never swap out a block owned (even partially) by a
+                        // prefetch-protected / resume-pending seq, else interleaved prefetch
+                        // gets undone by this same idle gate within the active-decode window.
+                        if ((owner & paged_prefetch_protected_seq).any()) {
+                            paged_idle_swap_skip_protected += 1;
+                        } else if (!idle_swap_ready ||
                                 nonidentity_remapped_blocks.find(block) == nonidentity_remapped_blocks.end()) {
                             paged_idle_swap_skip_not_remapped += 1;
                         } else if (paged_block_states[block] != paged_block_state::RESIDENT) {
@@ -4352,7 +4392,7 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                 "cold_not_in_read_window=%llu skip_mixed_active=%llu safe_swap_candidates=%llu "
                 "paged_idle_swap_enabled=%d paged_idle_swap_candidates=%llu "
                 "paged_idle_swap_out_calls=%llu paged_idle_swap_skip_not_remapped=%llu "
-                "paged_idle_swap_skip_not_resident=%llu "
+                "paged_idle_swap_skip_not_resident=%llu paged_idle_swap_skip_protected=%llu "
                 "paged_nonidentity_enabled=%d paged_nonidentity_remap_rows=%llu "
                 "paged_nonidentity_remap_blocks=%llu paged_nonidentity_skip_no_dummy=%llu "
                 "paged_nonidentity_skip_not_masked=%llu paged_nonidentity_skip_not_resident=%llu "
@@ -4403,6 +4443,7 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                 (unsigned long long) paged_idle_swap_out_calls,
                 (unsigned long long) paged_idle_swap_skip_not_remapped,
                 (unsigned long long) paged_idle_swap_skip_not_resident,
+                (unsigned long long) paged_idle_swap_skip_protected,
                 paged_nonidentity_probe_enabled ? 1 : 0,
                 (unsigned long long) paged_nonidentity_remap_rows,
                 (unsigned long long) paged_nonidentity_remap_blocks,

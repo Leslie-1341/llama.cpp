@@ -90,6 +90,28 @@ int32_t llama_memory_prefetch_seq(
     return mem->prefetch_seq(seq_id);
 }
 
+int32_t llama_memory_prefetch_seq_step(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+            uint32_t   max_blocks) {
+    if (!mem) {
+        return -1;
+    }
+
+    return mem->prefetch_seq_step(seq_id, max_blocks);
+}
+
+void llama_memory_set_seq_prefetch_protected(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+                bool   enabled) {
+    if (!mem) {
+        return;
+    }
+
+    mem->set_seq_prefetch_protected(seq_id, enabled);
+}
+
 bool llama_supports_rpc(void) {
     if (!ggml_backend_reg_count()) {
         ggml_backend_load_all();
