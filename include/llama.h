@@ -320,15 +320,32 @@ extern "C" {
         int32_t vm_pin_budget_mb;      // VM total mlock budget
         int32_t vm_prefetch_budget_mb; // VM graph prefetch budget
         int32_t vm_window_steps;       // VM graph prefetch window in execution steps
+        int32_t vm_window_layers;      // VM layer prefetch window
         int32_t vm_reclaim_budget_mb;  // VM DONTNEED reclaim budget
         int32_t vm_keep_behind_steps;  // VM keep-behind window for reclaim
+        int32_t vm_keep_behind_layers; // VM layer keep-behind window for reclaim
+        int32_t vm_reclaim_policy;     // VM reclaim policy: 0 none, 1 dontneed, 2 free, 3 pageout
+        int32_t vm_reclaim_distance;   // VM minimum layer distance before reclaim
+        int32_t vm_keep_behind_groups; // VM sliding-unmap groups kept behind current group
         int32_t vm_plan_cache_entries; // VM max graph plan cache entries
+        int32_t vm_pipeline_layers;    // VM subgraph pipeline prefetch layers
+        int32_t vm_subgraph_group_layers; // VM layers per submitted subgraph
+        int32_t vm_subgraph_sync_depth; // VM submitted subgraphs per backend sync
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool use_mmap;        // use mmap if possible
         bool vm_debug_log;    // dump VM mmap region residency classification
         bool vm_dontneed;     // reclaim unused mmap pages with MADV_DONTNEED
+        bool vm_layer_schedule; // use scheduler eval callbacks for layer-level VM prefetch/reclaim
+        bool vm_prefill_dontneed; // enable VM layer lifecycle/reclaim during prompt prefill
+        bool vm_subgraph;     // use layer-wise subgraph submission
+        bool vm_double_buffer; // use double-buffered VM layer prefetch
+        bool vm_subgraph_plan_path; // use backend graph plan create/compute/free for each subgraph
+        bool vm_subgraph_plan_cache; // cache and update backend graph plans for subgraphs
+        bool vm_subgraph_sequence; // execute cached CPU subgraph plans as one sequence
+        bool vm_sliding_unmap; // unmap completed layer groups and remap before reuse
+        bool vm_hugepage;     // use transparent hugepage (THP) for lower TLB miss rate
         bool use_direct_io;   // use direct io, takes precedence over use_mmap when supported
         bool use_mlock;       // force system to keep model in RAM
         bool check_tensors;   // validate model tensor data

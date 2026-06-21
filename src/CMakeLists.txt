@@ -24,6 +24,8 @@ add_library(llama
             llama-io.cpp
             llama-kv-cache.cpp
             llama-kv-cache-iswa.cpp
+            llama-window.cpp
+            llama-flex.cpp
             llama-memory.cpp
             llama-memory-hybrid.cpp
             llama-memory-hybrid-iswa.cpp
@@ -34,7 +36,6 @@ add_library(llama
             llama-model.cpp
             llama-quant.cpp
             llama-sampler.cpp
-            llama-vm.cpp
             llama-vocab.cpp
             unicode-data.cpp
             unicode.cpp

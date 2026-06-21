@@ -438,13 +438,72 @@ void llama_file::write_u32(uint32_t val) const { pimpl->write_u32(val); }
 
 // llama_mmap
 
+#if defined(__linux__) && defined(_POSIX_MAPPED_FILES)
+// Helper function to create 2 MiB aligned mmap for better THP success rate
+static void * mmap_aligned_hugepage(size_t size, int fd, bool use_alignment) {
+    if (!use_alignment) {
+        // Fast path: no alignment needed
+        void * addr = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+        return addr;
+    }
+
+    const size_t hugepage_size = 2ull * 1024ull * 1024ull; // 2 MiB
+
+    // Step 1: Over-allocate to ensure we can find aligned region
+    size_t alloc_size = size + hugepage_size;
+    void * addr = mmap(NULL, alloc_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (addr == MAP_FAILED) {
+        LLAMA_LOG_WARN("mmap_aligned_hugepage: over-allocation failed, falling back to unaligned mmap\n");
+        return mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+    }
+
+    // Step 2: Find aligned address within allocated region
+    uintptr_t base = (uintptr_t)addr;
+    uintptr_t aligned_base = (base + hugepage_size - 1) & ~(hugepage_size - 1);
+
+    // Step 3: Unmap unused prefix
+    size_t prefix_size = aligned_base - base;
+    if (prefix_size > 0) {
+        munmap(addr, prefix_size);
+    }
+
+    // Step 4: Unmap unused suffix
+    size_t suffix_size = alloc_size - prefix_size - size;
+    if (suffix_size > 0) {
+        munmap((void*)(aligned_base + size), suffix_size);
+    }
+
+    // Step 5: Remap aligned region with actual file mapping
+    void * aligned_addr = mmap((void*)aligned_base, size, PROT_READ,
+                               MAP_SHARED | MAP_FIXED, fd, 0);
+    if (aligned_addr == MAP_FAILED) {
+        LLAMA_LOG_WARN("mmap_aligned_hugepage: MAP_FIXED failed, unmapping reserved region\n");
+        munmap((void*)aligned_base, size);
+        // Fallback to unaligned mmap
+        return mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+    }
+
+    // Verify alignment
+    if ((uintptr_t)aligned_addr % hugepage_size != 0) {
+        LLAMA_LOG_WARN("mmap_aligned_hugepage: alignment verification failed (addr=%p)\n", aligned_addr);
+    }
+
+    return aligned_addr;
+}
+#endif
+
 struct llama_mmap::impl {
 #ifdef _POSIX_MAPPED_FILES
     std::vector<std::pair<size_t, size_t>> mapped_fragments;
+    std::vector<std::pair<size_t, size_t>> reserved_fragments;
+    int fd = -1;
 
     impl(struct llama_file * file, size_t prefetch, bool numa) {
         size = file->size();
-        int fd = file->file_id();
+        fd = dup(file->file_id());
+        if (fd < 0) {
+            throw std::runtime_error(format("dup failed for mmap file: %s", strerror(errno)));
+        }
         int flags = MAP_SHARED;
         if (numa) { prefetch = 0; }
 #ifdef __linux__
@@ -453,11 +512,31 @@ struct llama_mmap::impl {
                     strerror(errno));
         }
         if (prefetch) { flags |= MAP_POPULATE; }
-#endif
+
+        // Use aligned mmap for better THP success rate
+        // Note: alignment is controlled by external flag (will be passed via prefetch parameter encoding)
+        // For now, we check if hugepage alignment should be used based on environment variable
+        const char * env_align = std::getenv("LLAMA_HUGEPAGE_ALIGN");
+        bool use_alignment = (env_align != nullptr && std::string(env_align) == "1");
+
+        addr = mmap_aligned_hugepage(file->size(), fd, use_alignment);
+        if (addr == MAP_FAILED) {
+            throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
+        }
+
+        if (use_alignment) {
+            const size_t hugepage_size = 2ull * 1024ull * 1024ull;
+            uintptr_t base_addr = (uintptr_t)addr;
+            bool is_aligned = (base_addr % hugepage_size) == 0;
+            LLAMA_LOG_INFO("llama_mmap: base address %p (%s)\n",
+                          addr, is_aligned ? "2 MiB aligned" : "NOT aligned");
+        }
+#else
         addr = mmap(NULL, file->size(), PROT_READ, flags, fd, 0);
         if (addr == MAP_FAILED) {
             throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
         }
+#endif
 
         if (prefetch > 0) {
             if (posix_madvise(addr, std::min(file->size(), prefetch), POSIX_MADV_WILLNEED)) {
@@ -523,11 +602,85 @@ struct llama_mmap::impl {
         mapped_fragments = std::move(new_mapped_fragments);
     }
 
+    bool unmap_fragment_reserved(size_t first, size_t last) {
+        int page_size = sysconf(_SC_PAGESIZE);
+        align_range(&first, &last, page_size);
+        const size_t len = last - first;
+
+        if (len == 0) {
+            return true;
+        }
+
+        unmap_fragment(first, last);
+
+        void * target = (uint8_t *) addr + first;
+        void * reserved = mmap(target, len, PROT_NONE,
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        if (reserved == MAP_FAILED) {
+            LLAMA_LOG_WARN("warning: fixed address reservation failed: %s\n", strerror(errno));
+            return false;
+        }
+
+        reserved_fragments.emplace_back(first, last);
+        return true;
+    }
+
+    bool remap_fragment(size_t first, size_t last) {
+        int page_size = sysconf(_SC_PAGESIZE);
+        align_range(&first, &last, page_size);
+        const size_t len = last - first;
+
+        if (len == 0) {
+            return true;
+        }
+
+        for (const auto & frag : mapped_fragments) {
+            if (frag.first <= first && frag.second >= last) {
+                return true;
+            }
+        }
+
+        void * target = (uint8_t *) addr + first;
+        void * mapped = mmap(target, len, PROT_READ, MAP_SHARED | MAP_FIXED, fd, first);
+        if (mapped == MAP_FAILED) {
+            LLAMA_LOG_WARN("warning: fixed remap failed: %s\n", strerror(errno));
+            return false;
+        }
+
+        mapped_fragments.emplace_back(first, last);
+        std::sort(mapped_fragments.begin(), mapped_fragments.end());
+
+        std::vector<std::pair<size_t, size_t>> merged;
+        for (const auto & frag : mapped_fragments) {
+            if (merged.empty() || merged.back().second < frag.first) {
+                merged.push_back(frag);
+            } else {
+                merged.back().second = std::max(merged.back().second, frag.second);
+            }
+        }
+        mapped_fragments = std::move(merged);
+        reserved_fragments.erase(
+                std::remove_if(reserved_fragments.begin(), reserved_fragments.end(),
+                    [&](const auto & frag) {
+                        return frag.first >= first && frag.second <= last;
+                    }),
+                reserved_fragments.end());
+        return true;
+    }
+
     ~impl() {
         for (const auto & frag : mapped_fragments) {
             if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
                 LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
             }
+        }
+        for (const auto & frag : reserved_fragments) {
+            if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
+                LLAMA_LOG_WARN("warning: reserved fragment munmap failed: %s\n", strerror(errno));
+            }
+        }
+        if (fd >= 0) {
+            close(fd);
         }
     }
 #elif defined(_WIN32)
@@ -582,6 +735,18 @@ struct llama_mmap::impl {
         GGML_UNUSED(last);
     }
 
+    bool remap_fragment(size_t first, size_t last) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+        return false;
+    }
+
+    bool unmap_fragment_reserved(size_t first, size_t last) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+        return false;
+    }
+
     ~impl() {
         if (hMapping) {
             if (addr) {
@@ -611,6 +776,18 @@ struct llama_mmap::impl {
 
         throw std::runtime_error("mmap not supported");
     }
+
+    bool remap_fragment(size_t first, size_t last) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+        return false;
+    }
+
+    bool unmap_fragment_reserved(size_t first, size_t last) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+        return false;
+    }
 #endif
 
     void * addr;
@@ -624,6 +801,8 @@ size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
+bool llama_mmap::unmap_fragment_reserved(size_t first, size_t last) { return pimpl->unmap_fragment_reserved(first, last); }
+bool llama_mmap::remap_fragment(size_t first, size_t last) { return pimpl->remap_fragment(first, last); }
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mmap::SUPPORTED  = true;

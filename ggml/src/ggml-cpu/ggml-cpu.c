@@ -3,6 +3,7 @@
 
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "traits.h"
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
@@ -474,6 +475,12 @@ struct ggml_threadpool {
 
     struct ggml_cgraph * cgraph;
     struct ggml_cplan  * cplan;
+    struct ggml_cgraph ** sequence_cgraphs;
+    struct ggml_cplan  ** sequence_cplans;
+    int                  n_sequence_graphs;
+    ggml_graph_compute_sequence_step_callback sequence_step_callback;
+    ggml_graph_compute_sequence_node_callback sequence_node_callback;
+    void *               sequence_callback_data;
 
     // synchronization primitives
     atomic_int n_graph;       // updated when there is work to be done (i.e each graph) holds graph and active thread counts.
@@ -1699,11 +1706,26 @@ static void ggml_compute_forward_mul_mat_id(
 
 /////////////////////////////////
 
+static ggml_cpu_weight_stream_callback g_weight_stream_cb = NULL;
+static void *                           g_weight_stream_ud = NULL;
+
+void ggml_cpu_set_weight_stream_callback(ggml_cpu_weight_stream_callback cb, void * user_data) {
+    g_weight_stream_cb  = cb;
+    g_weight_stream_ud  = user_data;
+}
+
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
 
     if (tensor->op == GGML_OP_NONE || ggml_is_empty(tensor)) {
         return;
+    }
+
+    // Streamed-weight hook: ith==0 may fault the op's weights into a managed
+    // buffer and repoint their ->data; the barrier publishes that to all threads
+    // before the kernel reads it. Cheap no-op when no streaming is configured.
+    if (g_weight_stream_cb != NULL && g_weight_stream_cb(tensor, params->ith, g_weight_stream_ud)) {
+        ggml_barrier(params->threadpool);
     }
 
     // extra_buffer op?
@@ -3010,12 +3032,11 @@ static int ggml_cpu_try_fuse_ops(
     return 0;
 }
 
-static thread_ret_t ggml_graph_compute_thread(void * data) {
-    struct ggml_compute_state * state = (struct ggml_compute_state *) data;
+static thread_ret_t ggml_graph_compute_thread_graph(
+        struct ggml_compute_state * state,
+        const struct ggml_cgraph * cgraph,
+        const struct ggml_cplan * cplan) {
     struct ggml_threadpool    * tp    = state->threadpool;
-
-    const struct ggml_cgraph * cgraph = tp->cgraph;
-    const struct ggml_cplan  * cplan  = tp->cplan;
 
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
     ggml_backend_cpu_riscv64_spacemit_set_numa_thread_affinity(state->ith);
@@ -3042,11 +3063,17 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
         if (ggml_op_is_empty(node->op)) {
+            if (state->ith == 0 && tp->sequence_node_callback != NULL) {
+                tp->sequence_node_callback(node, tp->sequence_callback_data);
+            }
             // skip NOPs
             continue;
         }
 
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            if (state->ith == 0 && tp->sequence_node_callback != NULL) {
+                tp->sequence_node_callback(node, tp->sequence_callback_data);
+            }
             continue;
         }
 
@@ -3065,8 +3092,13 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             tp->ec    = GGML_STATUS_ABORTED;
         }
 
-        if (node_n + 1 < cgraph->n_nodes) {
+        if (node_n + 1 < cgraph->n_nodes ||
+                tp->sequence_node_callback != NULL) {
             ggml_barrier(state->threadpool);
+        }
+
+        if (state->ith == 0 && tp->sequence_node_callback != NULL) {
+            tp->sequence_node_callback(node, tp->sequence_callback_data);
         }
     }
 
@@ -3081,6 +3113,40 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
     ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(state->ith);
 #endif
+
+    return 0;
+}
+
+static thread_ret_t ggml_graph_compute_thread(void * data) {
+    struct ggml_compute_state * state = (struct ggml_compute_state *) data;
+    struct ggml_threadpool    * tp    = state->threadpool;
+
+    return ggml_graph_compute_thread_graph(state, tp->cgraph, tp->cplan);
+}
+
+static thread_ret_t ggml_graph_compute_sequence_thread(void * data) {
+    struct ggml_compute_state * state = (struct ggml_compute_state *) data;
+    struct ggml_threadpool    * tp    = state->threadpool;
+
+    for (int i = 0; i < tp->n_sequence_graphs; ++i) {
+        if (state->ith == 0) {
+            atomic_store_explicit(&tp->current_chunk, 0, memory_order_relaxed);
+            atomic_store_explicit(&tp->abort, -1, memory_order_relaxed);
+        }
+        ggml_barrier(tp);
+
+        ggml_graph_compute_thread_graph(state, tp->sequence_cgraphs[i], tp->sequence_cplans[i]);
+
+        if (state->ith == 0 && tp->sequence_step_callback != NULL) {
+            tp->sequence_step_callback(i, tp->sequence_callback_data);
+        }
+
+        ggml_barrier(tp);
+
+        if (tp->ec != GGML_STATUS_SUCCESS) {
+            break;
+        }
+    }
 
     return 0;
 }
@@ -3181,7 +3247,11 @@ static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
         ggml_graph_compute_check_for_work(state);
         if (state->pending) {
             state->pending = false;
-            ggml_graph_compute_thread(state);
+            if (threadpool->n_sequence_graphs > 0) {
+                ggml_graph_compute_sequence_thread(state);
+            } else {
+                ggml_graph_compute_thread(state);
+            }
         }
     }
 
@@ -3233,6 +3303,12 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     {
         threadpool->cgraph           = cgraph;
         threadpool->cplan            = cplan;
+        threadpool->sequence_cgraphs = NULL;
+        threadpool->sequence_cplans  = NULL;
+        threadpool->n_sequence_graphs = 0;
+        threadpool->sequence_step_callback = NULL;
+        threadpool->sequence_node_callback = cplan != NULL ? cplan->node_callback : NULL;
+        threadpool->sequence_callback_data = cplan != NULL ? cplan->node_callback_data : NULL;
         threadpool->n_graph          = 0;
         threadpool->n_barrier        = 0;
         threadpool->n_barrier_passed = 0;
@@ -3318,11 +3394,19 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
         struct ggml_threadpool_params ttp = ggml_threadpool_params_default(n_threads);
         threadpool = ggml_threadpool_new_impl(&ttp, cgraph, cplan);
+        threadpool->sequence_node_callback = cplan->node_callback;
+        threadpool->sequence_callback_data = cplan->node_callback_data;
     } else {
         // Reset some of the parameters that need resetting
         // No worker threads should be accessing the parameters below at this stage
         threadpool->cgraph           = cgraph;
         threadpool->cplan            = cplan;
+        threadpool->sequence_cgraphs = NULL;
+        threadpool->sequence_cplans  = NULL;
+        threadpool->n_sequence_graphs = 0;
+        threadpool->sequence_step_callback = NULL;
+        threadpool->sequence_node_callback = cplan->node_callback;
+        threadpool->sequence_callback_data = cplan->node_callback_data;
         threadpool->current_chunk    = 0;
         threadpool->abort            = -1;
         threadpool->ec               = GGML_STATUS_SUCCESS;
@@ -3375,6 +3459,135 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     }
 
     return ret;
+}
+
+enum ggml_status ggml_graph_compute_sequence(
+        struct ggml_cgraph ** cgraphs,
+        struct ggml_cplan ** cplans,
+        int n_graphs,
+        ggml_graph_compute_sequence_step_callback step_callback,
+        ggml_graph_compute_sequence_node_callback node_callback,
+        void * callback_data) {
+    ggml_cpu_init();
+
+    if (n_graphs <= 0) {
+        return GGML_STATUS_SUCCESS;
+    }
+
+    GGML_ASSERT(cgraphs);
+    GGML_ASSERT(cplans);
+    GGML_ASSERT(cgraphs[0]);
+    GGML_ASSERT(cplans[0]);
+    GGML_ASSERT(cplans[0]->n_threads > 0);
+    GGML_ASSERT(cplans[0]->work_size == 0 || cplans[0]->work_data != NULL);
+
+    int n_threads = cplans[0]->n_threads;
+    struct ggml_threadpool * threadpool = cplans[0]->threadpool;
+    bool disposable_threadpool = false;
+
+    if (threadpool == NULL) {
+        disposable_threadpool = true;
+        struct ggml_threadpool_params ttp = ggml_threadpool_params_default(n_threads);
+        threadpool = ggml_threadpool_new_impl(&ttp, NULL, NULL);
+    }
+
+    for (int i = 0; i < n_graphs; ++i) {
+        GGML_ASSERT(cgraphs[i]);
+        GGML_ASSERT(cplans[i]);
+        GGML_ASSERT(cplans[i]->threadpool == threadpool || cplans[i]->threadpool == NULL);
+        GGML_ASSERT(cplans[i]->n_threads == cplans[0]->n_threads);
+        GGML_ASSERT(cplans[i]->work_size == 0 || cplans[i]->work_data != NULL);
+    }
+
+#ifdef GGML_USE_OPENMP
+    threadpool->cgraph           = NULL;
+    threadpool->cplan            = NULL;
+    threadpool->sequence_cgraphs = cgraphs;
+    threadpool->sequence_cplans  = cplans;
+    threadpool->n_sequence_graphs = n_graphs;
+    threadpool->sequence_step_callback = step_callback;
+    threadpool->sequence_node_callback = node_callback;
+    threadpool->sequence_callback_data = callback_data;
+    threadpool->current_chunk    = 0;
+    threadpool->abort            = -1;
+    threadpool->ec               = GGML_STATUS_SUCCESS;
+
+    if (n_threads > 1) {
+        #pragma omp parallel num_threads(n_threads)
+        {
+            #pragma omp single
+            {
+                n_threads = omp_get_num_threads();
+                atomic_store_explicit(&threadpool->n_graph, n_threads, memory_order_relaxed);
+            }
+
+            const int ith = omp_get_thread_num();
+
+            ggml_thread_apply_priority(threadpool->prio);
+            if (ggml_thread_cpumask_is_valid(threadpool->workers[ith].cpumask)) {
+                ggml_thread_apply_affinity(threadpool->workers[ith].cpumask);
+            }
+            ggml_graph_compute_sequence_thread(&threadpool->workers[ith]);
+        }
+    } else {
+        atomic_store_explicit(&threadpool->n_graph, 1, memory_order_relaxed);
+        ggml_graph_compute_sequence_thread(&threadpool->workers[0]);
+    }
+
+    clear_numa_thread_affinity();
+
+    enum ggml_status ret = threadpool->ec;
+
+    threadpool->sequence_cgraphs = NULL;
+    threadpool->sequence_cplans  = NULL;
+    threadpool->n_sequence_graphs = 0;
+    threadpool->sequence_step_callback = NULL;
+    threadpool->sequence_node_callback = NULL;
+    threadpool->sequence_callback_data = NULL;
+
+    if (disposable_threadpool) {
+        ggml_threadpool_free(threadpool);
+    }
+
+    return ret;
+#else
+    if (n_threads > threadpool->n_threads) {
+        GGML_LOG_WARN("cplan requested more threads (%d) than available (%d)\n", n_threads, threadpool->n_threads);
+        n_threads = threadpool->n_threads;
+    }
+
+    threadpool->cgraph           = NULL;
+    threadpool->cplan            = NULL;
+    threadpool->sequence_cgraphs = cgraphs;
+    threadpool->sequence_cplans  = cplans;
+    threadpool->n_sequence_graphs = n_graphs;
+    threadpool->sequence_step_callback = step_callback;
+    threadpool->sequence_node_callback = node_callback;
+    threadpool->sequence_callback_data = callback_data;
+    threadpool->current_chunk    = 0;
+    threadpool->abort            = -1;
+    threadpool->ec               = GGML_STATUS_SUCCESS;
+
+    ggml_graph_compute_kickoff(threadpool, n_threads);
+    ggml_graph_compute_sequence_thread(&threadpool->workers[0]);
+
+    clear_numa_thread_affinity();
+
+    enum ggml_status ret = threadpool->ec;
+
+    threadpool->sequence_cgraphs = NULL;
+    threadpool->sequence_cplans  = NULL;
+    threadpool->n_sequence_graphs = 0;
+    threadpool->sequence_step_callback = NULL;
+    threadpool->sequence_node_callback = NULL;
+    threadpool->sequence_callback_data = NULL;
+
+    if (disposable_threadpool) {
+        ggml_threadpool_free(threadpool);
+    }
+
+    return ret;
+#endif
 }
 
 enum ggml_status ggml_graph_compute_with_ctx(struct ggml_context * ctx, struct ggml_cgraph * cgraph, int n_threads) {

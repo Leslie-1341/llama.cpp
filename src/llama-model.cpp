@@ -13,7 +13,9 @@
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
-#include "llama-vm.h"
+#include "llama-rss.h"
+#include "llama-window.h"
+#include "llama-flex.h"
 
 #include "models/models.h"
 
@@ -23,6 +25,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
@@ -941,7 +944,8 @@ struct llama_model::impl {
     llama_mlocks mlock_bufs;
     llama_mlocks mlock_mmaps;
 
-    std::unique_ptr<llama_vm_context> vm;
+    std::shared_ptr<llama_window_context> window;
+    std::shared_ptr<llama_flex_context> flex;
 
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
@@ -1170,6 +1174,44 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const int n_gpu_layers = this->n_gpu_layers();
 
     const bool use_mmap_buffer = true;
+    const bool lazy_v2_requested =
+            std::getenv("LLAMA_LAZY_V2") != nullptr &&
+            std::atoi(std::getenv("LLAMA_LAZY_V2")) > 0;
+    const bool lazy_window_requested =
+            lazy_v2_requested ||
+            (std::getenv("LLAMA_LAZY_LOADING") != nullptr &&
+             std::atoi(std::getenv("LLAMA_LAZY_LOADING")) > 0) ||
+            (params.vm_layer_schedule && params.vm_dontneed);
+    // FlexInfer-style streaming (llama-flex): mutually exclusive with the mmap
+    // window. Requires the same loader conditions (mmap home, no mlock/check).
+    const bool flex_requested =
+            std::getenv("LLAMA_FLEX") != nullptr &&
+            std::atoi(std::getenv("LLAMA_FLEX")) > 0;
+    const bool use_flex =
+            flex_requested &&
+            !use_mlock &&
+            !ml.check_tensors &&
+            ml.use_mmap &&
+            !params.vocab_only;
+
+    const bool use_lazy_window =
+            !use_flex &&
+            lazy_window_requested &&
+            !use_mlock &&
+            !ml.check_tensors &&
+            ml.use_mmap &&
+            !params.vocab_only;
+
+    if (lazy_window_requested && !use_lazy_window && params.vm_debug_log) {
+        LLAMA_LOG_WARN(
+                "%s: lazy window disabled for this loader pass "
+                "(mmap=%d, mlock=%d, check_tensors=%d, vocab_only=%d)\n",
+                __func__,
+                ml.use_mmap ? 1 : 0,
+                use_mlock ? 1 : 0,
+                ml.check_tensors ? 1 : 0,
+                params.vocab_only ? 1 : 0);
+    }
 
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
 
@@ -1177,7 +1219,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         __func__, ml.use_mmap ? "true" : "false", ml.use_direct_io ? "true" : "false");
 
     // build a list of buffer types for the CPU and GPU devices
-    pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
+    pimpl->cpu_buft_list = make_cpu_buft_list(
+            devices,
+            (use_lazy_window || use_flex) ? false : params.use_extra_bufts,
+            params.no_host);
     for (const auto & dev : devices) {
         buft_list_t buft_list = make_gpu_buft_list(dev.dev, split_mode, tensor_split);
         // add CPU buffer types as a fallback
@@ -1434,7 +1479,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    ml.init_mappings(!(use_lazy_window || use_flex), use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -1558,52 +1603,156 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // load tensor data
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
-        if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+        if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL,
+                    params.progress_callback, params.progress_callback_user_data, use_lazy_window)) {
             return false;
         }
     }
 
-    if (ml.use_mmap && !ml.mappings.empty()) {
-        std::vector<llama_vm_region_input> vm_inputs;
-        vm_inputs.reserve(ml.weights_map.size());
-
-        for (const auto & it : ml.weights_map) {
-            const auto & weight = it.second;
-            if (weight.idx >= ml.mappings.size()) {
-                continue;
-            }
-
-            const auto & mapping = ml.mappings.at(weight.idx);
-            if (!mapping) {
-                continue;
-            }
-
-            llama_vm_region_input input;
-            input.name = it.first;
-            input.addr = (uint8_t *) mapping->addr() + weight.offs;
-            input.size = ggml_nbytes(weight.tensor);
-            input.file_idx = weight.idx;
-            input.file_offset = weight.offs;
-            vm_inputs.emplace_back(std::move(input));
-        }
-
-        llama_vm_params vm_params;
-        vm_params.debug_log = params.vm_debug_log;
-        vm_params.block_size = size_t(std::max(1, params.vm_block_size_mb)) * 1024ull * 1024ull;
-        vm_params.pin_small_bytes = size_t(std::max(0, params.vm_pin_small_mb)) * 1024ull * 1024ull;
-        vm_params.pin_budget_bytes = size_t(std::max(0, params.vm_pin_budget_mb)) * 1024ull * 1024ull;
-        vm_params.prefetch_budget_bytes = size_t(std::max(0, params.vm_prefetch_budget_mb)) * 1024ull * 1024ull;
-        vm_params.reclaim_budget_bytes = size_t(std::max(0, params.vm_reclaim_budget_mb)) * 1024ull * 1024ull;
-        vm_params.window_steps = std::max(1, params.vm_window_steps);
-        vm_params.keep_behind_steps = std::max(0, params.vm_keep_behind_steps);
-        vm_params.max_plan_cache_entries = std::max(0, params.vm_plan_cache_entries);
-        vm_params.use_dontneed = params.vm_dontneed;
-        pimpl->vm = llama_vm_build_index(vm_inputs, hparams.n_layer, vm_params);
-    }
+    llama_rss_stage_log("A", "model_mmap_done");
 
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
+        }
+    }
+
+    if (use_lazy_window) {
+        std::vector<llama_window_region_input> inputs;
+        inputs.reserve(ml.weights_map.size());
+
+        for (const auto & it : ml.weights_map) {
+            const auto & weight = it.second;
+            if (weight.idx >= pimpl->mappings.size() || !pimpl->mappings[weight.idx]) {
+                continue;
+            }
+
+            llama_window_region_input input;
+            input.name = it.first;
+            input.addr = (uint8_t *) pimpl->mappings[weight.idx]->addr() + weight.offs;
+            input.size = ggml_nbytes(weight.tensor);
+            input.file_idx = weight.idx;
+            input.file_offset = weight.offs;
+            inputs.emplace_back(std::move(input));
+        }
+
+        llama_window_params window_params;
+        window_params.enabled = true;
+        const char * lazy_dontneed = std::getenv("LLAMA_LAZY_DONTNEED");
+        const char * lazy_window_size = std::getenv("LLAMA_LAZY_WINDOW_SIZE");
+        const char * lazy_prefetch_ahead = std::getenv("LLAMA_LAZY_PREFETCH_AHEAD");
+        const char * lazy_worker_threads = std::getenv("LLAMA_LAZY_WORKER_THREADS");
+        const char * lazy_auto_tune = std::getenv("LLAMA_LAZY_AUTO_TUNE");
+        const char * lazy_memory_limit = std::getenv("LLAMA_LAZY_MEMORY_LIMIT");
+        const char * lazy_prefill_aggressive = std::getenv("LLAMA_LAZY_PREFILL_AGGRESSIVE");
+
+        // When LLAMA_LAZY_V2 is active, also check its namespace env vars.
+        // LLAMA_LAZY_V2_* take precedence over LLAMA_LAZY_* when lazy_v2_requested.
+        const char * lazy_v2_window   = lazy_v2_requested ? std::getenv("LLAMA_LAZY_V2_WINDOW")    : nullptr;
+        const char * lazy_v2_prefetch = lazy_v2_requested ? std::getenv("LLAMA_LAZY_V2_PREFETCH")  : nullptr;
+        const char * lazy_v2_workers  = lazy_v2_requested ? std::getenv("LLAMA_LAZY_V2_WORKERS")   : nullptr;
+        const char * lazy_v2_memory   = lazy_v2_requested ? std::getenv("LLAMA_LAZY_V2_MEMORY_GB") : nullptr;
+
+        // Effective env vars: V2-namespace overrides base namespace when both are set
+        if (lazy_v2_window)   { lazy_window_size    = lazy_v2_window;   }
+        if (lazy_v2_prefetch) { lazy_prefetch_ahead = lazy_v2_prefetch; }
+        if (lazy_v2_workers)  { lazy_worker_threads = lazy_v2_workers;  }
+
+        // memory_limit: LAZY_V2_MEMORY_GB is in GB (same unit as LAZY_MEMORY_LIMIT)
+        if (lazy_v2_memory)   { lazy_memory_limit   = lazy_v2_memory;   }
+
+        window_params.memory_limit = lazy_memory_limit != nullptr
+                ? size_t(std::max(0.0, std::atof(lazy_memory_limit)) * 1024.0 * 1024.0 * 1024.0)
+                : 0;
+        window_params.use_dontneed =
+                params.vm_dontneed ||
+                (lazy_dontneed != nullptr && std::atoi(lazy_dontneed) > 0) ||
+                (lazy_v2_requested && window_params.memory_limit > 0);
+        window_params.auto_tune = lazy_auto_tune == nullptr ||
+                std::atoi(lazy_auto_tune) > 0;
+        window_params.prefill_aggressive =
+                lazy_prefill_aggressive != nullptr &&
+                std::atoi(lazy_prefill_aggressive) > 0;
+        window_params.debug_log = params.vm_debug_log ||
+                (std::getenv("LLAMA_LAZY_DEBUG") != nullptr) ||
+                (lazy_v2_requested && std::getenv("LLAMA_LAZY_V2_DEBUG") != nullptr);
+        window_params.window_size = lazy_window_size != nullptr
+                ? std::max(4, std::atoi(lazy_window_size))
+                : 12;
+        window_params.prefetch_ahead = lazy_prefetch_ahead != nullptr
+                ? std::max(1, std::atoi(lazy_prefetch_ahead))
+                : (lazy_v2_requested ? 4 : std::max(1, params.vm_pipeline_layers));
+        window_params.keep_behind = std::max(0, params.vm_keep_behind_layers);
+        window_params.worker_threads = lazy_worker_threads != nullptr
+                ? std::max(1, std::atoi(lazy_worker_threads))
+                : (lazy_v2_requested ? 2 : 1);
+
+        // prefetch_budget: use explicit param, or derive from memory_limit for V2
+        if (params.vm_prefetch_budget_mb > 0) {
+            window_params.prefetch_budget = size_t(params.vm_prefetch_budget_mb) * 1024ull * 1024ull;
+        } else if (lazy_v2_requested && window_params.memory_limit > 0) {
+            // Reserve up to 25% of the memory limit for prefetch buffering
+            window_params.prefetch_budget = window_params.memory_limit / 4;
+        } else {
+            window_params.prefetch_budget = 0;
+        }
+
+        // reclaim_budget: use explicit param, or derive from memory_limit for V2
+        if (window_params.use_dontneed) {
+            if (params.vm_reclaim_budget_mb > 0) {
+                window_params.reclaim_budget = size_t(params.vm_reclaim_budget_mb) * 1024ull * 1024ull;
+            } else if (lazy_v2_requested && window_params.memory_limit > 0) {
+                // Allow reclaiming up to 25% of the limit in a single pass
+                window_params.reclaim_budget = window_params.memory_limit / 4;
+            } else {
+                window_params.reclaim_budget = 0;
+            }
+        } else {
+            window_params.reclaim_budget = 0;
+        }
+
+        pimpl->window = llama_window_create(inputs, hparams.n_layer, window_params);
+    }
+
+    if (use_flex) {
+        llama_flex_params fp;
+        fp.enabled = true;
+        fp.debug_log   = std::getenv("LLAMA_FLEX_DEBUG") != nullptr;
+        fp.direct_io   = std::getenv("LLAMA_FLEX_BUFFERED") == nullptr; // default O_DIRECT
+        if (const char * v = std::getenv("LLAMA_FLEX_RING"))    { fp.ring_layers    = std::max(2, std::atoi(v)); }
+        if (const char * v = std::getenv("LLAMA_FLEX_AHEAD"))   { fp.prefetch_ahead = std::max(1, std::atoi(v)); }
+        if (const char * v = std::getenv("LLAMA_FLEX_THREADS")) { fp.io_threads     = std::max(1, std::atoi(v)); }
+        if (const char * v = std::getenv("LLAMA_FLEX_LOCK_GB")) {
+            fp.lock_bytes = (size_t)(std::max(0.0, std::atof(v)) * 1024.0 * 1024.0 * 1024.0);
+        }
+
+        std::vector<int> fds;
+        for (const auto & f : ml.files) {
+            fds.push_back(f->file_id());
+        }
+
+        pimpl->flex = llama_flex_create(fds, hparams.n_layer, fp);
+        if (llama_flex_enabled(pimpl->flex.get())) {
+            int registered = 0;
+            for (const auto & it : ml.weights_map) {
+                int layer = -1;
+                if (std::sscanf(it.first.c_str(), "blk.%d.", &layer) != 1 ||
+                        layer < 0 || layer >= hparams.n_layer) {
+                    continue; // only stream per-decoder-layer weights
+                }
+                llama_flex_tensor t;
+                t.name        = it.first;
+                t.file_idx    = it.second.idx;
+                t.file_offset = it.second.offs;
+                t.size        = ggml_nbytes(it.second.tensor);
+                llama_flex_register_tensor(*pimpl->flex, layer, t);
+                ++registered;
+            }
+            llama_flex_finalize(*pimpl->flex);
+            if (fp.debug_log) {
+                LLAMA_LOG_INFO("%s: llama-flex enabled, streaming %d layer tensors\n",
+                        __func__, registered);
+            }
         }
     }
 
@@ -1939,8 +2088,12 @@ bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
 }
 
-llama_vm_context * llama_model::get_vm_context() const {
-    return pimpl->vm.get();
+llama_window_context * llama_model::get_window_context() const {
+    return pimpl->window.get();
+}
+
+llama_flex_context * llama_model::get_flex_context() const {
+    return pimpl->flex.get();
 }
 
 const ggml_tensor * llama_model::get_tensor(const char * name) const {
@@ -2188,13 +2341,30 @@ llama_model_params llama_model_default_params() {
         /*.vm_pin_budget_mb            =*/ 128,
         /*.vm_prefetch_budget_mb       =*/ 512,
         /*.vm_window_steps             =*/ 2,
+        /*.vm_window_layers            =*/ 2,
         /*.vm_reclaim_budget_mb        =*/ 256,
         /*.vm_keep_behind_steps        =*/ 2,
+        /*.vm_keep_behind_layers       =*/ 2,
+        /*.vm_reclaim_policy           =*/ 0,
+        /*.vm_reclaim_distance         =*/ 0,
+        /*.vm_keep_behind_groups       =*/ 0,
         /*.vm_plan_cache_entries       =*/ 8,
+        /*.vm_pipeline_layers          =*/ 2,
+        /*.vm_subgraph_group_layers    =*/ 1,
+        /*.vm_subgraph_sync_depth      =*/ 1,
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,
         /*.vm_debug_log                =*/ false,
         /*.vm_dontneed                 =*/ false,
+        /*.vm_layer_schedule           =*/ false,
+        /*.vm_prefill_dontneed         =*/ false,
+        /*.vm_subgraph                 =*/ false,
+        /*.vm_double_buffer            =*/ false,
+        /*.vm_subgraph_plan_path       =*/ false,
+        /*.vm_subgraph_plan_cache      =*/ false,
+        /*.vm_subgraph_sequence        =*/ false,
+        /*.vm_sliding_unmap            =*/ false,
+        /*.vm_hugepage                 =*/ false,
         /*.use_direct_io               =*/ false,
         /*.use_mlock                   =*/ false,
         /*.check_tensors               =*/ false,

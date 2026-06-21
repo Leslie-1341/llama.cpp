@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-cpu.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -9,19 +10,31 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
-#include "llama-vm.h"
+#include "llama-rss.h"
+#include "llama-window.h"
+#include "llama-flex.h"
 #include "llama-ext.h"
 #include "llama.h"
 
 #include <cinttypes>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <mutex>
+#include <sys/resource.h>
 #include <stdexcept>
 
 //
 // llama_context
 //
+
+static void llama_window_cpu_node_done(const ggml_tensor * node, void * user_data) {
+    auto * window = static_cast<llama_window_context *>(user_data);
+    if (window != nullptr) {
+        llama_window_node_done(*window, node);
+    }
+}
 
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
@@ -1290,7 +1303,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+        const auto alloc_t0 = std::chrono::steady_clock::now();
+        const bool alloc_ok = ggml_backend_sched_alloc_graph(sched.get(), gf);
+        const auto alloc_t1 = std::chrono::steady_clock::now();
+        if (!alloc_ok) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
@@ -2324,13 +2340,44 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
-    if (auto * vm = model.get_vm_context()) {
-        llama_vm_on_graph_compute_begin(*vm, gf);
+    ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
+    auto * window = model.get_window_context();
+    auto * set_node_callback_fn =
+            (decltype(ggml_backend_cpu_set_node_callback) *) nullptr;
+    if (backend_cpu != nullptr && llama_window_enabled(window)) {
+        auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
+        set_node_callback_fn = (decltype(ggml_backend_cpu_set_node_callback) *)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_node_callback");
+        if (set_node_callback_fn != nullptr) {
+            set_node_callback_fn(backend_cpu, llama_window_cpu_node_done, window);
+            llama_window_graph_begin(*window, batched);
+        }
+    }
+
+    // FlexInfer-style streaming: install the per-node weight-stream hook on the
+    // CPU backend for the duration of this graph. Mutually exclusive with window.
+    auto * flex = model.get_flex_context();
+    const bool flex_active = backend_cpu != nullptr && llama_flex_enabled(flex);
+    if (flex_active) {
+        llama_flex_graph_begin(*flex);
+        ggml_cpu_set_weight_stream_callback(llama_flex_stream_callback, flex);
     }
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+    }
+
+    if (flex_active) {
+        ggml_backend_sched_synchronize(sched.get());
+        ggml_cpu_set_weight_stream_callback(nullptr, nullptr);
+    }
+
+    if (set_node_callback_fn != nullptr) {
+        ggml_backend_sched_synchronize(sched.get());
+        llama_window_graph_end(*window);
+        set_node_callback_fn(backend_cpu, nullptr, nullptr);
     }
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));

@@ -7,6 +7,7 @@
 #include "amx/amx.h"
 
 #include <cctype>
+#include <chrono>
 #include <string>
 #include <vector>
 
@@ -105,6 +106,8 @@ struct ggml_backend_cpu_context {
 
     ggml_abort_callback abort_callback;
     void *              abort_callback_data;
+    ggml_graph_compute_sequence_node_callback node_callback;
+    void *              node_callback_data;
 
     bool                use_ref;  // use reference implementation
 };
@@ -125,15 +128,67 @@ static void ggml_backend_cpu_free(ggml_backend_t backend) {
 struct ggml_backend_plan_cpu {
     struct ggml_cplan cplan;
     struct ggml_cgraph cgraph;
+    std::vector<struct ggml_tensor *> nodes;
+    std::vector<struct ggml_tensor *> leafs;
+    uint64_t signature;
 };
+
+static uint64_t ggml_backend_cpu_hash_u64(uint64_t h, uint64_t v) {
+    h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+    return h;
+}
+
+static uint64_t ggml_backend_cpu_graph_signature(const struct ggml_cgraph * cgraph) {
+    uint64_t h = 1469598103934665603ULL;
+
+    h = ggml_backend_cpu_hash_u64(h, (uint64_t) cgraph->n_nodes);
+    h = ggml_backend_cpu_hash_u64(h, (uint64_t) cgraph->n_leafs);
+    h = ggml_backend_cpu_hash_u64(h, (uint64_t) cgraph->order);
+
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const struct ggml_tensor * node = cgraph->nodes[i];
+        h = ggml_backend_cpu_hash_u64(h, (uint64_t) node->op);
+        h = ggml_backend_cpu_hash_u64(h, (uint64_t) node->type);
+        h = ggml_backend_cpu_hash_u64(h, (uint64_t) node->flags);
+        for (int j = 0; j < GGML_MAX_DIMS; ++j) {
+            h = ggml_backend_cpu_hash_u64(h, (uint64_t) node->ne[j]);
+            h = ggml_backend_cpu_hash_u64(h, (uint64_t) node->nb[j]);
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            const struct ggml_tensor * src = node->src[j];
+            h = ggml_backend_cpu_hash_u64(h, src != nullptr ? (uint64_t) src->op : UINT64_MAX);
+            h = ggml_backend_cpu_hash_u64(h, src != nullptr ? (uint64_t) src->type : UINT64_MAX);
+            if (src != nullptr) {
+                for (int k = 0; k < GGML_MAX_DIMS; ++k) {
+                    h = ggml_backend_cpu_hash_u64(h, (uint64_t) src->ne[k]);
+                    h = ggml_backend_cpu_hash_u64(h, (uint64_t) src->nb[k]);
+                }
+            }
+        }
+    }
+
+    return h;
+}
+
+static void ggml_backend_cpu_graph_plan_rebind(struct ggml_backend_plan_cpu * cpu_plan, const struct ggml_cgraph * cgraph) {
+    cpu_plan->nodes.assign(cgraph->nodes, cgraph->nodes + cgraph->n_nodes);
+    cpu_plan->leafs.assign(cgraph->leafs, cgraph->leafs + cgraph->n_leafs);
+
+    cpu_plan->cgraph = *cgraph;
+    cpu_plan->cgraph.nodes = cpu_plan->nodes.data();
+    cpu_plan->cgraph.leafs = cpu_plan->leafs.data();
+}
 
 static ggml_backend_graph_plan_t ggml_backend_cpu_graph_plan_create(ggml_backend_t backend, const struct ggml_cgraph * cgraph) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
 
     struct ggml_backend_plan_cpu * cpu_plan = new ggml_backend_plan_cpu;
 
+    const auto plan_t0 = std::chrono::steady_clock::now();
     cpu_plan->cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
-    cpu_plan->cgraph = *cgraph; // FIXME: deep copy
+    const auto plan_t1 = std::chrono::steady_clock::now();
+    cpu_plan->signature = ggml_backend_cpu_graph_signature(cgraph);
+    ggml_backend_cpu_graph_plan_rebind(cpu_plan, cgraph);
 
     if (cpu_plan->cplan.work_size > 0) {
         cpu_plan->cplan.work_data = new uint8_t[cpu_plan->cplan.work_size];
@@ -146,6 +201,16 @@ static ggml_backend_graph_plan_t ggml_backend_cpu_graph_plan_create(ggml_backend
     cpu_plan->cplan.abort_callback      = cpu_ctx->abort_callback;
     cpu_plan->cplan.abort_callback_data = cpu_ctx->abort_callback_data;
     cpu_plan->cplan.use_ref             = cpu_ctx->use_ref;
+    cpu_plan->cplan.node_callback       = cpu_ctx->node_callback;
+    cpu_plan->cplan.node_callback_data  = cpu_ctx->node_callback_data;
+
+    const auto plan_t2 = std::chrono::steady_clock::now();
+    if (std::getenv("GGML_CPU_PLAN_TIMING") != nullptr) {
+        const auto graph_plan_us = std::chrono::duration_cast<std::chrono::microseconds>(plan_t1 - plan_t0).count();
+        const auto plan_create_us = std::chrono::duration_cast<std::chrono::microseconds>(plan_t2 - plan_t0).count();
+        fprintf(stderr, "ggml_cpu: graph_plan_create nodes=%d plan_us=%lld total_us=%lld work_size=%zu\n",
+                cgraph->n_nodes, (long long) graph_plan_us, (long long) plan_create_us, cpu_plan->cplan.work_size);
+    }
 
     return cpu_plan;
 }
@@ -159,18 +224,92 @@ static void ggml_backend_cpu_graph_plan_free(ggml_backend_t backend, ggml_backen
     GGML_UNUSED(backend);
 }
 
+static enum ggml_status ggml_backend_cpu_graph_plan_update(ggml_backend_t backend, ggml_backend_graph_plan_t plan, const struct ggml_cgraph * cgraph) {
+    struct ggml_backend_plan_cpu * cpu_plan = (struct ggml_backend_plan_cpu *)plan;
+
+    const uint64_t signature = ggml_backend_cpu_graph_signature(cgraph);
+    if (signature != cpu_plan->signature) {
+        return GGML_STATUS_FAILED;
+    }
+
+    ggml_backend_cpu_graph_plan_rebind(cpu_plan, cgraph);
+
+    GGML_UNUSED(backend);
+    return GGML_STATUS_SUCCESS;
+}
+
 static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backend, ggml_backend_graph_plan_t plan) {
     struct ggml_backend_plan_cpu * cpu_plan = (struct ggml_backend_plan_cpu *)plan;
 
-    return ggml_graph_compute(&cpu_plan->cgraph, &cpu_plan->cplan);
+    const auto compute_t0 = std::chrono::steady_clock::now();
+    enum ggml_status status = ggml_graph_compute(&cpu_plan->cgraph, &cpu_plan->cplan);
+    const auto compute_t1 = std::chrono::steady_clock::now();
+
+    if (std::getenv("GGML_CPU_PLAN_TIMING") != nullptr) {
+        const auto compute_us = std::chrono::duration_cast<std::chrono::microseconds>(compute_t1 - compute_t0).count();
+        fprintf(stderr, "ggml_cpu: graph_plan_compute nodes=%d elapsed_us=%lld\n",
+                cpu_plan->cgraph.n_nodes, (long long) compute_us);
+    }
+
+    return status;
 
     GGML_UNUSED(backend);
+}
+
+enum ggml_status ggml_backend_cpu_graph_plan_sequence_compute(
+        ggml_backend_t backend,
+        ggml_backend_graph_plan_t * plans,
+        int n_plans,
+        ggml_graph_compute_sequence_step_callback step_callback,
+        ggml_graph_compute_sequence_node_callback node_callback,
+        void * callback_data) {
+    if (backend == nullptr || !ggml_backend_is_cpu(backend)) {
+        return GGML_STATUS_FAILED;
+    }
+
+    if (n_plans <= 0) {
+        return GGML_STATUS_SUCCESS;
+    }
+
+    std::vector<struct ggml_cgraph *> cgraphs;
+    std::vector<struct ggml_cplan *> cplans;
+    cgraphs.reserve(n_plans);
+    cplans.reserve(n_plans);
+
+    for (int i = 0; i < n_plans; ++i) {
+        if (plans[i] == nullptr) {
+            return GGML_STATUS_FAILED;
+        }
+        struct ggml_backend_plan_cpu * cpu_plan = (struct ggml_backend_plan_cpu *)plans[i];
+        cgraphs.push_back(&cpu_plan->cgraph);
+        cplans.push_back(&cpu_plan->cplan);
+    }
+
+    const auto compute_t0 = std::chrono::steady_clock::now();
+    enum ggml_status status = ggml_graph_compute_sequence(
+            cgraphs.data(),
+            cplans.data(),
+            n_plans,
+            step_callback,
+            node_callback,
+            callback_data);
+    const auto compute_t1 = std::chrono::steady_clock::now();
+
+    if (std::getenv("GGML_CPU_PLAN_TIMING") != nullptr) {
+        const auto compute_us = std::chrono::duration_cast<std::chrono::microseconds>(compute_t1 - compute_t0).count();
+        fprintf(stderr, "ggml_cpu: graph_plan_sequence_compute n_plans=%d elapsed_us=%lld\n",
+                n_plans, (long long) compute_us);
+    }
+
+    return status;
 }
 
 static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
 
+    const auto plan_t0 = std::chrono::steady_clock::now();
     struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
+    const auto plan_t1 = std::chrono::steady_clock::now();
 
     if (cpu_ctx->work_size < cplan.work_size) {
         delete[] cpu_ctx->work_data;
@@ -186,8 +325,22 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     cplan.abort_callback      = cpu_ctx->abort_callback;
     cplan.abort_callback_data = cpu_ctx->abort_callback_data;
     cplan.use_ref             = cpu_ctx->use_ref;
+    cplan.node_callback       = cpu_ctx->node_callback;
+    cplan.node_callback_data  = cpu_ctx->node_callback_data;
 
-    return ggml_graph_compute(cgraph, &cplan);
+    const auto compute_t0 = std::chrono::steady_clock::now();
+    enum ggml_status status = ggml_graph_compute(cgraph, &cplan);
+    const auto compute_t1 = std::chrono::steady_clock::now();
+
+    if (std::getenv("GGML_CPU_PLAN_TIMING") != nullptr) {
+        const auto plan_us = std::chrono::duration_cast<std::chrono::microseconds>(plan_t1 - plan_t0).count();
+        const auto compute_us = std::chrono::duration_cast<std::chrono::microseconds>(compute_t1 - compute_t0).count();
+        const auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(compute_t1 - plan_t0).count();
+        fprintf(stderr, "ggml_cpu: graph_compute nodes=%d plan_us=%lld compute_us=%lld total_us=%lld work_size=%zu\n",
+                cgraph->n_nodes, (long long) plan_us, (long long) compute_us, (long long) total_us, cplan.work_size);
+    }
+
+    return status;
 }
 
 static const struct ggml_backend_i ggml_backend_cpu_i = {
@@ -201,7 +354,7 @@ static const struct ggml_backend_i ggml_backend_cpu_i = {
     /* .synchronize             = */ NULL,
     /* .graph_plan_create       = */ ggml_backend_cpu_graph_plan_create,
     /* .graph_plan_free         = */ ggml_backend_cpu_graph_plan_free,
-    /* .graph_plan_update       = */ NULL,
+    /* .graph_plan_update       = */ ggml_backend_cpu_graph_plan_update,
     /* .graph_plan_compute      = */ ggml_backend_cpu_graph_plan_compute,
     /* .graph_compute           = */ ggml_backend_cpu_graph_compute,
     /* .event_record            = */ NULL,
@@ -229,6 +382,8 @@ ggml_backend_t ggml_backend_cpu_init(void) {
     ctx->work_size           = 0;
     ctx->abort_callback      = NULL;
     ctx->abort_callback_data = NULL;
+    ctx->node_callback       = NULL;
+    ctx->node_callback_data  = NULL;
     ctx->use_ref             = false;
 
     ggml_backend_t cpu_backend = new ggml_backend {
@@ -282,6 +437,17 @@ void ggml_backend_cpu_set_use_ref(ggml_backend_t backend_cpu, bool use_ref) {
 
     struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend_cpu->context;
     ctx->use_ref = use_ref;
+}
+
+void ggml_backend_cpu_set_node_callback(
+        ggml_backend_t backend_cpu,
+        ggml_graph_compute_sequence_node_callback node_callback,
+        void * node_callback_data) {
+    GGML_ASSERT(ggml_backend_is_cpu(backend_cpu));
+
+    struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *) backend_cpu->context;
+    ctx->node_callback = node_callback;
+    ctx->node_callback_data = node_callback_data;
 }
 
 // CPU backend - device
@@ -662,6 +828,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_backend_cpu_set_use_ref") == 0) {
         return (void *)ggml_backend_cpu_set_use_ref;
+    }
+    if (strcmp(name, "ggml_backend_cpu_set_node_callback") == 0) {
+        return (void *)ggml_backend_cpu_set_node_callback;
     }
 
     // threadpool - TODO:  move to ggml-base
