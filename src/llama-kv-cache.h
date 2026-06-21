@@ -477,6 +477,21 @@ private:
     // returns total resident bytes across all KV tensors. No-op (returns 0) unless
     // paged_mincore_enabled. Does not touch tensor contents or block state.
     uint64_t paged_sample_mincore() const;
+
+    // Stage 7D-A: debug-only SWAPPED-page refault tracing. When LLAMA_KV_PAGED_REFAULT_TRACE=1,
+    // a block that has been swapped out + madvise'd has its K/V page ranges mprotect(PROT_NONE)'d
+    // (same page-aligned interior as paged_madvise_block, so only pages fully owned by the block
+    // are touched). Any later read/write to those pages -- e.g. the decode graph's
+    // ggml_get_rows(k2d/v2d, row_idx) -- traps into a SIGSEGV handler that records the fault site
+    // (K/V, layer, block, step), restores the page to PROT_READ|PROT_WRITE, and returns so the
+    // faulting instruction retries. This is a diagnostic, NOT a memory-optimization mechanism: it
+    // does not change swap/madvise/row_idx semantics and is a no-op unless explicitly enabled.
+    void paged_refault_init();
+    void paged_refault_protect_block(uint32_t physical_block) const;
+    void paged_refault_unprotect_block(uint32_t physical_block) const;
+    void paged_refault_unprotect_all() const;
+    void paged_refault_drain() const;
+
     void paged_assert_identity(const slot_info & sinfo);
     void paged_shadow_validate(const slot_info & sinfo, uint32_t n_kv) const;
     bool paged_ingraph_gather_supported(int32_t il) const;
@@ -516,6 +531,14 @@ private:
     mutable uint64_t paged_shadow_gather_mismatch = 0;
     mutable uint64_t paged_shadow_gather_fail     = 0;
     mutable uint64_t paged_shadow_skipped_non_identity = 0;
+    // Stage 7D-B: state-aware shadow validation. paged_shadow_validate() used to read every
+    // row's raw K/V tensor memory unconditionally, refaulting SWAPPED pages back to resident
+    // (and polluting Stage 7C-G residency conclusions). These count the SWAPPED-aware skips.
+    mutable uint64_t paged_shadow_validate_calls          = 0;
+    mutable uint64_t paged_shadow_validate_blocks_checked = 0;
+    mutable uint64_t paged_shadow_validate_swapped_blocks_skipped = 0;
+    mutable uint64_t paged_shadow_validate_fault_risk_skipped    = 0;
+    mutable uint64_t paged_shadow_validate_bytes_skipped         = 0;
     mutable uint64_t paged_ingraph_gather_layers  = 0;
     mutable uint64_t paged_row_idx_changed        = 0;
     mutable uint64_t paged_row_idx_fail           = 0;
@@ -622,8 +645,47 @@ private:
     mutable bool     paged_mincore_before_madvise_set = false;
     mutable uint64_t paged_mincore_after_madvise_resident_bytes = 0;
     mutable uint64_t paged_mincore_after_resume_resident_bytes = 0;
+    // Stage 7C-C: per-block residency of currently-SWAPPED blocks (overwritten each sample).
+    // Detects SWAPPED blocks whose K/V pages were re-touched back to resident after swap-out.
+    mutable uint64_t paged_mincore_swapped_block_count = 0;
+    mutable uint64_t paged_mincore_swapped_total_bytes = 0;
+    mutable uint64_t paged_mincore_swapped_resident_bytes = 0;
+    mutable uint64_t paged_mincore_swapped_nonresident_bytes = 0;
+    mutable uint64_t paged_mincore_swapped_resident_blocks = 0;
+    mutable uint64_t paged_mincore_swapped_nonresident_blocks = 0;
     bool     paged_swap_pending = false;
     uint32_t paged_swap_pending_n_kv = 0;
+
+    // Stage 7D-A: debug-only refault tracing state. All off unless LLAMA_KV_PAGED_REFAULT_TRACE=1.
+    // A trap range maps a contiguous page-aligned [lo, hi) host interval back to (block, kind,
+    // layer) so the (async-signal-safe) handler can identify the fault and restore the page.
+    struct paged_refault_range {
+        uintptr_t lo;          // page-aligned start of the protected interval
+        uintptr_t hi;          // page-aligned end (exclusive)
+        uint32_t  block;       // owning physical block
+        uint32_t  layer_il;    // KV layer id
+        uint8_t   is_v;        // 0 = K tensor, 1 = V tensor
+    };
+    bool     paged_refault_trace_requested = false;
+    mutable bool     paged_refault_trace_enabled = false;
+    bool     paged_refault_trace_backtrace = false;
+    bool     paged_refault_trace_once = true;   // unprotect a page on first fault (default on)
+    uint64_t paged_refault_trace_max = 64;      // max faults logged before tracing self-disables
+    // Per-block protection bookkeeping. paged_refault_protected[block] != 0 means the block's
+    // pages are currently PROT_NONE. Indexed by physical block id, sized paged_n_blocks.
+    mutable std::vector<uint8_t> paged_refault_protected;
+    mutable uint64_t paged_refault_trace_enabled_flag = 0; // mirrors enabled for trace line
+    mutable uint64_t paged_refault_fault_count = 0;
+    mutable uint64_t paged_refault_fault_k_count = 0;
+    mutable uint64_t paged_refault_fault_v_count = 0;
+    mutable uint64_t paged_refault_fault_blocks = 0;       // distinct blocks that faulted
+    mutable uint64_t paged_refault_unmapped_fault_count = 0; // faults not in any KV trap range
+    mutable uint64_t paged_refault_protect_calls = 0;
+    mutable uint64_t paged_refault_unprotect_calls = 0;
+    mutable uint64_t paged_refault_protected_pages = 0;
+    mutable uint64_t paged_refault_unprotected_pages = 0;
+    mutable uint64_t paged_refault_protect_failures = 0;
+    mutable uint64_t paged_refault_unprotect_failures = 0;
 
     // Stage 4C-3: idle-seq and block-ownership telemetry only.
     bool     paged_idle_trace_enabled = false;
@@ -679,6 +741,73 @@ private:
     mutable uint64_t paged_nonidentity_cold_in_read_window_before = 0;
     mutable uint64_t paged_nonidentity_cold_in_read_window_after = 0;
     mutable uint64_t paged_nonidentity_safe_candidates_after = 0;
+    // Stage 7C-E: SWAPPED-block row_idx redirect. When a row maps to a physical block whose
+    // state is SWAPPED and that row is not visible to / needed by the active seq, the row_idx
+    // entry is redirected to a resident dummy physical row so the decode graph's ggml_get_rows
+    // never touches the madvise'd SWAPPED pages (which would refault them resident). These
+    // counters are telemetry only and never feed scheduling decisions.
+    //   redirect_rows            : rows redirected from a real SWAPPED phys row to the dummy row.
+    //   redirect_blocks          : distinct SWAPPED blocks that had >=1 row redirected this call.
+    //   redirect_skip_no_dummy   : rows that should have been redirected but had no resident dummy.
+    //   active_visible_violation : SWAPPED rows still visible to / needed by the active seq; this
+    //                              is a swap-out / visibility bug, surfaced rather than masked.
+    mutable uint64_t paged_swapped_redirect_rows = 0;
+    mutable uint64_t paged_swapped_redirect_blocks = 0;
+    mutable uint64_t paged_swapped_redirect_skip_no_dummy = 0;
+    mutable uint64_t paged_swapped_active_visible_violation = 0;
+    mutable uint64_t paged_swapped_redirect_probe_rows = 0;
+    mutable uint64_t paged_swapped_redirect_probe_swapped_rows = 0;
+    mutable uint64_t paged_swapped_redirect_probe_resident_rows = 0;
+    mutable uint64_t paged_swapped_redirect_probe_invalid_rows = 0;
+    mutable uint64_t paged_swapped_redirect_probe_state_mismatch = 0;
+    mutable uint64_t paged_swapped_redirect_probe_disabled = 0;
+    mutable uint64_t paged_swapped_active_visible_violation_rows = 0;
+    mutable uint64_t paged_swapped_active_visible_violation_blocks = 0;
+    mutable uint64_t paged_swapped_active_visible_logical_seq_has = 0;
+    mutable uint64_t paged_swapped_active_visible_phys_seq_has = 0;
+    mutable uint64_t paged_swapped_active_visible_in_read_window = 0;
+    mutable uint64_t paged_swapped_active_visible_not_in_read_window = 0;
+    mutable uint64_t paged_swapped_active_visible_masked = 0;
+    mutable uint64_t paged_swapped_active_visible_unmasked = 0;
+    // Stage 7C-F: invariant telemetry. A block that is SWAPPED must not contain rows that
+    // are currently active-visible and unmasked. These counters distinguish stale active
+    // ownership, later active writes, and logical resolution to an already-swapped block.
+    mutable uint64_t paged_swapped_active_violation_rows = 0;
+    mutable uint64_t paged_swapped_active_violation_blocks = 0;
+    mutable uint64_t paged_swapped_active_violation_block_had_active_owner_at_swapout = 0;
+    mutable uint64_t paged_swapped_active_violation_after_swapout_write = 0;
+    mutable uint64_t paged_swapped_active_violation_resolve_to_swapped = 0;
+    mutable uint64_t paged_swapped_active_visible_restore_rows = 0;
+    mutable uint64_t paged_swapped_active_visible_restore_blocks = 0;
+    mutable uint64_t paged_swap_out_skip_active_visible_block = 0;
+    mutable uint64_t paged_swap_out_skip_active_owned_block = 0;
+    // Stage 7C-G: narrowed swap-out gate telemetry. 7C-F blocked every idle swap-out by
+    // treating "block appears in the full-prefix read window" as "active-visible". These
+    // counters distinguish the real reasons a candidate is skipped from the over-broad
+    // read-window membership, so the trace can answer: was this idle block skipped because
+    // it is genuinely active-needed, or only because it fell inside the full-prefix gather?
+    //   candidate_blocks                 : idle-only RESIDENT blocks that reached the gate.
+    //   allowed_blocks                   : candidates that were actually swapped out.
+    //   skip_fullprefix_read_window_only : candidates that were in the full-prefix read
+    //                                      window yet had NO true active-needed unmasked cell,
+    //                                      so 7C-G still swaps them out (the recovered class).
+    //   skip_true_active_owned           : candidates whose physical block cells seq_has an
+    //                                      active seq (should be 0 for idle-only candidates).
+    //   skip_true_active_unmasked        : candidates with a physical cell that is active-
+    //                                      visible AND unmasked vs active_seq_pos_max; the only
+    //                                      correctness-mandated hard skip.
+    //   active_restore_from_swapped      : SWAPPED blocks swapped back in by the graph-pre
+    //                                      restore because they hold a true active-needed row.
+    //   idle_only_swapped_blocks         : blocks currently SWAPPED whose owners are idle-only.
+    mutable uint64_t paged_swap_out_candidate_blocks = 0;
+    mutable uint64_t paged_swap_out_allowed_blocks = 0;
+    mutable uint64_t paged_swap_out_skip_fullprefix_read_window_only = 0;
+    mutable uint64_t paged_swap_out_skip_true_active_owned = 0;
+    mutable uint64_t paged_swap_out_skip_true_active_unmasked = 0;
+    mutable uint64_t paged_active_restore_from_swapped_blocks = 0;
+    mutable uint64_t paged_idle_only_swapped_blocks = 0;
+    mutable uint64_t paged_write_to_swapped_block = 0;
+    mutable uint64_t paged_write_to_swapped_block_seq = 0;
 
     // Stage 4C-0: KV block access trace. When LLAMA_KV_PAGED_TRACE=1, emit one line per
     // decode step (per set_input_paged_row_idx call) to stderr describing the physical
