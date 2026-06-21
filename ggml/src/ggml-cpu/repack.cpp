@@ -15,6 +15,14 @@
 #include <cstring>
 #include <cassert>
 #include <cstdio>  // for GGML_ASSERT
+#include <cstdlib>
+#include <list>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+#ifdef __linux__
+#include <sys/mman.h>
+#endif
 
 #include "repack.h"
 
@@ -4833,4 +4841,242 @@ ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void) {
     };
 
     return &ggml_backend_cpu_buffer_type_repack;
+}
+
+// ---------------------------------------------------------------------------
+// JIT Per-Matrix Repack with Persistent Repack Cache
+//
+// Weights stay mmap-backed (Lazy V2). On first access, a weight matrix is
+// repacked into a persistent heap buffer (RepackCache). The original mmap
+// physical pages are then released via madvise(MADV_DONTNEED) — the virtual
+// mapping stays so the data can be reloaded if evicted. Subsequent accesses
+// hit the cache and run the fast GEMM kernel at near-native speed.
+//
+// RSS impact:
+//   Stable RSS ≈ cache_size (controlled by GGML_CPU_JIT_REPACK_CACHE_MB).
+//   Default: no eviction — all repacked layers stay, mmap pages freed →
+//   same RSS as native repack but demand-paged on first pass.
+//
+// Enable:  GGML_CPU_JIT_REPACK=1
+// Limit:   GGML_CPU_JIT_REPACK_CACHE_MB=N  (default: unlimited)
+// ---------------------------------------------------------------------------
+
+namespace ggml::cpu::jit_repack {
+
+// ---------------------------------------------------------------------------
+// RepackCache — bounded LRU cache of repacked weight buffers
+// ---------------------------------------------------------------------------
+
+class RepackCache {
+  public:
+    explicit RepackCache(size_t max_bytes) : max_bytes_(max_bytes) {}
+
+    // Returns pointer to cached repacked data, or nullptr on miss.
+    // Updates LRU order. Must be called with mu_ held.
+    const void * lookup(const void * key) {
+        auto it = map_.find(key);
+        if (it == map_.end()) return nullptr;
+        lru_.erase(it->second.lru_it);
+        lru_.push_front(key);
+        it->second.lru_it = lru_.begin();
+        return it->second.buf.data();
+    }
+
+    // Insert a repacked buffer and release the original mmap pages.
+    // Evicts LRU entries as needed. Must be called with mu_ held.
+    void insert(const void * key, std::vector<uint8_t> buf,
+                void * mmap_ptr, size_t mmap_size) {
+        size_t cost = buf.size();
+        while (cur_bytes_ + cost > max_bytes_ && !lru_.empty()) {
+            evict_one();
+        }
+        lru_.push_front(key);
+        auto & slot  = map_[key];
+        slot.buf     = std::move(buf);
+        slot.cost    = cost;
+        slot.lru_it  = lru_.begin();
+        cur_bytes_ += cost;
+#ifdef __linux__
+        // Release physical pages of the original mmap region.
+        // The virtual mapping remains; a future page fault reloads from file.
+        madvise(mmap_ptr, mmap_size, MADV_DONTNEED);
+#else
+        (void)mmap_ptr; (void)mmap_size;
+#endif
+    }
+
+  private:
+    struct Slot {
+        std::vector<uint8_t>          buf;
+        size_t                        cost;
+        std::list<const void *>::iterator lru_it;
+    };
+
+    void evict_one() {
+        const void * key = lru_.back();
+        lru_.pop_back();
+        auto it = map_.find(key);
+        if (it != map_.end()) {
+            cur_bytes_ -= it->second.cost;
+            map_.erase(it);
+        }
+    }
+
+    size_t max_bytes_;
+    size_t cur_bytes_ = 0;
+    std::unordered_map<const void *, Slot> map_;
+    std::list<const void *>                lru_;
+};
+
+// ---------------------------------------------------------------------------
+// tensor_traits — per-weight-type handler that uses the shared cache
+// ---------------------------------------------------------------------------
+
+class tensor_traits final : public ggml::cpu::tensor_traits {
+    const ggml::cpu::tensor_traits * rt_;
+    RepackCache *                    cache_;
+    std::mutex *                     mu_;
+
+  public:
+    tensor_traits(const ggml::cpu::tensor_traits * rt,
+                  RepackCache * cache, std::mutex * mu)
+        : rt_(rt), cache_(cache), mu_(mu) {}
+
+    bool work_size(int n_threads, const struct ggml_tensor * op, size_t & size) override {
+        size_t kwork = 0;
+        const_cast<ggml::cpu::tensor_traits *>(rt_)->work_size(n_threads, op, kwork);
+        // Work buffer: one pointer slot (thread 0 → other threads) + kernel q8 work.
+        // The repacked weights live in the cache, not the work buffer.
+        size = sizeof(const void *) + kwork;
+        return true;
+    }
+
+    bool compute_forward(struct ggml_compute_params * params,
+                         struct ggml_tensor *         op) override {
+        auto *       src0      = op->src[0];
+        const size_t repack_sz = ggml_nbytes(src0);
+
+        size_t kwork = 0;
+        const_cast<ggml::cpu::tensor_traits *>(rt_)->work_size(params->nth, op, kwork);
+
+        // Work buffer layout: [ptr: cached repacked data | kwork: kernel q8 scratch]
+        const void ** slot = reinterpret_cast<const void **>(params->wdata);
+
+        if (params->ith == 0) {
+            const void * cached = nullptr;
+
+            // Fast path: check cache without repacking.
+            {
+                std::lock_guard<std::mutex> lg(*mu_);
+                cached = cache_->lookup(src0->data);
+            }
+
+            if (!cached) {
+                // Cache miss: repack outside the lock (reads mmap pages).
+                std::vector<uint8_t> buf(repack_sz);
+                struct ggml_tensor tmp = *src0;
+                tmp.data = buf.data();
+                auto * rtb = const_cast<ggml::cpu::repack::tensor_traits_base *>(
+                    static_cast<const ggml::cpu::repack::tensor_traits_base *>(rt_));
+                int rc = rtb->repack(&tmp, src0->data, repack_sz);
+                if (rc == 0) {
+                    std::lock_guard<std::mutex> lg(*mu_);
+                    // Double-check: another thread may have inserted while we repacked.
+                    cached = cache_->lookup(src0->data);
+                    if (!cached) {
+                        // insert() calls MADV_DONTNEED on the original mmap region.
+                        cache_->insert(src0->data, std::move(buf),
+                                       src0->data, repack_sz);
+                        cached = cache_->lookup(src0->data);
+                    }
+                }
+            }
+            *slot = cached;
+        }
+
+        // All threads wait for thread 0 to populate *slot.
+        ggml_barrier(params->threadpool);
+
+        if (*slot == nullptr) {
+            return false;
+        }
+
+        // All threads run the fast repacked GEMM kernel using the cached data.
+        ggml_compute_params kp = *params;
+        kp.wdata               = reinterpret_cast<char *>(params->wdata) + sizeof(const void *);
+        kp.wsize               = kwork;
+
+        struct ggml_tensor src0_view = *src0;
+        src0_view.data               = const_cast<void *>(*slot);
+        struct ggml_tensor op_view   = *op;
+        op_view.src[0]               = &src0_view;
+
+        const_cast<ggml::cpu::tensor_traits *>(rt_)->compute_forward(&kp, &op_view);
+        return true;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// extra_buffer_type — singleton that owns the cache and traits map
+// ---------------------------------------------------------------------------
+
+class extra_buffer_type final : public ggml::cpu::extra_buffer_type {
+    // Shared cache (all weight types share one LRU pool).
+    std::unique_ptr<RepackCache> cache_;
+    std::mutex                   mu_;
+
+    // One jit tensor_traits wrapper per underlying repack traits pointer.
+    std::unordered_map<const ggml::cpu::tensor_traits *,
+                       std::unique_ptr<jit_repack::tensor_traits>>
+        traits_map_;
+
+  public:
+    extra_buffer_type() {
+        size_t max_bytes = SIZE_MAX / 2;  // effectively unlimited by default
+        if (const char * v = std::getenv("GGML_CPU_JIT_REPACK_CACHE_MB")) {
+            int64_t mb = std::atoll(v);
+            if (mb > 0) max_bytes = static_cast<size_t>(mb) * 1024 * 1024;
+        }
+        cache_ = std::make_unique<RepackCache>(max_bytes);
+    }
+
+    bool supports_op(ggml_backend_dev_t, const struct ggml_tensor * op) override {
+        return get_tensor_traits(op) != nullptr;
+    }
+
+    ggml::cpu::tensor_traits * get_tensor_traits(const struct ggml_tensor * op) override {
+        if (!std::getenv("GGML_CPU_JIT_REPACK") ||
+            std::atoi(std::getenv("GGML_CPU_JIT_REPACK")) == 0) return nullptr;
+
+        if (op->op != GGML_OP_MUL_MAT) return nullptr;
+
+        const auto * src0 = op->src[0];
+        const auto * src1 = op->src[1];
+        if (!src0 || !src0->buffer) return nullptr;
+
+        // Only activate for plain host (mmap-backed) buffers, not pre-repacked ones.
+        if (src0->buffer->buft == ggml_backend_cpu_repack_buffer_type()) return nullptr;
+        if (!ggml_backend_buft_is_host(src0->buffer->buft)) return nullptr;
+        if (ggml_n_dims(src0) != 2) return nullptr;
+
+        if (!src1 || src1->type != GGML_TYPE_F32) return nullptr;
+        if (src0->ne[3] != 1 || src1->ne[3] != 1 || op->ne[3] != 1) return nullptr;
+        if (src1->buffer && !ggml_backend_buft_is_host(src1->buffer->buft)) return nullptr;
+
+        const auto * rt = ggml_repack_get_optimal_repack_type(src0);
+        if (!rt) return nullptr;
+
+        auto & ptr = traits_map_[rt];
+        if (!ptr) {
+            ptr = std::make_unique<jit_repack::tensor_traits>(rt, cache_.get(), &mu_);
+        }
+        return ptr.get();
+    }
+};
+
+}  // namespace ggml::cpu::jit_repack
+
+ggml::cpu::extra_buffer_type * ggml_cpu_jit_repack_extra_buffer_type() {
+    static ggml::cpu::jit_repack::extra_buffer_type handler;
+    return &handler;
 }

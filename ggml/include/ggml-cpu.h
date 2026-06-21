@@ -7,9 +7,7 @@
 extern "C" {
 #endif
 
-    // optional callback invoked (on ith==0) after a graph node has completed and
-    // all CPU workers have crossed the node barrier; used to drive window advance,
-    // CLG prediction and async prefetch scheduling
+    typedef void (*ggml_graph_compute_sequence_step_callback)(int step, void * user_data);
     typedef void (*ggml_graph_compute_sequence_node_callback)(const struct ggml_tensor * node, void * user_data);
 
     // the compute plan that needs to be prepared for ggml_graph_compute()
@@ -32,6 +30,7 @@ extern "C" {
         // crossed the node barrier
         ggml_graph_compute_sequence_node_callback node_callback;
         void * node_callback_data;
+
     };
 
     // numa strategies
@@ -78,6 +77,14 @@ extern "C" {
                                        int   n_threads, /* = GGML_DEFAULT_N_THREADS */
                     struct ggml_threadpool * threadpool /* = NULL */ );
     GGML_BACKEND_API enum ggml_status  ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan);
+
+    GGML_BACKEND_API enum ggml_status  ggml_graph_compute_sequence(
+                    struct ggml_cgraph ** cgraphs,
+                     struct ggml_cplan ** cplans,
+                                      int   n_graphs,
+        ggml_graph_compute_sequence_step_callback step_callback,
+        ggml_graph_compute_sequence_node_callback node_callback,
+                                    void * callback_data);
 
     // same as ggml_graph_compute() but the work data is allocated as a part of the context
     // note: the drawback of this API is that you must have ensured that the context has enough memory for the work data
@@ -144,15 +151,19 @@ extern "C" {
     GGML_BACKEND_API void ggml_backend_cpu_set_n_threads     (ggml_backend_t backend_cpu, int n_threads);
     GGML_BACKEND_API void ggml_backend_cpu_set_threadpool    (ggml_backend_t backend_cpu, ggml_threadpool_t threadpool);
     GGML_BACKEND_API void ggml_backend_cpu_set_abort_callback(ggml_backend_t backend_cpu, ggml_abort_callback abort_callback, void * abort_callback_data);
-
     GGML_BACKEND_API void ggml_backend_cpu_set_use_ref(ggml_backend_t backend_cpu, bool use_ref);
-
-    // register a per-node callback on the CPU backend; it is propagated into the
-    // cplan and fired (on ith==0) after each node's barrier during graph compute
     GGML_BACKEND_API void ggml_backend_cpu_set_node_callback(
         ggml_backend_t backend_cpu,
         ggml_graph_compute_sequence_node_callback node_callback,
         void * node_callback_data);
+
+    GGML_BACKEND_API enum ggml_status ggml_backend_cpu_graph_plan_sequence_compute(
+        ggml_backend_t backend_cpu,
+        ggml_backend_graph_plan_t * plans,
+        int n_plans,
+        ggml_graph_compute_sequence_step_callback step_callback,
+        ggml_graph_compute_sequence_node_callback node_callback,
+        void * callback_data);
 
     // Weight-streaming hook (FlexInfer-style offloading).
     // Invoked by every CPU worker thread at the start of each node's compute.

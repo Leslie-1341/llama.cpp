@@ -10,6 +10,13 @@
 
 ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void);
 
+#ifdef __cplusplus
+// JIT per-matrix repack handler: repacks mmap-backed weights into the compute
+// work buffer on demand for Lazy V2 mode. Separate from the buffer-type list
+// so it never participates in tensor allocation, only compute dispatch.
+ggml::cpu::extra_buffer_type * ggml_cpu_jit_repack_extra_buffer_type();
+#endif
+
 template <int K> constexpr int QK_0() {
     if constexpr (K == 4) {
         return QK4_0;

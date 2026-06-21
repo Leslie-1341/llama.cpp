@@ -434,6 +434,15 @@ void ggml_backend_graph_plan_free(ggml_backend_t backend, ggml_backend_graph_pla
     backend->iface.graph_plan_free(backend, plan);
 }
 
+enum ggml_status ggml_backend_graph_plan_update(ggml_backend_t backend, ggml_backend_graph_plan_t plan, struct ggml_cgraph * cgraph) {
+    GGML_ASSERT(backend);
+    if (backend->iface.graph_plan_update == NULL) {
+        return GGML_STATUS_FAILED;
+    }
+
+    return backend->iface.graph_plan_update(backend, plan, cgraph);
+}
+
 enum ggml_status ggml_backend_graph_plan_compute(ggml_backend_t backend, ggml_backend_graph_plan_t plan) {
     GGML_ASSERT(backend);
     GGML_ASSERT(backend->iface.graph_plan_compute != NULL);

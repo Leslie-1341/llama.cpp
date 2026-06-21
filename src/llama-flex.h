@@ -44,9 +44,7 @@ struct llama_flex_stats {
     uint64_t layer_loads     = 0;
     uint64_t layer_hits      = 0;  // requested while already resident
     uint64_t wait_events     = 0;
-    uint64_t bytes_streamed  = 0;  // logical tensor bytes delivered to slots
-    uint64_t bytes_read_phys = 0;  // physical bytes pread() from disk (incl O_DIRECT alignment padding)
-    uint64_t read_ops        = 0;  // number of pread() calls issued for streaming
+    uint64_t bytes_streamed  = 0;
     uint64_t total_io_us     = 0;
     uint64_t total_wait_us   = 0;
     size_t   ring_bytes      = 0;  // total bytes held by the ring

@@ -315,9 +315,37 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        int32_t vm_block_size_mb;      // VM weight block size for mmap prefetching
+        int32_t vm_pin_small_mb;       // VM small tensor mlock threshold
+        int32_t vm_pin_budget_mb;      // VM total mlock budget
+        int32_t vm_prefetch_budget_mb; // VM graph prefetch budget
+        int32_t vm_window_steps;       // VM graph prefetch window in execution steps
+        int32_t vm_window_layers;      // VM layer prefetch window
+        int32_t vm_reclaim_budget_mb;  // VM DONTNEED reclaim budget
+        int32_t vm_keep_behind_steps;  // VM keep-behind window for reclaim
+        int32_t vm_keep_behind_layers; // VM layer keep-behind window for reclaim
+        int32_t vm_reclaim_policy;     // VM reclaim policy: 0 none, 1 dontneed, 2 free, 3 pageout
+        int32_t vm_reclaim_distance;   // VM minimum layer distance before reclaim
+        int32_t vm_keep_behind_groups; // VM sliding-unmap groups kept behind current group
+        int32_t vm_plan_cache_entries; // VM max graph plan cache entries
+        int32_t vm_pipeline_layers;    // VM subgraph pipeline prefetch layers
+        int32_t vm_subgraph_group_layers; // VM layers per submitted subgraph
+        int32_t vm_subgraph_sync_depth; // VM submitted subgraphs per backend sync
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool use_mmap;        // use mmap if possible
+        bool vm_debug_log;    // dump VM mmap region residency classification
+        bool vm_dontneed;     // reclaim unused mmap pages with MADV_DONTNEED
+        bool vm_layer_schedule; // use scheduler eval callbacks for layer-level VM prefetch/reclaim
+        bool vm_prefill_dontneed; // enable VM layer lifecycle/reclaim during prompt prefill
+        bool vm_subgraph;     // use layer-wise subgraph submission
+        bool vm_double_buffer; // use double-buffered VM layer prefetch
+        bool vm_subgraph_plan_path; // use backend graph plan create/compute/free for each subgraph
+        bool vm_subgraph_plan_cache; // cache and update backend graph plans for subgraphs
+        bool vm_subgraph_sequence; // execute cached CPU subgraph plans as one sequence
+        bool vm_sliding_unmap; // unmap completed layer groups and remap before reuse
+        bool vm_hugepage;     // use transparent hugepage (THP) for lower TLB miss rate
         bool use_direct_io;   // use direct io, takes precedence over use_mmap when supported
         bool use_mlock;       // force system to keep model in RAM
         bool check_tensors;   // validate model tensor data
@@ -767,29 +795,6 @@ extern "C" {
 
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
-
-    // Prefetch sequence-owned memory, if supported by the memory backend.
-    // Returns the number of prefetched blocks, 0 for unsupported backends, or a negative value on failure.
-    LLAMA_API int32_t llama_memory_prefetch_seq(
-            llama_memory_t mem,
-              llama_seq_id seq_id);
-
-    // Prefetch up to max_blocks sequence-owned memory blocks, if supported by the memory backend.
-    // max_blocks == 0 probes and updates backend last-call stats without restoring blocks.
-    // Returns the number of prefetched blocks, 0 for unsupported backends, or a negative value on failure.
-    LLAMA_API int32_t llama_memory_prefetch_seq_step(
-            llama_memory_t mem,
-              llama_seq_id seq_id,
-                uint32_t   max_blocks);
-
-    // Mark/unmark a sequence as prefetch-protected (resume-pending). While protected, blocks
-    // owned (even partially) by the sequence are excluded from idle swap-out victim selection,
-    // so interleaved/active-stage prefetch is not undone by the idle gate. Protected sequences
-    // can still be prefetched/swapped-in. No-op on backends without paged idle swap support.
-    LLAMA_API void llama_memory_set_seq_prefetch_protected(
-            llama_memory_t mem,
-              llama_seq_id seq_id,
-                    bool   enabled);
 
     //
     // State / sessions

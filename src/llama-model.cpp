@@ -7,15 +7,15 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
-#include "llama-flex.h"
-#include "llama-moe-buffer.h"
-#include "llama-window.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
+#include "llama-rss.h"
+#include "llama-window.h"
+#include "llama-flex.h"
 
 #include "models/models.h"
 
@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
@@ -35,6 +36,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
@@ -942,6 +944,9 @@ struct llama_model::impl {
     llama_mlocks mlock_bufs;
     llama_mlocks mlock_mmaps;
 
+    std::shared_ptr<llama_window_context> window;
+    std::shared_ptr<llama_flex_context> flex;
+
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
@@ -956,18 +961,6 @@ struct llama_model::impl {
     layer_dev dev_input = {};
     layer_dev dev_output = {};
     std::vector<layer_dev> dev_layer;
-
-    // dense weight streaming (llama-flex); only created when LLAMA_FLEX is set
-    std::shared_ptr<llama_flex_context> flex;
-
-    // MoE expert buffer streaming (llama-moe-buffer); only created when
-    // LLAMA_LAZY_MOE_BUFFER is set
-    std::shared_ptr<llama_moe_buffer_context> moe_buffer;
-
-    // CLG (Cross-Layer Gate) async-prefetch predictor (llama-window); only created
-    // on top of an active moe_buffer when LLAMA_LAZY_CLG / LLAMA_LAZY_MOE_BUFFER_CLG
-    // is set. Drives llama_moe_buffer_prefetch() via the CPU node callback.
-    std::shared_ptr<llama_window_context> window;
 
     bool has_tensor_overrides;
 };
@@ -1172,57 +1165,6 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
     vocab.load(ml, kv);
 }
 
-// Best-effort detection of memory available to this process: honors a cgroup v2
-// memory.max cap (minus current usage) and the system MemAvailable, returning
-// the tighter of the two. Returns SIZE_MAX when neither limit is discoverable.
-// Used only by the LLAMA_FLEX_AUTO adaptive ring sizing below.
-static size_t llama_detect_available_memory() {
-    size_t avail = SIZE_MAX;
-    // This process's own cgroup v2 path (/proc/self/cgroup -> "0::<path>"); reading
-    // /sys/fs/cgroup/memory.max directly would give the root limit and miss a cap.
-    std::string cg_path;
-    if (FILE * c = std::fopen("/proc/self/cgroup", "r")) {
-        char line[256];
-        while (std::fgets(line, sizeof(line), c)) {
-            if (std::strncmp(line, "0::", 3) == 0) {
-                cg_path = line + 3;
-                if (!cg_path.empty() && cg_path.back() == '\n') cg_path.pop_back();
-                break;
-            }
-        }
-        std::fclose(c);
-    }
-    if (!cg_path.empty()) {
-        const std::string base = "/sys/fs/cgroup" + (cg_path == "/" ? std::string() : cg_path);
-        if (FILE * f = std::fopen((base + "/memory.max").c_str(), "r")) {
-            char buf[64] = {0};
-            if (std::fgets(buf, sizeof(buf), f) && std::strncmp(buf, "max", 3) != 0) {
-                size_t cmax = std::strtoull(buf, nullptr, 10);
-                size_t cur  = 0;
-                if (FILE * g = std::fopen((base + "/memory.current").c_str(), "r")) {
-                    char b2[64] = {0};
-                    if (std::fgets(b2, sizeof(b2), g)) cur = std::strtoull(b2, nullptr, 10);
-                    std::fclose(g);
-                }
-                avail = std::min(avail, (size_t) (cmax > cur ? cmax - cur : 0));
-            }
-            std::fclose(f);
-        }
-    }
-    if (FILE * f = std::fopen("/proc/meminfo", "r")) {
-        char line[128];
-        while (std::fgets(line, sizeof(line), f)) {
-            unsigned long kb = 0;
-            if (std::sscanf(line, "MemAvailable: %lu kB", &kb) == 1) {
-                avail = std::min(avail, (size_t) (kb * 1024ull));
-                break;
-            }
-        }
-        std::fclose(f);
-    }
-    return avail;
-}
-
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
     const auto & use_mlock    = params.use_mlock;
@@ -1232,10 +1174,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const int n_gpu_layers = this->n_gpu_layers();
 
     const bool use_mmap_buffer = true;
-
-    // FlexInfer-style dense weight streaming (llama-flex). Enabled only via
-    // LLAMA_FLEX=1; requires mmap-home loading with no mlock and no tensor
-    // checking. When off, every path below behaves exactly as upstream.
+    const bool lazy_v2_requested =
+            std::getenv("LLAMA_LAZY_V2") != nullptr &&
+            std::atoi(std::getenv("LLAMA_LAZY_V2")) > 0;
+    const bool lazy_window_requested =
+            lazy_v2_requested ||
+            (std::getenv("LLAMA_LAZY_LOADING") != nullptr &&
+             std::atoi(std::getenv("LLAMA_LAZY_LOADING")) > 0) ||
+            (params.vm_layer_schedule && params.vm_dontneed);
+    // FlexInfer-style streaming (llama-flex): mutually exclusive with the mmap
+    // window. Requires the same loader conditions (mmap home, no mlock/check).
     const bool flex_requested =
             std::getenv("LLAMA_FLEX") != nullptr &&
             std::atoi(std::getenv("LLAMA_FLEX")) > 0;
@@ -1246,22 +1194,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             ml.use_mmap &&
             !params.vocab_only;
 
-    // Pre-compute the MoE-Buffer gate early (same predicate as the actual
-    // creation site below) so the buft list and mmap prefetch can be set up
-    // accordingly: like flex, the MoE-Buffer path streams expert weights into
-    // an anonymous buffer, so JIT-repack extra buffer types and full mmap
-    // prefetch must both be disabled to avoid non-reclaimable repack copies and
-    // wasted resident pages.
-    const char * moe_env = std::getenv("LLAMA_LAZY_MOE_BUFFER");
-    const bool   moe_requested = moe_env != nullptr && std::atoi(moe_env) > 0;
-    const bool   use_moe_buffer_pre =
-            moe_requested &&
+    const bool use_lazy_window =
             !use_flex &&
-            hparams.n_expert > 0 &&
-            hparams.n_expert_used > 0 &&
+            lazy_window_requested &&
+            !use_mlock &&
+            !ml.check_tensors &&
             ml.use_mmap &&
-            !params.vocab_only &&
-            !ml.check_tensors;
+            !params.vocab_only;
+
+    if (lazy_window_requested && !use_lazy_window && params.vm_debug_log) {
+        LLAMA_LOG_WARN(
+                "%s: lazy window disabled for this loader pass "
+                "(mmap=%d, mlock=%d, check_tensors=%d, vocab_only=%d)\n",
+                __func__,
+                ml.use_mmap ? 1 : 0,
+                use_mlock ? 1 : 0,
+                ml.check_tensors ? 1 : 0,
+                params.vocab_only ? 1 : 0);
+    }
 
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
 
@@ -1269,9 +1219,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         __func__, ml.use_mmap ? "true" : "false", ml.use_direct_io ? "true" : "false");
 
     // build a list of buffer types for the CPU and GPU devices
-    // flex repoints tensor->data at fault time, so JIT-repack extra buffer
-    // types (which would rewrite the weight layout) must stay disabled.
-    pimpl->cpu_buft_list = make_cpu_buft_list(devices, (use_flex || use_moe_buffer_pre) ? false : params.use_extra_bufts, params.no_host);
+    pimpl->cpu_buft_list = make_cpu_buft_list(
+            devices,
+            (use_lazy_window || use_flex) ? false : params.use_extra_bufts,
+            params.no_host);
     for (const auto & dev : devices) {
         buft_list_t buft_list = make_gpu_buft_list(dev.dev, split_mode, tensor_split);
         // add CPU buffer types as a fallback
@@ -1528,9 +1479,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    // flex streams each layer in on demand, so kernel read-ahead prefetch of
-    // the whole mapping would only defeat the bounded resident footprint.
-    ml.init_mappings((use_flex || use_moe_buffer_pre) ? false : true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    ml.init_mappings(!(use_lazy_window || use_flex), use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -1654,10 +1603,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // load tensor data
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
-        if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+        if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL,
+                    params.progress_callback, params.progress_callback_user_data, use_lazy_window)) {
             return false;
         }
     }
+
+    llama_rss_stage_log("A", "model_mmap_done");
 
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
@@ -1665,57 +1617,113 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    if (use_lazy_window) {
+        std::vector<llama_window_region_input> inputs;
+        inputs.reserve(ml.weights_map.size());
+
+        for (const auto & it : ml.weights_map) {
+            const auto & weight = it.second;
+            if (weight.idx >= pimpl->mappings.size() || !pimpl->mappings[weight.idx]) {
+                continue;
+            }
+
+            llama_window_region_input input;
+            input.name = it.first;
+            input.addr = (uint8_t *) pimpl->mappings[weight.idx]->addr() + weight.offs;
+            input.size = ggml_nbytes(weight.tensor);
+            input.file_idx = weight.idx;
+            input.file_offset = weight.offs;
+            inputs.emplace_back(std::move(input));
+        }
+
+        llama_window_params window_params;
+        window_params.enabled = true;
+        const char * lazy_dontneed = std::getenv("LLAMA_LAZY_DONTNEED");
+        const char * lazy_window_size = std::getenv("LLAMA_LAZY_WINDOW_SIZE");
+        const char * lazy_prefetch_ahead = std::getenv("LLAMA_LAZY_PREFETCH_AHEAD");
+        const char * lazy_worker_threads = std::getenv("LLAMA_LAZY_WORKER_THREADS");
+        const char * lazy_auto_tune = std::getenv("LLAMA_LAZY_AUTO_TUNE");
+        const char * lazy_memory_limit = std::getenv("LLAMA_LAZY_MEMORY_LIMIT");
+        const char * lazy_prefill_aggressive = std::getenv("LLAMA_LAZY_PREFILL_AGGRESSIVE");
+
+        // When LLAMA_LAZY_V2 is active, also check its namespace env vars.
+        // LLAMA_LAZY_V2_* take precedence over LLAMA_LAZY_* when lazy_v2_requested.
+        const char * lazy_v2_window   = lazy_v2_requested ? std::getenv("LLAMA_LAZY_V2_WINDOW")    : nullptr;
+        const char * lazy_v2_prefetch = lazy_v2_requested ? std::getenv("LLAMA_LAZY_V2_PREFETCH")  : nullptr;
+        const char * lazy_v2_workers  = lazy_v2_requested ? std::getenv("LLAMA_LAZY_V2_WORKERS")   : nullptr;
+        const char * lazy_v2_memory   = lazy_v2_requested ? std::getenv("LLAMA_LAZY_V2_MEMORY_GB") : nullptr;
+
+        // Effective env vars: V2-namespace overrides base namespace when both are set
+        if (lazy_v2_window)   { lazy_window_size    = lazy_v2_window;   }
+        if (lazy_v2_prefetch) { lazy_prefetch_ahead = lazy_v2_prefetch; }
+        if (lazy_v2_workers)  { lazy_worker_threads = lazy_v2_workers;  }
+
+        // memory_limit: LAZY_V2_MEMORY_GB is in GB (same unit as LAZY_MEMORY_LIMIT)
+        if (lazy_v2_memory)   { lazy_memory_limit   = lazy_v2_memory;   }
+
+        window_params.memory_limit = lazy_memory_limit != nullptr
+                ? size_t(std::max(0.0, std::atof(lazy_memory_limit)) * 1024.0 * 1024.0 * 1024.0)
+                : 0;
+        window_params.use_dontneed =
+                params.vm_dontneed ||
+                (lazy_dontneed != nullptr && std::atoi(lazy_dontneed) > 0) ||
+                (lazy_v2_requested && window_params.memory_limit > 0);
+        window_params.auto_tune = lazy_auto_tune == nullptr ||
+                std::atoi(lazy_auto_tune) > 0;
+        window_params.prefill_aggressive =
+                lazy_prefill_aggressive != nullptr &&
+                std::atoi(lazy_prefill_aggressive) > 0;
+        window_params.debug_log = params.vm_debug_log ||
+                (std::getenv("LLAMA_LAZY_DEBUG") != nullptr) ||
+                (lazy_v2_requested && std::getenv("LLAMA_LAZY_V2_DEBUG") != nullptr);
+        window_params.window_size = lazy_window_size != nullptr
+                ? std::max(4, std::atoi(lazy_window_size))
+                : 12;
+        window_params.prefetch_ahead = lazy_prefetch_ahead != nullptr
+                ? std::max(1, std::atoi(lazy_prefetch_ahead))
+                : (lazy_v2_requested ? 4 : std::max(1, params.vm_pipeline_layers));
+        window_params.keep_behind = std::max(0, params.vm_keep_behind_layers);
+        window_params.worker_threads = lazy_worker_threads != nullptr
+                ? std::max(1, std::atoi(lazy_worker_threads))
+                : (lazy_v2_requested ? 2 : 1);
+
+        // prefetch_budget: use explicit param, or derive from memory_limit for V2
+        if (params.vm_prefetch_budget_mb > 0) {
+            window_params.prefetch_budget = size_t(params.vm_prefetch_budget_mb) * 1024ull * 1024ull;
+        } else if (lazy_v2_requested && window_params.memory_limit > 0) {
+            // Reserve up to 25% of the memory limit for prefetch buffering
+            window_params.prefetch_budget = window_params.memory_limit / 4;
+        } else {
+            window_params.prefetch_budget = 0;
+        }
+
+        // reclaim_budget: use explicit param, or derive from memory_limit for V2
+        if (window_params.use_dontneed) {
+            if (params.vm_reclaim_budget_mb > 0) {
+                window_params.reclaim_budget = size_t(params.vm_reclaim_budget_mb) * 1024ull * 1024ull;
+            } else if (lazy_v2_requested && window_params.memory_limit > 0) {
+                // Allow reclaiming up to 25% of the limit in a single pass
+                window_params.reclaim_budget = window_params.memory_limit / 4;
+            } else {
+                window_params.reclaim_budget = 0;
+            }
+        } else {
+            window_params.reclaim_budget = 0;
+        }
+
+        pimpl->window = llama_window_create(inputs, hparams.n_layer, window_params);
+    }
+
     if (use_flex) {
         llama_flex_params fp;
-        fp.enabled   = true;
-        fp.debug_log = std::getenv("LLAMA_FLEX_DEBUG") != nullptr;
-        fp.direct_io = std::getenv("LLAMA_FLEX_BUFFERED") == nullptr; // default O_DIRECT
+        fp.enabled = true;
+        fp.debug_log   = std::getenv("LLAMA_FLEX_DEBUG") != nullptr;
+        fp.direct_io   = std::getenv("LLAMA_FLEX_BUFFERED") == nullptr; // default O_DIRECT
         if (const char * v = std::getenv("LLAMA_FLEX_RING"))    { fp.ring_layers    = std::max(2, std::atoi(v)); }
         if (const char * v = std::getenv("LLAMA_FLEX_AHEAD"))   { fp.prefetch_ahead = std::max(1, std::atoi(v)); }
         if (const char * v = std::getenv("LLAMA_FLEX_THREADS")) { fp.io_threads     = std::max(1, std::atoi(v)); }
         if (const char * v = std::getenv("LLAMA_FLEX_LOCK_GB")) {
             fp.lock_bytes = (size_t)(std::max(0.0, std::atof(v)) * 1024.0 * 1024.0 * 1024.0);
-        }
-
-        // Adaptive ring: size the resident layer ring from available memory, so we
-        // stream only as much as needed to fit.
-        //   available >= model    -> ring = n_layers (all resident, no streaming)
-        //   available <  model    -> ring = (available - non_layer - reserve) / max_layer
-        // A pre-scan sums layer-tensor bytes (largest layer sizes the ring slot) and
-        // non-layer bytes (embedding/output/norm: stay mmap-resident, the OOM floor).
-        if (std::getenv("LLAMA_FLEX_AUTO") && std::atoi(std::getenv("LLAMA_FLEX_AUTO")) > 0) {
-            std::vector<size_t> layer_bytes(hparams.n_layer, 0);
-            size_t non_layer = 0, layer_total = 0;
-            for (const auto & it : ml.weights_map) {
-                const size_t nb = ggml_nbytes(it.second.tensor);
-                int layer = -1;
-                if (std::sscanf(it.first.c_str(), "blk.%d.", &layer) == 1 &&
-                        layer >= 0 && layer < (int) hparams.n_layer) {
-                    layer_bytes[layer] += nb;
-                    layer_total        += nb;
-                } else {
-                    non_layer += nb;
-                }
-            }
-            size_t max_layer = 1;
-            for (size_t b : layer_bytes) max_layer = std::max(max_layer, b);
-
-            const size_t avail   = llama_detect_available_memory();
-            const size_t reserve = 512ull * 1024 * 1024;  // KV + compute scratch headroom
-            int ring = (int) hparams.n_layer;             // default: all resident
-            if (avail != SIZE_MAX && avail < non_layer + layer_total + reserve) {
-                const size_t fixed = non_layer + reserve;
-                const size_t room  = avail > fixed ? avail - fixed : 0;
-                ring = (int) std::min<size_t>(hparams.n_layer,
-                        std::max<size_t>(fp.prefetch_ahead + 2, room / max_layer));
-            }
-            fp.ring_layers = ring;
-            if (fp.debug_log) {
-                LLAMA_LOG_INFO("%s: flex adaptive ring=%d/%d (avail=%.0f MiB, "
-                        "max_layer=%.0f MiB, non_layer=%.0f MiB)\n", __func__,
-                        ring, (int) hparams.n_layer, avail == SIZE_MAX ? -1.0 : avail / 1048576.0,
-                        max_layer / 1048576.0, non_layer / 1048576.0);
-            }
         }
 
         std::vector<int> fds;
@@ -1744,171 +1752,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (fp.debug_log) {
                 LLAMA_LOG_INFO("%s: llama-flex enabled, streaming %d layer tensors\n",
                         __func__, registered);
-            }
-        }
-    }
-
-    // MoE expert buffer streaming (llama-moe-buffer). Env-only, opt-in via
-    // LLAMA_LAZY_MOE_BUFFER. Independent of flex: it only repoints the 3D
-    // `*_exps` expert weight tensors to anonymous buffers and streams the
-    // router-selected expert slices on demand. Requires mmap (we reuse the
-    // model fd + file offsets recorded by the loader). Dense models have no
-    // expert tensors, so registration finds nothing and this is a safe no-op.
-    if (use_moe_buffer_pre) {
-        llama_moe_buffer_params mp;
-        mp.enabled   = true;
-        mp.debug_log =
-            (std::getenv("LLAMA_LAZY_DEBUG")            && std::atoi(std::getenv("LLAMA_LAZY_DEBUG"))            > 0) ||
-            (std::getenv("LLAMA_LAZY_MOE_BUFFER_DEBUG") && std::atoi(std::getenv("LLAMA_LAZY_MOE_BUFFER_DEBUG")) > 0);
-
-        // budget: LLAMA_LAZY_MOE_BUFFER_MB sets a fixed resident cap; unset = 0
-        // (unbounded). Adaptive budgeting may override below.
-        if (const char * v = std::getenv("LLAMA_LAZY_MOE_BUFFER_MB")) {
-            mp.budget_bytes = (size_t) std::max(0, std::atoi(v)) * 1024ull * 1024ull;
-        }
-        if (const char * v = std::getenv("LLAMA_LAZY_MOE_BUFFER_WORKERS")) {
-            mp.n_workers = std::max(1, std::atoi(v));
-        }
-        if (const char * v = std::getenv("LLAMA_LAZY_MOE_BUFFER_HOT_RATIO")) {
-            mp.hot_ratio = std::max(0.0f, (float) std::atof(v));
-        }
-
-        pimpl->moe_buffer = llama_moe_buffer_create(mp);
-        // Enter the register loop based on the context existing, not on
-        // llama_moe_buffer_enabled(): the latter requires by_name to be
-        // non-empty, but by_name is only populated *by* this loop, so using it
-        // as the gate would always skip registration. enabled() is still the
-        // correct gate at graph_compute time (callback install).
-        if (pimpl->moe_buffer) {
-            int registered = 0;
-            for (const auto & it : ml.weights_map) {
-                ggml_tensor * t = it.second.tensor;
-                // Only 3D `*_exps.weight` expert weight tensors: ne[2] is the
-                // expert dimension, so the GEMM reads data + expert_id * nb[2].
-                // The `.weight` suffix excludes per-expert scale/bias sidecars
-                // (e.g. `_exps.scale`, `_exps.bias`) that also contain "_exps".
-                if (it.first.find("_exps.weight") == std::string::npos || t->ne[2] <= 1) {
-                    continue;
-                }
-                const int fd = ml.files.at(it.second.idx)->file_id();
-                if (llama_moe_buffer_register(
-                        *pimpl->moe_buffer,
-                        t,
-                        fd,
-                        it.second.offs,
-                        t->nb[2],          // expert_stride
-                        (int) t->ne[2])) { // n_expert
-                    ++registered;
-                }
-            }
-
-            // Adaptive budget (LLAMA_LAZY_MOE_BUFFER_AUTO): keep all experts
-            // resident if memory allows, else cap to what's left after the
-            // non-expert footprint + reserve. Reuses the flex helper.
-            if (std::getenv("LLAMA_LAZY_MOE_BUFFER_AUTO") &&
-                    std::atoi(std::getenv("LLAMA_LAZY_MOE_BUFFER_AUTO")) > 0) {
-                const size_t expert_bytes = llama_moe_buffer_expert_bytes(pimpl->moe_buffer.get());
-                const size_t model_bytes  = pimpl->n_bytes;
-                const size_t non_expert   = model_bytes > expert_bytes ? model_bytes - expert_bytes : 0;
-                const size_t reserve      = 512ull * 1024 * 1024; // KV + compute scratch headroom
-                const size_t avail        = llama_detect_available_memory();
-                size_t budget = 0; // unbounded
-                if (avail != SIZE_MAX && avail < non_expert + reserve + expert_bytes) {
-                    const size_t fixed = non_expert + reserve;
-                    const size_t room  = avail > fixed ? avail - fixed : 0;
-                    budget = std::max<size_t>(64ull * 1024 * 1024, room);
-                }
-                llama_moe_buffer_set_budget(pimpl->moe_buffer.get(), budget);
-                if (mp.debug_log) {
-                    LLAMA_LOG_INFO("%s: moe_buffer adaptive budget=%.0f MiB "
-                            "(avail=%.0f MiB, expert=%.0f MiB, non_expert=%.0f MiB)\n", __func__,
-                            budget / 1048576.0, avail == SIZE_MAX ? -1.0 : avail / 1048576.0,
-                            expert_bytes / 1048576.0, non_expert / 1048576.0);
-                }
-            }
-
-            if (mp.debug_log) {
-                LLAMA_LOG_INFO("%s: llama_moe_buffer: managing %d expert tensors\n",
-                        __func__, registered);
-            }
-
-            // Nothing matched (e.g. unexpected expert tensor naming): drop the
-            // context so graph_compute never installs a callback that manages
-            // zero tensors.
-            if (registered == 0) {
-                pimpl->moe_buffer.reset();
-            }
-        }
-
-        // CLG (Cross-Layer Gate) async prefetch. Layered strictly on top of an
-        // active moe_buffer: at ffn_inp-{L} the predictor applies layer L+1's gate
-        // weights to the current hidden state and issues llama_moe_buffer_prefetch()
-        // for the top-(K+delta) experts, giving the worker pool lead time before
-        // L+1's mul_mat_id runs. Correctness is unaffected — the moe_buffer's
-        // synchronous weight-stream callback still streams any missed expert.
-        // Opt-in, env-only; if the moe_buffer was dropped above we never create it.
-        const bool use_clg =
-            pimpl->moe_buffer &&
-            (
-                (std::getenv("LLAMA_LAZY_CLG")            && std::atoi(std::getenv("LLAMA_LAZY_CLG"))            > 0) ||
-                (std::getenv("LLAMA_LAZY_MOE_BUFFER_CLG") && std::atoi(std::getenv("LLAMA_LAZY_MOE_BUFFER_CLG")) > 0)
-            );
-        if (use_clg) {
-            llama_window_params wp;
-            wp.enabled       = true;
-            wp.clg_predict   = true;
-            wp.expert_window = false;   // CLG-only: no mmap sliding window / reclaim
-            wp.use_dontneed  = false;
-            wp.auto_tune     = false;
-            wp.debug_log =
-                (std::getenv("LLAMA_LAZY_DEBUG")                && std::atoi(std::getenv("LLAMA_LAZY_DEBUG"))                > 0) ||
-                (std::getenv("LLAMA_LAZY_MOE_BUFFER_DEBUG")     && std::atoi(std::getenv("LLAMA_LAZY_MOE_BUFFER_DEBUG"))     > 0) ||
-                (std::getenv("LLAMA_LAZY_CLG_DEBUG")            && std::atoi(std::getenv("LLAMA_LAZY_CLG_DEBUG"))            > 0);
-            if (const char * v = std::getenv("LLAMA_LAZY_CLG_DELTA")) {
-                wp.clg_delta = std::max(0, std::atoi(v));
-            } else if (const char * v2 = std::getenv("LLAMA_LAZY_MOE_BUFFER_CLG_DELTA")) {
-                wp.clg_delta = std::max(0, std::atoi(v2));
-            }
-
-            // Gate inputs: one per MoE layer carrying ffn_norm + ffn_gate_inp.
-            // llama_window_create dequantizes both to FP32 at init. Layers without
-            // a gate (dense layers) are skipped.
-            std::vector<llama_window_gate_input> gate_inputs;
-            gate_inputs.reserve(hparams.n_layer);
-            for (int il = 0; il < (int) hparams.n_layer; ++il) {
-                const auto & layer = layers[il];
-                if (layer.ffn_gate_inp == nullptr || layer.ffn_norm == nullptr) {
-                    continue;
-                }
-                llama_window_gate_input gi;
-                gi.layer         = il;
-                gi.norm_tensor   = layer.ffn_norm;
-                gi.norm_eps      = hparams.f_norm_rms_eps;
-                gi.gate_tensor   = layer.ffn_gate_inp;
-                gi.n_expert_used = (int) hparams.n_expert_used;
-                gate_inputs.push_back(gi);
-            }
-
-            if (!gate_inputs.empty()) {
-                pimpl->window = llama_window_create(
-                        /* inputs   = */ {},
-                        /* n_layers = */ (int) hparams.n_layer,
-                        /* params   = */ wp,
-                        /* gate_inputs = */ gate_inputs);
-                if (pimpl->window && llama_window_enabled(pimpl->window.get())) {
-                    // Bridge the predictor to the buffer so predicted experts are
-                    // routed to its async prefetch queue instead of an mmap window.
-                    llama_window_set_moe_buffer(*pimpl->window, pimpl->moe_buffer.get());
-                    if (wp.debug_log) {
-                        LLAMA_LOG_INFO("%s: CLG prefetch enabled over moe_buffer "
-                                "(%zu gate layers, delta=%d)\n",
-                                __func__, gate_inputs.size(), wp.clg_delta);
-                    }
-                } else {
-                    // Predictor failed to arm (no valid gate layers): don't keep a
-                    // context that would install a no-op node callback.
-                    pimpl->window.reset();
-                }
             }
         }
     }
@@ -2245,6 +2088,14 @@ bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
 }
 
+llama_window_context * llama_model::get_window_context() const {
+    return pimpl->window.get();
+}
+
+llama_flex_context * llama_model::get_flex_context() const {
+    return pimpl->flex.get();
+}
+
 const ggml_tensor * llama_model::get_tensor(const char * name) const {
     auto it = std::find_if(tensors_by_name.begin(), tensors_by_name.end(),
             [name](const std::pair<std::string, ggml_tensor *> & it) {
@@ -2255,18 +2106,6 @@ const ggml_tensor * llama_model::get_tensor(const char * name) const {
     }
 
     return it->second;
-}
-
-llama_flex_context * llama_model::get_flex_context() const {
-    return pimpl->flex.get();
-}
-
-llama_moe_buffer_context * llama_model::get_moe_buffer_context() const {
-    return pimpl->moe_buffer.get();
-}
-
-llama_window_context * llama_model::get_window_context() const {
-    return pimpl->window.get();
 }
 
 float llama_model::get_rope_freq_base (const llama_cparams & cparams, int il) const {
@@ -2497,8 +2336,35 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.vm_block_size_mb            =*/ 4,
+        /*.vm_pin_small_mb             =*/ 2,
+        /*.vm_pin_budget_mb            =*/ 128,
+        /*.vm_prefetch_budget_mb       =*/ 512,
+        /*.vm_window_steps             =*/ 2,
+        /*.vm_window_layers            =*/ 2,
+        /*.vm_reclaim_budget_mb        =*/ 256,
+        /*.vm_keep_behind_steps        =*/ 2,
+        /*.vm_keep_behind_layers       =*/ 2,
+        /*.vm_reclaim_policy           =*/ 0,
+        /*.vm_reclaim_distance         =*/ 0,
+        /*.vm_keep_behind_groups       =*/ 0,
+        /*.vm_plan_cache_entries       =*/ 8,
+        /*.vm_pipeline_layers          =*/ 2,
+        /*.vm_subgraph_group_layers    =*/ 1,
+        /*.vm_subgraph_sync_depth      =*/ 1,
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,
+        /*.vm_debug_log                =*/ false,
+        /*.vm_dontneed                 =*/ false,
+        /*.vm_layer_schedule           =*/ false,
+        /*.vm_prefill_dontneed         =*/ false,
+        /*.vm_subgraph                 =*/ false,
+        /*.vm_double_buffer            =*/ false,
+        /*.vm_subgraph_plan_path       =*/ false,
+        /*.vm_subgraph_plan_cache      =*/ false,
+        /*.vm_subgraph_sequence        =*/ false,
+        /*.vm_sliding_unmap            =*/ false,
+        /*.vm_hugepage                 =*/ false,
         /*.use_direct_io               =*/ false,
         /*.use_mlock                   =*/ false,
         /*.check_tensors               =*/ false,

@@ -4,7 +4,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -87,20 +86,6 @@ struct llama_flex_context {
                 w.join();
             }
         }
-        if (params.debug_log && stats.read_ops > 0) {
-            const double phys_mib = stats.bytes_read_phys / 1048576.0;
-            const double log_mib  = stats.bytes_streamed  / 1048576.0;
-            const double io_s     = stats.total_io_us / 1e6;
-            const double bw       = io_s > 0 ? phys_mib / io_s : 0.0;          // per-thread achieved MiB/s
-            const double redun    = log_mib > 0 ? (phys_mib / log_mib - 1.0) * 100.0 : 0.0;
-            const double avg_read = stats.read_ops > 0 ? phys_mib * 1024.0 / stats.read_ops : 0.0; // KiB/read
-            std::fprintf(stderr,
-                "llama_flex IO: loads=%llu reads=%llu avg_read=%.1f KiB  logical=%.0f MiB phys=%.0f MiB "
-                "align_redundancy=%.2f%%  achieved_bw=%.0f MiB/s (per-thread)  waits=%llu wait=%.0f ms\n",
-                (unsigned long long) stats.layer_loads, (unsigned long long) stats.read_ops,
-                avg_read, log_mib, phys_mib, redun, bw,
-                (unsigned long long) stats.wait_events, stats.total_wait_us / 1000.0);
-        }
         for (void * p : slots) {
             free(p);
         }
@@ -144,53 +129,22 @@ static int flex_acquire_slot(llama_flex_context & ctx, int layer) {
     return slot;
 }
 
-// Plain buffered pread loop. Returns true on success (full `size` bytes read).
-static bool flex_pread_buffered(int fd, uint8_t * dst, size_t foff, size_t size,
-                                size_t * phys_out) {
-    size_t left = size; off_t off = (off_t) foff; uint8_t * d = dst;
-    while (left > 0) {
-        ssize_t r = pread(fd, d, left, off);
-        if (r <= 0) return false;
-        d += r; off += r; left -= (size_t) r;
-    }
-    if (phys_out) *phys_out = size;
-    return true;
-}
-
-// Drop O_DIRECT from every open fd so subsequent buffered preads on the same
-// open file descriptions succeed (a buffered pread on an O_DIRECT fd would also
-// fail with EINVAL on unaligned offset/length). Idempotent; flips the context
-// onto the buffered path permanently. Must hold ctx.mutex.
-static void flex_disable_direct_io(llama_flex_context * ctx) {
-    if (!ctx->direct_io_active) {
-        return;
-    }
-#if defined(__linux__) && defined(O_DIRECT)
-    for (int fd : ctx->fds) {
-        if (fd < 0) continue;
-        int fl = fcntl(fd, F_GETFL);
-        if (fl >= 0) {
-            fcntl(fd, F_SETFL, fl & ~O_DIRECT);
-        }
-    }
-#endif
-    ctx->direct_io_active = false;
-}
-
 // Read `size` bytes at `foff` from file `file_idx` into `dst`. When O_DIRECT is
 // active, the read is issued on a block-aligned superset into the per-thread
 // `bounce` buffer and the exact bytes are copied out; otherwise a plain pread
 // loop is used. `bcap` is the bounce capacity. Returns true on success.
-//
-// On an O_DIRECT read failure (errno, short read, or oversize vs bounce) the
-// read is not abandoned: it logs a diagnostic, clears O_DIRECT on the fds, and
-// retries the exact request through the buffered path.
 static bool flex_read(llama_flex_context * ctx,
                       uint8_t * dst, uint16_t file_idx, size_t foff, size_t size,
-                      uint8_t * bounce, size_t bcap, size_t * phys_out = nullptr) {
+                      uint8_t * bounce, size_t bcap) {
     const int fd = ctx->fds[file_idx];
     if (!ctx->direct_io_active) {
-        return flex_pread_buffered(fd, dst, foff, size, phys_out);
+        size_t left = size; off_t off = (off_t) foff; uint8_t * d = dst;
+        while (left > 0) {
+            ssize_t r = pread(fd, d, left, off);
+            if (r <= 0) return false;
+            d += r; off += r; left -= (size_t) r;
+        }
+        return true;
     }
     const size_t A    = ctx->align;
     const size_t aoff = foff & ~(A - 1);
@@ -202,42 +156,15 @@ static bool flex_read(llama_flex_context * ctx,
     if (aoff + want > fsz) {
         want = fsz - aoff;            // final read may be a short EOF block
     }
-
-    const char * why    = nullptr;
-    int          saved  = 0;
-    ssize_t      r      = 0;
     if (head + size > bcap || want > bcap) {
-        why = "request exceeds bounce buffer";
-    } else {
-        r = pread(fd, bounce, want, (off_t) aoff);
-        saved = errno;
-        if (r < 0) {
-            why = "pread error";
-        } else if ((size_t) r < head + size) {
-            why = "short read";
-        }
+        return false;
     }
-
-    if (why == nullptr) {
-        std::memcpy(dst, bounce + head, size);
-        if (phys_out) *phys_out = want;
-        return true;
+    ssize_t r = pread(fd, bounce, want, (off_t) aoff);
+    if (r < 0 || (size_t) r < head + size) {
+        return false;
     }
-
-    // O_DIRECT read failed: diagnose, fall back to buffered for this and all
-    // future reads.
-    if (ctx->params.debug_log) {
-        std::fprintf(stderr,
-            "llama_flex: O_DIRECT %s (errno=%d %s) file_idx=%u foff=%zu size=%zu "
-            "aoff=%zu want=%zu read_bytes=%zd -- falling back to buffered\n",
-            why, saved, std::strerror(saved), (unsigned) file_idx, foff, size,
-            aoff, want, r);
-    }
-    {
-        std::lock_guard<std::mutex> lock(ctx->mutex);
-        flex_disable_direct_io(ctx);
-    }
-    return flex_pread_buffered(fd, dst, foff, size, phys_out);
+    std::memcpy(dst, bounce + head, size);
+    return true;
 }
 
 static void flex_worker(llama_flex_context * ctx) {
@@ -288,20 +215,15 @@ static void flex_worker(llama_flex_context * ctx) {
         const uint64_t t0 = now_us();
         bool ok = true;
         size_t streamed = 0;
-        size_t phys     = 0;
-        size_t ops      = 0;
         for (const auto & t : L.tensors) {
             if (t.locked) {
                 continue; // locked tensors live permanently in the lock buffer
             }
-            size_t p = 0;
-            if (!flex_read(ctx, base + t.buf_offset, t.file_idx, t.file_offset, t.size, bounce, bcap, &p)) {
+            if (!flex_read(ctx, base + t.buf_offset, t.file_idx, t.file_offset, t.size, bounce, bcap)) {
                 ok = false;
                 break;
             }
             streamed += t.size;
-            phys     += p;
-            ops      += 1;
         }
         const uint64_t dt = now_us() - t0;
 
@@ -311,10 +233,8 @@ static void flex_worker(llama_flex_context * ctx) {
                 L.state    = layer_state::resident;
                 L.last_use = now_us();
                 ctx->stats.layer_loads++;
-                ctx->stats.bytes_streamed  += streamed;
-                ctx->stats.bytes_read_phys += phys;
-                ctx->stats.read_ops        += ops;
-                ctx->stats.total_io_us     += dt;
+                ctx->stats.bytes_streamed += streamed;
+                ctx->stats.total_io_us    += dt;
             } else {
                 // Failed: drop the slot back.
                 ctx->slot_layer[L.slot] = -1;

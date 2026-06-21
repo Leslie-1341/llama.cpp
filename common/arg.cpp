@@ -3312,6 +3312,285 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_BENCH}));
     add_opt(common_arg(
+        {"--vm-debug-log"},
+        "Dump VM mmap region/block classification and graph prefetch plan",
+        [](common_params & params) {
+            params.vm_debug_log = true;
+            params.verbosity = LOG_LEVEL_DEBUG;
+            common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
+        }
+    ));
+    add_opt(common_arg(
+        {"--vm-block-size-mb"}, "N",
+        string_format("VM weight block size for mmap prefetching, in MiB (default: %d)", params.vm_block_size_mb),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.vm_block_size_mb = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--vm-pin-small-mb"}, "N",
+        string_format("VM small tensor mlock threshold, in MiB (default: %d)", params.vm_pin_small_mb),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.vm_pin_small_mb = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--vm-pin-budget-mb"}, "N",
+        string_format("VM total mlock budget for small tensors, in MiB (default: %d)", params.vm_pin_budget_mb),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.vm_pin_budget_mb = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--vm-prefetch-budget-mb"}, "N",
+        string_format("VM graph prefetch budget, in MiB (default: %d)", params.vm_prefetch_budget_mb),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.vm_prefetch_budget_mb = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--vm-window-steps"}, "N",
+        string_format("VM graph prefetch window in execution-plan steps (default: %d)", params.vm_window_steps),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.vm_window_steps = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--vm-layer-schedule"},
+        "VM use scheduler eval callbacks for layer-level mmap prefetch/reclaim (default: disabled)",
+        [](common_params & params) {
+            params.vm_layer_schedule = true;
+        }
+    ));
+    add_opt(common_arg(
+        {"--vm-window-layers"}, "N",
+        string_format("VM layer prefetch window, in layers (default: %d)", params.vm_window_layers),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.vm_window_layers = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--vm-dontneed"},
+        "VM reclaim prefetched mmap pages that are not used by the current graph plan (default: disabled)",
+        [](common_params & params) {
+            params.vm_dontneed = true;
+            params.vm_reclaim_policy = 1;
+        }
+    ));
+    add_opt(common_arg(
+        {"--vm-reclaim-policy"}, "{none,dontneed,soft,pageout}",
+        "VM mmap reclaim policy; soft uses MADV_FREE and may be unsupported for file-backed mappings",
+        [](common_params & params, const std::string & value) {
+            if (value == "none") {
+                params.vm_reclaim_policy = 0;
+                params.vm_dontneed = false;
+            } else if (value == "dontneed") {
+                params.vm_reclaim_policy = 1;
+                params.vm_dontneed = true;
+            } else if (value == "soft") {
+                params.vm_reclaim_policy = 2;
+                params.vm_dontneed = false;
+            } else if (value == "pageout") {
+                params.vm_reclaim_policy = 3;
+                params.vm_dontneed = false;
+            } else {
+                throw std::invalid_argument("invalid value");
+            }
+        }
+    ));
+    add_opt(common_arg(
+        {"--vm-prefill-dontneed"},
+        "VM enable layer lifecycle and MADV_DONTNEED during prompt prefill (default: disabled)",
+        [](common_params & params) {
+            params.vm_prefill_dontneed = true;
+            params.vm_subgraph = true;
+            params.vm_layer_schedule = true;
+            params.vm_double_buffer = true;
+            params.vm_dontneed = true;
+            params.vm_reclaim_policy = 1;
+        }
+    ));
+    add_opt(common_arg(
+        {"--vm-subgraph"},
+        "VM execute layer-wise subgraphs instead of submitting the full graph at once (default: disabled)",
+        [](common_params & params) {
+            params.vm_subgraph = true;
+        }
+    ));
+    add_opt(common_arg(
+        {"--vm-subgraph-group-layers"}, "N",
+        string_format("VM number of transformer layers per submitted subgraph (default: %d)", params.vm_subgraph_group_layers),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.vm_subgraph_group_layers = value;
+            params.vm_subgraph = true;
+        }
+    ));
+    add_opt(common_arg(
+        {"--vm-subgraph-sync-depth"}, "N",
+        string_format("VM submitted subgraphs per backend synchronization (default: %d)", params.vm_subgraph_sync_depth),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.vm_subgraph_sync_depth = value;
+            params.vm_subgraph = true;
+        }
+    ));
+    add_opt(common_arg(
+        {"--vm-double-buffer"},
+        "VM use double-buffered layer prefetch with subgraph execution (default: disabled)",
+        [](common_params & params) {
+            params.vm_double_buffer = true;
+            params.vm_subgraph = true;
+        }
+    ));
+    add_opt(common_arg(
+        {"--vm-subgraph-plan-path"},
+        "VM execute each subgraph through backend graph_plan_create/compute/free (default: disabled)",
+        [](common_params & params) {
+            params.vm_subgraph_plan_path = true;
+            params.vm_subgraph = true;
+        }
+    ));
+    add_opt(common_arg(
+        {"--vm-subgraph-plan-cache"},
+        "VM cache backend graph plans for subgraphs and update them across tokens (default: disabled)",
+        [](common_params & params) {
+            params.vm_subgraph_plan_cache = true;
+            params.vm_subgraph = true;
+        }
+    ));
+    add_opt(common_arg(
+        {"--vm-subgraph-sequence"},
+        "VM execute cached CPU subgraph plans through one persistent sequence executor (default: disabled)",
+        [](common_params & params) {
+            params.vm_subgraph_sequence = true;
+            params.vm_subgraph_plan_cache = true;
+            params.vm_subgraph = true;
+        }
+    ));
+    add_opt(common_arg(
+        {"--vm-pipeline-layers"}, "N",
+        string_format("VM subgraph pipeline prefetch layers (default: %d)", params.vm_pipeline_layers),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.vm_pipeline_layers = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--vm-reclaim-budget-mb"}, "N",
+        string_format("VM DONTNEED reclaim budget per graph, in MiB (default: %d)", params.vm_reclaim_budget_mb),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.vm_reclaim_budget_mb = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--vm-hugepage"},
+        "VM enable transparent hugepage (THP) support for lower TLB miss rate (default: disabled)",
+        [](common_params & params) {
+            params.vm_hugepage = true;
+        }
+    ));
+    add_opt(common_arg(
+        {"--vm-hugepage-align"},
+        "VM align mmap to 2 MiB boundaries for better THP success rate (default: auto-enabled with --vm-hugepage)",
+        [](common_params & params) {
+            params.vm_hugepage_align = true;
+        }
+    ));
+    add_opt(common_arg(
+        {"--no-vm-hugepage-align"},
+        "VM disable mmap alignment (for testing/debugging)",
+        [](common_params & params) {
+            params.vm_hugepage_align = false;
+        }
+    ));
+    add_opt(common_arg(
+        {"--vm-keep-behind-steps"}, "N",
+        string_format("VM keep-behind steps for conservative reclaim (default: %d)", params.vm_keep_behind_steps),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.vm_keep_behind_steps = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--vm-keep-behind-layers"}, "N",
+        string_format("VM keep-behind window for layer reclaim, in layers (default: %d)", params.vm_keep_behind_layers),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.vm_keep_behind_layers = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--vm-reclaim-distance"}, "N",
+        string_format("VM minimum layer distance before reclaim (default: %d)", params.vm_reclaim_distance),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.vm_reclaim_distance = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--vm-sliding-unmap"},
+        "VM unmap completed layer groups and remap them at the same address before reuse",
+        [](common_params & params) {
+            params.vm_sliding_unmap = true;
+            params.vm_subgraph = true;
+            params.vm_layer_schedule = true;
+        }
+    ));
+    add_opt(common_arg(
+        {"--vm-keep-behind-groups"}, "N",
+        string_format("VM sliding-unmap groups kept behind current group (default: %d)", params.vm_keep_behind_groups),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.vm_keep_behind_groups = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--vm-plan-cache"}, "N",
+        string_format("VM max graph exec-plan cache entries (default: %d)", params.vm_plan_cache_entries),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.vm_plan_cache_entries = value;
+        }
+    ));
+    add_opt(common_arg(
         {"--log-disable"},
         "Log disable",
         [](common_params &) {

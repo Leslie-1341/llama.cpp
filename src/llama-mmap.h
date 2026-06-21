@@ -49,6 +49,8 @@ struct llama_mmap {
     void * addr() const;
 
     void unmap_fragment(size_t first, size_t last);
+    bool unmap_fragment_reserved(size_t first, size_t last);
+    bool remap_fragment(size_t first, size_t last);
 
     static const bool SUPPORTED;
 

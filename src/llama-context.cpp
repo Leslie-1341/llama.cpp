@@ -10,21 +10,31 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
-#include "llama-flex.h"
-#include "llama-moe-buffer.h"
+#include "llama-rss.h"
 #include "llama-window.h"
+#include "llama-flex.h"
 #include "llama-ext.h"
 #include "llama.h"
 
 #include <cinttypes>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <mutex>
+#include <sys/resource.h>
 #include <stdexcept>
 
 //
 // llama_context
 //
+
+static void llama_window_cpu_node_done(const ggml_tensor * node, void * user_data) {
+    auto * window = static_cast<llama_window_context *>(user_data);
+    if (window != nullptr) {
+        llama_window_node_done(*window, node);
+    }
+}
 
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
@@ -1251,12 +1261,7 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
-    if (mctx) {
-        mctx->clear_paged_swap_error();
-    }
-
     if (mctx && !mctx->apply()) {
-        mctx->finish_paged_kv_write(llama_paged_kv_write_action::ROLLBACK_PRE_COMPUTE);
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
@@ -1293,22 +1298,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
         if (!gf) {
-            if (mctx) {
-                mctx->finish_paged_kv_write(llama_paged_kv_write_action::ROLLBACK_PRE_COMPUTE);
-            }
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
 
-        const bool graph_allocated = ggml_backend_sched_alloc_graph(sched.get(), gf);
-        const bool inject_graph_alloc_failure = mctx && mctx->test_paged_kv_fail_graph_alloc();
-        if (!graph_allocated || inject_graph_alloc_failure) {
-            if (mctx) {
-                mctx->finish_paged_kv_write(llama_paged_kv_write_action::ROLLBACK_PRE_COMPUTE);
-            }
-            LLAMA_LOG_ERROR("%s: failed to allocate graph%s\n", __func__,
-                    inject_graph_alloc_failure ? " (test injection)" : "");
+        const auto alloc_t0 = std::chrono::steady_clock::now();
+        const bool alloc_ok = ggml_backend_sched_alloc_graph(sched.get(), gf);
+        const auto alloc_t1 = std::chrono::steady_clock::now();
+        if (!alloc_ok) {
+            LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
@@ -1324,55 +1323,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
-    if (mctx && mctx->has_paged_swap_error()) {
-        const llama_paged_swap_error err = mctx->get_paged_swap_error();
-        LLAMA_LOG_ERROR(
-                "%s: paged KV swap-in failed before graph_compute: reason=%s physical_block=%u physical_cell=%u backend_status=%d backend_errno=%d\n",
-                __func__,
-                llama_paged_swap_error_reason_name(err.reason),
-                err.physical_block,
-                err.physical_cell,
-                err.backend_status,
-                err.backend_errno);
-        LLAMA_LOG_ERROR(
-                "KV_PAGED_PRE_GRAPH_FAILURE reason=%s graph_compute_skipped=1\n",
-                llama_paged_swap_error_reason_name(err.reason));
-        mctx->finish_paged_kv_write(llama_paged_kv_write_action::ROLLBACK_PRE_COMPUTE);
-        ret = GGML_STATUS_FAILED;
-        return nullptr;
-    }
-
-    if (mctx) {
-        mctx->mark_paged_kv_compute_started();
-    }
-    auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
-    const bool inject_compute_failure = mctx && mctx->test_paged_kv_fail_after_compute();
-    if (inject_compute_failure && status == GGML_STATUS_SUCCESS) {
-        status = GGML_STATUS_FAILED;
-    }
+    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
-        if (mctx) {
-            if (mctx->needs_paged_kv_post_graph_sync()) {
-                ggml_backend_sched_synchronize(sched.get());
-            }
-            mctx->finish_paged_kv_write(llama_paged_kv_write_action::INVALIDATE_COMPUTE_STARTED);
-        }
-        LLAMA_LOG_ERROR("%s: failed to compute graph%s, compute status: %d\n", __func__,
-                inject_compute_failure ? " (test injection after compute)" : "", status);
+        LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
     }
 
     ret = GGML_STATUS_SUCCESS;
-    if (mctx) {
-        if (mctx->needs_paged_kv_post_graph_sync()) {
-            ggml_backend_sched_synchronize(sched.get());
-        }
-        if (!mctx->finish_paged_kv_write(llama_paged_kv_write_action::COMMIT)) {
-            ret = GGML_STATUS_FAILED;
-            return nullptr;
-        }
-    }
 
     return res;
 }
@@ -1846,15 +1804,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
         if (!res) {
-            if (mctx->paged_kv_failure_handled()) {
-                switch (status) {
-                    case GGML_STATUS_ABORTED:      return  2;
-                    case GGML_STATUS_ALLOC_FAILED: return -2;
-                    case GGML_STATUS_FAILED:       return -3;
-                    case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
-                }
-            }
-
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
             llama_pos pos_min[LLAMA_MAX_SEQ];
             for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
@@ -2372,16 +2321,6 @@ llm_graph_params llama_context::graph_params(
     };
 }
 
-// Adapts the ggml CPU per-node callback signature to the window predictor.
-// Fired (on ith==0) after each node's barrier during graph compute; the window
-// intercepts ffn_inp-{L} nodes to issue CLG async prefetch for layer L+1.
-static void llama_clg_node_callback(const ggml_tensor * node, void * user_data) {
-    auto * window = static_cast<llama_window_context *>(user_data);
-    if (window != nullptr) {
-        llama_window_node_done(*window, node);
-    }
-}
-
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
                    bool   batched) {
@@ -2401,34 +2340,28 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
-    // Per-node weight-stream hook on the CPU backend for the duration of this
-    // graph. Used by FlexInfer-style dense streaming (llama-flex), which faults
-    // each op's flex-managed weights into its ring and repoints ->data. Only
-    // active when LLAMA_FLEX created a context; otherwise this is a no-op and
-    // the default (fully resident) path is unchanged.
+    ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
+    auto * window = model.get_window_context();
+    auto * set_node_callback_fn =
+            (decltype(ggml_backend_cpu_set_node_callback) *) nullptr;
+    if (backend_cpu != nullptr && llama_window_enabled(window)) {
+        auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
+        set_node_callback_fn = (decltype(ggml_backend_cpu_set_node_callback) *)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_node_callback");
+        if (set_node_callback_fn != nullptr) {
+            set_node_callback_fn(backend_cpu, llama_window_cpu_node_done, window);
+            llama_window_graph_begin(*window, batched);
+        }
+    }
+
+    // FlexInfer-style streaming: install the per-node weight-stream hook on the
+    // CPU backend for the duration of this graph. Mutually exclusive with window.
     auto * flex = model.get_flex_context();
-    auto * moe  = model.get_moe_buffer_context();
     const bool flex_active = backend_cpu != nullptr && llama_flex_enabled(flex);
-    // MoE buffer streaming only when flex is not driving the callback (single
-    // weight-stream callback; flex takes precedence). No composite callback.
-    const bool moe_active  = backend_cpu != nullptr && !flex_active && llama_moe_buffer_enabled(moe);
     if (flex_active) {
         llama_flex_graph_begin(*flex);
         ggml_cpu_set_weight_stream_callback(llama_flex_stream_callback, flex);
-    } else if (moe_active) {
-        ggml_cpu_set_weight_stream_callback(llama_moe_buffer_stream_callback, moe);
-    }
-
-    // CLG async prefetch: layered on top of the moe_buffer weight-stream path.
-    // The per-node callback lets the window predictor intercept ffn_inp-{L} and
-    // issue llama_moe_buffer_prefetch() for layer L+1. Correctness still rests on
-    // the moe weight-stream callback above (synchronous fallback on miss); the
-    // node callback only buys lead time, so a misprediction costs perf, not output.
-    auto * window = model.get_window_context();
-    const bool clg_active = moe_active && llama_window_enabled(window);
-    if (clg_active) {
-        llama_window_graph_begin(*window, batched);
-        ggml_backend_cpu_set_node_callback(backend_cpu, llama_clg_node_callback, window);
     }
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
@@ -2436,17 +2369,15 @@ ggml_status llama_context::graph_compute(
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
 
-    // Tear down the hooks before returning so no dangling callback survives this
-    // graph (including the error path above: we still synchronize and clear).
-    if (flex_active || moe_active || clg_active) {
+    if (flex_active) {
         ggml_backend_sched_synchronize(sched.get());
-        if (clg_active) {
-            ggml_backend_cpu_set_node_callback(backend_cpu, nullptr, nullptr);
-            llama_window_graph_end(*window);
-        }
-        if (flex_active || moe_active) {
-            ggml_cpu_set_weight_stream_callback(nullptr, nullptr);
-        }
+        ggml_cpu_set_weight_stream_callback(nullptr, nullptr);
+    }
+
+    if (set_node_callback_fn != nullptr) {
+        ggml_backend_sched_synchronize(sched.get());
+        llama_window_graph_end(*window);
+        set_node_callback_fn(backend_cpu, nullptr, nullptr);
     }
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));

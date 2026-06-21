@@ -1,5 +1,6 @@
 #include "llama-model-loader.h"
 
+
 #include "ggml-alloc.h"
 #include "ggml.h"
 #include "gguf.h"
@@ -1331,6 +1332,22 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
 }
 
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
+    // The runtime sliding-window controller (llama-window) operates on the
+    // stable traditional mmap. When it is requested -- either via LLAMA_LAZY_V2
+    // or the legacy LLAMA_LAZY_LOADING switch -- disable prefetch and mlock so
+    // pages are faulted in on demand and the window can reclaim them.
+    const char * lazy_v2_env = getenv("LLAMA_LAZY_V2");
+    const char * lazy_env    = getenv("LLAMA_LAZY_LOADING");
+    const bool use_lazy_window =
+        (lazy_v2_env && atoi(lazy_v2_env) > 0) ||
+        (lazy_env    && atoi(lazy_env)    > 0);
+
+    if (use_lazy_window) {
+        prefetch    = false;
+        mlock_mmaps = nullptr;
+    }
+
+    // Traditional full mmap
     if (use_mmap) {
         mappings.reserve(files.size());
         mmaps_used.reserve(files.size());
@@ -1356,6 +1373,9 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
             mappings.emplace_back(std::move(mapping));
         }
     }
+
+    // The runtime sliding-window controller (llama-window) is set up later in
+    // load_tensors and operates directly on the mmap mappings created above.
 
     // compute the total size of all tensors for progress reporting
     for (const auto & it : weights_map) {
@@ -1408,7 +1428,8 @@ bool llama_model_loader::load_all_data(
         llama_buf_map & bufs,
         llama_mlocks * lmlocks,
         llama_progress_callback progress_callback,
-        void * progress_callback_user_data) {
+        void * progress_callback_user_data,
+        bool mmap_only) {
     if (files.empty()) {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             set_tensor_data(t, set_tensor_data_ud);
@@ -1416,6 +1437,11 @@ bool llama_model_loader::load_all_data(
         return true;
     }
     GGML_ASSERT(size_data != 0 && "call init_mappings() first");
+
+    if (mmap_only && (!use_mmap || check_tensors || lmlocks != nullptr)) {
+        LLAMA_LOG_ERROR("%s: mmap-only loading requires mmap, check_tensors=false and no mlock\n", __func__);
+        return false;
+    }
 
     std::vector<no_init<uint8_t>> read_buf;
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
@@ -1541,6 +1567,12 @@ bool llama_model_loader::load_all_data(
             }
             uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
 
+            if (mmap_only && !(buf_mmap && cur->data == nullptr)) {
+                LLAMA_LOG_ERROR("%s: mmap-only loading requires an mmap-backed tensor buffer for %s\n",
+                        __func__, ggml_get_name(cur));
+                return false;
+            }
+
             if (check_tensors) {
                 validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {
                     return std::make_pair(cur, ggml_validate_row_data(cur->type, data, n_size));
@@ -1559,6 +1591,7 @@ bool llama_model_loader::load_all_data(
                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
             } else {
+                GGML_ASSERT(!mmap_only);
                 ggml_backend_tensor_set(cur, data, 0, n_size);
             }
         } else {

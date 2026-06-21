@@ -1365,30 +1365,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         common_set_adapter_lora(lctx, params.lora_adapters);
     }
 
-    // memory-aware warmup policy (LLAMA_LOW_MEM_WARMUP):
-    //   unset/"default" -> keep original warmup behavior unchanged
-    //   "off"           -> skip the whole warmup block (equivalent to --no-warmup)
-    //   "minimal"       -> skip the redundant decode warmup as well; all structural
-    //                      initialization (backend init, KV alloc, sched_reserve,
-    //                      output_reserve) already happened during context construction,
-    //                      so the only thing warmup does here is a perf pre-touch of the
-    //                      compute buffer, which is what inflates peak RSS.
-    bool low_mem_warmup_skip = false;
-    if (const char * low_mem_warmup = getenv("LLAMA_LOW_MEM_WARMUP")) {
-        if (low_mem_warmup[0] == '\0' || strcmp(low_mem_warmup, "default") == 0) {
-            // keep original behavior
-        } else if (strcmp(low_mem_warmup, "off") == 0) {
-            low_mem_warmup_skip = true;
-            LOG_INF("%s: LLAMA_LOW_MEM_WARMUP=off - low-memory mode, skipping full warmup (equivalent to --no-warmup)\n", __func__);
-        } else if (strcmp(low_mem_warmup, "minimal") == 0) {
-            low_mem_warmup_skip = true;
-            LOG_INF("%s: LLAMA_LOW_MEM_WARMUP=minimal - structural init already done during context construction; skipping redundant warmup decode pre-touch to lower peak RSS\n", __func__);
-        } else {
-            LOG_WRN("%s: LLAMA_LOW_MEM_WARMUP='%s' is not a recognized value (default|off|minimal); keeping original warmup behavior\n", __func__, low_mem_warmup);
-        }
-    }
-
-    if (params.warmup && !low_mem_warmup_skip) {
+    if (params.warmup) {
         LOG_INF("%s: warming up the model with an empty run - please wait ... (--no-warmup to disable)\n", __func__);
 
         llama_set_warmup(lctx, true);
@@ -1532,6 +1509,33 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.split_mode      = params.split_mode;
     mparams.tensor_split    = params.tensor_split;
     mparams.use_mmap        = params.use_mmap;
+    mparams.vm_debug_log    = params.vm_debug_log;
+    mparams.vm_block_size_mb      = params.vm_block_size_mb;
+    mparams.vm_pin_small_mb       = params.vm_pin_small_mb;
+    mparams.vm_pin_budget_mb      = params.vm_pin_budget_mb;
+    mparams.vm_prefetch_budget_mb = params.vm_prefetch_budget_mb;
+    mparams.vm_window_steps       = params.vm_window_steps;
+    mparams.vm_window_layers      = params.vm_window_layers;
+    mparams.vm_reclaim_budget_mb  = params.vm_reclaim_budget_mb;
+    mparams.vm_keep_behind_steps  = params.vm_keep_behind_steps;
+    mparams.vm_keep_behind_layers = params.vm_keep_behind_layers;
+    mparams.vm_plan_cache_entries = params.vm_plan_cache_entries;
+    mparams.vm_pipeline_layers    = params.vm_pipeline_layers;
+    mparams.vm_subgraph_group_layers = params.vm_subgraph_group_layers;
+    mparams.vm_subgraph_sync_depth = params.vm_subgraph_sync_depth;
+    mparams.vm_reclaim_policy      = params.vm_reclaim_policy;
+    mparams.vm_reclaim_distance    = params.vm_reclaim_distance;
+    mparams.vm_keep_behind_groups  = params.vm_keep_behind_groups;
+    mparams.vm_dontneed           = params.vm_dontneed;
+    mparams.vm_layer_schedule     = params.vm_layer_schedule;
+    mparams.vm_prefill_dontneed   = params.vm_prefill_dontneed;
+    mparams.vm_subgraph           = params.vm_subgraph;
+    mparams.vm_double_buffer      = params.vm_double_buffer;
+    mparams.vm_subgraph_plan_path = params.vm_subgraph_plan_path;
+    mparams.vm_subgraph_plan_cache = params.vm_subgraph_plan_cache;
+    mparams.vm_subgraph_sequence = params.vm_subgraph_sequence;
+    mparams.vm_sliding_unmap     = params.vm_sliding_unmap;
+    mparams.vm_hugepage          = params.vm_hugepage;
     mparams.use_direct_io   = params.use_direct_io;
     mparams.use_mlock       = params.use_mlock;
     mparams.check_tensors   = params.check_tensors;
