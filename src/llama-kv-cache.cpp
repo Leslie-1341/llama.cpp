@@ -428,6 +428,7 @@ llama_kv_cache::llama_kv_cache(
         const char * LLAMA_KV_PAGED_IDLE_TRACE = std::getenv("LLAMA_KV_PAGED_IDLE_TRACE");
         const char * LLAMA_KV_PAGED_IDLE_SWAP  = std::getenv("LLAMA_KV_PAGED_IDLE_SWAP");
         const char * LLAMA_KV_PAGED_IDLE_SWAP_MADVISE = std::getenv("LLAMA_KV_PAGED_IDLE_SWAP_MADVISE");
+        const char * LLAMA_KV_PAGED_SHADOW_VALIDATE = std::getenv("LLAMA_KV_PAGED_SHADOW_VALIDATE");
         const char * LLAMA_KV_PAGED_MINCORE = std::getenv("LLAMA_KV_PAGED_MINCORE");
         const char * LLAMA_KV_PAGED_REFAULT_TRACE           = std::getenv("LLAMA_KV_PAGED_REFAULT_TRACE");
         const char * LLAMA_KV_PAGED_REFAULT_TRACE_MAX       = std::getenv("LLAMA_KV_PAGED_REFAULT_TRACE_MAX");
@@ -468,6 +469,9 @@ llama_kv_cache::llama_kv_cache(
             paged_swap_enabled = paged_swap_env;
             paged_idle_swap_requested = idle_swap_env;
             paged_idle_swap_madvise_requested = idle_swap_madvise_env;
+            paged_shadow_validate_enabled = !(
+                LLAMA_KV_PAGED_SHADOW_VALIDATE &&
+                std::strcmp(LLAMA_KV_PAGED_SHADOW_VALIDATE, "0") == 0);
             paged_mincore_requested = LLAMA_KV_PAGED_MINCORE && std::strcmp(LLAMA_KV_PAGED_MINCORE, "1") == 0;
 #if defined(__linux__)
             // kv_paged_enabled already implies n_stream==1 && !v_trans (checked above). CPU host
@@ -6671,7 +6675,9 @@ bool llama_kv_cache_context::next() {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 
     if (paged_shadow_pending) {
-        kv->paged_shadow_validate(sinfos[i_cur], paged_shadow_n_kv);
+        if (kv->paged_shadow_validate_enabled) {
+            kv->paged_shadow_validate(sinfos[i_cur], paged_shadow_n_kv);
+        }
         paged_shadow_pending = false;
     }
 

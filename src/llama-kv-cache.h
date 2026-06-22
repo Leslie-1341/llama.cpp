@@ -534,6 +534,7 @@ private:
     // Stage 7D-B: state-aware shadow validation. paged_shadow_validate() used to read every
     // row's raw K/V tensor memory unconditionally, refaulting SWAPPED pages back to resident
     // (and polluting Stage 7C-G residency conclusions). These count the SWAPPED-aware skips.
+    bool     paged_shadow_validate_enabled = true;
     mutable uint64_t paged_shadow_validate_calls          = 0;
     mutable uint64_t paged_shadow_validate_blocks_checked = 0;
     mutable uint64_t paged_shadow_validate_swapped_blocks_skipped = 0;
