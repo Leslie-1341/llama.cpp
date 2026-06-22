@@ -388,9 +388,27 @@ int main(int argc, char ** argv) {
     const char * prefetch_during_active_env = std::getenv("LLAMA_KV_PAGED_PREFETCH_DURING_ACTIVE");
     const bool prefetch_during_active =
         prefetch_during_active_env != nullptr && std::atoi(prefetch_during_active_env) != 0;
+    const int32_t prefetch_auto_every_tokens =
+        parse_env_i32_or_default("LLAMA_KV_PAGED_PREFETCH_AUTO_EVERY_TOKENS", 4, true);
+    const int32_t prefetch_auto_blocks_per_step =
+        parse_env_i32_or_default("LLAMA_KV_PAGED_PREFETCH_AUTO_BLOCKS_PER_STEP", 1, true);
+    const int32_t prefetch_auto_safety_tokens =
+        parse_env_i32_or_default("LLAMA_KV_PAGED_PREFETCH_AUTO_SAFETY_TOKENS", 0, false);
     const char * defer_swapout_on_resume_env = std::getenv("LLAMA_KV_PAGED_DEFER_SWAPOUT_ON_RESUME");
     const bool defer_swapout_on_resume =
         defer_swapout_on_resume_env != nullptr && std::atoi(defer_swapout_on_resume_env) != 0;
+
+    fprintf(stderr,
+            "KV_SEMI_PREFETCH_CONFIG during_active=%d every=%d blocks_per_step=%d safety=%d "
+            "auto_every=%d auto_blocks_per_step=%d auto_safety=%d defer=%d\n",
+            prefetch_during_active ? 1 : 0,
+            prefetch_auto_every_tokens,
+            prefetch_auto_blocks_per_step,
+            prefetch_auto_safety_tokens,
+            prefetch_auto_every_tokens,
+            prefetch_auto_blocks_per_step,
+            prefetch_auto_safety_tokens,
+            defer_swapout_on_resume ? 1 : 0);
 
     llama_backend_init();
     llama_numa_init(params.numa);
@@ -474,6 +492,8 @@ int main(int argc, char ** argv) {
     const auto total_t0 = perf_clock::now();
     double active_decode_ms = 0.0;
     int32_t active_decode_tokens = 0;
+    int64_t prefetch_step_calls = 0;
+    int64_t prefetch_step_blocks = 0;
 
     const auto prefill_session = [&](semi_session & s, int phase) -> bool {
         s.state = session_state::PREFILL;
@@ -506,19 +526,39 @@ int main(int argc, char ** argv) {
         if (!prefetch_during_active) {
             return true;
         }
+        if (active_decode_tokens <= 0 || active_decode_tokens % prefetch_auto_every_tokens != 0) {
+            return true;
+        }
 
         for (semi_session & s : sessions) {
             if (s.state != session_state::RESUME_PENDING || !s.prefetch_protected) {
                 continue;
             }
 
-            const int32_t restored = llama_memory_prefetch_seq_step(llama_get_memory(ctx), s.seq_id, 1);
+            const int32_t restored = llama_memory_prefetch_seq_step(
+                    llama_get_memory(ctx), s.seq_id, prefetch_auto_blocks_per_step);
             if (restored < 0) {
                 fprintf(stderr,
                         "%s: llama_memory_prefetch_seq_step() failed for seq=%d\n",
                         __func__, (int) s.seq_id);
                 return false;
             }
+            prefetch_step_calls += 1;
+            if (restored > 0) {
+                prefetch_step_blocks += restored;
+            }
+            fprintf(stderr,
+                    "KV_SEMI_PREFETCH_STEP phase=%d seq=%d restored=%d every=%d blocks_per_step=%d "
+                    "safety=%d auto_safety=%d calls=%lld blocks=%lld\n",
+                    phase,
+                    (int) s.seq_id,
+                    restored,
+                    prefetch_auto_every_tokens,
+                    prefetch_auto_blocks_per_step,
+                    prefetch_auto_safety_tokens,
+                    prefetch_auto_safety_tokens,
+                    (long long) prefetch_step_calls,
+                    (long long) prefetch_step_blocks);
             log_session_event(s, phase, "prefetch_step");
         }
         return true;
@@ -616,6 +656,11 @@ int main(int argc, char ** argv) {
                         __func__, (int) s.seq_id);
                 return false;
             }
+            fprintf(stderr,
+                    "KV_SEMI_PREFETCH_SYNC phase=%d seq=%d restored=%d\n",
+                    phase,
+                    (int) s.seq_id,
+                    prefetch_blocks);
             log_session_event(s, phase, "prefetch");
         }
 
