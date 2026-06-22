@@ -259,6 +259,7 @@ public:
     int32_t prefetch_seq(llama_seq_id seq_id) override;
     int32_t prefetch_seq_step(llama_seq_id seq_id, uint32_t max_blocks) override;
     void set_seq_prefetch_protected(llama_seq_id seq_id, bool enabled) override;
+    void defer_idle_swapout(int32_t n_steps);
     void prefetch_seq_last_stats(
             uint64_t & owned_blocks,
             uint64_t & swapped_blocks,
@@ -463,7 +464,9 @@ private:
     uint32_t paged_write_resolve(uint32_t cell) const;
     void paged_ensure_write_resident(uint32_t phys_cell) const;
     void paged_check_read_resident(uint32_t phys_cell, bool active) const;
+    void paged_check_read_resident_impl(uint32_t phys_cell, bool active) const;
     void paged_swap_out_block(uint32_t physical_block, bool do_madvise = true) const;
+    void paged_swap_out_block_impl(uint32_t physical_block, bool do_madvise) const;
     bool paged_swap_in_block(uint32_t physical_block) const;
     uint64_t paged_madvise_block(
             uint32_t physical_block,
@@ -495,6 +498,7 @@ private:
     void paged_assert_identity(const slot_info & sinfo);
     void paged_shadow_validate(const slot_info & sinfo, uint32_t n_kv) const;
     bool paged_ingraph_gather_supported(int32_t il) const;
+    void paged_log_timing() const;
     void paged_log_stats() const;
 
     static constexpr uint32_t PAGED_BLOCK_INVALID = UINT32_MAX;
@@ -692,6 +696,20 @@ private:
     bool     paged_idle_trace_enabled = false;
     mutable std::array<uint64_t, LLAMA_MAX_SEQ> paged_idle_seq_last_active_step = {};
     mutable std::bitset<LLAMA_MAX_SEQ> paged_idle_seq_seen;
+    // Stage 8D-3: gated resume timing telemetry. Off unless
+    // LLAMA_KV_PAGED_RESUME_TIMING=1; counters are emitted once from the dtor path.
+    bool     paged_resume_timing_enabled = false;
+    // Stage 8D-4: gated per-step resume timing telemetry. Off unless
+    // LLAMA_KV_PAGED_RESUME_TIMING_STEP=1; emitted once per paged row_idx fill.
+    bool     paged_resume_timing_step_enabled = false;
+    mutable uint64_t paged_timing_set_input_us = 0;
+    mutable uint64_t paged_timing_set_input_calls = 0;
+    mutable uint64_t paged_timing_idle_maintenance_us = 0;
+    mutable uint64_t paged_timing_idle_maintenance_calls = 0;
+    mutable uint64_t paged_timing_swap_out_us = 0;
+    mutable uint64_t paged_timing_swap_out_calls = 0;
+    mutable uint64_t paged_timing_check_read_us = 0;
+    mutable uint64_t paged_timing_check_read_calls = 0;
     // Stage 6C-1A: seqs marked prefetch-protected (resume-pending) are excluded from idle
     // swap-out victim selection so interleaved prefetch is not undone by the same-step idle
     // gate. Does not change read-window / nonidentity / state-machine semantics.
@@ -733,6 +751,8 @@ private:
     mutable uint64_t paged_idle_swap_out_calls = 0;
     mutable uint64_t paged_idle_swap_skip_not_remapped = 0;
     mutable uint64_t paged_idle_swap_skip_not_resident = 0;
+    mutable uint64_t paged_idle_swap_skip_deferred = 0;
+    mutable int32_t  paged_defer_idle_swapout_steps = 0;
     mutable bool     paged_nonidentity_probe_enabled = false;
     mutable uint64_t paged_nonidentity_remap_rows = 0;
     mutable uint64_t paged_nonidentity_remap_blocks = 0;
@@ -822,6 +842,7 @@ private:
     mutable std::set<uint32_t> paged_trace_write_blocks;
     void paged_trace_note_write_block(uint32_t physical_block) const;
     void paged_trace_emit_step(
+            uint64_t step,
             const std::set<uint32_t> & read_blocks,
             const std::set<uint32_t> & active_read_blocks,
             uint32_t n_kv,

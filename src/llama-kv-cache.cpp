@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cassert>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <csignal>
 #include <cstdint>
@@ -35,6 +36,12 @@
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
+}
+
+static uint64_t llama_paged_timing_now_us() {
+    using clock = std::chrono::steady_clock;
+    return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+            clock::now().time_since_epoch()).count();
 }
 
 // orthonormal Walsh-Hadamard rotation matrix
@@ -418,6 +425,12 @@ llama_kv_cache::llama_kv_cache(
     }
 
     const char * LLAMA_KV_PAGED = std::getenv("LLAMA_KV_PAGED");
+    const char * LLAMA_KV_PAGED_RESUME_TIMING = std::getenv("LLAMA_KV_PAGED_RESUME_TIMING");
+    const char * LLAMA_KV_PAGED_RESUME_TIMING_STEP = std::getenv("LLAMA_KV_PAGED_RESUME_TIMING_STEP");
+    paged_resume_timing_enabled =
+        LLAMA_KV_PAGED_RESUME_TIMING && std::strcmp(LLAMA_KV_PAGED_RESUME_TIMING, "1") == 0;
+    paged_resume_timing_step_enabled =
+        LLAMA_KV_PAGED_RESUME_TIMING_STEP && std::strcmp(LLAMA_KV_PAGED_RESUME_TIMING_STEP, "1") == 0;
     const bool kv_paged_requested = LLAMA_KV_PAGED && std::strcmp(LLAMA_KV_PAGED, "1") == 0;
     if (kv_paged_requested) {
         const char * LLAMA_KV_PAGED_BLOCK_SIZE = std::getenv("LLAMA_KV_PAGED_BLOCK_SIZE");
@@ -534,6 +547,9 @@ llama_kv_cache::llama_kv_cache(
             }
             if (paged_idle_trace_enabled) {
                 LLAMA_LOG_INFO("%s: KV paged idle trace enabled (telemetry only)\n", __func__);
+            }
+            if (paged_resume_timing_enabled) {
+                LLAMA_LOG_INFO("%s: KV paged resume timing enabled (telemetry only)\n", __func__);
             }
             if (paged_idle_swap_requested) {
                 LLAMA_LOG_INFO("%s: KV paged idle swap requested (safe-candidate probe only)\n", __func__);
@@ -902,6 +918,7 @@ llama_kv_cache::~llama_kv_cache() {
                 (unsigned long long) lazy_clear_us,
                 lazy_clear_us / 1000.0);
     }
+    paged_log_timing();
     paged_log_stats();
 }
 
@@ -1332,6 +1349,13 @@ void llama_kv_cache::set_seq_prefetch_protected(llama_seq_id seq_id, bool enable
     paged_prefetch_protected_seq.set(seq_id, enabled);
 }
 
+void llama_kv_cache::defer_idle_swapout(int32_t n_steps) {
+    if (n_steps <= 0) {
+        return;
+    }
+    paged_defer_idle_swapout_steps = std::max(paged_defer_idle_swapout_steps, n_steps);
+}
+
 extern "C" bool llama_kv_cache_set_seq_prefetch_protected(
         llama_memory_t mem,
         llama_seq_id   seq_id,
@@ -1341,6 +1365,17 @@ extern "C" bool llama_kv_cache_set_seq_prefetch_protected(
         return false;
     }
     kv->set_seq_prefetch_protected(seq_id, enabled);
+    return true;
+}
+
+extern "C" bool llama_kv_cache_defer_idle_swapout(
+        llama_memory_t mem,
+        int32_t        n_steps) {
+    auto * kv = dynamic_cast<llama_kv_cache *>(mem);
+    if (!kv) {
+        return false;
+    }
+    kv->defer_idle_swapout(n_steps);
     return true;
 }
 
@@ -2029,6 +2064,18 @@ void llama_kv_cache::paged_ensure_write_resident(uint32_t phys_cell) const {
 }
 
 void llama_kv_cache::paged_check_read_resident(uint32_t phys_cell, bool active) const {
+    if (!paged_resume_timing_enabled && !paged_resume_timing_step_enabled) {
+        paged_check_read_resident_impl(phys_cell, active);
+        return;
+    }
+
+    const uint64_t start_us = llama_paged_timing_now_us();
+    paged_check_read_resident_impl(phys_cell, active);
+    paged_timing_check_read_us += llama_paged_timing_now_us() - start_us;
+    paged_timing_check_read_calls += 1;
+}
+
+void llama_kv_cache::paged_check_read_resident_impl(uint32_t phys_cell, bool active) const {
     if (!kv_paged_enabled || (!paged_block_release_enabled && !paged_swap_enabled) ||
             phys_cell == PAGED_BLOCK_INVALID || paged_block_size == 0) {
         return;
@@ -2072,6 +2119,18 @@ void llama_kv_cache::paged_check_read_resident(uint32_t phys_cell, bool active) 
 }
 
 void llama_kv_cache::paged_swap_out_block(uint32_t physical_block, bool do_madvise) const {
+    if (!paged_resume_timing_enabled && !paged_resume_timing_step_enabled) {
+        paged_swap_out_block_impl(physical_block, do_madvise);
+        return;
+    }
+
+    const uint64_t start_us = llama_paged_timing_now_us();
+    paged_swap_out_block_impl(physical_block, do_madvise);
+    paged_timing_swap_out_us += llama_paged_timing_now_us() - start_us;
+    paged_timing_swap_out_calls += 1;
+}
+
+void llama_kv_cache::paged_swap_out_block_impl(uint32_t physical_block, bool do_madvise) const {
     if (!kv_paged_enabled || !paged_swap_enabled || !kv_swap_store || v_trans || n_stream != 1 ||
             paged_block_size == 0 || v_cells.empty()) {
         return;
@@ -3187,6 +3246,27 @@ bool llama_kv_cache::paged_ingraph_gather_supported(int32_t il) const {
     return supported;
 }
 
+void llama_kv_cache::paged_log_timing() const {
+    if (!paged_resume_timing_enabled) {
+        return;
+    }
+
+    fprintf(stderr,
+            "KV_PAGED_TIMING "
+            "set_input_us=%llu set_input_calls=%llu "
+            "idle_maintenance_us=%llu idle_maintenance_calls=%llu "
+            "swap_out_us=%llu swap_out_calls=%llu "
+            "check_read_us=%llu check_read_calls=%llu\n",
+            (unsigned long long) paged_timing_set_input_us,
+            (unsigned long long) paged_timing_set_input_calls,
+            (unsigned long long) paged_timing_idle_maintenance_us,
+            (unsigned long long) paged_timing_idle_maintenance_calls,
+            (unsigned long long) paged_timing_swap_out_us,
+            (unsigned long long) paged_timing_swap_out_calls,
+            (unsigned long long) paged_timing_check_read_us,
+            (unsigned long long) paged_timing_check_read_calls);
+}
+
 void llama_kv_cache::paged_log_stats() const {
     if (!kv_paged_enabled) {
         return;
@@ -3229,6 +3309,7 @@ void llama_kv_cache::paged_log_stats() const {
             "paged_idle_swap_enabled=%d paged_idle_swap_candidates=%llu "
             "paged_idle_swap_out_calls=%llu paged_idle_swap_skip_not_remapped=%llu "
             "paged_idle_swap_skip_not_resident=%llu paged_idle_swap_skip_protected=%llu "
+            "paged_idle_swap_skip_deferred=%llu "
             "paged_nonidentity_enabled=%d paged_nonidentity_remap_rows=%llu "
             "paged_nonidentity_remap_blocks=%llu paged_nonidentity_skip_no_dummy=%llu "
             "paged_nonidentity_skip_not_masked=%llu paged_nonidentity_skip_not_resident=%llu "
@@ -3352,6 +3433,7 @@ void llama_kv_cache::paged_log_stats() const {
             (unsigned long long) paged_idle_swap_skip_not_remapped,
             (unsigned long long) paged_idle_swap_skip_not_resident,
             (unsigned long long) paged_idle_swap_skip_protected,
+            (unsigned long long) paged_idle_swap_skip_deferred,
             paged_nonidentity_probe_enabled ? 1 : 0,
             (unsigned long long) paged_nonidentity_remap_rows,
             (unsigned long long) paged_nonidentity_remap_blocks,
@@ -4661,7 +4743,36 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
 }
 
 void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    const bool timing_enabled = paged_resume_timing_enabled || paged_resume_timing_step_enabled;
+    const uint64_t step = paged_trace_step;
+    const uint64_t set_input_start_us = timing_enabled ? llama_paged_timing_now_us() : 0;
+    const uint64_t idle_maintenance_us_before = paged_timing_idle_maintenance_us;
+    const uint64_t swap_out_us_before = paged_timing_swap_out_us;
+    const uint64_t swap_out_calls_before = paged_timing_swap_out_calls;
+    const uint64_t check_read_us_before = paged_timing_check_read_us;
+    const uint64_t check_read_calls_before = paged_timing_check_read_calls;
+    const bool defer_idle_swapout_now = paged_defer_idle_swapout_steps > 0;
     if (!dst) {
+        if (timing_enabled) {
+            const uint64_t set_input_us = llama_paged_timing_now_us() - set_input_start_us;
+            if (paged_resume_timing_step_enabled) {
+                fprintf(stderr,
+                        "KV_PAGED_STEP_TIMING step=%llu set_input_us=%llu "
+                        "idle_maintenance_us=0 swap_out_us=0 swap_out_calls=0 "
+                        "check_read_us=0 check_read_calls=0 swapped_blocks=0 "
+                        "idle_owned_blocks=0 prefetch_protected_blocks=0 remaining_prefetch_blocks=0 "
+                        "defer_idle_swapout=%d swapout_deferred_blocks=0\n",
+                        (unsigned long long) step,
+                        (unsigned long long) set_input_us,
+                        defer_idle_swapout_now ? 1 : 0);
+            }
+            paged_timing_set_input_us += set_input_us;
+            paged_timing_set_input_calls += 1;
+        }
+        if (defer_idle_swapout_now && paged_defer_idle_swapout_steps > 0) {
+            paged_defer_idle_swapout_steps -= 1;
+        }
+        paged_trace_step += 1;
         return;
     }
 
@@ -5079,7 +5190,10 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
     paged_swapped_redirect_blocks += swapped_redirected_blocks.size();
     paged_swapped_active_visible_violation_blocks += swapped_active_visible_violation_blocks_this_call.size();
 
+    uint64_t prefetch_protected_blocks_this_call = 0;
+    uint64_t swapout_deferred_blocks_this_call = 0;
     if (paged_idle_trace_enabled) {
+        const uint64_t idle_maintenance_start_us = timing_enabled ? llama_paged_timing_now_us() : 0;
         const uint64_t idle_step = paged_idle_active_seq_steps;
         const uint64_t active_seq_count = active_seq.count();
         for (llama_seq_id seq_id = 0; seq_id < LLAMA_MAX_SEQ; ++seq_id) {
@@ -5233,6 +5347,10 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                     skip_mixed_active += 1;
                 }
 
+                if ((owner & paged_prefetch_protected_seq).any()) {
+                    prefetch_protected_blocks_this_call += 1;
+                }
+
                 if (has_active_seq) {
                     paged_swap_out_skip_active_owned_block += 1;
                     if (trace_read_blocks_before_remap.find(block) != trace_read_blocks_before_remap.end() ||
@@ -5319,11 +5437,16 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                             if (in_read_window) {
                                 paged_swap_out_skip_fullprefix_read_window_only += 1;
                             }
-                            const uint64_t before = paged_swap_out_calls;
-                            paged_swap_out_block(block, idle_swap_madvise_ready);
-                            if (paged_swap_out_calls > before) {
-                                paged_idle_swap_out_calls += 1;
-                                paged_swap_out_allowed_blocks += 1;
+                            if (defer_idle_swapout_now) {
+                                paged_idle_swap_skip_deferred += 1;
+                                swapout_deferred_blocks_this_call += 1;
+                            } else {
+                                const uint64_t before = paged_swap_out_calls;
+                                paged_swap_out_block(block, idle_swap_madvise_ready);
+                                if (paged_swap_out_calls > before) {
+                                    paged_idle_swap_out_calls += 1;
+                                    paged_swap_out_allowed_blocks += 1;
+                                }
                             }
                         }
                     }
@@ -5374,6 +5497,7 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                 "paged_idle_swap_enabled=%d paged_idle_swap_candidates=%llu "
                 "paged_idle_swap_out_calls=%llu paged_idle_swap_skip_not_remapped=%llu "
                 "paged_idle_swap_skip_not_resident=%llu paged_idle_swap_skip_protected=%llu "
+                "paged_idle_swap_skip_deferred=%llu "
                 "paged_nonidentity_enabled=%d paged_nonidentity_remap_rows=%llu "
                 "paged_nonidentity_remap_blocks=%llu paged_nonidentity_skip_no_dummy=%llu "
                 "paged_nonidentity_skip_not_masked=%llu paged_nonidentity_skip_not_resident=%llu "
@@ -5431,6 +5555,7 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                 (unsigned long long) paged_idle_swap_skip_not_remapped,
                 (unsigned long long) paged_idle_swap_skip_not_resident,
                 (unsigned long long) paged_idle_swap_skip_protected,
+                (unsigned long long) paged_idle_swap_skip_deferred,
                 paged_nonidentity_probe_enabled ? 1 : 0,
                 (unsigned long long) paged_nonidentity_remap_rows,
                 (unsigned long long) paged_nonidentity_remap_blocks,
@@ -5527,6 +5652,10 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                 (unsigned long long) paged_mincore_swapped_nonresident_blocks,
                 (unsigned long long) (paged_mincore_swapped_total_bytes > 0
                     ? paged_mincore_swapped_resident_bytes * 1000ull / paged_mincore_swapped_total_bytes : 0));
+        if (timing_enabled) {
+            paged_timing_idle_maintenance_us += llama_paged_timing_now_us() - idle_maintenance_start_us;
+            paged_timing_idle_maintenance_calls += 1;
+        }
     }
 
     if (paged_trace_enabled) {
@@ -5549,9 +5678,47 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                 trace_active_read_blocks.insert(phys / paged_block_size);
             }
         }
-        paged_trace_emit_step(trace_read_blocks, trace_active_read_blocks,
+        paged_trace_emit_step(step, trace_read_blocks, trace_active_read_blocks,
                 (uint32_t) dst->ne[0], active_n_kv);
     }
+
+    if (timing_enabled) {
+        const uint64_t set_input_us = llama_paged_timing_now_us() - set_input_start_us;
+        if (paged_resume_timing_step_enabled) {
+            uint64_t swapped_blocks = 0;
+            for (uint32_t b = 0; b < paged_n_blocks && b < paged_block_states.size(); ++b) {
+                if (paged_block_states[b] == paged_block_state::SWAPPED) {
+                    swapped_blocks += 1;
+                }
+            }
+
+            fprintf(stderr,
+                    "KV_PAGED_STEP_TIMING step=%llu set_input_us=%llu "
+                    "idle_maintenance_us=%llu swap_out_us=%llu swap_out_calls=%llu "
+                    "check_read_us=%llu check_read_calls=%llu swapped_blocks=%llu "
+                    "idle_owned_blocks=%llu prefetch_protected_blocks=%llu remaining_prefetch_blocks=%llu "
+                    "defer_idle_swapout=%d swapout_deferred_blocks=%llu\n",
+                    (unsigned long long) step,
+                    (unsigned long long) set_input_us,
+                    (unsigned long long) (paged_timing_idle_maintenance_us - idle_maintenance_us_before),
+                    (unsigned long long) (paged_timing_swap_out_us - swap_out_us_before),
+                    (unsigned long long) (paged_timing_swap_out_calls - swap_out_calls_before),
+                    (unsigned long long) (paged_timing_check_read_us - check_read_us_before),
+                    (unsigned long long) (paged_timing_check_read_calls - check_read_calls_before),
+                    (unsigned long long) swapped_blocks,
+                    (unsigned long long) paged_idle_cold_candidates,
+                    (unsigned long long) prefetch_protected_blocks_this_call,
+                    (unsigned long long) paged_prefetch_seq_last_swapped_blocks,
+                    defer_idle_swapout_now ? 1 : 0,
+                    (unsigned long long) swapout_deferred_blocks_this_call);
+        }
+        paged_timing_set_input_us += set_input_us;
+        paged_timing_set_input_calls += 1;
+    }
+    if (defer_idle_swapout_now && paged_defer_idle_swapout_steps > 0) {
+        paged_defer_idle_swapout_steps -= 1;
+    }
+    paged_trace_step += 1;
 }
 
 void llama_kv_cache::paged_trace_note_write_block(uint32_t physical_block) const {
@@ -5562,6 +5729,7 @@ void llama_kv_cache::paged_trace_note_write_block(uint32_t physical_block) const
 }
 
 void llama_kv_cache::paged_trace_emit_step(
+        uint64_t step,
         const std::set<uint32_t> & read_blocks,
         const std::set<uint32_t> & active_read_blocks,
         uint32_t n_kv,
@@ -5576,8 +5744,6 @@ void llama_kv_cache::paged_trace_emit_step(
     // read_blocks       = physical blocks covered by the padded row_idx tensor (n_kv wide).
     // active_read_blocks = physical blocks of the real, populated KV range (active_n_kv wide),
     //                      with padding/free/unwritten cells excluded.
-    const uint64_t step = paged_trace_step++;
-
     uint32_t resident = 0;
     uint32_t swapped  = 0;
     uint32_t released = 0;

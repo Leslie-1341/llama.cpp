@@ -33,6 +33,10 @@ extern "C" bool llama_kv_cache_set_seq_prefetch_protected(
         llama_seq_id   seq_id,
         bool           enabled);
 
+extern "C" bool llama_kv_cache_defer_idle_swapout(
+        llama_memory_t mem,
+        int32_t        n_steps);
+
 static double elapsed_ms(perf_clock::time_point t0, perf_clock::time_point t1) {
     return std::chrono::duration<double, std::milli>(t1 - t0).count();
 }
@@ -271,6 +275,12 @@ int main(int argc, char ** argv) {
     double seq1_prefill_ms = 0.0;
     double seq0_resume_first_token_ms = 0.0;
     double seq0_resume_total_ms = 0.0;
+    const char * resume_timing_step_env = std::getenv("LLAMA_KV_PAGED_RESUME_TIMING_STEP");
+    const bool resume_timing_step_enabled =
+        resume_timing_step_env != nullptr && std::strcmp(resume_timing_step_env, "1") == 0;
+    const char * defer_swapout_on_resume_env = std::getenv("LLAMA_KV_PAGED_DEFER_SWAPOUT_ON_RESUME");
+    const bool defer_swapout_on_resume =
+        defer_swapout_on_resume_env != nullptr && std::strcmp(defer_swapout_on_resume_env, "1") == 0;
     const char * resume_prefetch_env = std::getenv("LLAMA_KV_PAGED_RESUME_PREFETCH");
     const bool prefetch_enabled = resume_prefetch_env != nullptr && std::atoi(resume_prefetch_env) != 0;
     const char * prefetch_during_active_env = std::getenv("LLAMA_KV_PAGED_PREFETCH_DURING_ACTIVE");
@@ -654,6 +664,12 @@ int main(int argc, char ** argv) {
         seq0_resume_generated += common_token_to_piece(ctx, seq0_token);
 
         const auto seq0_resume_step_t0 = seq0_resume_decoded == 0 ? perf_clock::now() : perf_clock::time_point{};
+        if (seq0_resume_decoded == 0 && defer_swapout_on_resume) {
+            llama_kv_cache_defer_idle_swapout(llama_get_memory(ctx), 1);
+        }
+        if (seq0_resume_decoded == 0 && resume_timing_step_enabled) {
+            fprintf(stderr, "KV_RESUME_FIRST_BEGIN\n");
+        }
 
         common_batch_clear(batch);
         common_batch_add(batch, seq0_token, seq0_pos++, { 0 }, true);
@@ -668,6 +684,9 @@ int main(int argc, char ** argv) {
         common_sampler_accept(seq0_smpl, seq0_token, true);
         if (seq0_resume_decoded == 0) {
             seq0_resume_first_token_ms = elapsed_ms(seq0_resume_step_t0, perf_clock::now());
+            if (resume_timing_step_enabled) {
+                fprintf(stderr, "KV_RESUME_FIRST_END\n");
+            }
         }
     }
     seq0_resume_total_ms = elapsed_ms(seq0_resume_total_t0, perf_clock::now());
