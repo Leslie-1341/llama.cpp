@@ -4,13 +4,19 @@
 #include "sampling.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <climits>
 #include <clocale>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <string>
+#include <utility>
 #include <vector>
 
 #if defined(__linux__)
@@ -155,6 +161,123 @@ static bool decode_batch(llama_context * ctx, llama_batch & batch, const char * 
     return true;
 }
 
+static int32_t parse_env_i32_or_default(const char * name, int32_t default_value, bool require_positive) {
+    const char * value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return default_value;
+    }
+
+    errno = 0;
+    char * end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || parsed > INT32_MAX || parsed < INT32_MIN ||
+            (require_positive ? parsed <= 0 : parsed < 0)) {
+        fprintf(stderr, "%s: warning: invalid %s=%s, using %d\n", __func__, name, value, default_value);
+        return default_value;
+    }
+
+    return (int32_t) parsed;
+}
+
+static bool read_corpus_file(const char * path, std::string & out) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        fprintf(stderr, "%s: failed to open corpus file: %s\n", __func__, path);
+        return false;
+    }
+
+    out.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    if (!file.good() && !file.eof()) {
+        fprintf(stderr, "%s: failed to read corpus file: %s\n", __func__, path);
+        return false;
+    }
+
+    return true;
+}
+
+static std::string clean_corpus_text(const std::string & input) {
+    std::string cleaned;
+    cleaned.reserve(input.size());
+
+    bool in_space = true;
+    for (unsigned char ch : input) {
+        if (std::isspace(ch)) {
+            if (!in_space) {
+                cleaned.push_back(' ');
+                in_space = true;
+            }
+        } else {
+            cleaned.push_back((char) ch);
+            in_space = false;
+        }
+    }
+
+    if (!cleaned.empty() && cleaned.back() == ' ') {
+        cleaned.pop_back();
+    }
+
+    return cleaned;
+}
+
+static size_t utf8_advance_to_boundary(const std::string & text, size_t pos) {
+    while (pos < text.size() && (((unsigned char) text[pos] & 0xc0) == 0x80)) {
+        ++pos;
+    }
+    return pos;
+}
+
+static size_t utf8_retreat_to_boundary(const std::string & text, size_t pos) {
+    pos = std::min(pos, text.size());
+    while (pos > 0 && pos < text.size() && (((unsigned char) text[pos] & 0xc0) == 0x80)) {
+        --pos;
+    }
+    return pos;
+}
+
+static std::string corpus_chunk(const std::string & corpus, size_t raw_start, size_t chars) {
+    if (raw_start >= corpus.size()) {
+        return {};
+    }
+
+    size_t start = utf8_advance_to_boundary(corpus, raw_start);
+    if (start > 0 && corpus[start - 1] != ' ') {
+        const size_t next_space = corpus.find(' ', start);
+        if (next_space == std::string::npos) {
+            return {};
+        }
+        start = next_space + 1;
+    }
+    while (start < corpus.size() && corpus[start] == ' ') {
+        ++start;
+    }
+    start = utf8_advance_to_boundary(corpus, start);
+    if (start >= corpus.size()) {
+        return {};
+    }
+
+    const size_t hard_end = utf8_retreat_to_boundary(corpus, std::min(corpus.size(), start + chars));
+    size_t end = hard_end;
+    if (hard_end < corpus.size()) {
+        const size_t prev_space = corpus.rfind(' ', hard_end);
+        if (prev_space != std::string::npos && prev_space > start) {
+            end = prev_space;
+        }
+    }
+
+    if (end <= start) {
+        end = hard_end;
+    }
+    while (end > start && corpus[end - 1] == ' ') {
+        --end;
+    }
+
+    if (end <= start) {
+        return {};
+    }
+
+    return corpus.substr(start, end - start);
+}
+
 static void cleanup(std::vector<semi_session> & sessions, llama_batch & batch, llama_context * ctx, llama_model * model) {
     llama_batch_free(batch);
     for (semi_session & s : sessions) {
@@ -229,6 +352,39 @@ int main(int argc, char ** argv) {
         },
     };
 
+    const char * corpus_file_env = std::getenv("LLAMA_KV_SEMI_CORPUS_FILE");
+    const bool corpus_enabled = corpus_file_env != nullptr && corpus_file_env[0] != '\0';
+    int32_t corpus_chars = 1024;
+    int32_t corpus_offset = 0;
+    if (corpus_enabled) {
+        corpus_chars = parse_env_i32_or_default("LLAMA_KV_SEMI_CORPUS_CHARS", 1024, true);
+        corpus_offset = parse_env_i32_or_default("LLAMA_KV_SEMI_CORPUS_OFFSET", 0, false);
+
+        std::string corpus_raw;
+        if (!read_corpus_file(corpus_file_env, corpus_raw)) {
+            return 1;
+        }
+
+        const std::string corpus = clean_corpus_text(corpus_raw);
+        if (corpus.empty()) {
+            fprintf(stderr, "%s: corpus file is empty after cleaning: %s\n", __func__, corpus_file_env);
+            return 1;
+        }
+
+        for (size_t i = 0; i < sessions.size(); ++i) {
+            const size_t raw_start = (size_t) corpus_offset + i * (size_t) corpus_chars;
+            std::string chunk = corpus_chunk(corpus, raw_start, (size_t) corpus_chars);
+            if (chunk.empty()) {
+                fprintf(stderr,
+                        "%s: corpus is too short to provide non-empty chunk for session %s "
+                        "(file=%s chars=%d offset=%d)\n",
+                        __func__, sessions[i].name, corpus_file_env, corpus_chars, corpus_offset);
+                return 1;
+            }
+            sessions[i].prompt = std::move(chunk);
+        }
+    }
+
     const char * prefetch_during_active_env = std::getenv("LLAMA_KV_PAGED_PREFETCH_DURING_ACTIVE");
     const bool prefetch_during_active =
         prefetch_during_active_env != nullptr && std::atoi(prefetch_during_active_env) != 0;
@@ -268,6 +424,24 @@ int main(int argc, char ** argv) {
         }
         max_prompt_tokens = std::max(max_prompt_tokens, s.prompt_tokens.size());
         n_kv_req += (int32_t) s.prompt_tokens.size() + s.target_decode_tokens + 8;
+    }
+
+    if (corpus_enabled) {
+        fprintf(stderr,
+                "KV_SEMI_CORPUS enabled=1 file=%s chars=%d offset=%d "
+                "A_chars=%zu B_chars=%zu C_chars=%zu D_chars=%zu "
+                "A_tokens=%zu B_tokens=%zu C_tokens=%zu D_tokens=%zu\n",
+                corpus_file_env,
+                corpus_chars,
+                corpus_offset,
+                sessions[0].prompt.size(),
+                sessions[1].prompt.size(),
+                sessions[2].prompt.size(),
+                sessions[3].prompt.size(),
+                sessions[0].prompt_tokens.size(),
+                sessions[1].prompt_tokens.size(),
+                sessions[2].prompt_tokens.size(),
+                sessions[3].prompt_tokens.size());
     }
 
     llama_context_params ctx_params = common_context_params_to_llama(params);
