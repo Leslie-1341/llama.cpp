@@ -540,8 +540,10 @@ int main(int argc, char ** argv) {
                 continue;
             }
 
+            const auto step_prefetch_t0 = perf_clock::now();
             const int32_t restored = llama_memory_prefetch_seq_step(
                     llama_get_memory(ctx), s.seq_id, prefetch_auto_blocks_per_step);
+            const double step_prefetch_ms = elapsed_ms(step_prefetch_t0, perf_clock::now());
             if (restored < 0) {
                 fprintf(stderr,
                         "%s: llama_memory_prefetch_seq_step() failed for seq=%d\n",
@@ -554,7 +556,7 @@ int main(int argc, char ** argv) {
             }
             fprintf(stderr,
                     "KV_SEMI_PREFETCH_STEP phase=%d seq=%d restored=%d every=%d blocks_per_step=%d "
-                    "safety=%d auto_safety=%d calls=%lld blocks=%lld\n",
+                    "safety=%d auto_safety=%d calls=%lld blocks=%lld elapsed_ms=%.3f\n",
                     phase,
                     (int) s.seq_id,
                     restored,
@@ -563,7 +565,8 @@ int main(int argc, char ** argv) {
                     prefetch_auto_safety_tokens,
                     prefetch_auto_safety_tokens,
                     (long long) prefetch_step_calls,
-                    (long long) prefetch_step_blocks);
+                    (long long) prefetch_step_blocks,
+                    step_prefetch_ms);
             log_session_event(s, phase, "prefetch_step");
         }
         return true;
@@ -576,6 +579,7 @@ int main(int argc, char ** argv) {
 
         int32_t restored_total = 0;
         int32_t calls = 0;
+        const auto final_prefetch_t0 = perf_clock::now();
         while (restored_total < prefetch_final_sync_blocks) {
             const int32_t remaining = prefetch_final_sync_blocks - restored_total;
             const int32_t requested = std::min(prefetch_auto_blocks_per_step, remaining);
@@ -599,14 +603,15 @@ int main(int argc, char ** argv) {
         }
 
         fprintf(stderr,
-                "KV_SEMI_PREFETCH_FINAL phase=%d seq=%d requested=%d restored=%d calls=%d blocks=%lld rss_kb=%llu\n",
+                "KV_SEMI_PREFETCH_FINAL phase=%d seq=%d requested=%d restored=%d calls=%d blocks=%lld rss_kb=%llu elapsed_ms=%.3f\n",
                 phase,
                 (int) s.seq_id,
                 prefetch_final_sync_blocks,
                 restored_total,
                 calls,
                 (long long) final_prefetch_blocks,
-                (unsigned long long) current_rss_kb());
+                (unsigned long long) current_rss_kb(),
+                elapsed_ms(final_prefetch_t0, perf_clock::now()));
         return true;
     };
 
@@ -700,7 +705,9 @@ int main(int argc, char ** argv) {
         log_session_event(s, phase, "prefetch_probe");
 
         if (!prefetch_during_active) {
+            const auto sync_prefetch_t0 = perf_clock::now();
             const int32_t prefetch_blocks = llama_memory_prefetch_seq(llama_get_memory(ctx), s.seq_id);
+            const double sync_prefetch_ms = elapsed_ms(sync_prefetch_t0, perf_clock::now());
             if (prefetch_blocks < 0) {
                 fprintf(stderr,
                         "%s: llama_memory_prefetch_seq() failed for seq=%d\n",
@@ -708,10 +715,11 @@ int main(int argc, char ** argv) {
                 return false;
             }
             fprintf(stderr,
-                    "KV_SEMI_PREFETCH_SYNC phase=%d seq=%d restored=%d\n",
+                    "KV_SEMI_PREFETCH_SYNC phase=%d seq=%d restored=%d elapsed_ms=%.3f\n",
                     phase,
                     (int) s.seq_id,
-                    prefetch_blocks);
+                    prefetch_blocks,
+                    sync_prefetch_ms);
             log_session_event(s, phase, "prefetch");
         }
 
