@@ -498,6 +498,7 @@ private:
     void paged_assert_identity(const slot_info & sinfo);
     void paged_shadow_validate(const slot_info & sinfo, uint32_t n_kv) const;
     bool paged_ingraph_gather_supported(int32_t il) const;
+    void paged_log_base_timing() const;
     void paged_log_timing() const;
     void paged_log_stats() const;
 
@@ -702,6 +703,32 @@ private:
     // Stage 8D-4: gated per-step resume timing telemetry. Off unless
     // LLAMA_KV_PAGED_RESUME_TIMING_STEP=1; emitted once per paged row_idx fill.
     bool     paged_resume_timing_step_enabled = false;
+    // Stage 11-B-D: low-frequency paged base-path timing telemetry. Off unless
+    // LLAMA_KV_PAGED_TIMING=1; counters are emitted once from the dtor path.
+    bool     paged_base_timing_enabled = false;
+    mutable uint64_t paged_base_timing_getenv_calls = 0;
+    mutable uint64_t paged_base_timing_apply_calls = 0;
+    mutable uint64_t paged_base_timing_apply_paged_total_us = 0;
+    mutable uint64_t paged_base_timing_apply_ubatch_us = 0;
+    mutable uint64_t paged_base_timing_note_cells_us = 0;
+    mutable uint64_t paged_base_timing_assert_identity_us = 0;
+    mutable uint64_t paged_base_timing_swap_out_window_us = 0;
+    mutable uint64_t paged_base_timing_ensure_resident_us = 0;
+    mutable uint64_t paged_base_timing_clear_frontier_us = 0;
+    mutable uint64_t paged_base_timing_madvise_tail_us = 0;
+    mutable uint64_t paged_base_timing_paged_release_blocks_us = 0;
+    mutable uint64_t paged_base_timing_set_row_idx_calls = 0;
+    mutable uint64_t paged_base_timing_set_row_idx_total_us = 0;
+    mutable uint64_t paged_base_timing_active_visible_us = 0;
+    mutable uint64_t paged_base_timing_nonidentity_probe_us = 0;
+    mutable uint64_t paged_base_timing_swapped_blocks_scan_us = 0;
+    mutable uint64_t paged_base_timing_row_idx_fill_us = 0;
+    mutable uint64_t paged_base_timing_check_read_resident_us = 0;
+    mutable uint64_t paged_base_timing_check_read_resident_calls = 0;
+    mutable uint64_t paged_base_timing_paged_resolve_calls = 0;
+    mutable uint64_t paged_base_timing_cells_scanned = 0;
+    mutable uint64_t paged_base_timing_blocks_scanned = 0;
+    mutable uint64_t paged_base_timing_row_idx_entries = 0;
     mutable uint64_t paged_timing_set_input_us = 0;
     mutable uint64_t paged_timing_set_input_calls = 0;
     mutable uint64_t paged_timing_idle_maintenance_us = 0;
