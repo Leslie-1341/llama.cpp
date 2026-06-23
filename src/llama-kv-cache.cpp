@@ -488,9 +488,9 @@ llama_kv_cache::llama_kv_cache(
             paged_swap_enabled = paged_swap_env;
             paged_idle_swap_requested = idle_swap_env;
             paged_idle_swap_madvise_requested = idle_swap_madvise_env;
-            paged_shadow_validate_enabled = !(
+            paged_shadow_validate_enabled =
                 LLAMA_KV_PAGED_SHADOW_VALIDATE &&
-                std::strcmp(LLAMA_KV_PAGED_SHADOW_VALIDATE, "0") == 0);
+                std::strcmp(LLAMA_KV_PAGED_SHADOW_VALIDATE, "1") == 0;
             paged_mincore_requested = LLAMA_KV_PAGED_MINCORE && std::strcmp(LLAMA_KV_PAGED_MINCORE, "1") == 0;
 #if defined(__linux__)
             // kv_paged_enabled already implies n_stream==1 && !v_trans (checked above). CPU host
