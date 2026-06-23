@@ -774,11 +774,16 @@ private:
     mutable bool     paged_idle_swap_madvise_enabled = false;
     mutable bool     paged_idle_swap_warned = false;
     mutable bool     paged_idle_swap_madvise_warned = false;
+    uint64_t paged_idle_swap_every_tokens = 1;
+    uint64_t paged_idle_swap_max_blocks_per_step = 0;
+    uint64_t paged_idle_swap_min_idle_steps = 0;
+    bool     paged_idle_swap_debug_probes = true;
     mutable uint64_t paged_idle_swap_candidates = 0;
     mutable uint64_t paged_idle_swap_out_calls = 0;
     mutable uint64_t paged_idle_swap_skip_not_remapped = 0;
     mutable uint64_t paged_idle_swap_skip_not_resident = 0;
     mutable uint64_t paged_idle_swap_skip_deferred = 0;
+    mutable uint64_t paged_idle_swap_skip_min_idle = 0;
     mutable int32_t  paged_defer_idle_swapout_steps = 0;
     mutable bool     paged_nonidentity_probe_enabled = false;
     mutable uint64_t paged_nonidentity_remap_rows = 0;

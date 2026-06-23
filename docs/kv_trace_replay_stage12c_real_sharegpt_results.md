@@ -859,3 +859,98 @@ swap-out → restore → swap-out
 再构造 KV cache 占总 RSS 比例更大的 workload；
 最后做正式 3-run median 和最终汇报。
 ```
+
+## 17. Fast-maintenance optimization result
+
+在组件级消融后，本阶段继续优化 idle swap maintenance 主路径。审计显示，原 S5 aggressive reclaim 的主要 TPS 回退来自 `set_input_paged_row_idx` 中每 decode step 重复执行的 idle swap maintenance，包括 block/cell/seq ownership 扫描、idle candidate 重建、swap-out 判断、active-visible probe 和 debug counters。
+
+因此，本阶段加入 fast-maintenance 控制项：
+
+```text
+LLAMA_KV_PAGED_IDLE_SWAP_EVERY_TOKENS
+LLAMA_KV_PAGED_IDLE_SWAP_MAX_BLOCKS_PER_STEP
+LLAMA_KV_PAGED_IDLE_SWAP_MIN_IDLE_STEPS
+LLAMA_KV_PAGED_IDLE_SWAP_DEBUG_PROBES
+```
+
+默认不设置这些变量时，保持原 S5 行为。推荐 fast-maintenance 配置为：
+
+```text
+LLAMA_KV_PAGED_IDLE_SWAP_DEBUG_PROBES=0
+LLAMA_KV_PAGED_IDLE_SWAP_EVERY_TOKENS=8
+LLAMA_KV_PAGED_IDLE_SWAP_MAX_BLOCKS_PER_STEP=8
+LLAMA_KV_PAGED_IDLE_SWAP_MIN_IDLE_STEPS=16
+```
+
+该配置含义是：
+
+* 关闭非必要 debug probe / coverage counters；
+* 每 8 个 decode step 执行一次 idle swap maintenance；
+* 每次 maintenance 最多处理 8 个 idle block swap-out；
+* seq 至少 idle 16 个 step 后才允许 swap-out，避免短 idle 下 swap / restore 抖动。
+
+需要注意，fast-maintenance 只降低 idle candidate 维护和 swap-out 频率，不跳过 correctness safety checks。active-visible restore、SWAPPED row redirect、write-to-swapped 检查等 safety path 仍保持每步执行。
+
+### 17.1 Fast-maintenance 3-run median
+
+在 real ShareGPT-backed long-idle trace 上进行 3-run median 验证，结果如下：
+
+| case                                     |   ok | median TPS | median decode ms | median RSS KB |    RSS drop | KV capacity drop | TPS delta | decode ms delta |
+| ---------------------------------------- | ---: | ---------: | ---------------: | ------------: | ----------: | ---------------: | --------: | --------------: |
+| T0 baseline                              | True |  10.875037 |        77976.745 |       9333632 |   0.000 MiB |           0.000% |    0.000% |          0.000% |
+| V4 every8 + budget8 + debug off          | True |  10.092739 |        84020.801 |       8787704 | 533.133 MiB |          52.064% |   -7.194% |         +7.751% |
+| V5 every8 + budget8 + idle16 + debug off | True |  10.548073 |        80393.828 |       8707064 | 611.883 MiB |          59.754% |   -3.007% |         +3.100% |
+
+V5 是当前最优配置。相比原 aggressive reclaim 模式，V5 将 RSS drop 从约 716 MiB 降至约 612 MiB，但将 TPS 回退从约 -33% 降至约 -3%。也就是说，V5 保留了接近 60% KV cache 容量级别的 RSS 释放，同时几乎恢复 baseline 吞吐。
+
+### 17.2 Updated final result
+
+更新后的 Stage 12-C 推荐结果为：
+
+```text
+workload:
+  real ShareGPT-backed long-idle trace
+
+baseline:
+  median active_tps = 10.875037
+  median rss_kb = 9333632
+
+fast-maintenance V5:
+  median active_tps = 10.548073
+  median rss_kb = 8707064
+
+RSS drop:
+  626568 KiB = 611.883 MiB
+
+KV capacity drop:
+  59.754%
+
+TPS delta:
+  -3.007%
+
+decode ms delta:
+  +3.100%
+
+correctness:
+  exit = 0
+  real_abnormal = 0
+  summary_count = 8
+  all_finished = 1
+```
+
+因此，本阶段最终可以表述为：
+
+```text
+在真实 ShareGPT-backed long-idle workload 下，fast-maintenance V5 配置将最终 RSS 降低约 611.9 MiB，约等于 4096 ctx / f32 KV cache 容量的 59.8%，同时 active TPS 仅下降约 3.0%。相比原 aggressive reclaim 的约 33% TPS 回退，fast-maintenance 显著降低了 idle swap 主路径开销，证明该 KV cache 内存优化具备实际可用的性能-内存权衡。
+```
+
+### 17.3 Current stage conclusion after fast-maintenance
+
+加入 fast-maintenance 后，本阶段结论更新为：
+
+1. real ShareGPT-backed trace replay 已完整跑通；
+2. low-overhead lazy-only 模式可释放约 447.7 MiB RSS，TPS 回退约 2.8%；
+3. 原 aggressive reclaim 可释放约 716 MiB RSS，但 TPS 回退约 33%；
+4. fast-maintenance V5 可释放约 611.9 MiB RSS，约占 KV cache 容量 59.8%，TPS 仅回退约 3.0%；
+5. 主要优化来自 idle swap maintenance 降频、block budget、min idle steps 防抖和 debug probe gating；
+6. 下一步可以在该配置基础上构造更大 KV 占比场景，例如更大 ctx-size 或更长 history，以进一步放大总 RSS 下降比例。
