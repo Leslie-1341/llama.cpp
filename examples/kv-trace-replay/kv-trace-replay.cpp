@@ -317,8 +317,58 @@ static bool prompt_source_needs_corpus(const std::string & source) {
     return source.rfind("corpus:", 0) == 0;
 }
 
+static std::string dirname_of_trace_file(const std::string & trace_file) {
+    const size_t slash = trace_file.find_last_of("/\\");
+    if (slash == std::string::npos) {
+        return ".";
+    }
+    if (slash == 0) {
+        return trace_file.substr(0, 1);
+    }
+    return trace_file.substr(0, slash);
+}
+
+static bool is_safe_relative_path(const std::string & path) {
+    if (path.empty() || path[0] == '/' || path[0] == '\\') {
+        return false;
+    }
+    if (path.size() >= 2 && path[1] == ':') {
+        return false;
+    }
+    if (path.find(':') != std::string::npos) {
+        return false;
+    }
+
+    size_t begin = 0;
+    while (begin <= path.size()) {
+        const size_t sep = path.find_first_of("/\\", begin);
+        const size_t end = sep == std::string::npos ? path.size() : sep;
+        const std::string part = path.substr(begin, end - begin);
+        if (part == "..") {
+            return false;
+        }
+        if (sep == std::string::npos) {
+            break;
+        }
+        begin = sep + 1;
+    }
+
+    return true;
+}
+
+static std::string join_path(const std::string & dir, const std::string & relative_path) {
+    if (dir.empty() || dir == ".") {
+        return relative_path;
+    }
+    if (dir.back() == '/' || dir.back() == '\\') {
+        return dir + relative_path;
+    }
+    return dir + "/" + relative_path;
+}
+
 static bool resolve_prompt_source(
         const std::string & source,
+        const std::string & trace_dir,
         const std::string & corpus,
         std::string &       prompt,
         std::string &       reason) {
@@ -360,6 +410,27 @@ static bool resolve_prompt_source(
         return true;
     }
 
+    if (source.rfind("file:", 0) == 0) {
+        const std::string relative_path = source.substr(strlen("file:"));
+        if (!is_safe_relative_path(relative_path)) {
+            reason = "invalid file prompt_source path";
+            return false;
+        }
+
+        std::string prompt_raw;
+        if (!read_text_file(join_path(trace_dir, relative_path).c_str(), prompt_raw)) {
+            reason = "file prompt unreadable";
+            return false;
+        }
+
+        prompt = trim_ascii_space(prompt_raw);
+        if (prompt.empty()) {
+            reason = "empty file prompt";
+            return false;
+        }
+        return true;
+    }
+
     reason = "unsupported prompt_source";
     return false;
 }
@@ -375,6 +446,7 @@ static bool load_trace_file(
         return false;
     }
 
+    const std::string trace_dir = dirname_of_trace_file(trace_file);
     std::map<int32_t, trace_session> by_session;
     std::map<int32_t, int32_t> next_turn_by_session;
     std::map<int32_t, int64_t> last_arrival_by_session;
@@ -438,7 +510,7 @@ static bool load_trace_file(
         turn.line_no = line_no;
 
         std::string reason;
-        if (!resolve_prompt_source(turn.prompt_source, corpus, turn.prompt, reason)) {
+        if (!resolve_prompt_source(turn.prompt_source, trace_dir, corpus, turn.prompt, reason)) {
             trace_error_str(line_no, reason);
             return false;
         }
