@@ -616,9 +616,9 @@ T5 相比 T4：
 
 ---
 
-## 12. 当前最优结果口径
+## 12. Fast-maintenance 前的结果口径
 
-本阶段可以形成两个结果口径。
+在加入 fast-maintenance 前，本阶段形成了两个阶段性结果口径。最终推荐配置见第 17 节。
 
 ### 12.1 Low-overhead 模式
 
@@ -737,13 +737,13 @@ T3 没有额外 `madvise` 收益，却引入主要 TPS 回退。因此下一步�
 
 ---
 
-## 15. 后续优化方向
+## 15. Fast-maintenance 优化设计方向
 
-后续仍属于 Stage 12-C 的结果完善，不需要单独新开阶段。建议继续围绕真实 ShareGPT-backed workload 完善最终成果。
+组件级消融后，本阶段没有新开阶段，而是在 Stage 12-C 内继续围绕真实 ShareGPT-backed workload 优化 idle swap maintenance。以下方向构成了后续第 17 节 fast-maintenance patch 的设计基础。
 
 ### 15.1 优化目标
 
-目标不是进一步追求更大 RSS drop，而是：
+当时的优化目标不是进一步追求更大 RSS drop，而是：
 
 ```text
 保持 RSS drop 500–700 MiB；
@@ -825,13 +825,13 @@ swap-out → restore → swap-out
 * 重写 driver；
 * 改 tokenizer / ggml graph。
 
-当前更适合做最小 fast-maintenance patch。
+这些方向最终收敛为第 17 节的 fast-maintenance V5 配置。
 
 ---
 
-## 16. 阶段结论
+## 16. Fast-maintenance 前阶段小结
 
-本阶段完成了从 semi-real workload 到 real ShareGPT-backed trace replay 的关键推进。
+在加入 fast-maintenance 前，本阶段已经完成了从 semi-real workload 到 real ShareGPT-backed trace replay 的关键推进。
 
 主要成果包括：
 
@@ -846,19 +846,13 @@ swap-out → restore → swap-out
 9. aggressive reclaim 模式可释放约 70% KV 容量级别 RSS，但当前 TPS 回退约 33%；
 10. 当前主要瓶颈已定位为 idle swap 状态维护 / active-visible 检查 / swapped redirect / restore 判断，而不是 prefetch。
 
-因此，本阶段当前最重要结论是：
+因此，在加入 fast-maintenance 前，本阶段阶段性结论是：
 
 ```text
 真实 ShareGPT-backed workload 下，KV cache 内存优化机制已经完成端到端验证。低开销模式具备较好实用性；激进模式证明了接近 KV 容量上限的内存回收潜力，但仍需要优化 idle swap maintenance 开销，才能作为最终高性能方案。
 ```
 
-后续仍应在 Stage 12-C 内继续完善，而不是另开新阶段：
-
-```text
-先优化 idle swap maintenance 性能；
-再构造 KV cache 占总 RSS 比例更大的 workload；
-最后做正式 3-run median 和最终汇报。
-```
+该问题已经在第 17 节中通过 fast-maintenance V5 继续优化，并完成 3-run median、resume first-token latency 与 diagnostic counter 验证。
 
 ## 17. Fast-maintenance optimization result
 
@@ -895,15 +889,57 @@ LLAMA_KV_PAGED_IDLE_SWAP_MIN_IDLE_STEPS=16
 
 在 real ShareGPT-backed long-idle trace 上进行 3-run median 验证，结果如下：
 
-| case                                     |   ok | median TPS | median decode ms | median RSS KB |    RSS drop | KV capacity drop | TPS delta | decode ms delta |
-| ---------------------------------------- | ---: | ---------: | ---------------: | ------------: | ----------: | ---------------: | --------: | --------------: |
-| T0 baseline                              | True |  10.875037 |        77976.745 |       9333632 |   0.000 MiB |           0.000% |    0.000% |          0.000% |
-| V4 every8 + budget8 + debug off          | True |  10.092739 |        84020.801 |       8787704 | 533.133 MiB |          52.064% |   -7.194% |         +7.751% |
-| V5 every8 + budget8 + idle16 + debug off | True |  10.548073 |        80393.828 |       8707064 | 611.883 MiB |          59.754% |   -3.007% |         +3.100% |
+| case                                     |   ok | median TPS | median decode ms | median total wall ms | median RSS KB |    RSS drop | KV capacity drop | TPS delta | decode ms delta |
+| ---------------------------------------- | ---: | ---------: | ---------------: | -------------------: | ------------: | ----------: | ---------------: | --------: | --------------: |
+| T0 baseline                              | True |  10.875037 |        77976.745 |            96200.524 |       9333632 |   0.000 MiB |           0.000% |    0.000% |          0.000% |
+| V4 every8 + budget8 + debug off          | True |  10.092739 |        84020.801 |           102442.304 |       8787704 | 533.133 MiB |          52.064% |   -7.194% |         +7.751% |
+| V5 every8 + budget8 + idle16 + debug off | True |  10.548073 |        80393.828 |            98810.429 |       8707064 | 611.883 MiB |          59.754% |   -3.007% |         +3.100% |
 
-V5 是当前最优配置。相比原 aggressive reclaim 模式，V5 将 RSS drop 从约 716 MiB 降至约 612 MiB，但将 TPS 回退从约 -33% 降至约 -3%。也就是说，V5 保留了接近 60% KV cache 容量级别的 RSS 释放，同时几乎恢复 baseline 吞吐。
+V5 是当前最优配置。相比 V4，V5 同时获得了更大的 RSS drop 和更小的 TPS 回退：
 
-### 17.2 Updated final result
+```text
+V4:
+  RSS drop = 533.133 MiB
+  TPS delta = -7.194%
+
+V5:
+  RSS drop = 611.883 MiB
+  TPS delta = -3.007%
+```
+
+这说明 `MIN_IDLE_STEPS=16` 的防抖机制有效。它避免了短 idle 下过早 swap-out，减少 swap / restore 抖动，并把有限 swap-out budget 更集中地用于真正长期 idle 的 KV block。
+
+### 17.2 Resume first-token latency
+
+除了吞吐和 RSS，本阶段还解析了 resume first-token latency。该指标来自：
+
+```text
+KV_TRACE_SUMMARY ... resumed=<N> resume_first_avg_ms=<N>
+```
+
+它表示 session 从 idle 状态 resume 后，到恢复后首个 token 输出的平均延迟。该指标比初始 prefill first-token 更能反映 KV swap 场景下的用户感知延迟。
+
+3-run median 结果如下：
+
+| case                                     | resumed total | resume first weighted avg | max seq resume avg | prefetch final elapsed sum | prefetch final elapsed max | prefetch restored blocks |
+| ---------------------------------------- | ------------: | ------------------------: | -----------------: | -------------------------: | -------------------------: | -----------------------: |
+| T0 baseline                              |             6 |                100.251 ms |         103.217 ms |                   0.000 ms |                   0.000 ms |                        0 |
+| V4 every8 + budget8 + debug off          |             6 |                101.140 ms |         104.828 ms |                  34.097 ms |                  22.448 ms |                       15 |
+| V5 every8 + budget8 + idle16 + debug off |             6 |                101.493 ms |         104.076 ms |                  36.913 ms |                  25.700 ms |                       17 |
+
+V5 相比 baseline：
+
+```text
+resume first weighted avg delta:
+  101.493 ms - 100.251 ms = +1.242 ms
+
+max seq resume avg delta:
+  104.076 ms - 103.217 ms = +0.859 ms
+```
+
+因此，V5 在显著降低 RSS 的同时，resume first-token latency 基本保持稳定。final prefetch 的总耗时约 36.9 ms，单次最大约 25.7 ms，但它没有造成明显的 resume first-token 延迟恶化。
+
+### 17.3 Updated final result
 
 更新后的 Stage 12-C 推荐结果为：
 
@@ -913,11 +949,17 @@ workload:
 
 baseline:
   median active_tps = 10.875037
+  median active_decode_ms = 77976.745
+  median total_wall_ms = 96200.524
   median rss_kb = 9333632
+  median resume_first_weighted_avg_ms = 100.251
 
 fast-maintenance V5:
   median active_tps = 10.548073
+  median active_decode_ms = 80393.828
+  median total_wall_ms = 98810.429
   median rss_kb = 8707064
+  median resume_first_weighted_avg_ms = 101.493
 
 RSS drop:
   626568 KiB = 611.883 MiB
@@ -931,6 +973,12 @@ TPS delta:
 decode ms delta:
   +3.100%
 
+total wall delta:
+  +2.713%
+
+resume first-token weighted avg delta:
+  +1.242 ms
+
 correctness:
   exit = 0
   real_abnormal = 0
@@ -941,10 +989,10 @@ correctness:
 因此，本阶段最终可以表述为：
 
 ```text
-在真实 ShareGPT-backed long-idle workload 下，fast-maintenance V5 配置将最终 RSS 降低约 611.9 MiB，约等于 4096 ctx / f32 KV cache 容量的 59.8%，同时 active TPS 仅下降约 3.0%。相比原 aggressive reclaim 的约 33% TPS 回退，fast-maintenance 显著降低了 idle swap 主路径开销，证明该 KV cache 内存优化具备实际可用的性能-内存权衡。
+在真实 ShareGPT-backed long-idle workload 下，fast-maintenance V5 配置将最终 RSS 降低约 611.9 MiB，约等于 4096 ctx / f32 KV cache 容量的 59.8%；active TPS 仅下降约 3.0%，resume first-token weighted average latency 仅增加约 1.24 ms。相比原 aggressive reclaim 的约 33% TPS 回退，fast-maintenance 显著降低了 idle swap 主路径开销，证明该 KV cache 内存优化具备实际可用的性能-内存权衡。
 ```
 
-### 17.3 Current stage conclusion after fast-maintenance
+### 17.4 Current stage conclusion after fast-maintenance
 
 加入 fast-maintenance 后，本阶段结论更新为：
 
@@ -952,5 +1000,132 @@ correctness:
 2. low-overhead lazy-only 模式可释放约 447.7 MiB RSS，TPS 回退约 2.8%；
 3. 原 aggressive reclaim 可释放约 716 MiB RSS，但 TPS 回退约 33%；
 4. fast-maintenance V5 可释放约 611.9 MiB RSS，约占 KV cache 容量 59.8%，TPS 仅回退约 3.0%；
-5. 主要优化来自 idle swap maintenance 降频、block budget、min idle steps 防抖和 debug probe gating；
-6. 下一步可以在该配置基础上构造更大 KV 占比场景，例如更大 ctx-size 或更长 history，以进一步放大总 RSS 下降比例。
+5. fast-maintenance V5 对 resume first-token latency 影响很小，加权平均仅增加约 1.24 ms；
+6. 主要优化来自 idle swap maintenance 降频、block budget、min idle steps 防抖和 debug probe gating；
+7. 下一步可以在该配置基础上构造更大 KV 占比场景，例如更大 ctx-size 或更长 history，以进一步放大总 RSS 下降比例。
+
+### 17.5 Diagnostic counters and final metric checklist
+
+除 3-run median 性能结果外，本阶段额外执行了 V5 diagnostic run，用于验证 fast-maintenance 配置下 idle swap / madvise 机制确实被触发，并确认 safety counters 没有异常。该 diagnostic run 开启 `LLAMA_KV_PAGED_IDLE_TRACE=1`，因此只用于机制和 correctness 佐证，不用于性能统计。
+
+diagnostic run 中观察到：
+
+```text
+paged_idle_swap_enabled = 1
+paged_idle_swap_out_calls = 63
+paged_idle_swap_candidates = 3932
+paged_swap_madvise_calls = 63
+paged_swap_madvise_bytes = 247726080
+paged_swap_madvise_failures = 0
+paged_swapped_active_visible_violation = 0
+paged_write_to_swapped_block = 0
+paged_write_to_swapped_block_seq = 0
+paged_idle_only_swapped_blocks = 265
+paged_swap_rss_drop_last_kb = 3840
+paged_swap_rss_drop_max_kb = 3840
+paged_swap_rss_drop_sum_kb = 241920
+```
+
+这说明：
+
+1. V5 fast-maintenance 下 idle swap-out 确实发生；
+2. `madvise` 物理页回收路径被触发；
+3. 单次 block 回收 RSS drop 约为 3840 KiB，接近一个 4 MiB KV block 的实际物理页回收量；
+4. 没有出现 active-visible violation；
+5. 没有出现 write-to-swapped block；
+6. 没有出现 madvise failure；
+7. `DEBUG_PROBES=0` 生效，非必要 detailed probe / coverage counters 被关闭。
+
+因此，V5 的最终结果不仅包含 RSS/TPS/latency 指标，也有机制和 correctness 证据支撑。
+
+### 17.6 Final complete metric summary
+
+本阶段最终推荐结果采用 V5 fast-maintenance 配置：
+
+```text
+LLAMA_KV_PAGED_IDLE_SWAP_DEBUG_PROBES=0
+LLAMA_KV_PAGED_IDLE_SWAP_EVERY_TOKENS=8
+LLAMA_KV_PAGED_IDLE_SWAP_MAX_BLOCKS_PER_STEP=8
+LLAMA_KV_PAGED_IDLE_SWAP_MIN_IDLE_STEPS=16
+```
+
+配合原 S5 其他开关：
+
+```text
+LLAMA_KV_LAZY_TAIL=1
+LLAMA_KV_LAZY_CLEAR=1
+LLAMA_KV_PAGED=1
+LLAMA_KV_PAGED_INGRAPH=1
+LLAMA_KV_PAGED_GATHER_NONIDENTITY=1
+LLAMA_KV_PAGED_SWAP=1
+LLAMA_KV_PAGED_IDLE_SWAP=1
+LLAMA_KV_PAGED_IDLE_SWAP_MADVISE=1
+LLAMA_KV_PAGED_PREFETCH_DURING_ACTIVE=1
+LLAMA_KV_PAGED_PREFETCH_AUTO_EVERY_TOKENS=2
+LLAMA_KV_PAGED_PREFETCH_AUTO_BLOCKS_PER_STEP=2
+LLAMA_KV_PAGED_PREFETCH_AUTO_SAFETY_TOKENS=0
+LLAMA_KV_PAGED_PREFETCH_FINAL_SYNC_BLOCKS=12
+LLAMA_KV_PAGED_DEFER_SWAPOUT_ON_RESUME=1
+```
+
+完整指标如下。
+
+| category    |                     metric | T0 baseline | V5 fast-maintenance |                     delta |
+| ----------- | -------------------------: | ----------: | ------------------: | ------------------------: |
+| workload    |                   sessions |           8 |                   8 |                      same |
+| workload    |                      turns |          14 |                  14 |                      same |
+| workload    |              resumed turns |           6 |                   6 |                      same |
+| workload    |       active decode tokens |         848 |                 848 |                      same |
+| workload    |                   ctx-size |        4096 |                4096 |                      same |
+| workload    |                   parallel |           8 |                   8 |                      same |
+| memory      |                 median RSS | 9333632 KiB |         8707064 KiB |               -626568 KiB |
+| memory      |                   RSS drop |           0 |         611.883 MiB |              -611.883 MiB |
+| memory      |           KV capacity drop |           0 |             59.754% | +59.754 percentage points |
+| memory      |       total RSS drop ratio |           0 |              6.713% |  +6.713 percentage points |
+| throughput  |          median active TPS |   10.875037 |           10.548073 |                   -3.007% |
+| throughput  |    median active decode ms |   77976.745 |           80393.828 |                   +3.100% |
+| latency     |       median total wall ms |   96200.524 |           98810.429 |                   +2.713% |
+| latency     |  resume first weighted avg |  100.251 ms |          101.493 ms |                 +1.242 ms |
+| latency     |         max seq resume avg |  103.217 ms |          104.076 ms |                 +0.859 ms |
+| prefetch    | final prefetch elapsed sum |    0.000 ms |           36.913 ms |                +36.913 ms |
+| prefetch    | final prefetch elapsed max |    0.000 ms |           25.700 ms |                +25.700 ms |
+| prefetch    |      final restored blocks |           0 |                  17 |                       +17 |
+| correctness |                       exit |           0 |                   0 |                      pass |
+| correctness |              real_abnormal |           0 |                   0 |                      pass |
+| correctness |              summary_count |           8 |                   8 |                      pass |
+| correctness |               all_finished |           1 |                   1 |                      pass |
+| diagnostic  |   active-visible violation |           0 |                   0 |                      pass |
+| diagnostic  |     write-to-swapped block |           0 |                   0 |                      pass |
+| diagnostic  |           madvise failures |           0 |                   0 |                      pass |
+| diagnostic  |        idle swap-out calls |           0 |                  63 |       mechanism triggered |
+| diagnostic  |              madvise calls |           0 |                  63 |       mechanism triggered |
+| diagnostic  |              madvise bytes |           0 |           247726080 |       mechanism triggered |
+
+最终完整结论为：
+
+```text
+在 real ShareGPT-backed long-idle workload 上，fast-maintenance V5 取得 3-run median：
+最终 RSS 降低 611.883 MiB，
+约占 4096 ctx / f32 KV cache 容量的 59.754%，
+约占 baseline 总进程 RSS 的 6.713%；
+active TPS 仅下降 3.007%，
+active decode time 增加 3.100%，
+total wall time 增加 2.713%，
+resume first-token weighted average latency 仅增加 1.242 ms。
+diagnostic run 进一步确认 idle swap-out 和 madvise 路径被实际触发，且 active-visible violation、write-to-swapped block、madvise failure 均为 0。
+```
+
+相比原 aggressive reclaim：
+
+```text
+原 aggressive reclaim:
+  RSS drop ≈ 716 MiB
+  TPS delta ≈ -33% ~ -34%
+
+fast-maintenance V5:
+  RSS drop ≈ 611.9 MiB
+  TPS delta ≈ -3.0%
+  resume first-token weighted avg delta ≈ +1.24 ms
+```
+
+因此，fast-maintenance V5 在保留主要 KV cache 物理页回收收益的同时，显著降低了 idle swap 主路径开销，是当前 Stage 12-C 的最终推荐配置。
