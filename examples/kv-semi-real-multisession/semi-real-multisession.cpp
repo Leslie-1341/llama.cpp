@@ -394,13 +394,15 @@ int main(int argc, char ** argv) {
         parse_env_i32_or_default("LLAMA_KV_PAGED_PREFETCH_AUTO_BLOCKS_PER_STEP", 1, true);
     const int32_t prefetch_auto_safety_tokens =
         parse_env_i32_or_default("LLAMA_KV_PAGED_PREFETCH_AUTO_SAFETY_TOKENS", 0, false);
+    const int32_t prefetch_final_sync_blocks =
+        parse_env_i32_or_default("LLAMA_KV_PAGED_PREFETCH_FINAL_SYNC_BLOCKS", 0, false);
     const char * defer_swapout_on_resume_env = std::getenv("LLAMA_KV_PAGED_DEFER_SWAPOUT_ON_RESUME");
     const bool defer_swapout_on_resume =
         defer_swapout_on_resume_env != nullptr && std::atoi(defer_swapout_on_resume_env) != 0;
 
     fprintf(stderr,
             "KV_SEMI_PREFETCH_CONFIG during_active=%d every=%d blocks_per_step=%d safety=%d "
-            "auto_every=%d auto_blocks_per_step=%d auto_safety=%d defer=%d\n",
+            "auto_every=%d auto_blocks_per_step=%d auto_safety=%d defer=%d final_sync_blocks=%d\n",
             prefetch_during_active ? 1 : 0,
             prefetch_auto_every_tokens,
             prefetch_auto_blocks_per_step,
@@ -408,7 +410,8 @@ int main(int argc, char ** argv) {
             prefetch_auto_every_tokens,
             prefetch_auto_blocks_per_step,
             prefetch_auto_safety_tokens,
-            defer_swapout_on_resume ? 1 : 0);
+            defer_swapout_on_resume ? 1 : 0,
+            prefetch_final_sync_blocks);
 
     llama_backend_init();
     llama_numa_init(params.numa);
@@ -494,6 +497,8 @@ int main(int argc, char ** argv) {
     int32_t active_decode_tokens = 0;
     int64_t prefetch_step_calls = 0;
     int64_t prefetch_step_blocks = 0;
+    int64_t final_prefetch_calls = 0;
+    int64_t final_prefetch_blocks = 0;
 
     const auto prefill_session = [&](semi_session & s, int phase) -> bool {
         s.state = session_state::PREFILL;
@@ -564,9 +569,55 @@ int main(int argc, char ** argv) {
         return true;
     };
 
+    const auto run_final_prefetch_before_resume = [&](semi_session & s, int phase) -> bool {
+        if (prefetch_final_sync_blocks <= 0) {
+            return true;
+        }
+
+        int32_t restored_total = 0;
+        int32_t calls = 0;
+        while (restored_total < prefetch_final_sync_blocks) {
+            const int32_t remaining = prefetch_final_sync_blocks - restored_total;
+            const int32_t requested = std::min(prefetch_auto_blocks_per_step, remaining);
+            const int32_t restored = llama_memory_prefetch_seq_step(llama_get_memory(ctx), s.seq_id, requested);
+            if (restored < 0) {
+                fprintf(stderr,
+                        "%s: llama_memory_prefetch_seq_step() final prefetch failed for seq=%d\n",
+                        __func__, (int) s.seq_id);
+                return false;
+            }
+
+            calls += 1;
+            final_prefetch_calls += 1;
+            if (restored > 0) {
+                restored_total += restored;
+                final_prefetch_blocks += restored;
+            }
+            if (restored == 0) {
+                break;
+            }
+        }
+
+        fprintf(stderr,
+                "KV_SEMI_PREFETCH_FINAL phase=%d seq=%d requested=%d restored=%d calls=%d blocks=%lld rss_kb=%llu\n",
+                phase,
+                (int) s.seq_id,
+                prefetch_final_sync_blocks,
+                restored_total,
+                calls,
+                (long long) final_prefetch_blocks,
+                (unsigned long long) current_rss_kb());
+        return true;
+    };
+
     const auto decode_some = [&](semi_session & s, int phase, int32_t n_tokens, bool resume) -> bool {
         if (s.state == session_state::FINISHED || n_tokens <= 0) {
             return true;
+        }
+
+        const bool resume_from_pending = resume && s.state == session_state::RESUME_PENDING;
+        if (resume_from_pending && !run_final_prefetch_before_resume(s, phase)) {
+            return false;
         }
 
         s.state = resume ? session_state::RESUMING : session_state::ACTIVE_DECODE;
