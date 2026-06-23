@@ -4818,16 +4818,19 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
         std::strcmp(LLAMA_KV_PAGED_GATHER_NONIDENTITY, "1") == 0;
     paged_nonidentity_probe_enabled = nonidentity_probe;
 
+    // Stage 10-E-F: idle swap execution no longer depends on the idle-trace print
+    // flag. LLAMA_KV_PAGED_IDLE_TRACE only gates the per-step KV_PAGED_IDLE_TRACE
+    // diagnostic line below; whether idle swap-out / madvise actually run is decided
+    // here from the functional prerequisites alone.
     const bool idle_swap_ready =
         paged_idle_swap_requested &&
         paged_swap_enabled &&
         kv_swap_store &&
-        nonidentity_probe &&
-        paged_idle_trace_enabled;
+        nonidentity_probe;
     paged_idle_swap_enabled = idle_swap_ready;
     if (paged_idle_swap_requested && !idle_swap_ready && !paged_idle_swap_warned) {
         LLAMA_LOG_WARN("%s: LLAMA_KV_PAGED_IDLE_SWAP=1 requires LLAMA_KV_PAGED_SWAP=1, "
-                "LLAMA_KV_PAGED_GATHER_NONIDENTITY=1, LLAMA_KV_PAGED_IDLE_TRACE=1, and a backing store; "
+                "LLAMA_KV_PAGED_GATHER_NONIDENTITY=1, and a backing store; "
                 "idle swap disabled for this run\n", __func__);
         paged_idle_swap_warned = true;
     }
@@ -4837,7 +4840,7 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
     if (paged_idle_swap_madvise_requested && !idle_swap_madvise_ready && !paged_idle_swap_madvise_warned) {
         LLAMA_LOG_WARN("%s: LLAMA_KV_PAGED_IDLE_SWAP_MADVISE=1 requires idle swap ready "
                 "(LLAMA_KV_PAGED_IDLE_SWAP=1, LLAMA_KV_PAGED_SWAP=1, LLAMA_KV_PAGED_GATHER_NONIDENTITY=1, "
-                "LLAMA_KV_PAGED_IDLE_TRACE=1, and a backing store); idle swap madvise disabled for this run\n",
+                "and a backing store); idle swap madvise disabled for this run\n",
                 __func__);
         paged_idle_swap_madvise_warned = true;
     }
@@ -5192,7 +5195,12 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
 
     uint64_t prefetch_protected_blocks_this_call = 0;
     uint64_t swapout_deferred_blocks_this_call = 0;
-    if (paged_idle_trace_enabled) {
+    // Stage 10-E-F: idle maintenance (block analysis, safe-swap-candidate computation,
+    // prefetch-protection / defer checks, idle swap-out and madvise) is an execution path
+    // and must run whenever idle swap is requested OR diagnostics are on. The per-step
+    // KV_PAGED_IDLE_TRACE print is gated separately, inside this block.
+    const bool idle_maintenance_active = paged_idle_trace_enabled || paged_idle_swap_requested;
+    if (idle_maintenance_active) {
         const uint64_t idle_maintenance_start_us = timing_enabled ? llama_paged_timing_now_us() : 0;
         const uint64_t idle_step = paged_idle_active_seq_steps;
         const uint64_t active_seq_count = active_seq.count();
@@ -5487,6 +5495,9 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
         paged_nonidentity_cold_in_read_window_after = cold_in_read_window;
         paged_nonidentity_safe_candidates_after = safe_swap_candidates;
 
+        // Stage 10-E-F: per-step diagnostic line only. Execution (swap-out, madvise,
+        // counter updates, mincore snapshots above) is unconditional within this block.
+        if (paged_idle_trace_enabled) {
         fprintf(stderr,
                 "KV_PAGED_IDLE_TRACE step=%llu active_seq_source=%s active_seq_count=%llu "
                 "idle_seq_count=%llu seen_seq_count=%llu active_seq=%s seq_last_active=%s "
@@ -5652,6 +5663,7 @@ void llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                 (unsigned long long) paged_mincore_swapped_nonresident_blocks,
                 (unsigned long long) (paged_mincore_swapped_total_bytes > 0
                     ? paged_mincore_swapped_resident_bytes * 1000ull / paged_mincore_swapped_total_bytes : 0));
+        }
         if (timing_enabled) {
             paged_timing_idle_maintenance_us += llama_paged_timing_now_us() - idle_maintenance_start_us;
             paged_timing_idle_maintenance_calls += 1;
