@@ -314,6 +314,10 @@ public:
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
 
+    // paged KV row-index gather tensor for this input, or nullptr when paged KV is disabled.
+    // carried as a member (not a global) so it shares this input's lifetime and supports graph reuse.
+    ggml_tensor * paged_row_idx = nullptr;
+
     uint32_t visible_lo = 0;
 
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
