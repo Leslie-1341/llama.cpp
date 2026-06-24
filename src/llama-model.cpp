@@ -7,6 +7,7 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#include "llama-flex.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -954,6 +955,9 @@ struct llama_model::impl {
     layer_dev dev_output = {};
     std::vector<layer_dev> dev_layer;
 
+    // dense weight streaming (llama-flex); only created when LLAMA_FLEX is set
+    std::shared_ptr<llama_flex_context> flex;
+
     bool has_tensor_overrides;
 };
 
@@ -1157,6 +1161,57 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
     vocab.load(ml, kv);
 }
 
+// Best-effort detection of memory available to this process: honors a cgroup v2
+// memory.max cap (minus current usage) and the system MemAvailable, returning
+// the tighter of the two. Returns SIZE_MAX when neither limit is discoverable.
+// Used only by the LLAMA_FLEX_AUTO adaptive ring sizing below.
+static size_t llama_detect_available_memory() {
+    size_t avail = SIZE_MAX;
+    // This process's own cgroup v2 path (/proc/self/cgroup -> "0::<path>"); reading
+    // /sys/fs/cgroup/memory.max directly would give the root limit and miss a cap.
+    std::string cg_path;
+    if (FILE * c = std::fopen("/proc/self/cgroup", "r")) {
+        char line[256];
+        while (std::fgets(line, sizeof(line), c)) {
+            if (std::strncmp(line, "0::", 3) == 0) {
+                cg_path = line + 3;
+                if (!cg_path.empty() && cg_path.back() == '\n') cg_path.pop_back();
+                break;
+            }
+        }
+        std::fclose(c);
+    }
+    if (!cg_path.empty()) {
+        const std::string base = "/sys/fs/cgroup" + (cg_path == "/" ? std::string() : cg_path);
+        if (FILE * f = std::fopen((base + "/memory.max").c_str(), "r")) {
+            char buf[64] = {0};
+            if (std::fgets(buf, sizeof(buf), f) && std::strncmp(buf, "max", 3) != 0) {
+                size_t cmax = std::strtoull(buf, nullptr, 10);
+                size_t cur  = 0;
+                if (FILE * g = std::fopen((base + "/memory.current").c_str(), "r")) {
+                    char b2[64] = {0};
+                    if (std::fgets(b2, sizeof(b2), g)) cur = std::strtoull(b2, nullptr, 10);
+                    std::fclose(g);
+                }
+                avail = std::min(avail, (size_t) (cmax > cur ? cmax - cur : 0));
+            }
+            std::fclose(f);
+        }
+    }
+    if (FILE * f = std::fopen("/proc/meminfo", "r")) {
+        char line[128];
+        while (std::fgets(line, sizeof(line), f)) {
+            unsigned long kb = 0;
+            if (std::sscanf(line, "MemAvailable: %lu kB", &kb) == 1) {
+                avail = std::min(avail, (size_t) (kb * 1024ull));
+                break;
+            }
+        }
+        std::fclose(f);
+    }
+    return avail;
+}
+
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
     const auto & use_mlock    = params.use_mlock;
@@ -1167,13 +1222,28 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     const bool use_mmap_buffer = true;
 
+    // FlexInfer-style dense weight streaming (llama-flex). Enabled only via
+    // LLAMA_FLEX=1; requires mmap-home loading with no mlock and no tensor
+    // checking. When off, every path below behaves exactly as upstream.
+    const bool flex_requested =
+            std::getenv("LLAMA_FLEX") != nullptr &&
+            std::atoi(std::getenv("LLAMA_FLEX")) > 0;
+    const bool use_flex =
+            flex_requested &&
+            !use_mlock &&
+            !ml.check_tensors &&
+            ml.use_mmap &&
+            !params.vocab_only;
+
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
 
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (mmap = %s, direct_io = %s)\n",
         __func__, ml.use_mmap ? "true" : "false", ml.use_direct_io ? "true" : "false");
 
     // build a list of buffer types for the CPU and GPU devices
-    pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
+    // flex repoints tensor->data at fault time, so JIT-repack extra buffer
+    // types (which would rewrite the weight layout) must stay disabled.
+    pimpl->cpu_buft_list = make_cpu_buft_list(devices, use_flex ? false : params.use_extra_bufts, params.no_host);
     for (const auto & dev : devices) {
         buft_list_t buft_list = make_gpu_buft_list(dev.dev, split_mode, tensor_split);
         // add CPU buffer types as a fallback
@@ -1430,7 +1500,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    // flex streams each layer in on demand, so kernel read-ahead prefetch of
+    // the whole mapping would only defeat the bounded resident footprint.
+    ml.init_mappings(use_flex ? false : true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -1562,6 +1634,89 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
+        }
+    }
+
+    if (use_flex) {
+        llama_flex_params fp;
+        fp.enabled   = true;
+        fp.debug_log = std::getenv("LLAMA_FLEX_DEBUG") != nullptr;
+        fp.direct_io = std::getenv("LLAMA_FLEX_BUFFERED") == nullptr; // default O_DIRECT
+        if (const char * v = std::getenv("LLAMA_FLEX_RING"))    { fp.ring_layers    = std::max(2, std::atoi(v)); }
+        if (const char * v = std::getenv("LLAMA_FLEX_AHEAD"))   { fp.prefetch_ahead = std::max(1, std::atoi(v)); }
+        if (const char * v = std::getenv("LLAMA_FLEX_THREADS")) { fp.io_threads     = std::max(1, std::atoi(v)); }
+        if (const char * v = std::getenv("LLAMA_FLEX_LOCK_GB")) {
+            fp.lock_bytes = (size_t)(std::max(0.0, std::atof(v)) * 1024.0 * 1024.0 * 1024.0);
+        }
+
+        // Adaptive ring: size the resident layer ring from available memory, so we
+        // stream only as much as needed to fit.
+        //   available >= model    -> ring = n_layers (all resident, no streaming)
+        //   available <  model    -> ring = (available - non_layer - reserve) / max_layer
+        // A pre-scan sums layer-tensor bytes (largest layer sizes the ring slot) and
+        // non-layer bytes (embedding/output/norm: stay mmap-resident, the OOM floor).
+        if (std::getenv("LLAMA_FLEX_AUTO") && std::atoi(std::getenv("LLAMA_FLEX_AUTO")) > 0) {
+            std::vector<size_t> layer_bytes(hparams.n_layer, 0);
+            size_t non_layer = 0, layer_total = 0;
+            for (const auto & it : ml.weights_map) {
+                const size_t nb = ggml_nbytes(it.second.tensor);
+                int layer = -1;
+                if (std::sscanf(it.first.c_str(), "blk.%d.", &layer) == 1 &&
+                        layer >= 0 && layer < (int) hparams.n_layer) {
+                    layer_bytes[layer] += nb;
+                    layer_total        += nb;
+                } else {
+                    non_layer += nb;
+                }
+            }
+            size_t max_layer = 1;
+            for (size_t b : layer_bytes) max_layer = std::max(max_layer, b);
+
+            const size_t avail   = llama_detect_available_memory();
+            const size_t reserve = 512ull * 1024 * 1024;  // KV + compute scratch headroom
+            int ring = (int) hparams.n_layer;             // default: all resident
+            if (avail != SIZE_MAX && avail < non_layer + layer_total + reserve) {
+                const size_t fixed = non_layer + reserve;
+                const size_t room  = avail > fixed ? avail - fixed : 0;
+                ring = (int) std::min<size_t>(hparams.n_layer,
+                        std::max<size_t>(fp.prefetch_ahead + 2, room / max_layer));
+            }
+            fp.ring_layers = ring;
+            if (fp.debug_log) {
+                LLAMA_LOG_INFO("%s: flex adaptive ring=%d/%d (avail=%.0f MiB, "
+                        "max_layer=%.0f MiB, non_layer=%.0f MiB)\n", __func__,
+                        ring, (int) hparams.n_layer, avail == SIZE_MAX ? -1.0 : avail / 1048576.0,
+                        max_layer / 1048576.0, non_layer / 1048576.0);
+            }
+        }
+
+        std::vector<int> fds;
+        for (const auto & f : ml.files) {
+            fds.push_back(f->file_id());
+        }
+
+        pimpl->flex = llama_flex_create(fds, hparams.n_layer, fp);
+        if (llama_flex_enabled(pimpl->flex.get())) {
+            int registered = 0;
+            for (const auto & it : ml.weights_map) {
+                int layer = -1;
+                if (std::sscanf(it.first.c_str(), "blk.%d.", &layer) != 1 ||
+                        layer < 0 || layer >= hparams.n_layer) {
+                    continue; // only stream per-decoder-layer weights
+                }
+                llama_flex_tensor t;
+                t.name        = it.first;
+                t.file_idx    = it.second.idx;
+                t.file_offset = it.second.offs;
+                t.size        = ggml_nbytes(it.second.tensor);
+                llama_flex_register_tensor(*pimpl->flex, layer, t);
+                ++registered;
+            }
+            llama_flex_finalize(*pimpl->flex);
+            if (fp.debug_log) {
+                LLAMA_LOG_INFO("%s: llama-flex enabled, streaming %d layer tensors\n",
+                        __func__, registered);
+            }
         }
     }
 
@@ -1907,6 +2062,10 @@ const ggml_tensor * llama_model::get_tensor(const char * name) const {
     }
 
     return it->second;
+}
+
+llama_flex_context * llama_model::get_flex_context() const {
+    return pimpl->flex.get();
 }
 
 float llama_model::get_rope_freq_base (const llama_cparams & cparams, int il) const {

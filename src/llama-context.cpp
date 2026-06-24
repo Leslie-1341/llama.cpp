@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-cpu.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -9,6 +10,7 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-flex.h"
 #include "llama-ext.h"
 #include "llama.h"
 
@@ -2323,9 +2325,28 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
+    // Per-node weight-stream hook on the CPU backend for the duration of this
+    // graph. Used by FlexInfer-style dense streaming (llama-flex), which faults
+    // each op's flex-managed weights into its ring and repoints ->data. Only
+    // active when LLAMA_FLEX created a context; otherwise this is a no-op and
+    // the default (fully resident) path is unchanged.
+    auto * flex = model.get_flex_context();
+    const bool flex_active = backend_cpu != nullptr && llama_flex_enabled(flex);
+    if (flex_active) {
+        llama_flex_graph_begin(*flex);
+        ggml_cpu_set_weight_stream_callback(llama_flex_stream_callback, flex);
+    }
+
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+    }
+
+    // Tear down the hook before returning so no dangling callback survives this
+    // graph (including the error path above: we still synchronize and clear).
+    if (flex_active) {
+        ggml_backend_sched_synchronize(sched.get());
+        ggml_cpu_set_weight_stream_callback(nullptr, nullptr);
     }
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));

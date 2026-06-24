@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -143,23 +144,53 @@ static int flex_acquire_slot(llama_flex_context & ctx, int layer) {
     return slot;
 }
 
+// Plain buffered pread loop. Returns true on success (full `size` bytes read).
+static bool flex_pread_buffered(int fd, uint8_t * dst, size_t foff, size_t size,
+                                size_t * phys_out) {
+    size_t left = size; off_t off = (off_t) foff; uint8_t * d = dst;
+    while (left > 0) {
+        ssize_t r = pread(fd, d, left, off);
+        if (r <= 0) return false;
+        d += r; off += r; left -= (size_t) r;
+    }
+    if (phys_out) *phys_out = size;
+    return true;
+}
+
+// Drop O_DIRECT from every open fd so subsequent buffered preads on the same
+// open file descriptions succeed (a buffered pread on an O_DIRECT fd would also
+// fail with EINVAL on unaligned offset/length). Idempotent; flips the context
+// onto the buffered path permanently. Must hold ctx.mutex.
+static void flex_disable_direct_io(llama_flex_context * ctx) {
+    if (!ctx->direct_io_active) {
+        return;
+    }
+#if defined(__linux__) && defined(O_DIRECT)
+    for (int fd : ctx->fds) {
+        if (fd < 0) continue;
+        int fl = fcntl(fd, F_GETFL);
+        if (fl >= 0) {
+            fcntl(fd, F_SETFL, fl & ~O_DIRECT);
+        }
+    }
+#endif
+    ctx->direct_io_active = false;
+}
+
 // Read `size` bytes at `foff` from file `file_idx` into `dst`. When O_DIRECT is
 // active, the read is issued on a block-aligned superset into the per-thread
 // `bounce` buffer and the exact bytes are copied out; otherwise a plain pread
 // loop is used. `bcap` is the bounce capacity. Returns true on success.
+//
+// On an O_DIRECT read failure (errno, short read, or oversize vs bounce) the
+// read is not abandoned: it logs a diagnostic, clears O_DIRECT on the fds, and
+// retries the exact request through the buffered path.
 static bool flex_read(llama_flex_context * ctx,
                       uint8_t * dst, uint16_t file_idx, size_t foff, size_t size,
                       uint8_t * bounce, size_t bcap, size_t * phys_out = nullptr) {
     const int fd = ctx->fds[file_idx];
     if (!ctx->direct_io_active) {
-        size_t left = size; off_t off = (off_t) foff; uint8_t * d = dst;
-        while (left > 0) {
-            ssize_t r = pread(fd, d, left, off);
-            if (r <= 0) return false;
-            d += r; off += r; left -= (size_t) r;
-        }
-        if (phys_out) *phys_out = size;
-        return true;
+        return flex_pread_buffered(fd, dst, foff, size, phys_out);
     }
     const size_t A    = ctx->align;
     const size_t aoff = foff & ~(A - 1);
@@ -171,16 +202,42 @@ static bool flex_read(llama_flex_context * ctx,
     if (aoff + want > fsz) {
         want = fsz - aoff;            // final read may be a short EOF block
     }
+
+    const char * why    = nullptr;
+    int          saved  = 0;
+    ssize_t      r      = 0;
     if (head + size > bcap || want > bcap) {
-        return false;
+        why = "request exceeds bounce buffer";
+    } else {
+        r = pread(fd, bounce, want, (off_t) aoff);
+        saved = errno;
+        if (r < 0) {
+            why = "pread error";
+        } else if ((size_t) r < head + size) {
+            why = "short read";
+        }
     }
-    ssize_t r = pread(fd, bounce, want, (off_t) aoff);
-    if (r < 0 || (size_t) r < head + size) {
-        return false;
+
+    if (why == nullptr) {
+        std::memcpy(dst, bounce + head, size);
+        if (phys_out) *phys_out = want;
+        return true;
     }
-    std::memcpy(dst, bounce + head, size);
-    if (phys_out) *phys_out = want;
-    return true;
+
+    // O_DIRECT read failed: diagnose, fall back to buffered for this and all
+    // future reads.
+    if (ctx->params.debug_log) {
+        std::fprintf(stderr,
+            "llama_flex: O_DIRECT %s (errno=%d %s) file_idx=%u foff=%zu size=%zu "
+            "aoff=%zu want=%zu read_bytes=%zd -- falling back to buffered\n",
+            why, saved, std::strerror(saved), (unsigned) file_idx, foff, size,
+            aoff, want, r);
+    }
+    {
+        std::lock_guard<std::mutex> lock(ctx->mutex);
+        flex_disable_direct_io(ctx);
+    }
+    return flex_pread_buffered(fd, dst, foff, size, phys_out);
 }
 
 static void flex_worker(llama_flex_context * ctx) {
