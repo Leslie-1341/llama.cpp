@@ -179,7 +179,8 @@ binary:
   ./build/bin/llama-kv-trace-replay
 
 ctx-size:
-  4096
+  4096 for main long-idle / fast-maintenance result
+  8192 for larger KV-ratio validation
 
 batch-size:
   512
@@ -393,9 +394,9 @@ active_tps delta ≈ -33.6%
 
 ---
 
-## 9. KV cache 容量估算与收益占比
+## 9. Fast-maintenance 前 KV cache 理论容量估算与收益占比
 
-### 9.1 KV cache 理论容量
+### 9.1 ctx4096 KV cache 理论容量
 
 当前配置：
 
@@ -417,7 +418,7 @@ ctx-size = 4096
 = 256 KiB/token
 ```
 
-总 KV cache 容量：
+总 theoretical KV capacity：
 
 ```text
 4096 × 256 KiB
@@ -449,7 +450,7 @@ paged_cov_idle_owned_bytes=557842432
 
 这与理论估算一致。
 
-### 9.3 long-idle 收益占 KV cache 容量比例
+### 9.3 Fast-maintenance 前 long-idle 收益占理论 KV 容量比例
 
 long-idle T5 RSS drop：
 
@@ -466,8 +467,10 @@ long-idle T5 RSS drop：
 因此可以表述为：
 
 ```text
-在 4096 ctx、f32 KV 配置下，Llama-3-8B 的 KV cache 容量约为 1 GiB。long-idle ShareGPT-backed trace 中，S5 将最终 RSS 降低约 717 MiB，相当于 KV cache 总容量的约 70%。
+在 4096 ctx、f32 KV 配置下，Llama-3-8B 的 theoretical KV capacity 约为 1 GiB。fast-maintenance 前的 long-idle ShareGPT-backed trace 中，aggressive S5 将最终 RSS 降低约 717 MiB，约等于 theoretical KV capacity 的 70%。
 ```
+
+该比例是 RSS drop 与 theoretical KV capacity 的对比，不表示 KV buffer capacity 本身被改变。后续第 19 节使用 mincore 进一步补齐实际 KV resident 口径。
 
 ### 9.4 总 RSS 下降比例
 
@@ -493,7 +496,7 @@ S5 RSS drop：
 
 ```text
 总进程 RSS 下降约 7.9%；
-释放量约等于 KV cache 容量的 70%。
+释放量约等于 theoretical KV capacity 的 70%。
 ```
 
 这能避免只看总 RSS 时低估 KV cache 优化效果。
@@ -532,7 +535,7 @@ prefetch 不是当前 TPS 回退的主要原因。
 
 ### 11.1 实验结果
 
-| case                    | 说明                               |    RSS drop | KV capacity drop | TPS delta | active_decode_ms delta |
+| case                    | 说明                               |    RSS drop | RSS drop / theoretical KV | TPS delta | active_decode_ms delta |
 | ----------------------- | -------------------------------- | ----------: | ---------------: | --------: | ---------------------: |
 | T1_lazy_only            | lazy tail / lazy clear           | 447.691 MiB |          43.720% |   -2.827% |                +2.909% |
 | T2_paged_no_swap        | paged path, no swap              | 462.164 MiB |          45.133% |   -3.478% |                +3.603% |
@@ -633,14 +636,14 @@ LLAMA_KV_LAZY_CLEAR=1
 
 ```text
 RSS drop ≈ 447.7 MiB
-占 KV cache 容量 ≈ 43.7%
+RSS drop / theoretical KV ≈ 43.7%
 TPS delta ≈ -2.8%
 ```
 
 适合表述为：
 
 ```text
-在真实 ShareGPT-backed long-idle workload 下，low-overhead lazy-only 模式可在 TPS 仅下降约 2.8% 的情况下，将进程 RSS 降低约 447.7 MiB，约等于 4096 ctx / f32 KV cache 容量的 43.7%。
+在真实 ShareGPT-backed long-idle workload 下，low-overhead lazy-only 模式可在 TPS 仅下降约 2.8% 的情况下，将进程 RSS 降低约 447.7 MiB，约等于 4096 ctx / f32 theoretical KV capacity 的 43.7%。
 ```
 
 ### 12.2 Aggressive reclaim 模式
@@ -665,26 +668,26 @@ LLAMA_KV_PAGED_DEFER_SWAPOUT_ON_RESUME=1
 
 ```text
 RSS drop ≈ 716.9 MiB
-占 KV cache 容量 ≈ 70.0%
+RSS drop / theoretical KV ≈ 70.0%
 TPS delta ≈ -33.5%
 ```
 
 适合表述为：
 
 ```text
-在真实 ShareGPT-backed long-idle workload 下，aggressive reclaim 模式可将最终 RSS 降低约 716.9 MiB，约等于 4096 ctx / f32 KV cache 容量的 70.0%。但当前 idle swap 主路径维护开销较大，导致 active TPS 回退约 33.5%，后续仍需继续优化 maintenance 策略。
+在真实 ShareGPT-backed long-idle workload 下，aggressive reclaim 模式可将最终 RSS 降低约 716.9 MiB，约等于 4096 ctx / f32 theoretical KV capacity 的 70.0%。但 fast-maintenance 前 idle swap 主路径维护开销较大，导致 active TPS 回退约 33.5%。该问题已在第 17 节通过 fast-maintenance V5 显著缓解。
 ```
 
 ---
 
 ## 13. 为什么需要构造 KV cache 占比更大的场景
 
-当前 long-idle baseline 总 RSS 约 9.1 GiB，而 KV cache 容量约 1 GiB。
+fast-maintenance 前的 ctx4096 long-idle baseline 总 RSS 约 9.1 GiB，而 theoretical KV capacity 约 1 GiB。
 
 因此，即使释放 717 MiB：
 
 ```text
-对 KV cache 容量：约 70%
+对 theoretical KV capacity：约 70%
 对总进程 RSS：约 7.9%
 ```
 
@@ -703,7 +706,7 @@ TPS delta ≈ -33.5%
 * 使用 KV cache 更显著的模型和参数组合；
 * 保持 `cache-type-k=f32`、`cache-type-v=f32` 作为压力配置，便于放大 KV 内存占比。
 
-但当前不应立即扩大场景，因为 aggressive reclaim 的 TPS 回退仍偏大。更合理顺序是：
+在当时不应立即扩大场景，因为 aggressive reclaim 的 TPS 回退仍偏大。更合理顺序是：
 
 ```text
 先优化 idle swap maintenance 开销；
@@ -711,11 +714,13 @@ TPS delta ≈ -33.5%
 最后做正式 3-run median。
 ```
 
+该顺序已经在本阶段后续完成：第 17 节完成 fast-maintenance V5，降低 TPS 回退；第 18 节完成 ctx8192 larger KV-ratio validation；第 19 节进一步用 mincore 补齐实际 KV resident / memory composition 口径。
+
 ---
 
-## 14. 当前瓶颈
+## 14. Fast-maintenance 前的主要瓶颈
 
-本阶段已经定位出当前主要瓶颈：
+在加入 fast-maintenance 前，本阶段定位出的主要瓶颈是：
 
 ```text
 不是 paged read path；
@@ -733,7 +738,7 @@ T3_idle_swap_no_madvise:
   TPS delta ≈ -27.5%
 ```
 
-T3 没有额外 `madvise` 收益，却引入主要 TPS 回退。因此下一步应优化 idle swap maintenance，而不是继续调 prefetch。
+T3 没有额外 `madvise` 收益，却引入主要 TPS 回退。因此，后续第 17 节优先优化 idle swap maintenance，而不是继续调 prefetch。
 
 ---
 
@@ -841,7 +846,7 @@ swap-out → restore → swap-out
 4. tiny real ShareGPT-backed smoke 通过；
 5. medium real ShareGPT-backed smoke 在关闭 heavy idle trace 后通过；
 6. long-idle real ShareGPT-backed probe 通过，并获得约 717 MiB RSS drop；
-7. KV cache 容量估算显示该 RSS drop 约等于 4096 ctx / f32 KV cache 容量的 70%；
+7. theoretical KV capacity 估算显示该 RSS drop 约等于 4096 ctx / f32 theoretical KV capacity 的 70%；
 8. 组件级消融显示 low-overhead lazy-only 模式可用，约 447.7 MiB RSS drop，TPS 仅下降约 2.8%；
 9. aggressive reclaim 模式可释放约 70% KV 容量级别 RSS，但当前 TPS 回退约 33%；
 10. 当前主要瓶颈已定位为 idle swap 状态维护 / active-visible 检查 / swapped redirect / restore 判断，而不是 prefetch。
@@ -889,7 +894,7 @@ LLAMA_KV_PAGED_IDLE_SWAP_MIN_IDLE_STEPS=16
 
 在 real ShareGPT-backed long-idle trace 上进行 3-run median 验证，结果如下：
 
-| case                                     |   ok | median TPS | median decode ms | median total wall ms | median RSS KB |    RSS drop | KV capacity drop | TPS delta | decode ms delta |
+| case                                     |   ok | median TPS | median decode ms | median total wall ms | median RSS KB |    RSS drop | RSS drop / theoretical KV | TPS delta | decode ms delta |
 | ---------------------------------------- | ---: | ---------: | ---------------: | -------------------: | ------------: | ----------: | ---------------: | --------: | --------------: |
 | T0 baseline                              | True |  10.875037 |        77976.745 |            96200.524 |       9333632 |   0.000 MiB |           0.000% |    0.000% |          0.000% |
 | V4 every8 + budget8 + debug off          | True |  10.092739 |        84020.801 |           102442.304 |       8787704 | 533.133 MiB |          52.064% |   -7.194% |         +7.751% |
@@ -964,7 +969,7 @@ fast-maintenance V5:
 RSS drop:
   626568 KiB = 611.883 MiB
 
-KV capacity drop:
+RSS drop / theoretical KV capacity:
   59.754%
 
 TPS delta:
@@ -989,7 +994,7 @@ correctness:
 因此，本阶段最终可以表述为：
 
 ```text
-在真实 ShareGPT-backed long-idle workload 下，fast-maintenance V5 配置将最终 RSS 降低约 611.9 MiB，约等于 4096 ctx / f32 KV cache 容量的 59.8%；active TPS 仅下降约 3.0%，resume first-token weighted average latency 仅增加约 1.24 ms。相比原 aggressive reclaim 的约 33% TPS 回退，fast-maintenance 显著降低了 idle swap 主路径开销，证明该 KV cache 内存优化具备实际可用的性能-内存权衡。
+在真实 ShareGPT-backed long-idle workload 下，fast-maintenance V5 配置将最终 RSS 降低约 611.9 MiB，约等于 4096 ctx / f32 theoretical KV capacity 的 59.8%；active TPS 仅下降约 3.0%，resume first-token weighted average latency 仅增加约 1.24 ms。相比原 aggressive reclaim 的约 33% TPS 回退，fast-maintenance 显著降低了 idle swap 主路径开销，证明该 KV cache 内存优化具备实际可用的性能-内存权衡。
 ```
 
 ### 17.4 Current stage conclusion after fast-maintenance
@@ -999,10 +1004,10 @@ correctness:
 1. real ShareGPT-backed trace replay 已完整跑通；
 2. low-overhead lazy-only 模式可释放约 447.7 MiB RSS，TPS 回退约 2.8%；
 3. 原 aggressive reclaim 可释放约 716 MiB RSS，但 TPS 回退约 33%；
-4. fast-maintenance V5 可释放约 611.9 MiB RSS，约占 KV cache 容量 59.8%，TPS 仅回退约 3.0%；
+4. fast-maintenance V5 可释放约 611.9 MiB RSS，约等于 4096 ctx / f32 theoretical KV capacity 的 59.8%，TPS 仅回退约 3.0%；
 5. fast-maintenance V5 对 resume first-token latency 影响很小，加权平均仅增加约 1.24 ms；
 6. 主要优化来自 idle swap maintenance 降频、block budget、min idle steps 防抖和 debug probe gating；
-7. 下一步可以在该配置基础上构造更大 KV 占比场景，例如更大 ctx-size 或更长 history，以进一步放大总 RSS 下降比例。
+7. 已在第 18 节基于该配置完成 ctx8192 larger KV-ratio validation，并在第 19 节补齐 KV resident / memory composition diagnostic。
 
 ### 17.5 Diagnostic counters and final metric checklist
 
@@ -1080,7 +1085,7 @@ LLAMA_KV_PAGED_DEFER_SWAPOUT_ON_RESUME=1
 | workload    |                   parallel |           8 |                   8 |                      same |
 | memory      |                 median RSS | 9333632 KiB |         8707064 KiB |               -626568 KiB |
 | memory      |                   RSS drop |           0 |         611.883 MiB |              -611.883 MiB |
-| memory      |           KV capacity drop |           0 |             59.754% | +59.754 percentage points |
+| memory      | RSS drop / theoretical KV |           0 |             59.754% | +59.754 percentage points |
 | memory      |       total RSS drop ratio |           0 |              6.713% |  +6.713 percentage points |
 | throughput  |          median active TPS |   10.875037 |           10.548073 |                   -3.007% |
 | throughput  |    median active decode ms |   77976.745 |           80393.828 |                   +3.100% |
@@ -1106,7 +1111,7 @@ LLAMA_KV_PAGED_DEFER_SWAPOUT_ON_RESUME=1
 ```text
 在 real ShareGPT-backed long-idle workload 上，fast-maintenance V5 取得 3-run median：
 最终 RSS 降低 611.883 MiB，
-约占 4096 ctx / f32 KV cache 容量的 59.754%，
+约等于 4096 ctx / f32 theoretical KV capacity 的 59.754%，
 约占 baseline 总进程 RSS 的 6.713%；
 active TPS 仅下降 3.007%，
 active decode time 增加 3.100%，
@@ -1136,7 +1141,7 @@ fast-maintenance V5:
 
 ### 18.1 Motivation
 
-ctx4096 / f32 KV 配置下，Llama-3-8B 的 KV cache 理论容量约为：
+ctx4096 / f32 KV 配置下，Llama-3-8B 的 theoretical KV capacity 约为：
 
 ```text
 1024 MiB
@@ -1144,7 +1149,7 @@ ctx4096 / f32 KV 配置下，Llama-3-8B 的 KV cache 理论容量约为：
 
 而 baseline 总 RSS 约为 9.1 GiB。因此即使 V5 释放约 611.9 MiB RSS，总进程 RSS 下降比例仍为约 6.7%。
 
-为验证 KV cache 占比更大时的收益，本节将 `ctx-size` 提高到 8192。此时理论 KV cache 容量为：
+为验证 KV cache 占比更大时的收益，本节将 `ctx-size` 提高到 8192。此时 theoretical KV capacity 为：
 
 ```text
 8192 × 256 KiB = 2048 MiB = 2 GiB
@@ -1187,7 +1192,7 @@ Derived metrics:
 RSS drop:
   10364540 KiB - 8706484 KiB = 1658056 KiB = 1619.195 MiB
 
-KV capacity drop:
+RSS drop / theoretical KV capacity:
   1619.195 MiB / 2048 MiB = 79.062%
 
 total RSS drop ratio:
@@ -1211,7 +1216,7 @@ max seq resume avg delta:
 
 ### 18.4 Interpretation
 
-ctx8192 结果显示，fast-maintenance V5 在更大 KV cache 容量下仍然稳定：
+ctx8192 结果显示，fast-maintenance V5 在更大 theoretical KV capacity 下仍然稳定：
 
 1. `exit = 0`；
 2. `real_abnormal = 0`；
@@ -1222,7 +1227,7 @@ ctx8192 结果显示，fast-maintenance V5 在更大 KV cache 容量下仍然稳
 
 与 ctx4096 主结果相比：
 
-| setting    |     RSS drop | KV capacity drop | total RSS drop | TPS delta |
+| setting    |     RSS drop | RSS drop / theoretical KV | total RSS drop | TPS delta |
 | ---------- | -----------: | ---------------: | -------------: | --------: |
 | ctx4096 V5 |  611.883 MiB |          59.754% |         6.713% |   -3.007% |
 | ctx8192 V5 | 1619.195 MiB |          79.062% |        15.997% |   -1.006% |
@@ -1236,12 +1241,181 @@ ctx8192 验证进一步强化了 Stage 12-C 结论：
 ```text
 fast-maintenance V5 不仅在 ctx4096 下能以约 3% TPS 回退释放约 611.9 MiB RSS；
 在 ctx8192 下还能以约 1% TPS 回退释放约 1.58 GiB RSS，
-约占 2 GiB KV cache 容量的 79.1%，
+约等于 2 GiB theoretical KV capacity 的 79.1%，
 约占 baseline 总进程 RSS 的 16.0%。
 ```
 
 因此，本阶段最终成果可以表述为：
 
 ```text
-在真实 ShareGPT-backed long-idle workload 中，fast-maintenance V5 能够稳定触发 idle KV swap-out 与 madvise 物理页回收；在 ctx4096 下释放约 611.9 MiB RSS，TPS 回退约 3.0%；在 ctx8192 下释放约 1619.2 MiB RSS，总进程 RSS 下降约 16.0%，TPS 回退仅约 1.0%。这证明该优化在 KV cache 占比更高的长上下文场景中收益更加明显，并具备较好的性能-内存权衡。
+在真实 ShareGPT-backed long-idle workload 中，fast-maintenance V5 能够稳定触发 idle KV swap-out 与 madvise 物理页回收；在 ctx4096 下释放约 611.9 MiB RSS，TPS 回退约 3.0%；在 ctx8192 下释放约 1619.2 MiB RSS，总进程 RSS 下降约 16.0%，TPS 回退仅约 1.0%。第 19 节的 mincore diagnostic 进一步确认这些 RSS 下降主要来自 KV resident pages 的减少。这证明该优化在 KV cache 占比更高的长上下文场景中收益更加明显，并具备较好的性能-内存权衡。
 ```
+## 19. KV resident and memory composition diagnostic
+
+前述结果主要基于进程 RSS 差分和 theoretical KV capacity 进行解释。为进一步确认 RSS 下降是否确实来自 KV cache resident pages，本节补充 `LLAMA_KV_PAGED_MINCORE=1` 诊断实验。
+
+需要说明的是，theoretical KV capacity、KV allocated size 和 KV resident size 不是同一概念：
+
+```text
+theoretical KV capacity:
+  由模型结构、ctx-size、K/V dtype 决定的理论 KV 容量上限。
+
+KV allocated size:
+  llama.cpp 实际创建的 KV buffer 大小，通常接近 theoretical KV capacity。
+
+KV resident size:
+  通过 mincore 采样得到的当前常驻物理内存中的 KV pages。
+```
+
+因此，本节重点关注 `kv_mincore_resident_bytes`，即实际运行过程中 KV cache 对 RSS 的真实贡献。该 telemetry 为只读采样，不改变 KV block 内容或调度语义。
+
+### 19.1 Diagnostic setup
+
+本节使用与 Stage 12-C 主结果相同的 real ShareGPT-backed long-idle trace，仅开启只读 mincore telemetry。由于 `LLAMA_KV_PAGED_MINCORE=1` 依赖 paged KV path，因此这里使用一个 diagnostic baseline：
+
+```text
+M0_no_madvise_mincore:
+  paged enabled
+  idle swap enabled
+  madvise disabled
+  lazy disabled
+  mincore enabled
+```
+
+该配置不作为性能 baseline，只用于观察在未进行 madvise 物理页回收时，KV buffer 是否基本全部 resident。由于纯 T0 baseline 不启用 paged KV path，无法直接输出 `kv_mincore_*` 字段，因此本节使用 M0 作为 baseline-like KV resident 参照。
+
+V5 diagnostic 配置为：
+
+```text
+V5_mincore:
+  final V5 fast-maintenance configuration
+  mincore enabled
+```
+
+也就是说：
+
+```text
+M0_no_madvise_mincore 用于估计 baseline-like KV resident；
+V5_mincore 用于估计优化后的 KV resident。
+```
+
+### 19.2 ctx4096 diagnostic result
+
+| case                  |  process RSS |    KV total | KV resident | KV resident ratio | KV resident share of total RSS | swapped nonresident |
+| --------------------- | -----------: | ----------: | ----------: | ----------------: | -----------------------------: | ------------------: |
+| T0 pure               | 9114.793 MiB |         N/A |         N/A |               N/A |                            N/A |                 N/A |
+| M0 no-madvise mincore | 9100.367 MiB | 1023.75 MiB | 1023.75 MiB |            100.0% |                        11.232% |             0.0 MiB |
+| V5 mincore            | 8503.047 MiB | 1023.75 MiB |  426.00 MiB |           41.612% |                         5.010% |           150.0 MiB |
+
+Derived metrics:
+
+```text
+process RSS drop:
+  9114.793 MiB - 8503.047 MiB = 611.746 MiB
+
+KV resident drop:
+  1023.75 MiB - 426.00 MiB = 597.75 MiB
+
+KV resident drop ratio:
+  597.75 MiB / 1023.75 MiB = 58.388%
+
+baseline-like KV resident share of total RSS:
+  1023.75 MiB / 9114.793 MiB = 11.232%
+
+V5 KV resident share of total RSS:
+  426.00 MiB / 8503.047 MiB = 5.010%
+```
+
+ctx4096 下，M0 diagnostic 显示 KV buffer 约 1023.75 MiB，且基本全部 resident。V5 后，KV resident 降至约 426.00 MiB，降低约 597.75 MiB，占 baseline-like KV resident 的约 58.4%。
+
+这说明 ctx4096 下的约 611.7 MiB process RSS drop 主要可以由 KV resident drop 解释。
+
+### 19.3 ctx8192 diagnostic result
+
+| case                  |   process RSS |    KV total | KV resident | KV resident ratio | KV resident share of total RSS | swapped nonresident |
+| --------------------- | ------------: | ----------: | ----------: | ----------------: | -----------------------------: | ------------------: |
+| T0 pure               | 10121.414 MiB |         N/A |         N/A |               N/A |                            N/A |                 N/A |
+| M0 no-madvise mincore | 10123.938 MiB | 2047.75 MiB | 2047.75 MiB |            100.0% |                        20.232% |             0.0 MiB |
+| V5 mincore            |  8502.246 MiB | 2047.75 MiB |  426.00 MiB |           20.803% |                         5.010% |           150.0 MiB |
+
+Derived metrics:
+
+```text
+process RSS drop:
+  10121.414 MiB - 8502.246 MiB = 1619.168 MiB
+
+KV resident drop:
+  2047.75 MiB - 426.00 MiB = 1621.75 MiB
+
+KV resident drop ratio:
+  1621.75 MiB / 2047.75 MiB = 79.197%
+
+baseline-like KV resident share of total RSS:
+  2047.75 MiB / 10121.414 MiB = 20.232%
+
+V5 KV resident share of total RSS:
+  426.00 MiB / 8502.246 MiB = 5.010%
+```
+
+ctx8192 下，M0 diagnostic 显示 KV buffer 约 2047.75 MiB，且基本全部 resident。V5 后，KV resident 仍降至约 426.00 MiB，降低约 1621.75 MiB，占 baseline-like KV resident 的约 79.2%。
+
+这解释了为什么 ctx8192 的总进程 RSS 下降比例明显高于 ctx4096：ctx8192 中 KV cache 在 baseline 总 RSS 中的占比从约 11.2% 提高到约 20.2%，而 V5 最终将 KV resident 压到几乎相同的 426 MiB 级别。
+
+### 19.4 Memory composition interpretation
+
+基于 mincore diagnostic，可以得到更清晰的内存构成解释：
+
+| setting | baseline-like KV resident | V5 KV resident | KV resident drop | process RSS drop |
+| ------- | ------------------------: | -------------: | ---------------: | ---------------: |
+| ctx4096 |               1023.75 MiB |     426.00 MiB |       597.75 MiB |      611.746 MiB |
+| ctx8192 |               2047.75 MiB |     426.00 MiB |      1621.75 MiB |     1619.168 MiB |
+
+可以看到，process RSS drop 与 KV resident drop 高度一致。因此，本阶段 RSS 下降不是单纯的理论容量推算，而是能够通过 mincore 直接观察到 KV resident pages 的减少。
+
+模型权重、compute buffer、runtime allocator、线程栈、shared libraries 等非 KV 内存并不是本优化直接作用对象。它们构成总 RSS 的背景项，约为 8 GiB 级别。ctx-size 增大主要增加 KV cache resident，而 V5 能够将最终 KV resident 压到约 426 MiB。因此 ctx4096 和 ctx8192 的 V5 最终 RSS 都稳定在约 8.5 GiB 附近。
+
+### 19.5 About swapped nonresident bytes
+
+V5 diagnostic 中，`kv_swapped_nonresident_mib` 为 150 MiB。这个数值不等于全部释放的 KV resident。
+
+全部 KV nonresident 可以由以下差值得到：
+
+```text
+ctx4096:
+  1023.75 MiB - 426.00 MiB = 597.75 MiB
+
+ctx8192:
+  2047.75 MiB - 426.00 MiB = 1621.75 MiB
+```
+
+其中，`kv_swapped_nonresident_mib = 150 MiB` 表示当前处于 swapped block 状态并且 mincore 采样为 nonresident 的 KV block。剩余 nonresident KV 区域主要来自 lazy tail / lazy clear 避免未使用 KV 区域被物理提交，以及 madvise 后不再 resident 的 KV pages。
+
+因此，正确解释是：
+
+```text
+V5 使最终 KV resident 从 baseline-like 的 1023.75 / 2047.75 MiB 降至约 426.00 MiB；
+其中当前 swapped-block nonresident 为 150 MiB；
+整体 KV resident drop 分别为 597.75 MiB 和 1621.75 MiB。
+```
+
+### 19.6 Updated conclusion
+
+KV resident diagnostic 补齐了本阶段的内存构成解释链：
+
+```text
+ctx4096:
+  baseline-like KV resident ≈ 1023.75 MiB
+  V5 KV resident ≈ 426.00 MiB
+  KV resident drop ≈ 597.75 MiB
+  process RSS drop ≈ 611.75 MiB
+
+ctx8192:
+  baseline-like KV resident ≈ 2047.75 MiB
+  V5 KV resident ≈ 426.00 MiB
+  KV resident drop ≈ 1621.75 MiB
+  process RSS drop ≈ 1619.17 MiB
+```
+
+这说明 V5 的主要收益确实来自 KV cache resident pages 的减少。随着 ctx-size 从 4096 增至 8192，baseline-like KV resident 从约 1 GiB 增至约 2 GiB，而 V5 最终 KV resident 仍维持在约 426 MiB。因此，总进程 RSS drop 从约 6.7% 提高到约 16.0%。
+
+该结果进一步证明：在长上下文、多 session、idle/resume 的 KV memory pressure 场景中，fast-maintenance V5 能够稳定降低 KV resident memory，并且当 KV cache 占总内存比例更高时，总 RSS 收益更明显。
