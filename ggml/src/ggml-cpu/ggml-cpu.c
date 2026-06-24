@@ -3,6 +3,7 @@
 
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "traits.h"
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
@@ -474,6 +475,10 @@ struct ggml_threadpool {
 
     struct ggml_cgraph * cgraph;
     struct ggml_cplan  * cplan;
+
+    // optional per-node callback, propagated from the cplan
+    ggml_graph_compute_sequence_node_callback node_callback;
+    void *               node_callback_data;
 
     // synchronization primitives
     atomic_int n_graph;       // updated when there is work to be done (i.e each graph) holds graph and active thread counts.
@@ -1699,11 +1704,26 @@ static void ggml_compute_forward_mul_mat_id(
 
 /////////////////////////////////
 
+static ggml_cpu_weight_stream_callback g_weight_stream_cb = NULL;
+static void *                          g_weight_stream_ud = NULL;
+
+void ggml_cpu_set_weight_stream_callback(ggml_cpu_weight_stream_callback cb, void * user_data) {
+    g_weight_stream_cb = cb;
+    g_weight_stream_ud = user_data;
+}
+
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
 
     if (tensor->op == GGML_OP_NONE || ggml_is_empty(tensor)) {
         return;
+    }
+
+    // Streamed-weight hook: ith==0 may fault the op's weights into a managed
+    // buffer and repoint their ->data; the barrier publishes that to all threads
+    // before the kernel reads it. Cheap no-op when no streaming is configured.
+    if (g_weight_stream_cb != NULL && g_weight_stream_cb(tensor, params->ith, g_weight_stream_ud)) {
+        ggml_barrier(params->threadpool);
     }
 
     // extra_buffer op?
@@ -3042,11 +3062,17 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
         if (ggml_op_is_empty(node->op)) {
+            if (state->ith == 0 && tp->node_callback != NULL) {
+                tp->node_callback(node, tp->node_callback_data);
+            }
             // skip NOPs
             continue;
         }
 
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            if (state->ith == 0 && tp->node_callback != NULL) {
+                tp->node_callback(node, tp->node_callback_data);
+            }
             continue;
         }
 
@@ -3065,8 +3091,12 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             tp->ec    = GGML_STATUS_ABORTED;
         }
 
-        if (node_n + 1 < cgraph->n_nodes) {
+        if (node_n + 1 < cgraph->n_nodes || tp->node_callback != NULL) {
             ggml_barrier(state->threadpool);
+        }
+
+        if (state->ith == 0 && tp->node_callback != NULL) {
+            tp->node_callback(node, tp->node_callback_data);
         }
     }
 
@@ -3233,6 +3263,8 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     {
         threadpool->cgraph           = cgraph;
         threadpool->cplan            = cplan;
+        threadpool->node_callback        = cplan != NULL ? cplan->node_callback : NULL;
+        threadpool->node_callback_data   = cplan != NULL ? cplan->node_callback_data : NULL;
         threadpool->n_graph          = 0;
         threadpool->n_barrier        = 0;
         threadpool->n_barrier_passed = 0;
@@ -3323,6 +3355,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         // No worker threads should be accessing the parameters below at this stage
         threadpool->cgraph           = cgraph;
         threadpool->cplan            = cplan;
+        threadpool->node_callback        = cplan->node_callback;
+        threadpool->node_callback_data   = cplan->node_callback_data;
         threadpool->current_chunk    = 0;
         threadpool->abort            = -1;
         threadpool->ec               = GGML_STATUS_SUCCESS;
