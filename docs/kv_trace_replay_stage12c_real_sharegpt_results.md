@@ -1129,3 +1129,119 @@ fast-maintenance V5:
 ```
 
 因此，fast-maintenance V5 在保留主要 KV cache 物理页回收收益的同时，显著降低了 idle swap 主路径开销，是当前 Stage 12-C 的最终推荐配置。
+
+## 18. Larger KV-ratio ctx8192 validation
+
+在 ctx4096 主结果之外，本阶段进一步构造更大 KV cache 占比场景，用于验证 fast-maintenance V5 在更大上下文容量下是否仍能稳定运行，并观察总进程 RSS 下降比例是否随 KV cache 占比增大而放大。
+
+### 18.1 Motivation
+
+ctx4096 / f32 KV 配置下，Llama-3-8B 的 KV cache 理论容量约为：
+
+```text
+1024 MiB
+```
+
+而 baseline 总 RSS 约为 9.1 GiB。因此即使 V5 释放约 611.9 MiB RSS，总进程 RSS 下降比例仍为约 6.7%。
+
+为验证 KV cache 占比更大时的收益，本节将 `ctx-size` 提高到 8192。此时理论 KV cache 容量为：
+
+```text
+8192 × 256 KiB = 2048 MiB = 2 GiB
+```
+
+### 18.2 Experiment setup
+
+实验仍使用 real ShareGPT-backed long-idle trace，保持 session / turn / token 数一致，只改变 `ctx-size`：
+
+```text
+ctx-size = 8192
+parallel = 8
+cache-type-k = f32
+cache-type-v = f32
+active decode tokens = 848
+sessions = 8
+turns = 14
+resumed turns = 6
+```
+
+V5 fast-maintenance 配置保持不变：
+
+```text
+LLAMA_KV_PAGED_IDLE_SWAP_DEBUG_PROBES=0
+LLAMA_KV_PAGED_IDLE_SWAP_EVERY_TOKENS=8
+LLAMA_KV_PAGED_IDLE_SWAP_MAX_BLOCKS_PER_STEP=8
+LLAMA_KV_PAGED_IDLE_SWAP_MIN_IDLE_STEPS=16
+```
+
+### 18.3 ctx8192 3-run median
+
+| case                        |   ok | median TPS | median decode ms | median total wall ms | median RSS KB | resume first weighted avg | max seq resume avg | prefetch elapsed sum | prefetch elapsed max | prefetch restored blocks |
+| --------------------------- | ---: | ---------: | ---------------: | -------------------: | ------------: | ------------------------: | -----------------: | -------------------: | -------------------: | -----------------------: |
+| T0 ctx8192 baseline         | True |  10.846081 |        78184.923 |            96365.403 |      10364540 |                103.225 ms |         108.933 ms |             0.000 ms |             0.000 ms |                        0 |
+| V5 ctx8192 fast-maintenance | True |  10.736931 |        78979.742 |            97296.760 |       8706484 |                100.830 ms |         104.047 ms |            38.715 ms |            26.835 ms |                       17 |
+
+Derived metrics:
+
+```text
+RSS drop:
+  10364540 KiB - 8706484 KiB = 1658056 KiB = 1619.195 MiB
+
+KV capacity drop:
+  1619.195 MiB / 2048 MiB = 79.062%
+
+total RSS drop ratio:
+  1619.195 MiB / (10364540 KiB / 1024) = 15.997%
+
+TPS delta:
+  -1.006%
+
+active decode ms delta:
+  +1.017%
+
+total wall delta:
+  +0.966%
+
+resume first-token weighted avg delta:
+  -2.395 ms
+
+max seq resume avg delta:
+  -4.886 ms
+```
+
+### 18.4 Interpretation
+
+ctx8192 结果显示，fast-maintenance V5 在更大 KV cache 容量下仍然稳定：
+
+1. `exit = 0`；
+2. `real_abnormal = 0`；
+3. `summary_count = 8`；
+4. `all_finished = 1`；
+5. resume first-token latency 没有恶化；
+6. final prefetch / restore 路径被触发，median restored blocks 为 17。
+
+与 ctx4096 主结果相比：
+
+| setting    |     RSS drop | KV capacity drop | total RSS drop | TPS delta |
+| ---------- | -----------: | ---------------: | -------------: | --------: |
+| ctx4096 V5 |  611.883 MiB |          59.754% |         6.713% |   -3.007% |
+| ctx8192 V5 | 1619.195 MiB |          79.062% |        15.997% |   -1.006% |
+
+这说明，当 KV cache 占总进程 RSS 的比例增大时，V5 的总 RSS 下降比例也显著放大。ctx8192 下，V5 将总进程 RSS 降低约 16.0%，而 TPS 仅下降约 1.0%。
+
+### 18.5 Updated conclusion with ctx8192 validation
+
+ctx8192 验证进一步强化了 Stage 12-C 结论：
+
+```text
+fast-maintenance V5 不仅在 ctx4096 下能以约 3% TPS 回退释放约 611.9 MiB RSS；
+在 ctx8192 下还能以约 1% TPS 回退释放约 1.58 GiB RSS，
+约占 2 GiB KV cache 容量的 79.1%，
+约占 baseline 总进程 RSS 的 16.0%。
+```
+
+因此，本阶段最终成果可以表述为：
+
+```text
+在真实 ShareGPT-backed long-idle workload 中，fast-maintenance V5 能够稳定触发 idle KV swap-out 与 madvise 物理页回收；在 ctx4096 下释放约 611.9 MiB RSS，TPS 回退约 3.0%；在 ctx8192 下释放约 1619.2 MiB RSS，总进程 RSS 下降约 16.0%，TPS 回退仅约 1.0%。这证明该优化在 KV cache 占比更高的长上下文场景中收益更加明显，并具备较好的性能-内存权衡。
+```
