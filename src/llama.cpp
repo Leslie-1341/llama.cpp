@@ -4,6 +4,7 @@
 
 #include "llama-chat.h"
 #include "llama-context.h"
+#include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-vocab.h"
 #include "llama-model-loader.h"
@@ -77,6 +78,38 @@ bool llama_supports_gpu_offload(void) {
     return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) != nullptr ||
            ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU) != nullptr ||
            llama_supports_rpc();
+}
+
+int32_t llama_memory_prefetch_seq(
+        llama_memory_t mem,
+          llama_seq_id seq_id) {
+    if (!mem) {
+        return -1;
+    }
+
+    return mem->prefetch_seq(seq_id);
+}
+
+int32_t llama_memory_prefetch_seq_step(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+            uint32_t   max_blocks) {
+    if (!mem) {
+        return -1;
+    }
+
+    return mem->prefetch_seq_step(seq_id, max_blocks);
+}
+
+void llama_memory_set_seq_prefetch_protected(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+                bool   enabled) {
+    if (!mem) {
+        return;
+    }
+
+    mem->set_seq_prefetch_protected(seq_id, enabled);
 }
 
 bool llama_supports_rpc(void) {
@@ -575,4 +608,3 @@ const char * llama_print_system_info(void) {
 
     return s.c_str();
 }
-

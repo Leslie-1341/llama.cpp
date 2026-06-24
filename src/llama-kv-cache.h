@@ -5,6 +5,13 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <cstddef>
+#include <cstdio>
+#include <cstdint>
+#include <array>
+#include <bitset>
+#include <memory>
+#include <set>
 #include <unordered_map>
 #include <vector>
 
@@ -12,10 +19,123 @@ struct llama_cparams;
 struct llama_hparams;
 struct llama_model;
 struct llama_context;
+class llama_kv_cache_context;
 
 //
 // llama_kv_cache
 //
+
+// Stage2-backend0: backing-store abstraction shell for runtime KV swap.
+//
+// This interface is intentionally not instantiated or called in backend0. It only fixes the
+// seam for future exact offload work, where a file-backed/tmpfile implementation can persist
+// cell or block bytes outside the anonymous KV tensor allocation. No file I/O, swap-out,
+// swap-in, ensure_resident, prefetch, or madvise behavior is implemented here.
+enum class llama_kv_backing_store_status : uint8_t {
+    ok = 0,
+    disabled,
+    io_error,
+    bad_slot,
+};
+
+struct llama_kv_backing_store_stats {
+    uint64_t bytes_written  = 0;
+    uint64_t bytes_read     = 0;
+    uint64_t bytes_released = 0;
+    uint64_t write_calls    = 0;
+    uint64_t read_calls     = 0;
+    uint64_t release_calls  = 0;
+    int      last_errno     = 0;
+};
+
+class llama_kv_backing_store_i {
+public:
+    virtual ~llama_kv_backing_store_i() = default;
+
+    virtual llama_kv_backing_store_status write_cell(
+            uint32_t   strm,
+            uint32_t   cell,
+            const void * data,
+            size_t     size,
+            uint64_t & offset_out) {
+        (void) strm;
+        (void) cell;
+        (void) data;
+        (void) size;
+        offset_out = 0;
+        return llama_kv_backing_store_status::disabled;
+    }
+
+    virtual llama_kv_backing_store_status read_cell(
+            uint32_t strm,
+            uint32_t cell,
+            uint64_t offset,
+            void *   data,
+            size_t   size) {
+        (void) strm;
+        (void) cell;
+        (void) offset;
+        (void) data;
+        (void) size;
+        return llama_kv_backing_store_status::disabled;
+    }
+
+    virtual llama_kv_backing_store_status release(uint64_t offset, size_t size) {
+        (void) offset;
+        (void) size;
+        return llama_kv_backing_store_status::disabled;
+    }
+
+    virtual llama_kv_backing_store_status reset() {
+        return llama_kv_backing_store_status::disabled;
+    }
+
+    virtual const llama_kv_backing_store_stats & get_stats() const {
+        static const llama_kv_backing_store_stats empty;
+        return empty;
+    }
+};
+
+class llama_kv_backing_store_file : public llama_kv_backing_store_i {
+public:
+    llama_kv_backing_store_file();
+    ~llama_kv_backing_store_file() override;
+
+    llama_kv_backing_store_status write_cell(
+            uint32_t   strm,
+            uint32_t   cell,
+            const void * data,
+            size_t     size,
+            uint64_t & offset_out) override;
+
+    llama_kv_backing_store_status read_cell(
+            uint32_t strm,
+            uint32_t cell,
+            uint64_t offset,
+            void *   data,
+            size_t   size) override;
+
+    llama_kv_backing_store_status release(uint64_t offset, size_t size) override;
+    llama_kv_backing_store_status reset() override;
+
+    bool is_enabled() const {
+        return fd >= 0;
+    }
+
+    uint64_t get_file_len() const {
+        return file_len;
+    }
+
+    const llama_kv_backing_store_stats & get_stats() const override {
+        return stats;
+    }
+
+private:
+    int fd = -1;
+    std::FILE * file = nullptr;
+    uint64_t file_len = 0;
+    llama_kv_backing_store_stats stats;
+};
 
 class llama_kv_cache : public llama_memory_i {
 public:
@@ -108,7 +228,7 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse);
 
-    ~llama_kv_cache() = default;
+    ~llama_kv_cache();
 
     //
     // llama_memory_i
@@ -136,6 +256,18 @@ public:
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
+    int32_t prefetch_seq(llama_seq_id seq_id) override;
+    int32_t prefetch_seq_step(llama_seq_id seq_id, uint32_t max_blocks) override;
+    void set_seq_prefetch_protected(llama_seq_id seq_id, bool enabled) override;
+    void defer_idle_swapout(int32_t n_steps);
+    void prefetch_seq_last_stats(
+            uint64_t & owned_blocks,
+            uint64_t & swapped_blocks,
+            uint64_t & resident_blocks,
+            uint64_t & released_blocks,
+            uint64_t & invalid_cells,
+            uint64_t & failures) const;
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
     // state write/load
@@ -160,10 +292,13 @@ public:
     //
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
+    uint32_t get_visible_lo(const slot_info & sinfo) const;
+    uint32_t get_reserve_n_kv() const;
+    bool uses_approx_dynamic_view() const;
 
     // get views of the current state of the cache
-    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
-    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, uint32_t visible_lo, const slot_info & sinfo, bool causal_attn, ggml_tensor * row_idx = nullptr) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, uint32_t visible_lo, const slot_info & sinfo, bool causal_attn, ggml_tensor * row_idx = nullptr) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
@@ -187,28 +322,53 @@ public:
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
 
+    // Stage2-exact-swapout0: no-op scaffold for future exact swap-in before KV reads.
+    // Not called from apply() in this stage.
+    void ensure_resident(uint32_t n_kv);
+    void swap_out_window(uint32_t n_kv);
+    void sample_swap_rss();
+
+    // stage F1 / P1: advise the unused tail capacity [GGML_PAD(n_kv, 256), kv_size) away via
+    // MADV_DONTNEED to lower current RSS. No-op unless LLAMA_KV_LAZY_TAIL=1 (and !v_trans &&
+    // n_stream==1). See docs/kv_lazy_block_stage_f1_design.md.
+    void madvise_tail(uint32_t n_kv);
+    void paged_release_blocks(uint32_t n_kv);
+    void paged_swap_out_window(uint32_t n_kv);
+
+    // stage P2: clear-frontier. When LLAMA_KV_LAZY_CLEAR=1 (and !v_trans && n_stream==1),
+    // the construction-time full buffer clear is replaced by clearing only the [0, clear_frontier)
+    // prefix; the tail [clear_frontier, kv_size) is left untouched so it is never committed,
+    // lowering peak RSS. As n_kv grows past clear_frontier this advances the frontier, zeroing
+    // newly-readable rows before the graph reads K/V. No-op unless kv_lazy_clear.
+    // See docs/kv_lazy_block_stage_p2_read.md.
+    void clear_frontier_advance(uint32_t n_kv);
+
     //
     // input API
     //
 
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    ggml_tensor * build_input_paged_row_idx(ggml_context * ctx, uint32_t n_kv) const;
 
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
+    void set_input_paged_row_idx(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t visible_lo, const slot_info & sinfo) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
 private:
+    friend class llama_kv_cache_context;
+
     const llama_model & model;
     const llama_hparams & hparams;
 
@@ -249,6 +409,507 @@ private:
 
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
+
+    // Stage2-exact-swapout0 scaffold. This only parses env, owns the file-backed backend
+    // when explicitly enabled, and defines counters/no-op hooks. It does not touch KV tensors,
+    // cell state, apply(), attention, madvise, or prefetch.
+    enum class kv_swap_mode {
+        off,
+        exact,
+        approx,
+    };
+
+    std::unique_ptr<llama_kv_backing_store_i> kv_swap_store;
+    bool kv_swap_enabled = false;
+    kv_swap_mode kv_swap_mode_ = kv_swap_mode::off;
+    uint64_t kv_swap_out_calls = 0;
+    uint64_t kv_swap_in_calls = 0;
+    uint64_t kv_swap_ensure_calls = 0;
+    uint32_t kv_swap_window = 0;
+    uint32_t kv_swap_sink = 0;
+    uint64_t kv_swap_window_calls = 0;
+    uint64_t kv_swap_window_skipped = 0;
+    uint64_t kv_swap_backend_failures = 0;
+    mutable uint64_t kv_approx_calls = 0;
+    uint64_t kv_approx_window = 0;
+    mutable uint64_t kv_approx_masked = 0;
+    mutable uint64_t kv_approx_debug_get_k_visible_gt0_calls = 0;
+    mutable uint64_t kv_approx_debug_get_v_visible_gt0_calls = 0;
+    mutable bool     kv_approx_dynamic_warned = false;
+    bool     kv_swap_rss_sample = false;
+    uint64_t kv_swap_rss_samples = 0;
+    uint64_t kv_swap_rss_min_kb = 0;
+    uint64_t kv_swap_rss_max_kb = 0;
+    uint64_t kv_swap_rss_last_kb = 0;
+    bool     kv_swap_madvise = false;
+    uint64_t kv_swap_madvise_calls = 0;
+    uint64_t kv_swap_madvise_candidate_runs = 0;
+    uint64_t kv_swap_madvise_advised_runs = 0;
+    uint64_t kv_swap_madvise_advised_bytes = 0;
+    uint64_t kv_swap_madvise_failures = 0;
+    uint64_t kv_swap_madvise_skipped_bytes = 0;
+
+    void swap_out_cell(uint32_t cell);
+    void swap_in_cell(uint32_t cell);
+    void madvise_swapped_runs(uint32_t n_kv);
+    void kv_swap_roundtrip_selftest();
+
+    // Stage 1 paged KV metadata scaffold. Off unless LLAMA_KV_PAGED=1 and only maintains an
+    // identity block table for internal accounting; it is not consumed by KV read/write paths.
+    void paged_init(uint32_t kv_size);
+    void paged_reset();
+    void paged_build_block_table();
+    void paged_note_cells(const slot_info & sinfo);
+    uint32_t paged_resolve(uint32_t cell) const;
+    uint32_t paged_write_resolve(uint32_t cell) const;
+    void paged_ensure_write_resident(uint32_t phys_cell) const;
+    void paged_check_read_resident(uint32_t phys_cell, bool active) const;
+    void paged_check_read_resident_impl(uint32_t phys_cell, bool active) const;
+    void paged_swap_out_block(uint32_t physical_block, bool do_madvise = true) const;
+    void paged_swap_out_block_impl(uint32_t physical_block, bool do_madvise) const;
+    bool paged_swap_in_block(uint32_t physical_block) const;
+    uint64_t paged_madvise_block(
+            uint32_t physical_block,
+            const std::vector<uint8_t> * active,
+            uint64_t & failures,
+            uint64_t & skipped,
+            uint64_t & skip_live) const;
+    // Stage 5E-1: read-only KV resident page sampling via mincore(2). Walks every KV layer's
+    // K/V tensor, page-aligns each tensor's [data, data+nbytes) interval (same align rule as
+    // paged_madvise_block), and counts resident pages. Updates the kv_mincore_* counters and
+    // returns total resident bytes across all KV tensors. No-op (returns 0) unless
+    // paged_mincore_enabled. Does not touch tensor contents or block state.
+    uint64_t paged_sample_mincore() const;
+
+    // Stage 7D-A: debug-only SWAPPED-page refault tracing. When LLAMA_KV_PAGED_REFAULT_TRACE=1,
+    // a block that has been swapped out + madvise'd has its K/V page ranges mprotect(PROT_NONE)'d
+    // (same page-aligned interior as paged_madvise_block, so only pages fully owned by the block
+    // are touched). Any later read/write to those pages -- e.g. the decode graph's
+    // ggml_get_rows(k2d/v2d, row_idx) -- traps into a SIGSEGV handler that records the fault site
+    // (K/V, layer, block, step), restores the page to PROT_READ|PROT_WRITE, and returns so the
+    // faulting instruction retries. This is a diagnostic, NOT a memory-optimization mechanism: it
+    // does not change swap/madvise/row_idx semantics and is a no-op unless explicitly enabled.
+    void paged_refault_init();
+    void paged_refault_protect_block(uint32_t physical_block) const;
+    void paged_refault_unprotect_block(uint32_t physical_block) const;
+    void paged_refault_unprotect_all() const;
+    void paged_refault_drain() const;
+
+    void paged_assert_identity(const slot_info & sinfo);
+    void paged_shadow_validate(const slot_info & sinfo, uint32_t n_kv) const;
+    bool paged_ingraph_gather_supported(int32_t il) const;
+    void paged_log_base_timing() const;
+    void paged_log_timing() const;
+    void paged_log_stats() const;
+
+    static constexpr uint32_t PAGED_BLOCK_INVALID = UINT32_MAX;
+
+    enum class paged_block_state : uint8_t {
+        UNUSED   = 0,
+        RESIDENT = 1,
+        RELEASED = 2,
+        SWAPPED  = 3,
+    };
+
+    bool     kv_paged_enabled  = false;
+    bool     kv_paged_warned   = false;
+    uint32_t paged_block_size  = 16;
+    uint32_t paged_n_blocks    = 0;
+    uint32_t paged_kv_size     = 0;
+    uint32_t paged_shift       = 0;
+    bool     paged_non_identity_enabled = false;
+    std::vector<uint32_t> paged_block_table;
+    std::vector<uint8_t>  paged_block_used;
+    mutable std::vector<paged_block_state> paged_block_states;
+    mutable std::vector<uint64_t> paged_swap_offsets;
+    mutable std::vector<size_t>   paged_swap_sizes;
+    std::vector<uint32_t> paged_free_list;
+    uint64_t paged_alloc_calls     = 0;
+    uint64_t paged_blocks_in_use   = 0;
+    uint64_t paged_identity_checks = 0;
+    uint64_t paged_identity_fail   = 0;
+    mutable uint64_t paged_write_resolve_checks  = 0;
+    mutable uint64_t paged_write_resolve_fail    = 0;
+    mutable uint64_t paged_write_resolve_changed = 0;
+    mutable uint64_t paged_shadow_gather_calls    = 0;
+    mutable uint64_t paged_shadow_gather_changed  = 0;
+    mutable uint64_t paged_shadow_gather_mismatch = 0;
+    mutable uint64_t paged_shadow_gather_fail     = 0;
+    mutable uint64_t paged_shadow_skipped_non_identity = 0;
+    // Stage 7D-B: state-aware shadow validation. paged_shadow_validate() used to read every
+    // row's raw K/V tensor memory unconditionally, refaulting SWAPPED pages back to resident
+    // (and polluting Stage 7C-G residency conclusions). These count the SWAPPED-aware skips.
+    bool     paged_shadow_validate_enabled = false;
+    mutable uint64_t paged_shadow_validate_calls          = 0;
+    mutable uint64_t paged_shadow_validate_blocks_checked = 0;
+    mutable uint64_t paged_shadow_validate_swapped_blocks_skipped = 0;
+    mutable uint64_t paged_shadow_validate_fault_risk_skipped    = 0;
+    mutable uint64_t paged_shadow_validate_bytes_skipped         = 0;
+    mutable uint64_t paged_ingraph_gather_layers  = 0;
+    mutable uint64_t paged_row_idx_changed        = 0;
+    mutable uint64_t paged_row_idx_fail           = 0;
+    mutable bool     paged_ingraph_warned         = false;
+    uint64_t paged_block_mapping_changed = 0;
+    uint64_t paged_mapping_oob_fail = 0;
+    mutable uint64_t paged_logical_to_physical_checks = 0;
+    mutable uint64_t paged_logical_to_physical_fail = 0;
+    bool     paged_block_release_enabled = false;
+    uint64_t paged_block_release_calls = 0;
+    uint64_t paged_blocks_released = 0;
+    uint64_t paged_blocks_released_unused = 0;
+    uint64_t paged_block_release_bytes = 0;
+    uint64_t paged_block_release_blocks_last = 0;
+    uint64_t paged_block_release_bytes_last = 0;
+    uint64_t paged_block_release_skip_live = 0;
+    uint64_t paged_block_release_skip_unaligned = 0;
+    uint64_t paged_block_release_fail = 0;
+    uint64_t paged_block_release_rss_samples = 0;
+    uint64_t paged_block_release_rss_before_last_kb = 0;
+    uint64_t paged_block_release_rss_after_last_kb = 0;
+    uint64_t paged_block_release_rss_before_max_kb = 0;
+    uint64_t paged_block_release_rss_after_min_kb = 0;
+    uint64_t paged_block_release_rss_drop_last_kb = 0;
+    uint64_t paged_block_release_rss_drop_max_kb = 0;
+    mutable uint64_t paged_block_ensure_calls = 0;
+    mutable uint64_t paged_block_ensure_released = 0;
+    mutable uint64_t paged_release_violation = 0;
+    mutable uint64_t paged_active_release_violation = 0;
+    mutable uint64_t paged_padded_release_violation = 0;
+    bool     paged_swap_enabled = false;
+    mutable uint64_t paged_swap_out_calls = 0;
+    mutable uint64_t paged_swap_in_calls = 0;
+    mutable uint64_t paged_blocks_swapped_out = 0;
+    mutable uint64_t paged_blocks_swapped_in = 0;
+    mutable uint64_t paged_swap_bytes_out = 0;
+    mutable uint64_t paged_swap_bytes_in = 0;
+    mutable uint32_t paged_swap_in_last_block = PAGED_BLOCK_INVALID;
+    mutable uint64_t paged_swap_backend_failures = 0;
+    mutable uint64_t paged_swap_window_skipped = 0;
+    mutable uint64_t paged_swap_read_swapped_hits = 0;
+    mutable uint64_t paged_swap_read_swap_in_calls = 0;
+    mutable uint64_t paged_swap_read_swap_in_failures = 0;
+    mutable uint64_t paged_swap_write_swapped_hits = 0;
+    mutable uint64_t paged_swap_write_swap_in_calls = 0;
+    mutable uint64_t paged_swap_write_swap_in_failures = 0;
+    mutable uint64_t paged_swap_in_fail_no_offset = 0;
+    mutable uint64_t paged_swap_in_fail_bad_size = 0;
+    mutable uint64_t paged_swap_in_fail_read_cell = 0;
+    mutable uint64_t paged_swap_in_fail_tensor_set = 0;
+    mutable uint64_t paged_swap_madvise_calls = 0;
+    mutable uint64_t paged_swap_madvise_bytes = 0;
+    mutable uint64_t paged_swap_madvise_failures = 0;
+    mutable uint64_t paged_swap_madvise_skipped = 0;
+    mutable uint64_t paged_swap_madvise_skip_no_full_page = 0;
+    mutable uint64_t paged_swap_madvise_skip_neighbor = 0;
+    mutable uint64_t paged_swap_rss_samples = 0;
+    mutable uint64_t paged_swap_rss_before_last_kb = 0;
+    mutable uint64_t paged_swap_rss_after_last_kb = 0;
+    mutable uint64_t paged_swap_rss_drop_last_kb = 0;
+    mutable uint64_t paged_swap_rss_drop_max_kb = 0;
+    // cumulative RSS telemetry across the whole idle-swap madvise window (Stage 5C-scale-B).
+    // before_first: RSS before the FIRST madvise sample (recorded once, never overwritten).
+    // total_drop:   max(0, before_first - after_last) — net RSS change over the window.
+    // drop_sum:     sum of per-call max(0, before - after) — accumulated local positive drops.
+    mutable uint64_t paged_swap_rss_before_first_kb = 0;
+    mutable bool     paged_swap_rss_before_first_set = false;
+    mutable uint64_t paged_swap_rss_total_drop_kb = 0;
+    mutable uint64_t paged_swap_rss_drop_sum_kb = 0;
+    mutable uint64_t paged_prefetch_seq_calls = 0;
+    mutable uint64_t paged_prefetch_seq_blocks = 0;
+    mutable uint64_t paged_prefetch_seq_bytes = 0;
+    mutable uint64_t paged_prefetch_seq_skip_resident = 0;
+    mutable uint64_t paged_prefetch_seq_skip_released = 0;
+    mutable uint64_t paged_prefetch_seq_failures = 0;
+    mutable uint64_t paged_prefetch_seq_last_owned_blocks = 0;
+    mutable uint64_t paged_prefetch_seq_last_swapped_blocks = 0;
+    mutable uint64_t paged_prefetch_seq_last_resident_blocks = 0;
+    mutable uint64_t paged_prefetch_seq_last_released_blocks = 0;
+    mutable uint64_t paged_prefetch_seq_last_invalid_cells = 0;
+    mutable uint64_t paged_prefetch_seq_last_failures = 0;
+
+    // Stage 5E-1: read-only KV resident page telemetry via mincore(2). Off unless
+    // LLAMA_KV_PAGED_MINCORE=1 (Linux + CPU + kv_paged_enabled && !v_trans && n_stream==1).
+    // These counters never feed back into swap/madvise/state-machine decisions.
+    bool     paged_mincore_requested = false;
+    mutable bool     paged_mincore_enabled = false;
+    mutable bool     paged_mincore_warned  = false;
+    mutable uint64_t paged_mincore_sample_calls = 0;
+    mutable uint64_t paged_mincore_failures = 0;
+    // last-sample aggregate (overwritten each sample)
+    mutable uint64_t paged_mincore_total_bytes = 0;
+    mutable uint64_t paged_mincore_resident_bytes = 0;
+    mutable uint64_t paged_mincore_total_pages = 0;
+    mutable uint64_t paged_mincore_resident_pages = 0;
+    mutable uint64_t paged_mincore_k_total_bytes = 0;
+    mutable uint64_t paged_mincore_k_resident_bytes = 0;
+    mutable uint64_t paged_mincore_v_total_bytes = 0;
+    mutable uint64_t paged_mincore_v_resident_bytes = 0;
+    // snapshots at the four sample points (0 if that point never fired)
+    mutable uint64_t paged_mincore_prefill_resident_bytes = 0;
+    mutable bool     paged_mincore_prefill_set = false;
+    mutable uint64_t paged_mincore_before_madvise_resident_bytes = 0;
+    mutable bool     paged_mincore_before_madvise_set = false;
+    mutable uint64_t paged_mincore_after_madvise_resident_bytes = 0;
+    mutable uint64_t paged_mincore_after_resume_resident_bytes = 0;
+    // Stage 7C-C: per-block residency of currently-SWAPPED blocks (overwritten each sample).
+    // Detects SWAPPED blocks whose K/V pages were re-touched back to resident after swap-out.
+    mutable uint64_t paged_mincore_swapped_block_count = 0;
+    mutable uint64_t paged_mincore_swapped_total_bytes = 0;
+    mutable uint64_t paged_mincore_swapped_resident_bytes = 0;
+    mutable uint64_t paged_mincore_swapped_nonresident_bytes = 0;
+    mutable uint64_t paged_mincore_swapped_resident_blocks = 0;
+    mutable uint64_t paged_mincore_swapped_nonresident_blocks = 0;
+    bool     paged_swap_pending = false;
+    uint32_t paged_swap_pending_n_kv = 0;
+
+    // Stage 7D-A: debug-only refault tracing state. All off unless LLAMA_KV_PAGED_REFAULT_TRACE=1.
+    // A trap range maps a contiguous page-aligned [lo, hi) host interval back to (block, kind,
+    // layer) so the (async-signal-safe) handler can identify the fault and restore the page.
+    struct paged_refault_range {
+        uintptr_t lo;          // page-aligned start of the protected interval
+        uintptr_t hi;          // page-aligned end (exclusive)
+        uint32_t  block;       // owning physical block
+        uint32_t  layer_il;    // KV layer id
+        uint8_t   is_v;        // 0 = K tensor, 1 = V tensor
+    };
+    bool     paged_refault_trace_requested = false;
+    mutable bool     paged_refault_trace_enabled = false;
+    bool     paged_refault_trace_backtrace = false;
+    bool     paged_refault_trace_once = true;   // unprotect a page on first fault (default on)
+    uint64_t paged_refault_trace_max = 64;      // max faults logged before tracing self-disables
+    // Per-block protection bookkeeping. paged_refault_protected[block] != 0 means the block's
+    // pages are currently PROT_NONE. Indexed by physical block id, sized paged_n_blocks.
+    mutable std::vector<uint8_t> paged_refault_protected;
+    mutable uint64_t paged_refault_trace_enabled_flag = 0; // mirrors enabled for trace line
+    mutable uint64_t paged_refault_fault_count = 0;
+    mutable uint64_t paged_refault_fault_k_count = 0;
+    mutable uint64_t paged_refault_fault_v_count = 0;
+    mutable uint64_t paged_refault_fault_blocks = 0;       // distinct blocks that faulted
+    mutable uint64_t paged_refault_unmapped_fault_count = 0; // faults not in any KV trap range
+    mutable uint64_t paged_refault_protect_calls = 0;
+    mutable uint64_t paged_refault_unprotect_calls = 0;
+    mutable uint64_t paged_refault_protected_pages = 0;
+    mutable uint64_t paged_refault_unprotected_pages = 0;
+    mutable uint64_t paged_refault_protect_failures = 0;
+    mutable uint64_t paged_refault_unprotect_failures = 0;
+
+    // Stage 4C-3: idle-seq and block-ownership telemetry only.
+    bool     paged_idle_trace_enabled = false;
+    mutable std::array<uint64_t, LLAMA_MAX_SEQ> paged_idle_seq_last_active_step = {};
+    mutable std::bitset<LLAMA_MAX_SEQ> paged_idle_seq_seen;
+    // Stage 8D-3: gated resume timing telemetry. Off unless
+    // LLAMA_KV_PAGED_RESUME_TIMING=1; counters are emitted once from the dtor path.
+    bool     paged_resume_timing_enabled = false;
+    // Stage 8D-4: gated per-step resume timing telemetry. Off unless
+    // LLAMA_KV_PAGED_RESUME_TIMING_STEP=1; emitted once per paged row_idx fill.
+    bool     paged_resume_timing_step_enabled = false;
+    // Stage 11-B-D: low-frequency paged base-path timing telemetry. Off unless
+    // LLAMA_KV_PAGED_TIMING=1; counters are emitted once from the dtor path.
+    bool     paged_base_timing_enabled = false;
+    mutable uint64_t paged_base_timing_getenv_calls = 0;
+    mutable uint64_t paged_base_timing_apply_calls = 0;
+    mutable uint64_t paged_base_timing_apply_paged_total_us = 0;
+    mutable uint64_t paged_base_timing_apply_ubatch_us = 0;
+    mutable uint64_t paged_base_timing_note_cells_us = 0;
+    mutable uint64_t paged_base_timing_assert_identity_us = 0;
+    mutable uint64_t paged_base_timing_swap_out_window_us = 0;
+    mutable uint64_t paged_base_timing_ensure_resident_us = 0;
+    mutable uint64_t paged_base_timing_clear_frontier_us = 0;
+    mutable uint64_t paged_base_timing_madvise_tail_us = 0;
+    mutable uint64_t paged_base_timing_paged_release_blocks_us = 0;
+    mutable uint64_t paged_base_timing_set_row_idx_calls = 0;
+    mutable uint64_t paged_base_timing_set_row_idx_total_us = 0;
+    mutable uint64_t paged_base_timing_active_visible_us = 0;
+    mutable uint64_t paged_base_timing_nonidentity_probe_us = 0;
+    mutable uint64_t paged_base_timing_swapped_blocks_scan_us = 0;
+    mutable uint64_t paged_base_timing_row_idx_fill_us = 0;
+    mutable uint64_t paged_base_timing_check_read_resident_us = 0;
+    mutable uint64_t paged_base_timing_check_read_resident_calls = 0;
+    mutable uint64_t paged_base_timing_paged_resolve_calls = 0;
+    mutable uint64_t paged_base_timing_cells_scanned = 0;
+    mutable uint64_t paged_base_timing_blocks_scanned = 0;
+    mutable uint64_t paged_base_timing_row_idx_entries = 0;
+    mutable uint64_t paged_timing_set_input_us = 0;
+    mutable uint64_t paged_timing_set_input_calls = 0;
+    mutable uint64_t paged_timing_idle_maintenance_us = 0;
+    mutable uint64_t paged_timing_idle_maintenance_calls = 0;
+    mutable uint64_t paged_timing_swap_out_us = 0;
+    mutable uint64_t paged_timing_swap_out_calls = 0;
+    mutable uint64_t paged_timing_check_read_us = 0;
+    mutable uint64_t paged_timing_check_read_calls = 0;
+    // Stage 6C-1A: seqs marked prefetch-protected (resume-pending) are excluded from idle
+    // swap-out victim selection so interleaved prefetch is not undone by the same-step idle
+    // gate. Does not change read-window / nonidentity / state-machine semantics.
+    std::bitset<LLAMA_MAX_SEQ> paged_prefetch_protected_seq;
+    mutable uint64_t paged_idle_swap_skip_protected = 0;
+    mutable uint64_t paged_idle_active_seq_steps = 0;
+    mutable uint64_t paged_idle_active_seq_empty = 0;
+    mutable uint64_t paged_idle_seq_seen_count = 0;
+    mutable uint64_t paged_idle_active_seq_count_last = 0;
+    mutable uint64_t paged_idle_idle_seq_count_last = 0;
+    mutable uint64_t paged_idle_active_seq_count_max = 0;
+    mutable uint64_t paged_idle_non_empty_blocks = 0;
+    mutable uint64_t paged_idle_single_seq_blocks = 0;
+    mutable uint64_t paged_idle_multi_seq_blocks = 0;
+    mutable uint64_t paged_idle_blocks_with_active_seq = 0;
+    mutable uint64_t paged_idle_blocks_without_active_seq = 0;
+    mutable uint64_t paged_idle_cold_candidates = 0;
+    mutable uint64_t paged_idle_read_window_blocks = 0;
+    mutable uint64_t paged_idle_cold_in_read_window = 0;
+    mutable uint64_t paged_idle_cold_not_in_read_window = 0;
+    mutable uint64_t paged_idle_skip_mixed_active = 0;
+    mutable uint64_t paged_idle_safe_swap_candidates = 0;
+    mutable uint64_t paged_cov_idle_owned_blocks = 0;
+    mutable uint64_t paged_cov_in_read_window_blocks = 0;
+    mutable uint64_t paged_cov_not_in_read_window_blocks = 0;
+    mutable uint64_t paged_cov_resident_safe_blocks = 0;
+    mutable uint64_t paged_cov_nonidentity_remapped_blocks = 0;
+    mutable uint64_t paged_cov_idle_owned_bytes = 0;
+    mutable uint64_t paged_cov_in_read_window_bytes = 0;
+    mutable uint64_t paged_cov_resident_safe_bytes = 0;
+    mutable uint64_t paged_cov_nonidentity_remapped_bytes = 0;
+    bool     paged_idle_swap_requested = false;
+    bool     paged_idle_swap_madvise_requested = false;
+    mutable bool     paged_idle_swap_enabled = false;
+    mutable bool     paged_idle_swap_madvise_enabled = false;
+    mutable bool     paged_idle_swap_warned = false;
+    mutable bool     paged_idle_swap_madvise_warned = false;
+    uint64_t paged_idle_swap_every_tokens = 1;
+    uint64_t paged_idle_swap_max_blocks_per_step = 0;
+    uint64_t paged_idle_swap_min_idle_steps = 0;
+    bool     paged_idle_swap_debug_probes = true;
+    mutable uint64_t paged_idle_swap_candidates = 0;
+    mutable uint64_t paged_idle_swap_out_calls = 0;
+    mutable uint64_t paged_idle_swap_skip_not_remapped = 0;
+    mutable uint64_t paged_idle_swap_skip_not_resident = 0;
+    mutable uint64_t paged_idle_swap_skip_deferred = 0;
+    mutable uint64_t paged_idle_swap_skip_min_idle = 0;
+    mutable int32_t  paged_defer_idle_swapout_steps = 0;
+    mutable bool     paged_nonidentity_probe_enabled = false;
+    mutable uint64_t paged_nonidentity_remap_rows = 0;
+    mutable uint64_t paged_nonidentity_remap_blocks = 0;
+    mutable uint64_t paged_nonidentity_skip_no_dummy = 0;
+    mutable uint64_t paged_nonidentity_skip_not_masked = 0;
+    mutable uint64_t paged_nonidentity_skip_not_resident = 0;
+    mutable uint64_t paged_nonidentity_cold_in_read_window_before = 0;
+    mutable uint64_t paged_nonidentity_cold_in_read_window_after = 0;
+    mutable uint64_t paged_nonidentity_safe_candidates_after = 0;
+    // Stage 7C-E: SWAPPED-block row_idx redirect. When a row maps to a physical block whose
+    // state is SWAPPED and that row is not visible to / needed by the active seq, the row_idx
+    // entry is redirected to a resident dummy physical row so the decode graph's ggml_get_rows
+    // never touches the madvise'd SWAPPED pages (which would refault them resident). These
+    // counters are telemetry only and never feed scheduling decisions.
+    //   redirect_rows            : rows redirected from a real SWAPPED phys row to the dummy row.
+    //   redirect_blocks          : distinct SWAPPED blocks that had >=1 row redirected this call.
+    //   redirect_skip_no_dummy   : rows that should have been redirected but had no resident dummy.
+    //   active_visible_violation : SWAPPED rows still visible to / needed by the active seq; this
+    //                              is a swap-out / visibility bug, surfaced rather than masked.
+    mutable uint64_t paged_swapped_redirect_rows = 0;
+    mutable uint64_t paged_swapped_redirect_blocks = 0;
+    mutable uint64_t paged_swapped_redirect_skip_no_dummy = 0;
+    mutable uint64_t paged_swapped_active_visible_violation = 0;
+    mutable uint64_t paged_swapped_redirect_probe_rows = 0;
+    mutable uint64_t paged_swapped_redirect_probe_swapped_rows = 0;
+    mutable uint64_t paged_swapped_redirect_probe_resident_rows = 0;
+    mutable uint64_t paged_swapped_redirect_probe_invalid_rows = 0;
+    mutable uint64_t paged_swapped_redirect_probe_state_mismatch = 0;
+    mutable uint64_t paged_swapped_redirect_probe_disabled = 0;
+    mutable uint64_t paged_swapped_active_visible_violation_rows = 0;
+    mutable uint64_t paged_swapped_active_visible_violation_blocks = 0;
+    mutable uint64_t paged_swapped_active_visible_logical_seq_has = 0;
+    mutable uint64_t paged_swapped_active_visible_phys_seq_has = 0;
+    mutable uint64_t paged_swapped_active_visible_in_read_window = 0;
+    mutable uint64_t paged_swapped_active_visible_not_in_read_window = 0;
+    mutable uint64_t paged_swapped_active_visible_masked = 0;
+    mutable uint64_t paged_swapped_active_visible_unmasked = 0;
+    // Stage 7C-F: invariant telemetry. A block that is SWAPPED must not contain rows that
+    // are currently active-visible and unmasked. These counters distinguish stale active
+    // ownership, later active writes, and logical resolution to an already-swapped block.
+    mutable uint64_t paged_swapped_active_violation_rows = 0;
+    mutable uint64_t paged_swapped_active_violation_blocks = 0;
+    mutable uint64_t paged_swapped_active_violation_block_had_active_owner_at_swapout = 0;
+    mutable uint64_t paged_swapped_active_violation_after_swapout_write = 0;
+    mutable uint64_t paged_swapped_active_violation_resolve_to_swapped = 0;
+    mutable uint64_t paged_swapped_active_visible_restore_rows = 0;
+    mutable uint64_t paged_swapped_active_visible_restore_blocks = 0;
+    mutable uint64_t paged_swap_out_skip_active_visible_block = 0;
+    mutable uint64_t paged_swap_out_skip_active_owned_block = 0;
+    // Stage 7C-G: narrowed swap-out gate telemetry. 7C-F blocked every idle swap-out by
+    // treating "block appears in the full-prefix read window" as "active-visible". These
+    // counters distinguish the real reasons a candidate is skipped from the over-broad
+    // read-window membership, so the trace can answer: was this idle block skipped because
+    // it is genuinely active-needed, or only because it fell inside the full-prefix gather?
+    //   candidate_blocks                 : idle-only RESIDENT blocks that reached the gate.
+    //   allowed_blocks                   : candidates that were actually swapped out.
+    //   skip_fullprefix_read_window_only : candidates that were in the full-prefix read
+    //                                      window yet had NO true active-needed unmasked cell,
+    //                                      so 7C-G still swaps them out (the recovered class).
+    //   skip_true_active_owned           : candidates whose physical block cells seq_has an
+    //                                      active seq (should be 0 for idle-only candidates).
+    //   skip_true_active_unmasked        : candidates with a physical cell that is active-
+    //                                      visible AND unmasked vs active_seq_pos_max; the only
+    //                                      correctness-mandated hard skip.
+    //   active_restore_from_swapped      : SWAPPED blocks swapped back in by the graph-pre
+    //                                      restore because they hold a true active-needed row.
+    //   idle_only_swapped_blocks         : blocks currently SWAPPED whose owners are idle-only.
+    mutable uint64_t paged_swap_out_candidate_blocks = 0;
+    mutable uint64_t paged_swap_out_allowed_blocks = 0;
+    mutable uint64_t paged_swap_out_skip_fullprefix_read_window_only = 0;
+    mutable uint64_t paged_swap_out_skip_true_active_owned = 0;
+    mutable uint64_t paged_swap_out_skip_true_active_unmasked = 0;
+    mutable uint64_t paged_active_restore_from_swapped_blocks = 0;
+    mutable uint64_t paged_idle_only_swapped_blocks = 0;
+    mutable uint64_t paged_write_to_swapped_block = 0;
+    mutable uint64_t paged_write_to_swapped_block_seq = 0;
+
+    // Stage 4C-0: KV block access trace. When LLAMA_KV_PAGED_TRACE=1, emit one line per
+    // decode step (per set_input_paged_row_idx call) to stderr describing the physical
+    // blocks read/written this step plus current block-state population counts. Telemetry
+    // only: it does not change paged_resolve / write paths / swap / release behavior and the
+    // collection is gated behind paged_trace_enabled so the default path is untouched.
+    bool     paged_trace_enabled = false;
+    mutable uint64_t paged_trace_step = 0;
+    // physical blocks written during the current step, collected by set_input_k/v_idxs and
+    // consumed (and cleared) by the trace emit in set_input_paged_row_idx.
+    mutable std::set<uint32_t> paged_trace_write_blocks;
+    void paged_trace_note_write_block(uint32_t physical_block) const;
+    void paged_trace_emit_step(
+            uint64_t step,
+            const std::set<uint32_t> & read_blocks,
+            const std::set<uint32_t> & active_read_blocks,
+            uint32_t n_kv,
+            uint32_t active_n_kv) const;
+
+    // stage F1 / P1: KV Lazy-Block tail madvise. When LLAMA_KV_LAZY_TAIL=1, after n_kv is
+    // known each step we advise the page-aligned interior of the *unused tail* capacity
+    // [GGML_PAD(n_kv, 256), kv_size) of every layer's K/V tensor away via MADV_DONTNEED.
+    // This targets capacity that is never inside the [0, n_kv) read window -> aims to lower
+    // *current* RSS (not peak; peak is pinned by the construction-time buffer clear). Off by
+    // default; requires !v_trans && n_stream==1. See docs/kv_lazy_block_stage_f1_design.md.
+    bool     kv_lazy_tail              = false;
+    bool     kv_lazy_tail_warned       = false; // unsupported-layout warning emitted once
+    uint64_t lazy_tail_madvise_calls    = 0; // madvise() invocations issued
+    uint64_t lazy_tail_madvise_bytes    = 0; // total page-aligned tail bytes advised away
+    uint64_t lazy_tail_madvise_failures = 0; // madvise() calls that returned non-zero
+    uint64_t lazy_tail_madvise_us       = 0; // cumulative time spent in the tail probe
+    uint64_t lazy_tail_rss_before_kb    = 0; // /proc/self/statm RSS before first tail advise
+    uint64_t lazy_tail_rss_after_kb     = 0; // /proc/self/statm RSS after most recent advise
+
+    // stage P2: clear-frontier state. When kv_lazy_clear, only [0, clear_frontier) is ever
+    // zeroed; the tail is left uncommitted to lower peak RSS. See docs/kv_lazy_block_stage_p2_read.md.
+    bool     kv_lazy_clear         = false;
+    bool     kv_lazy_clear_warned  = false; // unsupported-layout warning emitted once
+    uint32_t clear_frontier        = 0;     // cells in [0, clear_frontier) have been zeroed
+    uint64_t lazy_clear_init_bytes = 0;     // bytes zeroed at construction (prefix)
+    uint64_t lazy_clear_grow_bytes = 0;     // bytes zeroed by frontier advances
+    uint64_t lazy_clear_skipped_bytes = 0;  // tail bytes left uncleared at construction
+    uint64_t lazy_clear_calls      = 0;     // frontier-advance invocations that zeroed rows
+    uint64_t lazy_clear_us         = 0;     // cumulative time spent zeroing
+
+    // current process RSS in KiB from /proc/self/statm (0 if unavailable).
+    uint64_t get_current_rss_kb() const;
+    // peak process RSS in KiB from /proc/self/status VmHWM (0 if unavailable).
+    uint64_t get_peak_rss_kb() const;
 
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
@@ -349,13 +1010,15 @@ public:
     //
 
     uint32_t get_n_kv() const;
+    uint32_t get_visible_lo() const;
+    bool uses_approx_dynamic_view() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
 
     // get views of the current state of the cache
-    ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
-    ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il, bool causal_attn, ggml_tensor * row_idx = nullptr) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, bool causal_attn, ggml_tensor * row_idx = nullptr) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory
@@ -371,12 +1034,14 @@ public:
     //   helps understand the implementation logic of cpy_k and cpy_v
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    ggml_tensor * build_input_paged_row_idx(ggml_context * ctx) const;
 
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_paged_row_idx(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
@@ -417,4 +1082,8 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+    uint32_t visible_lo = 0;
+
+    bool     paged_shadow_pending = false;
+    uint32_t paged_shadow_n_kv    = 0;
 };

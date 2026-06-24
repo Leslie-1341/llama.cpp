@@ -314,6 +314,12 @@ public:
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
 
+    // paged KV row-index gather tensor for this input, or nullptr when paged KV is disabled.
+    // carried as a member (not a global) so it shares this input's lifetime and supports graph reuse.
+    ggml_tensor * paged_row_idx = nullptr;
+
+    uint32_t visible_lo = 0;
+
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
     //       llm_graph_params from a previous batch, causing stack-use-after-return
@@ -349,6 +355,8 @@ public:
 
     ggml_tensor * self_kq_mask     = nullptr; // F32 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //     [n_kv, n_batch/n_stream, 1, n_stream]
+
+    uint32_t visible_lo = 0;
 
     const llama_hparams hparams;
     const llama_cparams cparams;

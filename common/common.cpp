@@ -1365,7 +1365,30 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         common_set_adapter_lora(lctx, params.lora_adapters);
     }
 
-    if (params.warmup) {
+    // memory-aware warmup policy (LLAMA_LOW_MEM_WARMUP):
+    //   unset/"default" -> keep original warmup behavior unchanged
+    //   "off"           -> skip the whole warmup block (equivalent to --no-warmup)
+    //   "minimal"       -> skip the redundant decode warmup as well; all structural
+    //                      initialization (backend init, KV alloc, sched_reserve,
+    //                      output_reserve) already happened during context construction,
+    //                      so the only thing warmup does here is a perf pre-touch of the
+    //                      compute buffer, which is what inflates peak RSS.
+    bool low_mem_warmup_skip = false;
+    if (const char * low_mem_warmup = getenv("LLAMA_LOW_MEM_WARMUP")) {
+        if (low_mem_warmup[0] == '\0' || strcmp(low_mem_warmup, "default") == 0) {
+            // keep original behavior
+        } else if (strcmp(low_mem_warmup, "off") == 0) {
+            low_mem_warmup_skip = true;
+            LOG_INF("%s: LLAMA_LOW_MEM_WARMUP=off - low-memory mode, skipping full warmup (equivalent to --no-warmup)\n", __func__);
+        } else if (strcmp(low_mem_warmup, "minimal") == 0) {
+            low_mem_warmup_skip = true;
+            LOG_INF("%s: LLAMA_LOW_MEM_WARMUP=minimal - structural init already done during context construction; skipping redundant warmup decode pre-touch to lower peak RSS\n", __func__);
+        } else {
+            LOG_WRN("%s: LLAMA_LOW_MEM_WARMUP='%s' is not a recognized value (default|off|minimal); keeping original warmup behavior\n", __func__, low_mem_warmup);
+        }
+    }
+
+    if (params.warmup && !low_mem_warmup_skip) {
         LOG_INF("%s: warming up the model with an empty run - please wait ... (--no-warmup to disable)\n", __func__);
 
         llama_set_warmup(lctx, true);

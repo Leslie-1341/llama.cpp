@@ -16,6 +16,7 @@
 #include <cstring>
 #include <numeric>
 #include <sstream>
+#include <unordered_map>
 #include <unordered_set>
 
 // dedup helpers
@@ -453,6 +454,10 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
 
+    if (paged_row_idx) {
+        mctx->set_input_paged_row_idx(paged_row_idx, ubatch);
+    }
+
     mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
 
     if (self_k_rot) {
@@ -474,7 +479,14 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
+    if (paged_row_idx) {
+        res &= paged_row_idx->ne[0] == mctx->get_n_kv();
+    }
+
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+    if (mctx->uses_approx_dynamic_view() && params.cparams.causal_attn) {
+        res &= visible_lo == mctx->get_visible_lo();
+    }
 
     return res;
 }
@@ -495,6 +507,9 @@ bool llm_graph_input_attn_k::can_reuse(const llm_graph_params & params) {
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+    if (mctx->uses_approx_dynamic_view() && params.cparams.causal_attn) {
+        res &= visible_lo == mctx->get_visible_lo();
+    }
 
     return res;
 }
@@ -2167,12 +2182,14 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     const llama_kv_cache_context * mctx_cur) {
 
     auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur);
+    inp->visible_lo = mctx_cur->get_visible_lo();
 
     {
         GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE && "Use llama_kv_cache_iswa for SWA");
 
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
+        inp->paged_row_idx = mctx_cur->build_input_paged_row_idx(ctx0);
 
         inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
         inp->self_kq_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp->self_kq_mask, GGML_TYPE_F16) : inp->self_kq_mask;
@@ -2235,10 +2252,11 @@ ggml_tensor * llm_graph_context::build_attn(
     }
 
     const auto & kq_mask = inp->get_kq_mask();
+    ggml_tensor * row_idx = inp->paged_row_idx;
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il, cparams.causal_attn, row_idx);
+    ggml_tensor * v = mctx_cur->get_v(ctx0, il, cparams.causal_attn, row_idx);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
@@ -2275,6 +2293,7 @@ static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(
     const llama_kv_cache_context * mctx_cur) {
 
     auto inp = std::make_unique<llm_graph_input_attn_k>(hparams, cparams, mctx_cur);
+    inp->visible_lo = mctx_cur->get_visible_lo();
 
     {
         GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE && "Use llama_kv_cache_iswa for SWA");
@@ -2328,7 +2347,7 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kq_mask = inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il, cparams.causal_attn);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
@@ -2416,8 +2435,8 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il, cparams.causal_attn);
+    ggml_tensor * v = mctx_cur->get_v(ctx0, il, cparams.causal_attn);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);

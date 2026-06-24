@@ -1,0 +1,5 @@
+set(TARGET llama-kv-idle-swap-resume)
+add_executable(${TARGET} idle-swap-resume.cpp)
+install(TARGETS ${TARGET} RUNTIME)
+target_link_libraries(${TARGET} PRIVATE llama-common llama ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)

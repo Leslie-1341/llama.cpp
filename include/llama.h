@@ -768,6 +768,29 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
+    // Prefetch sequence-owned memory, if supported by the memory backend.
+    // Returns the number of prefetched blocks, 0 for unsupported backends, or a negative value on failure.
+    LLAMA_API int32_t llama_memory_prefetch_seq(
+            llama_memory_t mem,
+              llama_seq_id seq_id);
+
+    // Prefetch up to max_blocks sequence-owned memory blocks, if supported by the memory backend.
+    // max_blocks == 0 probes and updates backend last-call stats without restoring blocks.
+    // Returns the number of prefetched blocks, 0 for unsupported backends, or a negative value on failure.
+    LLAMA_API int32_t llama_memory_prefetch_seq_step(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                uint32_t   max_blocks);
+
+    // Mark/unmark a sequence as prefetch-protected (resume-pending). While protected, blocks
+    // owned (even partially) by the sequence are excluded from idle swap-out victim selection,
+    // so interleaved/active-stage prefetch is not undone by the idle gate. Protected sequences
+    // can still be prefetched/swapped-in. No-op on backends without paged idle swap support.
+    LLAMA_API void llama_memory_set_seq_prefetch_protected(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                    bool   enabled);
+
     //
     // State / sessions
     //

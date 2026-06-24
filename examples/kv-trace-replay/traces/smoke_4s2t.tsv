@@ -1,0 +1,9 @@
+# session_id	turn_id	arrival_ms	prompt_source	target_decode_tokens	idle_ms
+0	0	0	corpus:0:1024	24	250
+1	0	40	corpus:1024:384	8	0
+2	0	80	corpus:1536:512	16	600
+3	0	120	corpus:2304:384	8	0
+0	1	300	corpus:2816:256	12	0
+1	1	500	corpus:3584:256	8	0
+3	1	560	corpus:3968:256	8	0
+2	1	720	corpus:3200:256	12	0

@@ -112,6 +112,17 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
+    virtual int32_t prefetch_seq(llama_seq_id seq_id) { GGML_UNUSED(seq_id); return 0; }
+    virtual int32_t prefetch_seq_step(llama_seq_id seq_id, uint32_t max_blocks) {
+        GGML_UNUSED(seq_id);
+        GGML_UNUSED(max_blocks);
+        return 0;
+    }
+    virtual void set_seq_prefetch_protected(llama_seq_id seq_id, bool enabled) {
+        GGML_UNUSED(seq_id);
+        GGML_UNUSED(enabled);
+    }
+
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
 
     //
