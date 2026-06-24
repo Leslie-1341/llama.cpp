@@ -160,3 +160,15 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# KV cache experiment artifacts
+kv_logs/
+sharegpt_data/
+sharegpt_dat/
+trace_out/
+trace_prompts/
+*.err
+*.log
+*.trace
+/*.gguf
+/models/*.gguf
