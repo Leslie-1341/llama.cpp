@@ -12,6 +12,7 @@
 #include "llama-model.h"
 #include "llama-flex.h"
 #include "llama-moe-buffer.h"
+#include "llama-window.h"
 #include "llama-ext.h"
 #include "llama.h"
 
@@ -2307,6 +2308,16 @@ llm_graph_params llama_context::graph_params(
     };
 }
 
+// Adapts the ggml CPU per-node callback signature to the window predictor.
+// Fired (on ith==0) after each node's barrier during graph compute; the window
+// intercepts ffn_inp-{L} nodes to issue CLG async prefetch for layer L+1.
+static void llama_clg_node_callback(const ggml_tensor * node, void * user_data) {
+    auto * window = static_cast<llama_window_context *>(user_data);
+    if (window != nullptr) {
+        llama_window_node_done(*window, node);
+    }
+}
+
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
                    bool   batched) {
@@ -2344,16 +2355,34 @@ ggml_status llama_context::graph_compute(
         ggml_cpu_set_weight_stream_callback(llama_moe_buffer_stream_callback, moe);
     }
 
+    // CLG async prefetch: layered on top of the moe_buffer weight-stream path.
+    // The per-node callback lets the window predictor intercept ffn_inp-{L} and
+    // issue llama_moe_buffer_prefetch() for layer L+1. Correctness still rests on
+    // the moe weight-stream callback above (synchronous fallback on miss); the
+    // node callback only buys lead time, so a misprediction costs perf, not output.
+    auto * window = model.get_window_context();
+    const bool clg_active = moe_active && llama_window_enabled(window);
+    if (clg_active) {
+        llama_window_graph_begin(*window, batched);
+        ggml_backend_cpu_set_node_callback(backend_cpu, llama_clg_node_callback, window);
+    }
+
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
 
-    // Tear down the hook before returning so no dangling callback survives this
+    // Tear down the hooks before returning so no dangling callback survives this
     // graph (including the error path above: we still synchronize and clear).
-    if (flex_active || moe_active) {
+    if (flex_active || moe_active || clg_active) {
         ggml_backend_sched_synchronize(sched.get());
-        ggml_cpu_set_weight_stream_callback(nullptr, nullptr);
+        if (clg_active) {
+            ggml_backend_cpu_set_node_callback(backend_cpu, nullptr, nullptr);
+            llama_window_graph_end(*window);
+        }
+        if (flex_active || moe_active) {
+            ggml_cpu_set_weight_stream_callback(nullptr, nullptr);
+        }
     }
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));

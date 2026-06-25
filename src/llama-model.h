@@ -19,6 +19,7 @@ struct llama_ubatch;
 struct llama_model_loader;
 struct llama_flex_context;
 struct llama_moe_buffer_context;
+struct llama_window_context;
 
 // available models
 enum llm_type {
@@ -625,6 +626,11 @@ struct llama_model {
 
     // MoE expert buffer-streaming context, or nullptr when LLAMA_LAZY_MOE_BUFFER is off
     llama_moe_buffer_context * get_moe_buffer_context() const;
+
+    // CLG (Cross-Layer Gate) prefetch predictor context, or nullptr when CLG is off
+    // (LLAMA_LAZY_CLG / LLAMA_LAZY_MOE_BUFFER_CLG). Only created on top of an active
+    // MoE buffer; drives async expert prefetch via the CPU node callback.
+    llama_window_context * get_window_context() const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;

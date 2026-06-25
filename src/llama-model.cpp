@@ -9,6 +9,7 @@
 #include "llama-model-loader.h"
 #include "llama-flex.h"
 #include "llama-moe-buffer.h"
+#include "llama-window.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -963,6 +964,11 @@ struct llama_model::impl {
     // LLAMA_LAZY_MOE_BUFFER is set
     std::shared_ptr<llama_moe_buffer_context> moe_buffer;
 
+    // CLG (Cross-Layer Gate) async-prefetch predictor (llama-window); only created
+    // on top of an active moe_buffer when LLAMA_LAZY_CLG / LLAMA_LAZY_MOE_BUFFER_CLG
+    // is set. Drives llama_moe_buffer_prefetch() via the CPU node callback.
+    std::shared_ptr<llama_window_context> window;
+
     bool has_tensor_overrides;
 };
 
@@ -1833,6 +1839,78 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 pimpl->moe_buffer.reset();
             }
         }
+
+        // CLG (Cross-Layer Gate) async prefetch. Layered strictly on top of an
+        // active moe_buffer: at ffn_inp-{L} the predictor applies layer L+1's gate
+        // weights to the current hidden state and issues llama_moe_buffer_prefetch()
+        // for the top-(K+delta) experts, giving the worker pool lead time before
+        // L+1's mul_mat_id runs. Correctness is unaffected — the moe_buffer's
+        // synchronous weight-stream callback still streams any missed expert.
+        // Opt-in, env-only; if the moe_buffer was dropped above we never create it.
+        const bool use_clg =
+            pimpl->moe_buffer &&
+            (
+                (std::getenv("LLAMA_LAZY_CLG")            && std::atoi(std::getenv("LLAMA_LAZY_CLG"))            > 0) ||
+                (std::getenv("LLAMA_LAZY_MOE_BUFFER_CLG") && std::atoi(std::getenv("LLAMA_LAZY_MOE_BUFFER_CLG")) > 0)
+            );
+        if (use_clg) {
+            llama_window_params wp;
+            wp.enabled       = true;
+            wp.clg_predict   = true;
+            wp.expert_window = false;   // CLG-only: no mmap sliding window / reclaim
+            wp.use_dontneed  = false;
+            wp.auto_tune     = false;
+            wp.debug_log =
+                (std::getenv("LLAMA_LAZY_DEBUG")                && std::atoi(std::getenv("LLAMA_LAZY_DEBUG"))                > 0) ||
+                (std::getenv("LLAMA_LAZY_MOE_BUFFER_DEBUG")     && std::atoi(std::getenv("LLAMA_LAZY_MOE_BUFFER_DEBUG"))     > 0) ||
+                (std::getenv("LLAMA_LAZY_CLG_DEBUG")            && std::atoi(std::getenv("LLAMA_LAZY_CLG_DEBUG"))            > 0);
+            if (const char * v = std::getenv("LLAMA_LAZY_CLG_DELTA")) {
+                wp.clg_delta = std::max(0, std::atoi(v));
+            } else if (const char * v2 = std::getenv("LLAMA_LAZY_MOE_BUFFER_CLG_DELTA")) {
+                wp.clg_delta = std::max(0, std::atoi(v2));
+            }
+
+            // Gate inputs: one per MoE layer carrying ffn_norm + ffn_gate_inp.
+            // llama_window_create dequantizes both to FP32 at init. Layers without
+            // a gate (dense layers) are skipped.
+            std::vector<llama_window_gate_input> gate_inputs;
+            gate_inputs.reserve(hparams.n_layer);
+            for (int il = 0; il < (int) hparams.n_layer; ++il) {
+                const auto & layer = layers[il];
+                if (layer.ffn_gate_inp == nullptr || layer.ffn_norm == nullptr) {
+                    continue;
+                }
+                llama_window_gate_input gi;
+                gi.layer         = il;
+                gi.norm_tensor   = layer.ffn_norm;
+                gi.norm_eps      = hparams.f_norm_rms_eps;
+                gi.gate_tensor   = layer.ffn_gate_inp;
+                gi.n_expert_used = (int) hparams.n_expert_used;
+                gate_inputs.push_back(gi);
+            }
+
+            if (!gate_inputs.empty()) {
+                pimpl->window = llama_window_create(
+                        /* inputs   = */ {},
+                        /* n_layers = */ (int) hparams.n_layer,
+                        /* params   = */ wp,
+                        /* gate_inputs = */ gate_inputs);
+                if (pimpl->window && llama_window_enabled(pimpl->window.get())) {
+                    // Bridge the predictor to the buffer so predicted experts are
+                    // routed to its async prefetch queue instead of an mmap window.
+                    llama_window_set_moe_buffer(*pimpl->window, pimpl->moe_buffer.get());
+                    if (wp.debug_log) {
+                        LLAMA_LOG_INFO("%s: CLG prefetch enabled over moe_buffer "
+                                "(%zu gate layers, delta=%d)\n",
+                                __func__, gate_inputs.size(), wp.clg_delta);
+                    }
+                } else {
+                    // Predictor failed to arm (no valid gate layers): don't keep a
+                    // context that would install a no-op node callback.
+                    pimpl->window.reset();
+                }
+            }
+        }
     }
 
     return true;
@@ -2185,6 +2263,10 @@ llama_flex_context * llama_model::get_flex_context() const {
 
 llama_moe_buffer_context * llama_model::get_moe_buffer_context() const {
     return pimpl->moe_buffer.get();
+}
+
+llama_window_context * llama_model::get_window_context() const {
+    return pimpl->window.get();
 }
 
 float llama_model::get_rope_freq_base (const llama_cparams & cparams, int il) const {
