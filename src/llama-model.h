@@ -18,6 +18,7 @@ struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
 struct llama_flex_context;
+struct llama_moe_buffer_context;
 
 // available models
 enum llm_type {
@@ -621,6 +622,9 @@ struct llama_model {
 
     // flex (dense weight streaming) context, or nullptr when LLAMA_FLEX is off
     llama_flex_context * get_flex_context() const;
+
+    // MoE expert buffer-streaming context, or nullptr when LLAMA_LAZY_MOE_BUFFER is off
+    llama_moe_buffer_context * get_moe_buffer_context() const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;

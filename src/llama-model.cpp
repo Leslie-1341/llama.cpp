@@ -8,6 +8,7 @@
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
 #include "llama-flex.h"
+#include "llama-moe-buffer.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -958,6 +959,10 @@ struct llama_model::impl {
     // dense weight streaming (llama-flex); only created when LLAMA_FLEX is set
     std::shared_ptr<llama_flex_context> flex;
 
+    // MoE expert buffer streaming (llama-moe-buffer); only created when
+    // LLAMA_LAZY_MOE_BUFFER is set
+    std::shared_ptr<llama_moe_buffer_context> moe_buffer;
+
     bool has_tensor_overrides;
 };
 
@@ -1235,6 +1240,23 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             ml.use_mmap &&
             !params.vocab_only;
 
+    // Pre-compute the MoE-Buffer gate early (same predicate as the actual
+    // creation site below) so the buft list and mmap prefetch can be set up
+    // accordingly: like flex, the MoE-Buffer path streams expert weights into
+    // an anonymous buffer, so JIT-repack extra buffer types and full mmap
+    // prefetch must both be disabled to avoid non-reclaimable repack copies and
+    // wasted resident pages.
+    const char * moe_env = std::getenv("LLAMA_LAZY_MOE_BUFFER");
+    const bool   moe_requested = moe_env != nullptr && std::atoi(moe_env) > 0;
+    const bool   use_moe_buffer_pre =
+            moe_requested &&
+            !use_flex &&
+            hparams.n_expert > 0 &&
+            hparams.n_expert_used > 0 &&
+            ml.use_mmap &&
+            !params.vocab_only &&
+            !ml.check_tensors;
+
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
 
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (mmap = %s, direct_io = %s)\n",
@@ -1243,7 +1265,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // build a list of buffer types for the CPU and GPU devices
     // flex repoints tensor->data at fault time, so JIT-repack extra buffer
     // types (which would rewrite the weight layout) must stay disabled.
-    pimpl->cpu_buft_list = make_cpu_buft_list(devices, use_flex ? false : params.use_extra_bufts, params.no_host);
+    pimpl->cpu_buft_list = make_cpu_buft_list(devices, (use_flex || use_moe_buffer_pre) ? false : params.use_extra_bufts, params.no_host);
     for (const auto & dev : devices) {
         buft_list_t buft_list = make_gpu_buft_list(dev.dev, split_mode, tensor_split);
         // add CPU buffer types as a fallback
@@ -1502,7 +1524,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // flex streams each layer in on demand, so kernel read-ahead prefetch of
     // the whole mapping would only defeat the bounded resident footprint.
-    ml.init_mappings(use_flex ? false : true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    ml.init_mappings((use_flex || use_moe_buffer_pre) ? false : true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -1716,6 +1738,99 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (fp.debug_log) {
                 LLAMA_LOG_INFO("%s: llama-flex enabled, streaming %d layer tensors\n",
                         __func__, registered);
+            }
+        }
+    }
+
+    // MoE expert buffer streaming (llama-moe-buffer). Env-only, opt-in via
+    // LLAMA_LAZY_MOE_BUFFER. Independent of flex: it only repoints the 3D
+    // `*_exps` expert weight tensors to anonymous buffers and streams the
+    // router-selected expert slices on demand. Requires mmap (we reuse the
+    // model fd + file offsets recorded by the loader). Dense models have no
+    // expert tensors, so registration finds nothing and this is a safe no-op.
+    if (use_moe_buffer_pre) {
+        llama_moe_buffer_params mp;
+        mp.enabled   = true;
+        mp.debug_log =
+            (std::getenv("LLAMA_LAZY_DEBUG")            && std::atoi(std::getenv("LLAMA_LAZY_DEBUG"))            > 0) ||
+            (std::getenv("LLAMA_LAZY_MOE_BUFFER_DEBUG") && std::atoi(std::getenv("LLAMA_LAZY_MOE_BUFFER_DEBUG")) > 0);
+
+        // budget: LLAMA_LAZY_MOE_BUFFER_MB sets a fixed resident cap; unset = 0
+        // (unbounded). Adaptive budgeting may override below.
+        if (const char * v = std::getenv("LLAMA_LAZY_MOE_BUFFER_MB")) {
+            mp.budget_bytes = (size_t) std::max(0, std::atoi(v)) * 1024ull * 1024ull;
+        }
+        if (const char * v = std::getenv("LLAMA_LAZY_MOE_BUFFER_WORKERS")) {
+            mp.n_workers = std::max(1, std::atoi(v));
+        }
+        if (const char * v = std::getenv("LLAMA_LAZY_MOE_BUFFER_HOT_RATIO")) {
+            mp.hot_ratio = std::max(0.0f, (float) std::atof(v));
+        }
+
+        pimpl->moe_buffer = llama_moe_buffer_create(mp);
+        // Enter the register loop based on the context existing, not on
+        // llama_moe_buffer_enabled(): the latter requires by_name to be
+        // non-empty, but by_name is only populated *by* this loop, so using it
+        // as the gate would always skip registration. enabled() is still the
+        // correct gate at graph_compute time (callback install).
+        if (pimpl->moe_buffer) {
+            int registered = 0;
+            for (const auto & it : ml.weights_map) {
+                ggml_tensor * t = it.second.tensor;
+                // Only 3D `*_exps.weight` expert weight tensors: ne[2] is the
+                // expert dimension, so the GEMM reads data + expert_id * nb[2].
+                // The `.weight` suffix excludes per-expert scale/bias sidecars
+                // (e.g. `_exps.scale`, `_exps.bias`) that also contain "_exps".
+                if (it.first.find("_exps.weight") == std::string::npos || t->ne[2] <= 1) {
+                    continue;
+                }
+                const int fd = ml.files.at(it.second.idx)->file_id();
+                if (llama_moe_buffer_register(
+                        *pimpl->moe_buffer,
+                        t,
+                        fd,
+                        it.second.offs,
+                        t->nb[2],          // expert_stride
+                        (int) t->ne[2])) { // n_expert
+                    ++registered;
+                }
+            }
+
+            // Adaptive budget (LLAMA_LAZY_MOE_BUFFER_AUTO): keep all experts
+            // resident if memory allows, else cap to what's left after the
+            // non-expert footprint + reserve. Reuses the flex helper.
+            if (std::getenv("LLAMA_LAZY_MOE_BUFFER_AUTO") &&
+                    std::atoi(std::getenv("LLAMA_LAZY_MOE_BUFFER_AUTO")) > 0) {
+                const size_t expert_bytes = llama_moe_buffer_expert_bytes(pimpl->moe_buffer.get());
+                const size_t model_bytes  = pimpl->n_bytes;
+                const size_t non_expert   = model_bytes > expert_bytes ? model_bytes - expert_bytes : 0;
+                const size_t reserve      = 512ull * 1024 * 1024; // KV + compute scratch headroom
+                const size_t avail        = llama_detect_available_memory();
+                size_t budget = 0; // unbounded
+                if (avail != SIZE_MAX && avail < non_expert + reserve + expert_bytes) {
+                    const size_t fixed = non_expert + reserve;
+                    const size_t room  = avail > fixed ? avail - fixed : 0;
+                    budget = std::max<size_t>(64ull * 1024 * 1024, room);
+                }
+                llama_moe_buffer_set_budget(pimpl->moe_buffer.get(), budget);
+                if (mp.debug_log) {
+                    LLAMA_LOG_INFO("%s: moe_buffer adaptive budget=%.0f MiB "
+                            "(avail=%.0f MiB, expert=%.0f MiB, non_expert=%.0f MiB)\n", __func__,
+                            budget / 1048576.0, avail == SIZE_MAX ? -1.0 : avail / 1048576.0,
+                            expert_bytes / 1048576.0, non_expert / 1048576.0);
+                }
+            }
+
+            if (mp.debug_log) {
+                LLAMA_LOG_INFO("%s: llama_moe_buffer: managing %d expert tensors\n",
+                        __func__, registered);
+            }
+
+            // Nothing matched (e.g. unexpected expert tensor naming): drop the
+            // context so graph_compute never installs a callback that manages
+            // zero tensors.
+            if (registered == 0) {
+                pimpl->moe_buffer.reset();
             }
         }
     }
@@ -2066,6 +2181,10 @@ const ggml_tensor * llama_model::get_tensor(const char * name) const {
 
 llama_flex_context * llama_model::get_flex_context() const {
     return pimpl->flex.get();
+}
+
+llama_moe_buffer_context * llama_model::get_moe_buffer_context() const {
+    return pimpl->moe_buffer.get();
 }
 
 float llama_model::get_rope_freq_base (const llama_cparams & cparams, int il) const {

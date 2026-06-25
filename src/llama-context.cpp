@@ -11,6 +11,7 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-flex.h"
+#include "llama-moe-buffer.h"
 #include "llama-ext.h"
 #include "llama.h"
 
@@ -2331,10 +2332,16 @@ ggml_status llama_context::graph_compute(
     // active when LLAMA_FLEX created a context; otherwise this is a no-op and
     // the default (fully resident) path is unchanged.
     auto * flex = model.get_flex_context();
+    auto * moe  = model.get_moe_buffer_context();
     const bool flex_active = backend_cpu != nullptr && llama_flex_enabled(flex);
+    // MoE buffer streaming only when flex is not driving the callback (single
+    // weight-stream callback; flex takes precedence). No composite callback.
+    const bool moe_active  = backend_cpu != nullptr && !flex_active && llama_moe_buffer_enabled(moe);
     if (flex_active) {
         llama_flex_graph_begin(*flex);
         ggml_cpu_set_weight_stream_callback(llama_flex_stream_callback, flex);
+    } else if (moe_active) {
+        ggml_cpu_set_weight_stream_callback(llama_moe_buffer_stream_callback, moe);
     }
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
@@ -2344,7 +2351,7 @@ ggml_status llama_context::graph_compute(
 
     // Tear down the hook before returning so no dangling callback survives this
     // graph (including the error path above: we still synchronize and clear).
-    if (flex_active) {
+    if (flex_active || moe_active) {
         ggml_backend_sched_synchronize(sched.get());
         ggml_cpu_set_weight_stream_callback(nullptr, nullptr);
     }
