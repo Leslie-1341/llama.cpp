@@ -106,6 +106,9 @@ struct ggml_backend_cpu_context {
     ggml_abort_callback abort_callback;
     void *              abort_callback_data;
 
+    ggml_graph_compute_sequence_node_callback node_callback;
+    void *              node_callback_data;
+
     bool                use_ref;  // use reference implementation
 };
 
@@ -146,6 +149,8 @@ static ggml_backend_graph_plan_t ggml_backend_cpu_graph_plan_create(ggml_backend
     cpu_plan->cplan.abort_callback      = cpu_ctx->abort_callback;
     cpu_plan->cplan.abort_callback_data = cpu_ctx->abort_callback_data;
     cpu_plan->cplan.use_ref             = cpu_ctx->use_ref;
+    cpu_plan->cplan.node_callback       = cpu_ctx->node_callback;
+    cpu_plan->cplan.node_callback_data  = cpu_ctx->node_callback_data;
 
     return cpu_plan;
 }
@@ -186,6 +191,8 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     cplan.abort_callback      = cpu_ctx->abort_callback;
     cplan.abort_callback_data = cpu_ctx->abort_callback_data;
     cplan.use_ref             = cpu_ctx->use_ref;
+    cplan.node_callback       = cpu_ctx->node_callback;
+    cplan.node_callback_data  = cpu_ctx->node_callback_data;
 
     return ggml_graph_compute(cgraph, &cplan);
 }
@@ -229,6 +236,8 @@ ggml_backend_t ggml_backend_cpu_init(void) {
     ctx->work_size           = 0;
     ctx->abort_callback      = NULL;
     ctx->abort_callback_data = NULL;
+    ctx->node_callback       = NULL;
+    ctx->node_callback_data  = NULL;
     ctx->use_ref             = false;
 
     ggml_backend_t cpu_backend = new ggml_backend {
@@ -282,6 +291,17 @@ void ggml_backend_cpu_set_use_ref(ggml_backend_t backend_cpu, bool use_ref) {
 
     struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend_cpu->context;
     ctx->use_ref = use_ref;
+}
+
+void ggml_backend_cpu_set_node_callback(
+        ggml_backend_t backend_cpu,
+        ggml_graph_compute_sequence_node_callback node_callback,
+        void * node_callback_data) {
+    GGML_ASSERT(ggml_backend_is_cpu(backend_cpu));
+
+    struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend_cpu->context;
+    ctx->node_callback = node_callback;
+    ctx->node_callback_data = node_callback_data;
 }
 
 // CPU backend - device
@@ -662,6 +682,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_backend_cpu_set_use_ref") == 0) {
         return (void *)ggml_backend_cpu_set_use_ref;
+    }
+    if (strcmp(name, "ggml_backend_cpu_set_node_callback") == 0) {
+        return (void *)ggml_backend_cpu_set_node_callback;
     }
 
     // threadpool - TODO:  move to ggml-base

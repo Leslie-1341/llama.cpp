@@ -7,6 +7,11 @@
 extern "C" {
 #endif
 
+    // optional callback invoked (on ith==0) after a graph node has completed and
+    // all CPU workers have crossed the node barrier; used to drive window advance,
+    // CLG prediction and async prefetch scheduling
+    typedef void (*ggml_graph_compute_sequence_node_callback)(const struct ggml_tensor * node, void * user_data);
+
     // the compute plan that needs to be prepared for ggml_graph_compute()
     // since https://github.com/ggml-org/ggml/issues/287
     struct ggml_cplan {
@@ -22,6 +27,11 @@ extern "C" {
 
         // use only reference implementations
         bool use_ref;
+
+        // optional callback after a node has completed and all CPU workers have
+        // crossed the node barrier
+        ggml_graph_compute_sequence_node_callback node_callback;
+        void * node_callback_data;
     };
 
     // numa strategies
@@ -136,6 +146,23 @@ extern "C" {
     GGML_BACKEND_API void ggml_backend_cpu_set_abort_callback(ggml_backend_t backend_cpu, ggml_abort_callback abort_callback, void * abort_callback_data);
 
     GGML_BACKEND_API void ggml_backend_cpu_set_use_ref(ggml_backend_t backend_cpu, bool use_ref);
+
+    // register a per-node callback on the CPU backend; it is propagated into the
+    // cplan and fired (on ith==0) after each node's barrier during graph compute
+    GGML_BACKEND_API void ggml_backend_cpu_set_node_callback(
+        ggml_backend_t backend_cpu,
+        ggml_graph_compute_sequence_node_callback node_callback,
+        void * node_callback_data);
+
+    // Weight-streaming hook (FlexInfer-style offloading).
+    // Invoked by every CPU worker thread at the start of each node's compute.
+    // The callback may, on ith==0, fault the op's streamed weight(s) into a
+    // managed buffer and repoint their ->data. It must return the same value on
+    // every thread for a given op: true if the op owns streamed weights (the
+    // runtime then issues a barrier so the repoint is visible to all threads
+    // before the kernel runs), false otherwise. Set to NULL to disable.
+    typedef bool (*ggml_cpu_weight_stream_callback)(struct ggml_tensor * op, int ith, void * user_data);
+    GGML_BACKEND_API void ggml_cpu_set_weight_stream_callback(ggml_cpu_weight_stream_callback cb, void * user_data);
 
     GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cpu_reg(void);
 
