@@ -1,599 +1,486 @@
-# llama.cpp
+# FlexKV-OS（Flexible Weight-KV Runtime Memory System）
 
-![llama](https://user-images.githubusercontent.com/1991296/230134379-7181e485-c521-4d23-a0d6-f7b3b61ba524.png)
+![project-logo](./figures/school_logo.jpg)
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp)](https://github.com/ggml-org/llama.cpp/releases)
-[![Server](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
+## 一、基本信息
 
-[Manifesto](https://github.com/ggml-org/llama.cpp/discussions/205) / [ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md)
+### 1.1 队伍介绍
 
-LLM inference in C/C++
+|    项目    | 内容                                     |
+| :------: | :------------------------------------- |
+| **项目名称** | FlexKV-OS：面向内存受限 LLM 推理的权重–KV 协同流式内存系统 |
+| **基础框架** | llama.cpp / ggml                       |
+| **优化方向** | LLM 推理运行时内存优化、权重流式管理、KV Cache 物理页回收    |
+| **适用场景** | 边缘设备、本地低内存环境、长上下文多会话推理                 |
+| **小组成员** | 苏安炫、李思甜                                |
+| **项目导师** | 夏文 李诗逸                                    |
+| **仓库地址** | https://gitlab.eduxiji.net/T2026181239911430/project3136859-389161                                    |
+| **参赛文档** | `docs/参赛文档.pdf`                        |
 
-## Recent API changes
+### 1.2 摘要
 
-- [Changelog for `libllama` API](https://github.com/ggml-org/llama.cpp/issues/9289)
-- [Changelog for `llama-server` REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
+随着大语言模型参数规模和上下文长度持续增长，LLM 推理对物理内存的需求迅速上升。对于边缘设备、嵌入式设备和本地低内存环境而言，完整加载模型权重和长期保留 KV Cache 往往会导致 RSS 过高、同步缺页频繁、推理吞吐下降，甚至直接触发 OOM。原生 `llama.cpp` 主要依赖 `mmap` 和操作系统 page cache 管理模型权重，虽然实现简单，但在内存压力下缺乏应用层可控的驻留与回收策略；同时，KV Cache 作为运行时动态状态，会随着上下文长度和 session 数增加持续膨胀，尤其在 idle/resume 多会话场景中，历史 KV 长期占据物理页。
 
-## Hot topics
+针对上述问题，本项目提出 **FlexKV-OS**，一个基于 `llama.cpp` 的运行时内存优化系统。系统将模型权重和 KV Cache 统一视为可调度的运行时内存对象：在权重侧，针对 Dense 模型设计 layer-level Dense Flex Buffer，针对 MoE 模型设计 expert-level MoE-Buffer，并结合 CLG expert prefetch 实现预测驱动的异步加载；在 KV Cache 侧，设计 Paged-KV Reclaim，将 KV Cache 的逻辑上下文状态与物理驻留状态解耦，对 idle-owned 且 active-invisible 的 KV block 执行 swap-out，并通过 `madvise(MADV_DONTNEED)` 释放物理页。
 
-- **Hugging Face cache migration: models downloaded with `-hf` are now stored in the standard Hugging Face cache directory, enabling sharing with other HF tools.**
-- **[guide : using the new WebUI of llama.cpp](https://github.com/ggml-org/llama.cpp/discussions/16938)**
-- [guide : running gpt-oss with llama.cpp](https://github.com/ggml-org/llama.cpp/discussions/15396)
-- [[FEEDBACK] Better packaging for llama.cpp to support downstream consumers 🤗](https://github.com/ggml-org/llama.cpp/discussions/15313)
-- Support for the `gpt-oss` model with native MXFP4 format has been added | [PR](https://github.com/ggml-org/llama.cpp/pull/15091) | [Collaboration with NVIDIA](https://blogs.nvidia.com/blog/rtx-ai-garage-openai-oss) | [Comment](https://github.com/ggml-org/llama.cpp/discussions/15095)
-- Multimodal support arrived in `llama-server`: [#12898](https://github.com/ggml-org/llama.cpp/pull/12898) | [documentation](./docs/multimodal.md)
-- VS Code extension for FIM completions: https://github.com/ggml-org/llama.vscode
-- Vim/Neovim plugin for FIM completions: https://github.com/ggml-org/llama.vim
-- Hugging Face Inference Endpoints now support GGUF out of the box! https://github.com/ggml-org/llama.cpp/discussions/9669
-- Hugging Face GGUF editor: [discussion](https://github.com/ggml-org/llama.cpp/discussions/9268) | [tool](https://huggingface.co/spaces/CISCai/gguf-editor)
-- WebGPU support is now available in the browser, see a blog/demo introducing it [here](https://reeselevine.github.io/llamas-on-the-web/).
+实验结果表明，FlexKV-OS 能够在不修改模型权重、不改变推理语义、不截断上下文的前提下降低运行时 RSS。权重侧优化能够显著减少 repack 和全量驻留带来的冗余内存；Paged-KV Reclaim 在 ctx4096 和 ctx8192 多 session trace replay 中分别降低约 611.883 MiB 和 1619.195 MiB RSS；权重侧 Flex 与 KV Cache reclaim 组合后，RSS 从 8,683,152 KB 降至 4,703,812 KB，总体下降约 45.83%，同时 active TPS 保持接近原始路径。
 
-----
+### 1.3 主要工作
 
-## Quick start
+* **构建了面向 LLM 推理的运行时内存调度框架**
+  在 `llama.cpp` / `ggml` 中引入轻量 hook，将推理执行层、权重管理模块和 KV Cache 管理模块连接起来，使模型权重和 KV Cache 能够在运行时被显式加载、替换、换出和恢复。
 
-Getting started with llama.cpp is straightforward. Here are several ways to install it on your machine:
+* **实现了 Dense 模型的 layer-level Flex Buffer**
+  针对 Dense 模型每个 token 都需要访问全部层权重的特点，系统以 decoder layer 为基本单位维护匿名 ring slot，通过 LRU 替换和自适应 ring size 控制权重工作集，避免原生 mmap 在内存受限场景下发生不可控驻留或 OOM。
 
-- Install `llama.cpp` using [brew, nix or winget](docs/install.md)
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
+* **实现了 MoE 模型的 expert-level MoE-Buffer**
+  针对 MoE 模型专家稀疏激活特征，系统以 expert slice 为粒度维护 `COLD / INFLIGHT / RESIDENT` 三态缓存，并结合后台 worker、LRU 驱逐和 hot expert 保护，在有限内存中保留高频活跃 expert。
 
-Once installed, you'll need a model to work with. Head to the [Obtaining and quantizing models](#obtaining-and-quantizing-models) section to learn more.
+* **设计了 CLG expert prefetch 机制**
+  系统在图节点完成后获取当前 hidden state，预测下一层可能激活的 Top-K + delta expert，并提前提交给 MoE-Buffer worker 异步加载。预测路径只影响性能，实际 kernel 前仍由 `weight stream callback` 做同步兜底，从而保证正确性。
 
-Example command:
+* **实现了 Paged-KV Reclaim 运行时回收机制**
+  系统将 KV Cache 划分为 block，维护 owner、resident/swapped、active visibility、resume protection 等状态。对于 idle-owned 且 active-invisible 的 block，系统先写入 backing store，再调用 `madvise(MADV_DONTNEED)` 释放原 KV tensor 物理页，并在 session resume 时按需恢复。
 
-```sh
-# Use a local model file
-llama-cli -m my_model.gguf
+* **提供了可验证的内存收益诊断路径**
+  除进程级 RSS 外，系统引入 `mincore` 对 KV tensor 地址范围进行 resident page 采样，证明 RSS 下降主要来自 KV resident pages 的真实减少，而不是其他内存波动。
 
-# Or download and run a model directly from Hugging Face
-llama-cli -hf ggml-org/gemma-3-1b-it-GGUF
+---
 
-# Launch OpenAI-compatible API server
-llama-server -hf ggml-org/gemma-3-1b-it-GGUF
+## 二、项目概述
+
+### 2.1 背景和意义
+
+大语言模型推理通常包含两个主要阶段：Prefill 阶段和 Decode 阶段。Prefill 阶段需要处理完整输入序列，Decode 阶段则逐 token 自回归生成。在 Decode 阶段，每生成一个 token 都需要访问模型权重，并读取历史 KV Cache。随着模型参数量、上下文长度和并发 session 数增加，权重 I/O 与 KV Cache I/O 逐渐成为推理系统的核心瓶颈。
+
+在资源充足的服务器环境中，可以依靠大内存、大显存和高带宽存储缓解这些问题。但在边缘设备、本地 CPU 推理和低内存机器上，LLM 推理面临更严格的资源约束：
+
+* 模型权重无法完整常驻物理内存；
+* 存储带宽远低于内存带宽；
+* page fault 和同步 I/O 会直接阻塞推理线程；
+* KV Cache 随上下文长度线性增长；
+* idle session 的历史 KV 虽暂时不用，但仍长期占据物理页；
+* 原生 `mmap` 与 page cache 行为不可控，难以根据模型访存特征主动调度。
+
+因此，LLM 推理系统需要从“静态加载模型”转向“运行时管理工作集”。FlexKV-OS 正是围绕这一目标设计：将模型权重和 KV Cache 从被动驻留对象转化为可调度、可回收、可恢复的运行时资源。
+
+### 2.2 当前任务主要痛点
+
+#### 2.2.1 权重驻留不可控
+
+原生 `llama.cpp` 依赖 `mmap` 加载模型权重，由内核在访问时触发缺页调入。这种方式在内存充足时效果较好，但在内存紧张时，应用层难以控制哪些权重应当保留、哪些权重可以释放。当 repack 或 extra buffer 存在时，还会产生额外匿名副本，导致文件页与重排后的匿名页重复驻留。
+
+#### 2.2.2 Dense 与 MoE 模型访存模式差异明显
+
+Dense 模型每个 token 都会访问全部层权重，优化重点是控制 layer-level working set；MoE 模型每个 token 只激活少量 expert，优化重点是利用 expert 稀疏性进行细粒度缓存。如果使用统一策略处理 Dense 和 MoE，会忽略模型结构差异，难以同时兼顾性能和内存收益。
+
+#### 2.2.3 KV Cache 动态增长且难以安全释放
+
+KV Cache 是推理运行时产生的状态，不能像只读权重一样简单丢弃。历史 KV 未来可能被 resume session 再次访问，因此系统必须保证上下文逻辑不变。原生连续 KV buffer 难以区分“逻辑上需要保留”和“当前物理上必须驻留”，导致 idle session 的 KV 长期占据 RSS。
+
+#### 2.2.4 内存优化需要兼顾正确性和可验证性
+
+LLM 推理系统不能为了节省内存改变模型输出。权重流式、expert 预取、KV swap-out 都必须在不破坏数值语义和 attention 语义的前提下进行。同时，比赛场景不仅需要展示 RSS 降低，还要证明内存下降来自真实物理页回收，而不是测试噪声。
+
+### 2.3 项目介绍及动机
+
+FlexKV-OS 的设计动机来自 LLM 推理访存模式的两个观察。
+
+第一，LLM 权重访问具有高度结构性。Dense 模型按照 layer 顺序执行，MoE 模型虽然存在路由选择，但 expert 激活具有稀疏性和局部性。因此，系统可以根据模型结构提前判断未来可能访问的数据，并将被动缺页转化为主动调度。
+
+第二，KV Cache 的逻辑生命周期和物理驻留状态并不等价。某些 idle session 的历史 KV 在逻辑上仍需保留，但当前 active request 不会读取它们。只要系统能记录其 backing store 位置，并在 resume 前恢复，就可以释放这些 block 对应的物理页。
+
+基于上述动机，FlexKV-OS 采用“双路径协同”的整体方案：
+
+* 权重侧：根据模型结构分别采用 Dense Flex Buffer 和 MoE-Buffer，控制模型参数的物理驻留；
+* KV 侧：根据 session 状态和 attention 可见性，对 idle KV block 执行安全换出；
+* 调度侧：通过 node callback 和 weight stream callback 接入 llama.cpp 执行过程，实现异步预取与同步兜底；
+* 验证侧：通过 RSS、TPS、perplexity、trace replay 和 mincore 共同验证内存收益与正确性。
+
+### 2.4 整体架构
+
+![architecture](./figures/flow/main.png)
+
+FlexKV-OS 整体分为三层：
+
+* **推理执行层**：负责 Transformer layer、MoE router、attention 和 GGML CPU kernel 的执行；
+* **运行时内存调度层**：负责 Dense Flex、MoE-Buffer、CLG expert prefetch 和 Paged-KV Reclaim；
+* **操作系统与存储层**：提供 `mmap`、`pread`、`O_DIRECT`、`madvise`、`mincore` 等底层机制。
+
+
+
+### 2.5 整体流程
+
+
+
+系统运行流程可以概括为：
+
+1. 模型加载阶段注册权重 tensor、layer 信息、expert slice 信息和 KV Cache metadata；
+2. 推理执行阶段通过 node callback 捕获 layer 执行进度；
+3. CLG 根据 hidden state 预测下一层 expert，并提交异步预取；
+4. CPU kernel 执行前通过 weight stream callback 检查权重是否 resident；
+5. Dense Flex 或 MoE-Buffer 在必要时执行同步兜底加载；
+6. KV Cache 模块根据 session idle/resume 状态识别可换出的 KV block；
+7. 对 idle-owned 且 active-invisible 的 block 写入 backing store；
+8. 调用 `madvise(MADV_DONTNEED)` 释放对应 KV 物理页；
+9. session resume 时按需 swap-in，并通过 prefetch 降低首 token 延迟；
+10. 通过 RSS、TPS、mincore 和 trace replay 验证系统效果。
+
+### 2.6 核心技术与模块架构
+
+#### 2.6.1 Dense Flex Buffer 模块
+
+![Dense Flex](./figures/flow/weight.png)
+
+**优势：将 Dense 模型权重从全量 mmap 驻留转化为 layer-level 工作集控制，在内存受限场景下提供确定性驻留边界。**
+
+该模块主要包含：
+
+* layer tensor 注册；
+* ring slot 管理；
+* LRU layer 替换；
+* `O_DIRECT` / buffered read；
+* adaptive ring size；
+* `weight stream callback` 同步兜底。
+
+#### 2.6.2 MoE-Buffer 模块
+
+![MoE Buffer](./figures/flow/moe.png)
+
+**优势：利用 MoE expert 稀疏激活特征，只保留当前 workload 下的活跃 expert，并将冷 expert 转化为可按需换入的状态。**
+
+该模块主要包含：
+
+* expert slice 注册；
+* `COLD / INFLIGHT / RESIDENT` 三态状态机；
+* 后台 worker 预取；
+* LRU 驱逐；
+* hot expert 保护；
+* budget 控制；
+* expert data 指针重定向。
+
+#### 2.6.3 CLG Expert Prefetch 模块
+
+![CLG](./figures/flow/pre.png)
+
+**优势：基于当前 hidden state 预测下一层 expert，将同步 I/O 尽可能提前到后台执行，提高 I/O 与计算重叠。**
+
+该模块主要包含：
+
+* node callback；
+* hidden state 读取；
+* expert score 计算；
+* Top-K + delta 选择；
+* MoE-Buffer prefetch task 提交。
+
+CLG 只负责性能优化，不改变真实 routing。预测失败时由 `weight stream callback` 做同步兜底。
+
+#### 2.6.4 Paged-KV Reclaim 模块
+
+![Paged KV](./figures/flow/swap.png)
+
+**优势：将 KV Cache 的逻辑上下文状态与物理驻留状态解耦，使 idle session 历史 KV 在不截断上下文的前提下释放物理页。**
+
+该模块主要包含：
+
+* block-level KV metadata；
+* owner / visibility 状态维护；
+* paged row index；
+* idle block swap-out；
+* backing store；
+* `madvise(MADV_DONTNEED)`；
+* resume swap-in；
+* resume-aware prefetch；
+* fast maintenance；
+* `mincore` resident page 诊断。
+
+
+---
+
+## 三、项目目标及完成情况
+
+项目实现目标如下：
+
+| 实现内容               | 完成情况 | 说明                                                                 |
+| ------------------ | ---- | ------------------------------------------------------------------ |
+| 目标 1：分析 LLM 推理访存行为 | 全部完成 | 分析权重逐层访问、MoE expert 稀疏激活和 KV Cache 随上下文增长的规律                       |
+| 目标 2：降低运行时物理内存占用   | 全部完成 | 实现 Dense Flex、MoE-Buffer 和 Paged-KV Reclaim，降低权重和 KV Cache RSS     |
+| 目标 3：通过预取隐藏 I/O 延迟 | 全部完成 | 实现 CLG expert prefetch、多 worker 预取和 resume-aware KV prefetch       |
+| 目标 4：保证推理语义不变      | 全部完成 | 通过同步兜底、先保存后释放、perplexity 对比和 trace replay 保证正确性                    |
+| 目标 5：构建可复现实验与诊断工具  | 全部完成 | 支持 llama-bench、llama-perplexity、llama-kv-trace-replay 和 mincore 诊断 |
+
+初赛实现内容及时间节点如下：
+
+| 实现内容  | 时间      | 说明                                                                   |
+| ----- | ------- | -------------------------------------------------------------------- |
+| 行动项 1 | 第 1–2 周 | 调研 llama.cpp、GGUF、mmap、KV Cache 管理机制和相关 LLM 推理内存优化工作                 |
+| 行动项 2 | 第 3 周   | 搭建 Ubuntu / llama.cpp 开发环境，完成 baseline 编译与测试                         |
+| 行动项 3 | 第 4–5 周 | 实现权重侧基础流式管理，包括 Dense layer 注册和 MoE expert slice 管理                   |
+| 行动项 4 | 第 6 周   | 实现 MoE-Buffer 三态状态机、多 worker 加载、LRU 驱逐和 hot expert 保护                |
+| 行动项 5 | 第 7 周   | 实现 CLG expert prefetch，打通 node callback 与 MoE-Buffer 预取路径            |
+| 行动项 6 | 第 8 周   | 实现 Paged-KV metadata、swap-out / swap-in、paged row index 与 madvise 回收 |
+| 行动项 7 | 第 9 周   | 完成 trace replay、mincore 诊断、权重侧和 KV 侧组合测试                             |
+| 行动项 8 | 第 10 周  | 完成文档整理、README 编写、测试结果汇总与参赛材料准备                                       |
+
+后续优化方向：
+
+* 支持 GPU backend 下的 device-memory KV reclaim；
+* 将 KV prefetch 从 driver 协作式进一步扩展为独立后台 worker；
+* 支持更细粒度的 block-level Dense 权重流式管理；
+* 引入更智能的 expert / layer 预测策略；
+* 支持更多模型结构和更大规模模型；
+* 进一步优化权重侧与 KV 侧共享 I/O 带宽调度。
+
+---
+
+## 四、分析测试结果
+
+### 4.1 测试环境
+
+| 项目         | 配置                                                       |
+| ---------- | -------------------------------------------------------- |
+| 操作系统       | Ubuntu 22.04                                             |
+| Linux 内核   | 5.15.0+                                                  |
+| 机器类型       | 物理机                                                      |
+| 内存         | 23GB                                                     |
+| CPU        | x86-64，8 核                                               |
+| 存储         | SSD，顺序读速约 279MB/s                                        |
+| Dense 测试模型 | Llama-3-8B-Instruct-Q4_K_M.gguf                          |
+| Dense 模型大小 | 约 4.58GB                                                 |
+| MoE 测试模型   | Qwen1.5-MoE-A2.7B-20-experts-SFT-trained.Q4_K_M.gguf     |
+| MoE 模型结构   | 24 个 MoE layer，每层 20 个 expert，top-4 激活                   |
+| 内存限制方式     | cgroup v2 `memory.max`                                   |
+| 测试工具       | `llama-bench`、`llama-perplexity`、`llama-kv-trace-replay` |
+
+### 4.2 权重管理模块测试结果
+
+#### 4.2.1 关闭 repack 的内存收益
+
+| 配置                    |     RSS |          吞吐 |
+| --------------------- | ------: | ----------: |
+| Dense native，含 repack | 7.77 GB |  8.15 tok/s |
+| Dense，关闭 repack       | 4.56 GB |  8.60 tok/s |
+| MoE native，含 repack   | 5.73 GB | 19.26 tok/s |
+| MoE，关闭 repack         | 3.60 GB | 19.58 tok/s |
+
+结果表明，repack 会引入额外匿名权重副本。关闭 repack 后，Dense 模型 RSS 从 7.77 GB 降至 4.56 GB，MoE 模型 RSS 从 5.73 GB 降至 3.60 GB，同时吞吐未下降。
+
+#### 4.2.2 Dense Flex / Window 路径
+
+| 配置             |       RSS |         吞吐 | 说明                      |
+| -------------- | --------: | ---------: | ----------------------- |
+| native         |   7770 MB | 8.15 tok/s | 全量 page fault 驻留        |
+| window / flex  |   4560 MB | 8.60 tok/s | 仅窗口层或受控工作集常驻            |
+| 3GB cgroup cap | 约 4.26 GB | 0.40 tok/s | 避免 OOM，但进入 I/O-bound 状态 |
+
+Dense 路径能够在内存相对充足时压缩 RSS，并保持接近原生路径的吞吐。在极端内存限制下，系统可以将 native OOM 转化为可运行状态，但由于 Dense 模型每个 token 都需要访问全部层权重，吞吐会受 SSD I/O 限制明显下降。
+
+### 4.3 MoE-Buffer 测试结果
+
+#### 4.3.1 MoE-Buffer 工作集边界
+
+|  Budget | Evictions | Read / token |          吞吐 |
+| ------: | --------: | -----------: | ----------: |
+|  768 MB |      7392 |          598 |  1.97 tok/s |
+| 1536 MB |      2710 |          272 |  2.23 tok/s |
+| 2048 MB |       618 |          132 |  6.22 tok/s |
+| 2432 MB |         0 |          约 0 | 11.57 tok/s |
+| 2560 MB |         0 |          约 0 |  9.43 tok/s |
+
+MoE-Buffer 存在明显工作集边界。当 budget 较小时，expert 在 `COLD / INFLIGHT / RESIDENT` 之间频繁切换，系统处于 I/O 抖动状态。当 budget 提升至约 2432 MB 后，evictions 降为 0，read/token 接近 0，说明缓冲区已经覆盖当前 workload 下的有效 expert 工作集。
+
+#### 4.3.2 CLG 预测与预取效果
+
+| Delta |     RSS | 命中率 |          吞吐 |
+| ----: | ------: | --: | ----------: |
+|     0 | 2411 MB | 94% | 12.52 tok/s |
+|     4 | 2579 MB | 93% | 16.48 tok/s |
+|     8 | 2634 MB | 93% | 17.27 tok/s |
+
+适度增加 delta 会带来少量 RSS 增长，但可以扩大预取 expert 集合，增加 I/O 与计算之间的重叠时间，从而显著提升 MoE 路径吞吐。
+
+#### 4.3.3 MoE 多 worker I/O 加速
+
+|  Budget | 1 worker | 4 worker |  加速比 |
+| ------: | -------: | -------: | ---: |
+|  512 MB |     1.58 |     2.87 | 1.8x |
+|  768 MB |     1.97 |     3.75 | 1.9x |
+| 1536 MB |     2.23 |     5.42 | 2.4x |
+
+在 MoE-Buffer 处于 I/O 主导区间时，多 worker 并行读取能够提升 expert 预取速度，减少计算线程等待 `INFLIGHT` expert 的时间。
+
+#### 4.3.4 极端内存约束鲁棒性
+
+| 模型 / 配置             |     RSS |         吞吐 | 结果           |
+| ------------------- | ------: | ---------: | ------------ |
+| Dense native        |       - |          - | OOM          |
+| Dense Window / Flex | 4.26 GB | 0.40 tok/s | I/O-bound 运行 |
+| MoE-Buffer          | 1.90 GB | 2.57 tok/s | 稳定运行         |
+
+结果表明，FlexKV-OS 可以在极端内存约束下将原生路径的 OOM 转化为可运行状态。MoE 模型由于具有 expert 稀疏激活特征，在受限内存下比 Dense 模型更容易维持稳定吞吐。
+
+### 4.4 KV Cache 回收测试结果
+
+#### 4.4.1 ctx4096 trace replay
+
+| 指标                              |      Baseline |      Paged-KV |           变化 |
+| ------------------------------- | ------------: | ------------: | -----------: |
+| Process RSS                     | 9,333,632 KiB | 8,707,064 KiB | -611.883 MiB |
+| Active TPS                      |     10.875037 |     10.548073 |      -3.007% |
+| Active decode time              | 77,976.745 ms | 80,393.828 ms |      +3.100% |
+| Resume first-token weighted avg |    100.251 ms |    101.493 ms |    +1.242 ms |
+
+在 ctx4096 多 session idle/resume 场景中，Paged-KV Reclaim 释放约 612 MiB RSS，active TPS 回退约 3%，resume first-token latency 增量约 1.2 ms。
+
+#### 4.4.2 ctx8192 trace replay
+
+| 指标                              |       Baseline |      Paged-KV |            变化 |
+| ------------------------------- | -------------: | ------------: | ------------: |
+| Process RSS                     | 10,364,540 KiB | 8,706,484 KiB | -1619.195 MiB |
+| Active TPS                      |      10.846081 |     10.736931 |       -1.006% |
+| Active decode time              |  78,184.923 ms | 78,979.742 ms |       +1.017% |
+| Total wall time                 |  96,365.403 ms | 97,296.760 ms |       +0.966% |
+| Resume first-token weighted avg |     103.225 ms |    100.830 ms |     -2.395 ms |
+
+在 ctx8192 场景下，KV Cache 占总内存比例更高，因此 Paged-KV Reclaim 的收益更明显。系统释放约 1.58 GiB RSS，而 active TPS 仅下降约 1%。
+
+#### 4.4.3 mincore resident page 诊断
+
+ctx4096：
+
+| 指标                | Baseline-like |    Paged-KV |            变化 |
+| ----------------- | ------------: | ----------: | ------------: |
+| KV total          |   1023.75 MiB | 1023.75 MiB |             0 |
+| KV resident       |   1023.75 MiB |   426.0 MiB |   -597.75 MiB |
+| KV resident ratio |        100.0% |      41.61% |       -58.39% |
+| Process RSS drop  |             - |           - | 约 611.746 MiB |
+
+ctx8192：
+
+| 指标                | Baseline-like |    Paged-KV |             变化 |
+| ----------------- | ------------: | ----------: | -------------: |
+| KV total          |   2047.75 MiB | 2047.75 MiB |              0 |
+| KV resident       |   2047.75 MiB |   426.0 MiB |   -1621.75 MiB |
+| KV resident ratio |        100.0% |      20.80% |        -79.20% |
+| Process RSS drop  |             - |           - | 约 1619.168 MiB |
+
+`mincore` 结果表明，RSS 下降主要来自 KV tensor resident pages 的真实减少，而不是进程其他内存波动。
+
+### 4.5 权重侧与 KV Cache 组合优化
+
+| 配置             |          RSS | Active TPS | KV swap-out |
+| -------------- | -----------: | ---------: | ----------: |
+| default        | 8,683,152 KB |     14.593 |           0 |
+| flex auto      | 5,134,680 KB |     14.749 |           0 |
+| KV-only        | 8,250,536 KB |     14.143 |          23 |
+| KV + flex auto | 4,703,812 KB |     14.171 |          23 |
+
+Flex auto 与 KV Cache reclaim 作用于不同内存来源：前者降低模型权重驻留压力，后者释放 idle KV block 对应物理页。组合后 RSS 从 8,683,152 KB 降至 4,703,812 KB，整体下降约 45.83%，同时 active TPS 仍保持接近原始路径。
+
+---
+
+## 五、功能展示
+
+
+链接：https://pan.quark.cn/s/3aa676ba1a33
+
+
+
+## 六、文档信息
+
+* [参赛文档](./docs/参赛文档.pdf)
+* [参赛演示文档](./docs/操作系统设计赛.pptx)
+
+---
+
+## 七、目录索引
+
+```shell
+.
+├── CMakeLists.txt
+├── README.md
+├── LICENSE
+├── docs
+│   ├── 参赛文档.pdf
+│   └── reproduce_kv_cache_optimization.md
+├── pics
+│   ├── flexkv_architecture.png
+│   ├── flexkv_workflow.png
+│   ├── dense_flex.png
+│   ├── moe_buffer.png
+│   ├── clg_prefetch.png
+│   ├── paged_kv.png
+│   └── demo.png
+├── src
+│   ├── llama-flex.h
+│   ├── llama-flex.cpp
+│   ├── llama-moe-buffer.h
+│   ├── llama-moe-buffer.cpp
+│   ├── llama-window.h
+│   ├── llama-window.cpp
+│   ├── llama-kv-cache.h
+│   ├── llama-kv-cache.cpp
+│   ├── llama-graph.h
+│   ├── llama-graph.cpp
+│   ├── llama-model.cpp
+│   └── llama-context.cpp
+├── ggml
+│   ├── include
+│   │   └── ggml-cpu.h
+│   └── src
+│       └── ggml-cpu
+│           └── ggml-cpu.c
+├── examples
+│   └── kv-trace-replay
+│       ├── traces
+│       │   └── smoke_4s2t.tsv
+│       └── README.md
+└── build
 ```
 
-## Description
+---
 
-The main goal of `llama.cpp` is to enable LLM inference with minimal setup and state-of-the-art performance on a wide
-range of hardware - locally and in the cloud.
+## 八、正确性保证
 
-- Plain C/C++ implementation without any dependencies
-- Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks
-- AVX, AVX2, AVX512 and AMX support for x86 architectures
-- RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures
-- 1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use
-- Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
-- Vulkan and SYCL backend support
-- CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
+FlexKV-OS 通过以下规则保证推理语义不变：
 
-The `llama.cpp` project is the main playground for developing new features for the [ggml](https://github.com/ggml-org/ggml) library.
+1. 不修改模型权重数值。
+2. Flex 和 MoE-Buffer 只改变权重的物理驻留位置。
+3. CLG 只预测未来访问，不改变真实 MoE routing。
+4. `weight stream callback` 在 CPU kernel 执行前提供同步兜底。
+5. KV Cache 只对 idle-owned 且 active-invisible 的 block 执行 swap-out。
+6. KV 数据必须先写入 backing store，之后才能释放物理页。
+7. session resume 时，在 block 被 active attention 访问前恢复 KV 数据。
+8. `madvise(MADV_DONTNEED)` 只释放物理页，不改变逻辑模型状态。
+9. `mincore` 只用于诊断，不建议在正式性能测试中开启。
 
-<details>
-<summary>Models</summary>
+---
 
-Typically finetunes of the base models below are supported as well.
+## 九、当前限制
 
-Instructions for adding support for new models: [HOWTO-add-model.md](docs/development/HOWTO-add-model.md)
+当前原型仍存在以下限制：
 
-#### Text-only
+1. 当前实现主要面向 Linux CPU 推理路径。
+2. Flex 和 MoE-Buffer 假设权重通过 CPU 侧模型文件访问。
+3. 暂不支持 GPU backend 下的 device-memory KV reclaim。
+4. `madvise` 和 `mincore` 语义只适用于 host memory，不适用于 GPU memory。
+5. 不建议与 `mlock` 同时使用，否则物理页可能无法被正常回收。
+6. Flex 和 MoE-Buffer 当前不是统一的 shared weight-stream callback 路径。
+7. CLG 当前作为 MoE-Buffer 的预取机制使用，而不是独立通用 layer-window 机制。
+8. Paged-KV 路径要求兼容的 KV layout，当前主要面向 `n_stream == 1` 且 `!v_trans`。
+9. `LLAMA_KV_PAGED_MINCORE=1` 会引入额外开销，只建议用于诊断。
 
-- [X] LLaMA 🦙
-- [x] LLaMA 2 🦙🦙
-- [x] LLaMA 3 🦙🦙🦙
-- [X] [Mistral 7B](https://huggingface.co/mistralai/Mistral-7B-v0.1)
-- [x] [Mixtral MoE](https://huggingface.co/models?search=mistral-ai/Mixtral)
-- [x] [DBRX](https://huggingface.co/databricks/dbrx-instruct)
-- [x] [Jamba](https://huggingface.co/ai21labs)
-- [X] [Falcon](https://huggingface.co/models?search=tiiuae/falcon)
-- [X] [Chinese LLaMA / Alpaca](https://github.com/ymcui/Chinese-LLaMA-Alpaca) and [Chinese LLaMA-2 / Alpaca-2](https://github.com/ymcui/Chinese-LLaMA-Alpaca-2)
-- [X] [Vigogne (French)](https://github.com/bofenghuang/vigogne)
-- [X] [BERT](https://github.com/ggml-org/llama.cpp/pull/5423)
-- [X] [Koala](https://bair.berkeley.edu/blog/2023/04/03/koala/)
-- [X] [Baichuan 1 & 2](https://huggingface.co/models?search=baichuan-inc/Baichuan) + [derivations](https://huggingface.co/hiyouga/baichuan-7b-sft)
-- [X] [Aquila 1 & 2](https://huggingface.co/models?search=BAAI/Aquila)
-- [X] [Starcoder models](https://github.com/ggml-org/llama.cpp/pull/3187)
-- [X] [Refact](https://huggingface.co/smallcloudai/Refact-1_6B-fim)
-- [X] [MPT](https://github.com/ggml-org/llama.cpp/pull/3417)
-- [X] [Bloom](https://github.com/ggml-org/llama.cpp/pull/3553)
-- [x] [Yi models](https://huggingface.co/models?search=01-ai/Yi)
-- [X] [StableLM models](https://huggingface.co/stabilityai)
-- [x] [Deepseek models](https://huggingface.co/models?search=deepseek-ai/deepseek)
-- [x] [Qwen models](https://huggingface.co/models?search=Qwen/Qwen)
-- [x] [PLaMo-13B](https://github.com/ggml-org/llama.cpp/pull/3557)
-- [x] [Phi models](https://huggingface.co/models?search=microsoft/phi)
-- [x] [PhiMoE](https://github.com/ggml-org/llama.cpp/pull/11003)
-- [x] [GPT-2](https://huggingface.co/gpt2)
-- [x] [Orion 14B](https://github.com/ggml-org/llama.cpp/pull/5118)
-- [x] [InternLM2](https://huggingface.co/models?search=internlm2)
-- [x] [CodeShell](https://github.com/WisdomShell/codeshell)
-- [x] [Gemma](https://ai.google.dev/gemma)
-- [x] [Mamba](https://github.com/state-spaces/mamba)
-- [x] [Grok-1](https://huggingface.co/keyfan/grok-1-hf)
-- [x] [Xverse](https://huggingface.co/models?search=xverse)
-- [x] [Command-R models](https://huggingface.co/models?search=CohereForAI/c4ai-command-r)
-- [x] [SEA-LION](https://huggingface.co/models?search=sea-lion)
-- [x] [GritLM-7B](https://huggingface.co/GritLM/GritLM-7B) + [GritLM-8x7B](https://huggingface.co/GritLM/GritLM-8x7B)
-- [x] [OLMo](https://allenai.org/olmo)
-- [x] [OLMo 2](https://allenai.org/olmo)
-- [x] [OLMoE](https://huggingface.co/allenai/OLMoE-1B-7B-0924)
-- [x] [Granite models](https://huggingface.co/collections/ibm-granite/granite-code-models-6624c5cec322e4c148c8b330)
-- [x] [GPT-NeoX](https://github.com/EleutherAI/gpt-neox) + [Pythia](https://github.com/EleutherAI/pythia)
-- [x] [Snowflake-Arctic MoE](https://huggingface.co/collections/Snowflake/arctic-66290090abe542894a5ac520)
-- [x] [Smaug](https://huggingface.co/models?search=Smaug)
-- [x] [Poro 34B](https://huggingface.co/LumiOpen/Poro-34B)
-- [x] [Bitnet b1.58 models](https://huggingface.co/1bitLLM)
-- [x] [Flan T5](https://huggingface.co/models?search=flan-t5)
-- [x] [Open Elm models](https://huggingface.co/collections/apple/openelm-instruct-models-6619ad295d7ae9f868b759ca)
-- [x] [ChatGLM3-6b](https://huggingface.co/THUDM/chatglm3-6b) + [ChatGLM4-9b](https://huggingface.co/THUDM/glm-4-9b) + [GLMEdge-1.5b](https://huggingface.co/THUDM/glm-edge-1.5b-chat) + [GLMEdge-4b](https://huggingface.co/THUDM/glm-edge-4b-chat)
-- [x] [GLM-4-0414](https://huggingface.co/collections/THUDM/glm-4-0414-67f3cbcb34dd9d252707cb2e)
-- [x] [SmolLM](https://huggingface.co/collections/HuggingFaceTB/smollm-6695016cad7167254ce15966)
-- [x] [EXAONE-3.0-7.8B-Instruct](https://huggingface.co/LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct)
-- [x] [FalconMamba Models](https://huggingface.co/collections/tiiuae/falconmamba-7b-66b9a580324dd1598b0f6d4a)
-- [x] [Jais](https://huggingface.co/inceptionai/jais-13b-chat)
-- [x] [Bielik-11B-v2.3](https://huggingface.co/collections/speakleash/bielik-11b-v23-66ee813238d9b526a072408a)
-- [x] [RWKV-7](https://huggingface.co/collections/shoumenchougou/rwkv7-gxx-gguf)
-- [x] [RWKV-6](https://github.com/BlinkDL/RWKV-LM)
-- [x] [QRWKV-6](https://huggingface.co/recursal/QRWKV6-32B-Instruct-Preview-v0.1)
-- [x] [GigaChat-20B-A3B](https://huggingface.co/ai-sage/GigaChat-20B-A3B-instruct)
-- [X] [Trillion-7B-preview](https://huggingface.co/trillionlabs/Trillion-7B-preview)
-- [x] [Ling models](https://huggingface.co/collections/inclusionAI/ling-67c51c85b34a7ea0aba94c32)
-- [x] [LFM2 models](https://huggingface.co/collections/LiquidAI/lfm2-686d721927015b2ad73eaa38)
-- [x] [Hunyuan models](https://huggingface.co/collections/tencent/hunyuan-dense-model-6890632cda26b19119c9c5e7)
-- [x] [BailingMoeV2 (Ring/Ling 2.0) models](https://huggingface.co/collections/inclusionAI/ling-v2-68bf1dd2fc34c306c1fa6f86)
+---
 
-#### Multimodal
+## 十、项目亮点
 
-- [x] [LLaVA 1.5 models](https://huggingface.co/collections/liuhaotian/llava-15-653aac15d994e992e2677a7e), [LLaVA 1.6 models](https://huggingface.co/collections/liuhaotian/llava-16-65b9e40155f60fd046a5ccf2)
-- [x] [BakLLaVA](https://huggingface.co/models?search=SkunkworksAI/Bakllava)
-- [x] [Obsidian](https://huggingface.co/NousResearch/Obsidian-3B-V0.5)
-- [x] [ShareGPT4V](https://huggingface.co/models?search=Lin-Chen/ShareGPT4V)
-- [x] [MobileVLM 1.7B/3B models](https://huggingface.co/models?search=mobileVLM)
-- [x] [Yi-VL](https://huggingface.co/models?search=Yi-VL)
-- [x] [Mini CPM](https://huggingface.co/models?search=MiniCPM)
-- [x] [Moondream](https://huggingface.co/vikhyatk/moondream2)
-- [x] [Bunny](https://github.com/BAAI-DCAI/Bunny)
-- [x] [GLM-EDGE](https://huggingface.co/models?search=glm-edge)
-- [x] [Qwen2-VL](https://huggingface.co/collections/Qwen/qwen2-vl-66cee7455501d7126940800d)
-- [x] [LFM2-VL](https://huggingface.co/collections/LiquidAI/lfm2-vl-68963bbc84a610f7638d5ffa)
+FlexKV-OS 是一个面向 LLM 推理的系统级内存优化方案，核心亮点包括：
 
-</details>
+* **权重与 KV Cache 协同优化**：同时覆盖静态模型权重和动态运行时 KV Cache。
+* **Dense / MoE 分路径优化**：Dense 使用 layer-level 管理，MoE 使用 expert-level 管理。
+* **预测与正确性分离**：CLG 负责性能优化，weight stream callback 负责执行前兜底。
+* **KV Cache 逻辑保留、物理释放**：idle session 历史 KV 不截断、不删除，只释放暂时不需要的物理页。
+* **RSS 下降可验证**：不仅可以观察进程 RSS，还可以通过 `mincore` 证明 KV resident pages 真实下降。
+* **最小侵入式集成**：通过轻量 hook 和独立模块扩展 `llama.cpp`，不重写核心推理框架。
 
-<details>
-<summary>Bindings</summary>
-
-- Python: [ddh0/easy-llama](https://github.com/ddh0/easy-llama)
-- Python: [abetlen/llama-cpp-python](https://github.com/abetlen/llama-cpp-python)
-- Go: [go-skynet/go-llama.cpp](https://github.com/go-skynet/go-llama.cpp)
-- Node.js: [withcatai/node-llama-cpp](https://github.com/withcatai/node-llama-cpp)
-- JS/TS (llama.cpp server client): [lgrammel/modelfusion](https://modelfusion.dev/integration/model-provider/llamacpp)
-- JS/TS (Programmable Prompt Engine CLI): [offline-ai/cli](https://github.com/offline-ai/cli)
-- JavaScript/Wasm (works in browser): [tangledgroup/llama-cpp-wasm](https://github.com/tangledgroup/llama-cpp-wasm)
-- Typescript/Wasm (nicer API, available on npm): [ngxson/wllama](https://github.com/ngxson/wllama)
-- Ruby: [yoshoku/llama_cpp.rb](https://github.com/yoshoku/llama_cpp.rb)
-- Ruby: [docusealco/rllama](https://github.com/docusealco/rllama)
-- Rust (more features): [edgenai/llama_cpp-rs](https://github.com/edgenai/llama_cpp-rs)
-- Rust (nicer API): [mdrokz/rust-llama.cpp](https://github.com/mdrokz/rust-llama.cpp)
-- Rust (more direct bindings): [utilityai/llama-cpp-rs](https://github.com/utilityai/llama-cpp-rs)
-- Rust (automated build from crates.io): [ShelbyJenkins/llm_client](https://github.com/ShelbyJenkins/llm_client)
-- C#/.NET: [SciSharp/LLamaSharp](https://github.com/SciSharp/LLamaSharp)
-- C#/VB.NET (more features - community license): [LM-Kit.NET](https://docs.lm-kit.com/lm-kit-net/index.html)
-- Scala 3: [donderom/llm4s](https://github.com/donderom/llm4s)
-- Clojure: [phronmophobic/llama.clj](https://github.com/phronmophobic/llama.clj)
-- React Native: [mybigday/llama.rn](https://github.com/mybigday/llama.rn)
-- Java: [kherud/java-llama.cpp](https://github.com/kherud/java-llama.cpp)
-- Java: [QuasarByte/llama-cpp-jna](https://github.com/QuasarByte/llama-cpp-jna)
-- Zig: [deins/llama.cpp.zig](https://github.com/Deins/llama.cpp.zig)
-- Flutter/Dart: [netdur/llama_cpp_dart](https://github.com/netdur/llama_cpp_dart)
-- Flutter: [xuegao-tzx/Fllama](https://github.com/xuegao-tzx/Fllama)
-- PHP (API bindings and features built on top of llama.cpp): [distantmagic/resonance](https://github.com/distantmagic/resonance) [(more info)](https://github.com/ggml-org/llama.cpp/pull/6326)
-- Guile Scheme: [guile_llama_cpp](https://savannah.nongnu.org/projects/guile-llama-cpp)
-- Swift [srgtuszy/llama-cpp-swift](https://github.com/srgtuszy/llama-cpp-swift)
-- Swift [ShenghaiWang/SwiftLlama](https://github.com/ShenghaiWang/SwiftLlama)
-- Delphi [Embarcadero/llama-cpp-delphi](https://github.com/Embarcadero/llama-cpp-delphi)
-- Go (no CGo needed): [hybridgroup/yzma](https://github.com/hybridgroup/yzma)
-- Android: [llama.android](/examples/llama.android)
-
-</details>
-
-<details>
-<summary>UIs</summary>
-
-*(to have a project listed here, it should clearly state that it depends on `llama.cpp`)*
-
-- [AI Sublime Text plugin](https://github.com/yaroslavyaroslav/OpenAI-sublime-text) (MIT)
-- [BonzAI App](https://apps.apple.com/us/app/bonzai-your-local-ai-agent/id6752847988) (proprietary)
-- [cztomsik/ava](https://github.com/cztomsik/ava) (MIT)
-- [Dot](https://github.com/alexpinel/Dot) (GPL)
-- [eva](https://github.com/ylsdamxssjxxdd/eva) (MIT)
-- [iohub/collama](https://github.com/iohub/coLLaMA) (Apache-2.0)
-- [janhq/jan](https://github.com/janhq/jan) (AGPL)
-- [johnbean393/Sidekick](https://github.com/johnbean393/Sidekick) (MIT)
-- [KanTV](https://github.com/zhouwg/kantv?tab=readme-ov-file) (Apache-2.0)
-- [KodiBot](https://github.com/firatkiral/kodibot) (GPL)
-- [llama.vim](https://github.com/ggml-org/llama.vim) (MIT)
-- [LARS](https://github.com/abgulati/LARS) (AGPL)
-- [Llama Assistant](https://github.com/vietanhdev/llama-assistant) (GPL)
-- [LlamaLib](https://github.com/undreamai/LlamaLib) (Apache-2.0)
-- [LLMFarm](https://github.com/guinmoon/LLMFarm?tab=readme-ov-file) (MIT)
-- [LLMUnity](https://github.com/undreamai/LLMUnity) (MIT)
-- [LMStudio](https://lmstudio.ai/) (proprietary)
-- [LocalAI](https://github.com/mudler/LocalAI) (MIT)
-- [LostRuins/koboldcpp](https://github.com/LostRuins/koboldcpp) (AGPL)
-- [MindMac](https://mindmac.app) (proprietary)
-- [MindWorkAI/AI-Studio](https://github.com/MindWorkAI/AI-Studio) (FSL-1.1-MIT)
-- [Mobile-Artificial-Intelligence/maid](https://github.com/Mobile-Artificial-Intelligence/maid) (MIT)
-- [Mozilla-Ocho/llamafile](https://github.com/Mozilla-Ocho/llamafile) (Apache-2.0)
-- [nat/openplayground](https://github.com/nat/openplayground) (MIT)
-- [nomic-ai/gpt4all](https://github.com/nomic-ai/gpt4all) (MIT)
-- [ollama/ollama](https://github.com/ollama/ollama) (MIT)
-- [oobabooga/text-generation-webui](https://github.com/oobabooga/text-generation-webui) (AGPL)
-- [PocketPal AI](https://github.com/a-ghorbani/pocketpal-ai) (MIT)
-- [psugihara/FreeChat](https://github.com/psugihara/FreeChat) (MIT)
-- [ptsochantaris/emeltal](https://github.com/ptsochantaris/emeltal) (MIT)
-- [pythops/tenere](https://github.com/pythops/tenere) (AGPL)
-- [ramalama](https://github.com/containers/ramalama) (MIT)
-- [semperai/amica](https://github.com/semperai/amica) (MIT)
-- [withcatai/catai](https://github.com/withcatai/catai) (MIT)
-- [Autopen](https://github.com/blackhole89/autopen) (GPL)
-
-</details>
-
-<details>
-<summary>Tools</summary>
-
-- [akx/ggify](https://github.com/akx/ggify) – download PyTorch models from Hugging Face Hub and convert them to GGML
-- [akx/ollama-dl](https://github.com/akx/ollama-dl) – download models from the Ollama library to be used directly with llama.cpp
-- [crashr/gppm](https://github.com/crashr/gppm) – launch llama.cpp instances utilizing NVIDIA Tesla P40 or P100 GPUs with reduced idle power consumption
-- [gpustack/gguf-parser](https://github.com/gpustack/gguf-parser-go/tree/main/cmd/gguf-parser) - review/check the GGUF file and estimate the memory usage
-- [Styled Lines](https://marketplace.unity.com/packages/tools/generative-ai/styled-lines-llama-cpp-model-292902) (proprietary licensed, async wrapper of inference part for game development in Unity3d with pre-built Mobile and Web platform wrappers and a model example)
-- [unslothai/unsloth](https://github.com/unslothai/unsloth) – 🦥 exports/saves fine-tuned and trained models to GGUF (Apache-2.0)
-
-</details>
-
-<details>
-<summary>Infrastructure</summary>
-
-- [Paddler](https://github.com/intentee/paddler) - Open-source LLMOps platform for hosting and scaling AI in your own infrastructure
-- [GPUStack](https://github.com/gpustack/gpustack) - Manage GPU clusters for running LLMs
-- [llama_cpp_canister](https://github.com/onicai/llama_cpp_canister) - llama.cpp as a smart contract on the Internet Computer, using WebAssembly
-- [llama-swap](https://github.com/mostlygeek/llama-swap) - transparent proxy that adds automatic model switching with llama-server
-- [Kalavai](https://github.com/kalavai-net/kalavai-client) - Crowdsource end to end LLM deployment at any scale
-- [llmaz](https://github.com/InftyAI/llmaz) - ☸️ Easy, advanced inference platform for large language models on Kubernetes.
-- [LLMKube](https://github.com/defilantech/llmkube) - Kubernetes operator for llama.cpp with multi-GPU and Apple Silicon Metal
-  support"
-</details>
-
-<details>
-<summary>Games</summary>
-
-- [Lucy's Labyrinth](https://github.com/MorganRO8/Lucys_Labyrinth) - A simple maze game where agents controlled by an AI model will try to trick you.
-
-</details>
-
-
-## Supported backends
-
-| Backend | Target devices |
-| --- | --- |
-| [Metal](docs/build.md#metal-build) | Apple Silicon |
-| [BLAS](docs/build.md#blas-build) | All |
-| [BLIS](docs/backend/BLIS.md) | All |
-| [SYCL](docs/backend/SYCL.md) | Intel GPU |
-| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
-| [MUSA](docs/build.md#musa) | Moore Threads GPU |
-| [CUDA](docs/build.md#cuda) | Nvidia GPU |
-| [HIP](docs/build.md#hip) | AMD GPU |
-| [ZenDNN](docs/build.md#zendnn) | AMD CPU |
-| [Vulkan](docs/build.md#vulkan) | GPU |
-| [CANN](docs/build.md#cann) | Ascend NPU |
-| [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
-| [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
-| [WebGPU](docs/build.md#webgpu) | All |
-| [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
-| [Hexagon [In Progress]](docs/backend/snapdragon/README.md) | Snapdragon |
-| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
-
-## Obtaining and quantizing models
-
-The [Hugging Face](https://huggingface.co) platform hosts a [number of LLMs](https://huggingface.co/models?library=gguf&sort=trending) compatible with `llama.cpp`:
-
-- [Trending](https://huggingface.co/models?library=gguf&sort=trending)
-- [LLaMA](https://huggingface.co/models?sort=trending&search=llama+gguf)
-
-You can either manually download the GGUF file or directly use any `llama.cpp`-compatible models from [Hugging Face](https://huggingface.co/) or other model hosting sites, by using this CLI argument: `-hf <user>/<model>[:quant]`. For example:
-
-```sh
-llama-cli -hf ggml-org/gemma-3-1b-it-GGUF
-```
-
-By default, the CLI would download from Hugging Face, you can switch to other options with the environment variable `MODEL_ENDPOINT`. The `MODEL_ENDPOINT` must point to a Hugging Face compatible API endpoint.
-
-After downloading a model, use the CLI tools to run it locally - see below.
-
-`llama.cpp` requires the model to be stored in the [GGUF](https://github.com/ggml-org/ggml/blob/master/docs/gguf.md) file format. Models in other data formats can be converted to GGUF using the `convert_*.py` Python scripts in this repo.
-
-The Hugging Face platform provides a variety of online tools for converting, quantizing and hosting models with `llama.cpp`:
-
-- Use the [GGUF-my-repo space](https://huggingface.co/spaces/ggml-org/gguf-my-repo) to convert to GGUF format and quantize model weights to smaller sizes
-- Use the [GGUF-my-LoRA space](https://huggingface.co/spaces/ggml-org/gguf-my-lora) to convert LoRA adapters to GGUF format (more info: https://github.com/ggml-org/llama.cpp/discussions/10123)
-- Use the [GGUF-editor space](https://huggingface.co/spaces/CISCai/gguf-editor) to edit GGUF meta data in the browser (more info: https://github.com/ggml-org/llama.cpp/discussions/9268)
-- Use the [Inference Endpoints](https://ui.endpoints.huggingface.co/) to directly host `llama.cpp` in the cloud (more info: https://github.com/ggml-org/llama.cpp/discussions/9669)
-
-To learn more about model quantization, [read this documentation](tools/quantize/README.md)
-
-## [`llama-cli`](tools/cli)
-
-#### A CLI tool for accessing and experimenting with most of `llama.cpp`'s functionality.
-
-- <details open>
-    <summary>Run in conversation mode</summary>
-
-    Models with a built-in chat template will automatically activate conversation mode. If this doesn't occur, you can manually enable it by adding `-cnv` and specifying a suitable chat template with `--chat-template NAME`
-
-    ```bash
-    llama-cli -m model.gguf
-
-    # > hi, who are you?
-    # Hi there! I'm your helpful assistant! I'm an AI-powered chatbot designed to assist and provide information to users like you. I'm here to help answer your questions, provide guidance, and offer support on a wide range of topics. I'm a friendly and knowledgeable AI, and I'm always happy to help with anything you need. What's on your mind, and how can I assist you today?
-    #
-    # > what is 1+1?
-    # Easy peasy! The answer to 1+1 is... 2!
-    ```
-
-    </details>
-
-- <details>
-    <summary>Run in conversation mode with custom chat template</summary>
-
-    ```bash
-    # use the "chatml" template (use -h to see the list of supported templates)
-    llama-cli -m model.gguf -cnv --chat-template chatml
-
-    # use a custom template
-    llama-cli -m model.gguf -cnv --in-prefix 'User: ' --reverse-prompt 'User:'
-    ```
-
-    </details>
-
-- <details>
-    <summary>Constrain the output with a custom grammar</summary>
-
-    ```bash
-    llama-cli -m model.gguf -n 256 --grammar-file grammars/json.gbnf -p 'Request: schedule a call at 8pm; Command:'
-
-    # {"appointmentTime": "8pm", "appointmentDetails": "schedule a a call"}
-    ```
-
-    The [grammars/](grammars/) folder contains a handful of sample grammars. To write your own, check out the [GBNF Guide](grammars/README.md).
-
-    For authoring more complex JSON grammars, check out https://grammar.intrinsiclabs.ai/
-
-    </details>
-
-
-## [`llama-server`](tools/server)
-
-#### A lightweight, [OpenAI API](https://github.com/openai/openai-openapi) compatible, HTTP server for serving LLMs.
-
-- <details open>
-    <summary>Start a local HTTP server with default configuration on port 8080</summary>
-
-    ```bash
-    llama-server -m model.gguf --port 8080
-
-    # Basic web UI can be accessed via browser: http://localhost:8080
-    # Chat completion endpoint: http://localhost:8080/v1/chat/completions
-    ```
-
-    </details>
-
-- <details>
-    <summary>Support multiple-users and parallel decoding</summary>
-
-    ```bash
-    # up to 4 concurrent requests, each with 4096 max context
-    llama-server -m model.gguf -c 16384 -np 4
-    ```
-
-    </details>
-
-- <details>
-    <summary>Enable speculative decoding</summary>
-
-    ```bash
-    # the draft.gguf model should be a small variant of the target model.gguf
-    llama-server -m model.gguf -md draft.gguf
-    ```
-
-    </details>
-
-- <details>
-    <summary>Serve an embedding model</summary>
-
-    ```bash
-    # use the /embedding endpoint
-    llama-server -m model.gguf --embedding --pooling cls -ub 8192
-    ```
-
-    </details>
-
-- <details>
-    <summary>Serve a reranking model</summary>
-
-    ```bash
-    # use the /reranking endpoint
-    llama-server -m model.gguf --reranking
-    ```
-
-    </details>
-
-- <details>
-    <summary>Constrain all outputs with a grammar</summary>
-
-    ```bash
-    # custom grammar
-    llama-server -m model.gguf --grammar-file grammar.gbnf
-
-    # JSON
-    llama-server -m model.gguf --grammar-file grammars/json.gbnf
-    ```
-
-    </details>
-
-
-## [`llama-perplexity`](tools/perplexity)
-
-#### A tool for measuring the [perplexity](tools/perplexity/README.md) [^1] (and other quality metrics) of a model over a given text.
-
-- <details open>
-    <summary>Measure the perplexity over a text file</summary>
-
-    ```bash
-    llama-perplexity -m model.gguf -f file.txt
-
-    # [1]15.2701,[2]5.4007,[3]5.3073,[4]6.2965,[5]5.8940,[6]5.6096,[7]5.7942,[8]4.9297, ...
-    # Final estimate: PPL = 5.4007 +/- 0.67339
-    ```
-
-    </details>
-
-- <details>
-    <summary>Measure KL divergence</summary>
-
-    ```bash
-    # TODO
-    ```
-
-    </details>
-
-[^1]: [https://huggingface.co/docs/transformers/perplexity](https://huggingface.co/docs/transformers/perplexity)
-
-## [`llama-bench`](tools/llama-bench)
-
-#### Benchmark the performance of the inference for various parameters.
-
-- <details open>
-    <summary>Run default benchmark</summary>
-
-    ```bash
-    llama-bench -m model.gguf
-
-    # Output:
-    # | model               |       size |     params | backend    | threads |          test |                  t/s |
-    # | ------------------- | ---------: | ---------: | ---------- | ------: | ------------: | -------------------: |
-    # | qwen2 1.5B Q4_0     | 885.97 MiB |     1.54 B | Metal,BLAS |      16 |         pp512 |      5765.41 ± 20.55 |
-    # | qwen2 1.5B Q4_0     | 885.97 MiB |     1.54 B | Metal,BLAS |      16 |         tg128 |        197.71 ± 0.81 |
-    #
-    # build: 3e0ba0e60 (4229)
-    ```
-
-    </details>
-
-## [`llama-simple`](examples/simple)
-
-#### A minimal example for implementing apps with `llama.cpp`. Useful for developers.
-
-- <details>
-    <summary>Basic text completion</summary>
-
-    ```bash
-    llama-simple -m model.gguf
-
-    # Hello my name is Kaitlyn and I am a 16 year old girl. I am a junior in high school and I am currently taking a class called "The Art of
-    ```
-
-    </details>
-
-
-## Contributing
-
-- Contributors can open PRs
-- Collaborators will be invited based on contributions
-- Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
-- Any help with managing issues, PRs and projects is very appreciated!
-- See [good first issues](https://github.com/ggml-org/llama.cpp/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) for tasks suitable for first contributions
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
-- Make sure to read this: [Inference at the edge](https://github.com/ggml-org/llama.cpp/discussions/205)
-- A bit of backstory for those who are interested: [Changelog podcast](https://changelog.com/podcast/532)
-
-## Other documentation
-
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [GBNF grammars](grammars/README.md)
-
-#### Development documentation
-
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Build on Android](docs/android.md)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-
-#### Seminal papers and background on the models
-
-If your issue is with model generation quality, then please at least scan the following links and papers to understand the limitations of LLaMA models. This is especially important when choosing an appropriate model size and appreciating both the significant and subtle differences between LLaMA models and ChatGPT:
-- LLaMA:
-    - [Introducing LLaMA: A foundational, 65-billion-parameter large language model](https://ai.facebook.com/blog/large-language-model-llama-meta-ai/)
-    - [LLaMA: Open and Efficient Foundation Language Models](https://arxiv.org/abs/2302.13971)
-- GPT-3
-    - [Language Models are Few-Shot Learners](https://arxiv.org/abs/2005.14165)
-- GPT-3.5 / InstructGPT / ChatGPT:
-    - [Aligning language models to follow instructions](https://openai.com/research/instruction-following)
-    - [Training language models to follow instructions with human feedback](https://arxiv.org/abs/2203.02155)
-
-## XCFramework
-The XCFramework is a precompiled version of the library for iOS, visionOS, tvOS,
-and macOS. It can be used in Swift projects without the need to compile the
-library from source. For example:
-```swift
-// swift-tools-version: 5.10
-// The swift-tools-version declares the minimum version of Swift required to build this package.
-
-import PackageDescription
-
-let package = Package(
-    name: "MyLlamaPackage",
-    targets: [
-        .executableTarget(
-            name: "MyLlamaPackage",
-            dependencies: [
-                "LlamaFramework"
-            ]),
-        .binaryTarget(
-            name: "LlamaFramework",
-            url: "https://github.com/ggml-org/llama.cpp/releases/download/b5046/llama-b5046-xcframework.zip",
-            checksum: "c19be78b5f00d8d29a25da41042cb7afa094cbf6280a225abe614b03b20029ab"
-        )
-    ]
-)
-```
-The above example is using an intermediate build `b5046` of the library. This can be modified
-to use a different version by changing the URL and checksum.
-
-## Completions
-Command-line completion is available for some environments.
-
-#### Bash Completion
-```bash
-$ build/bin/llama-cli --completion-bash > ~/.llama-completion.bash
-$ source ~/.llama-completion.bash
-```
-Optionally this can be added to your `.bashrc` or `.bash_profile` to load it
-automatically. For example:
-```console
-$ echo "source ~/.llama-completion.bash" >> ~/.bashrc
-```
-
-## Dependencies
-
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [stb-image](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [miniaudio.h](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+---
