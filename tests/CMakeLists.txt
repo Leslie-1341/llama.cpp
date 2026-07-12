@@ -194,6 +194,12 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-llama-archs.cpp)
 endif()
 
+# KV-P0-B1: fixed physical-cell slot backing store - no model, drives llama_kv_backing_store_file
+# directly via the internal src/ header (same pattern as test-llama-archs.cpp above).
+if (UNIX)
+    llama_build_and_test(test-kv-backing-store.cpp)
+endif()
+
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
 llama_build_and_test(test-jinja.cpp)
 llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)

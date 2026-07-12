@@ -12,6 +12,7 @@
 #include <bitset>
 #include <memory>
 #include <set>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -39,6 +40,8 @@ enum class llama_kv_backing_store_status : uint8_t {
 };
 
 struct llama_kv_backing_store_stats {
+    // cumulative I/O volume across the lifetime of the store (grows with every swap-out/in,
+    // independent of the fixed on-disk capacity below).
     uint64_t bytes_written  = 0;
     uint64_t bytes_read     = 0;
     uint64_t bytes_released = 0;
@@ -46,6 +49,9 @@ struct llama_kv_backing_store_stats {
     uint64_t read_calls     = 0;
     uint64_t release_calls  = 0;
     int      last_errno     = 0;
+    // fixed logical capacity (n_slots * cell_stride) of the fixed-slot backing store. Set once
+    // at construction; unlike the counters above this never grows and is preserved by reset().
+    uint64_t bytes_capacity = 0;
 };
 
 class llama_kv_backing_store_i {
@@ -96,9 +102,20 @@ public:
     }
 };
 
+// KV-P0-B1: fixed physical-cell slot backing store.
+//
+// The file is a fixed-capacity (n_slots * cell_stride) sparse file. offset(cell_id) =
+// cell_id * cell_stride is a pure function of the constructor arguments - there is no
+// append-at-file_len allocation, so the file never grows past its initial capacity no matter
+// how many times a given cell is swapped out. A repeat swap-out of the same physical cell
+// overwrites its own slot in place.
 class llama_kv_backing_store_file : public llama_kv_backing_store_i {
 public:
-    llama_kv_backing_store_file();
+    // dir:         directory the backing file is created in ("" => "/tmp").
+    // n_slots:     number of fixed physical-cell slots (== KV physical cell count).
+    // cell_stride: bytes per slot (== full K/V byte width of one physical cell across all
+    //              layers). Must be > 0 for the store to become enabled.
+    llama_kv_backing_store_file(const std::string & dir, uint32_t n_slots, size_t cell_stride);
     ~llama_kv_backing_store_file() override;
 
     llama_kv_backing_store_status write_cell(
@@ -122,18 +139,43 @@ public:
         return fd >= 0;
     }
 
-    uint64_t get_file_len() const {
-        return file_len;
+    uint32_t get_n_slots() const {
+        return n_slots;
+    }
+
+    size_t get_cell_stride() const {
+        return cell_stride;
+    }
+
+    uint64_t get_capacity() const {
+        return capacity;
+    }
+
+    bool used_o_tmpfile() const {
+        return used_o_tmpfile_;
+    }
+
+    const std::string & get_dir() const {
+        return dir;
     }
 
     const llama_kv_backing_store_stats & get_stats() const override {
         return stats;
     }
 
+    // actual on-disk size/allocation of the backing file (fstat-based). Used to verify the
+    // fixed-capacity invariant (actual_file_size() == get_capacity() at all times) and that
+    // repeated in-place overwrites of the same slots do not grow disk usage.
+    uint64_t get_actual_file_size() const;
+    uint64_t get_actual_blocks_512() const;
+
 private:
     int fd = -1;
-    std::FILE * file = nullptr;
-    uint64_t file_len = 0;
+    std::string dir;
+    uint32_t n_slots     = 0;
+    size_t   cell_stride = 0;
+    uint64_t capacity    = 0;
+    bool     used_o_tmpfile_ = false;
     llama_kv_backing_store_stats stats;
 };
 

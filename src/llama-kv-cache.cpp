@@ -115,46 +115,153 @@ static const char * llama_kv_backing_store_status_name(llama_kv_backing_store_st
     return "unknown";
 }
 
-llama_kv_backing_store_file::llama_kv_backing_store_file() {
+llama_kv_backing_store_file::llama_kv_backing_store_file(
+        const std::string & dir_req,
+        uint32_t n_slots_,
+        size_t cell_stride_)
+    : dir(dir_req.empty() ? std::string("/tmp") : dir_req), n_slots(n_slots_), cell_stride(cell_stride_) {
 #if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
-#if defined(O_TMPFILE)
-    fd = open("/tmp", O_TMPFILE | O_RDWR | O_CLOEXEC, S_IRUSR | S_IWUSR);
-    if (fd >= 0) {
+    if (n_slots == 0 || cell_stride == 0) {
+        stats.last_errno = EOVERFLOW;
         return;
     }
-    stats.last_errno = errno;
+    if ((uint64_t) cell_stride > std::numeric_limits<uint64_t>::max() / (uint64_t) n_slots) {
+        stats.last_errno = EOVERFLOW;
+        return;
+    }
+
+    const uint64_t capacity_ = (uint64_t) n_slots * (uint64_t) cell_stride;
+    if (capacity_ > (uint64_t) std::numeric_limits<off_t>::max()) {
+        stats.last_errno = EOVERFLOW;
+        return;
+    }
+
+    capacity = capacity_;
+
+    // LLAMA_KV_SWAP_DIR must be honored exactly: if the directory is not usable, fail rather
+    // than silently falling back to some other location the caller did not ask for.
+    struct stat st;
+    if (::stat(dir.c_str(), &st) != 0) {
+        stats.last_errno = errno;
+        return;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        stats.last_errno = ENOTDIR;
+        return;
+    }
+
+#if defined(O_TMPFILE)
+    fd = open(dir.c_str(), O_TMPFILE | O_RDWR | O_CLOEXEC, S_IRUSR | S_IWUSR);
+    if (fd >= 0) {
+        used_o_tmpfile_ = true;
+    } else {
+        stats.last_errno = errno;
+    }
 #endif
 
-    file = std::tmpfile();
-    if (!file) {
+    if (fd < 0) {
+        // O_TMPFILE unavailable/unsupported on this directory's filesystem: fall back to
+        // mkstemp()+unlink() *within the same directory* so the file is still anonymous and
+        // still under the caller-specified path. Never falls back to a different directory.
+        std::string tmpl = dir + "/llama-kv-swap-XXXXXX";
+        std::vector<char> buf(tmpl.begin(), tmpl.end());
+        buf.push_back('\0');
+
+        const int tmp_fd = mkstemp(buf.data());
+        if (tmp_fd < 0) {
+            stats.last_errno = errno;
+            return;
+        }
+
+        if (unlink(buf.data()) != 0) {
+            stats.last_errno = errno;
+            close(tmp_fd);
+            return;
+        }
+        const int fd_flags = fcntl(tmp_fd, F_GETFD);
+        if (fd_flags < 0 || fcntl(tmp_fd, F_SETFD, fd_flags | FD_CLOEXEC) != 0) {
+            stats.last_errno = errno;
+            close(tmp_fd);
+            return;
+        }
+
+        fd = tmp_fd;
+        used_o_tmpfile_ = false;
+    }
+
+    if (ftruncate(fd, (off_t) capacity) != 0) {
         stats.last_errno = errno;
+        close(fd);
+        fd = -1;
         return;
     }
 
-    fd = fileno(file);
-    if (fd < 0) {
-        stats.last_errno = errno;
-        std::fclose(file);
-        file = nullptr;
-    }
+    stats.bytes_capacity = capacity;
+    stats.last_errno = 0;
 #else
     stats.last_errno = ENOSYS;
 #endif
 }
 
-llama_kv_backing_store_file::~llama_kv_backing_store_file() {
-#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
-    if (file) {
-        std::fclose(file);
-        file = nullptr;
-        fd = -1;
-        return;
+static bool llama_kv_fixed_slot_bounds(
+        uint32_t   cell,
+        uint32_t   n_slots,
+        size_t     cell_stride,
+        uint64_t   capacity,
+        uint64_t & offset_out) {
+    offset_out = 0;
+    if (cell >= n_slots || cell_stride == 0) {
+        return false;
+    }
+    if (cell != 0 && (uint64_t) cell_stride > std::numeric_limits<uint64_t>::max() / (uint64_t) cell) {
+        return false;
     }
 
+    const uint64_t offset = (uint64_t) cell * (uint64_t) cell_stride;
+    if (offset > capacity || (uint64_t) cell_stride > capacity - offset) {
+        return false;
+    }
+
+    offset_out = offset;
+    return true;
+}
+
+llama_kv_backing_store_file::~llama_kv_backing_store_file() {
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
     if (fd >= 0) {
         close(fd);
         fd = -1;
     }
+#endif
+}
+
+uint64_t llama_kv_backing_store_file::get_actual_file_size() const {
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+    if (fd < 0) {
+        return 0;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        return 0;
+    }
+    return (uint64_t) st.st_size;
+#else
+    return 0;
+#endif
+}
+
+uint64_t llama_kv_backing_store_file::get_actual_blocks_512() const {
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+    if (fd < 0) {
+        return 0;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        return 0;
+    }
+    return (uint64_t) st.st_blocks;
+#else
+    return 0;
 #endif
 }
 
@@ -165,19 +272,23 @@ llama_kv_backing_store_status llama_kv_backing_store_file::write_cell(
         size_t     size,
         uint64_t & offset_out) {
     (void) strm;
-    (void) cell;
 
     offset_out = 0;
 
     if (fd < 0) {
         return llama_kv_backing_store_status::disabled;
     }
-    if (!data || size == 0) {
+    if (!data || size == 0 || cell >= n_slots || size != cell_stride) {
         return llama_kv_backing_store_status::bad_slot;
     }
 
 #if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
-    const uint64_t offset = file_len;
+    // offset is a pure function of cell: repeat swap-outs of the same physical cell always
+    // overwrite the same fixed slot, so the file never grows past n_slots * cell_stride.
+    uint64_t offset = 0;
+    if (!llama_kv_fixed_slot_bounds(cell, n_slots, cell_stride, capacity, offset)) {
+        return llama_kv_backing_store_status::bad_slot;
+    }
     const char * ptr = static_cast<const char *>(data);
     size_t written = 0;
 
@@ -198,7 +309,6 @@ llama_kv_backing_store_status llama_kv_backing_store_file::write_cell(
     }
 
     offset_out = offset;
-    file_len += size;
     stats.bytes_written += size;
     stats.write_calls += 1;
     stats.last_errno = 0;
@@ -217,21 +327,28 @@ llama_kv_backing_store_status llama_kv_backing_store_file::read_cell(
         void *   data,
         size_t   size) {
     (void) strm;
-    (void) cell;
 
     if (fd < 0) {
         return llama_kv_backing_store_status::disabled;
     }
-    if (!data || size == 0 || offset > file_len || size > file_len - offset) {
+    if (!data || size == 0 || cell >= n_slots || size != cell_stride) {
+        return llama_kv_backing_store_status::bad_slot;
+    }
+
+    uint64_t expected_offset = 0;
+    if (!llama_kv_fixed_slot_bounds(cell, n_slots, cell_stride, capacity, expected_offset) ||
+            offset != expected_offset || size > capacity - expected_offset) {
+        // caller-supplied offset does not match this cell's fixed slot address (stale/corrupt
+        // metadata) - refuse rather than trusting it.
         return llama_kv_backing_store_status::bad_slot;
     }
 
 #if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
     char * ptr = static_cast<char *>(data);
-    size_t read = 0;
+    size_t read_bytes = 0;
 
-    while (read < size) {
-        const ssize_t ret = pread(fd, ptr + read, size - read, (off_t) (offset + read));
+    while (read_bytes < size) {
+        const ssize_t ret = pread(fd, ptr + read_bytes, size - read_bytes, (off_t) (expected_offset + read_bytes));
         if (ret < 0) {
             if (errno == EINTR) {
                 continue;
@@ -243,7 +360,7 @@ llama_kv_backing_store_status llama_kv_backing_store_file::read_cell(
             stats.last_errno = EIO;
             return llama_kv_backing_store_status::io_error;
         }
-        read += (size_t) ret;
+        read_bytes += (size_t) ret;
     }
 
     stats.bytes_read += size;
@@ -261,7 +378,8 @@ llama_kv_backing_store_status llama_kv_backing_store_file::release(uint64_t offs
     if (fd < 0) {
         return llama_kv_backing_store_status::disabled;
     }
-    if (size == 0 || offset > file_len || size > file_len - offset) {
+    if (size == 0 || size != cell_stride || cell_stride == 0 ||
+            offset % cell_stride != 0 || offset > capacity || size > capacity - offset) {
         return llama_kv_backing_store_status::bad_slot;
     }
 
@@ -273,19 +391,35 @@ llama_kv_backing_store_status llama_kv_backing_store_file::release(uint64_t offs
 }
 
 llama_kv_backing_store_status llama_kv_backing_store_file::reset() {
-    stats = {};
-
+    // reset() only clears cumulative I/O telemetry and re-zeroes the fixed-capacity file; the
+    // slot geometry (n_slots/cell_stride/capacity) is structural and survives reset so the
+    // store can be reused immediately with the same addressing.
     if (fd < 0) {
-        return llama_kv_backing_store_status::disabled;
+        return llama_kv_backing_store_status::io_error;
     }
 
 #if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+    // truncate to 0 then back up to capacity to re-establish a zero-filled sparse file of the
+    // same fixed size (portable across tmpfs/regular filesystems; avoids relying on
+    // FALLOC_FL_PUNCH_HOLE support).
     if (ftruncate(fd, 0) != 0) {
         stats.last_errno = errno;
         return llama_kv_backing_store_status::io_error;
     }
+    if (ftruncate(fd, (off_t) capacity) != 0) {
+        stats.last_errno = errno;
+        close(fd);
+        fd = -1;
+        return llama_kv_backing_store_status::io_error;
+    }
 
-    file_len = 0;
+    stats.bytes_written  = 0;
+    stats.bytes_read     = 0;
+    stats.bytes_released = 0;
+    stats.write_calls    = 0;
+    stats.read_calls     = 0;
+    stats.release_calls  = 0;
+    stats.last_errno = 0;
     return llama_kv_backing_store_status::ok;
 #else
     stats.last_errno = ENOSYS;
@@ -305,7 +439,9 @@ static void llama_kv_backing_store_selftest_once() {
         return;
     }
 
-    llama_kv_backing_store_file store;
+    const char payload[] = "hello-kv";
+
+    llama_kv_backing_store_file store("", /*n_slots=*/1, /*cell_stride=*/sizeof(payload));
     if (!store.is_enabled()) {
         const auto & stats = store.get_stats();
         LLAMA_LOG_ERROR("KV_SWAP_BACKEND_SELFTEST: backing store selftest fail status=disabled errno=%d\n",
@@ -313,7 +449,6 @@ static void llama_kv_backing_store_selftest_once() {
         return;
     }
 
-    const char payload[] = "hello-kv";
     char restored[sizeof(payload)] = {};
     uint64_t offset = 0;
 
@@ -372,6 +507,17 @@ llama_kv_cache::llama_kv_cache(
 
     llama_kv_backing_store_selftest_once();
 
+    // KV-P0-B1: shared backing-store directory for both exact and paged swap. Honored exactly
+    // as given (see llama_kv_backing_store_file ctor) - no silent fallback to a different dir.
+    const char * LLAMA_KV_SWAP_DIR = std::getenv("LLAMA_KV_SWAP_DIR");
+    const std::string kv_swap_dir = LLAMA_KV_SWAP_DIR ? LLAMA_KV_SWAP_DIR : "";
+
+    // Resolved to true below if exact swap passes its own validity checks. Actual backing-store
+    // construction (and the exact/paged mutual-exclusion decision) is deferred until the KV
+    // layer tensors exist, because the fixed per-cell slot stride is computed from their row
+    // sizes (see the deferred construction block after the layer loop).
+    bool kv_swap_want_exact = false;
+
     const char * LLAMA_KV_SWAP      = std::getenv("LLAMA_KV_SWAP");
     const char * LLAMA_KV_SWAP_MODE = std::getenv("LLAMA_KV_SWAP_MODE");
     const char * LLAMA_KV_SWAP_WINDOW = std::getenv("LLAMA_KV_SWAP_WINDOW");
@@ -407,20 +553,8 @@ llama_kv_cache::llama_kv_cache(
             LLAMA_LOG_WARN("%s: KV swap exact mode requires !v_trans && n_stream==1 "
                     "(v_trans=%d, n_stream=%u) - disabled\n", __func__, (int) v_trans, n_stream);
         } else {
-            auto store = std::make_unique<llama_kv_backing_store_file>();
-            if (!store->is_enabled()) {
-                const auto & stats = store->get_stats();
-                kv_swap_backend_failures += 1;
-                LLAMA_LOG_WARN("%s: KV swap exact mode disabled: file backing store unavailable "
-                        "(errno=%d)\n", __func__, stats.last_errno);
-            } else {
-                kv_swap_store   = std::move(store);
-                kv_swap_enabled = true;
-                kv_swap_mode_   = kv_swap_mode::exact;
-                kv_swap_madvise = kv_swap_madvise_requested;
-                LLAMA_LOG_INFO("%s: KV swap exact mode enabled (backend=file, window=%u, sink=%u)\n",
-                        __func__, kv_swap_window, kv_swap_sink);
-            }
+            // backing-store construction deferred: see kv_swap_want_exact declaration above.
+            kv_swap_want_exact = true;
         }
     }
 
@@ -540,27 +674,15 @@ llama_kv_cache::llama_kv_cache(
                     }
                 }
             }
+            // paged_swap_enabled here is still the tentative request flag; final resolution
+            // (mutual exclusion with exact swap, then backing-store construction) happens after
+            // the KV layer tensors are built - see the deferred construction block below.
             paged_block_release_enabled = release_env && !paged_swap_enabled;
-            if (paged_swap_enabled && !kv_swap_store) {
-                auto store = std::make_unique<llama_kv_backing_store_file>();
-                if (!store->is_enabled()) {
-                    const auto & stats = store->get_stats();
-                    paged_swap_backend_failures += 1;
-                    paged_swap_enabled = false;
-                    LLAMA_LOG_WARN("%s: KV paged block swap disabled: file backing store unavailable "
-                            "(errno=%d)\n", __func__, stats.last_errno);
-                } else {
-                    kv_swap_store = std::move(store);
-                }
-            }
             LLAMA_LOG_INFO("%s: KV paged metadata enabled (block_size=%u, n_blocks=%u, shift=%u, "
                     "non_identity=%d, mapping_changed=%llu)\n",
                     __func__, paged_block_size, paged_n_blocks, paged_shift,
                     paged_non_identity_enabled ? 1 : 0,
                     (unsigned long long) paged_block_mapping_changed);
-            if (paged_swap_enabled) {
-                LLAMA_LOG_INFO("%s: KV paged block swap enabled (backend=file, release=disabled)\n", __func__);
-            }
             if (paged_block_release_enabled) {
                 LLAMA_LOG_INFO("%s: KV paged block release enabled (madvise-only)\n", __func__);
             }
@@ -583,6 +705,20 @@ llama_kv_cache::llama_kv_cache(
             // itself is built lazily on the first protect call, once KV tensor data is allocated.
             paged_refault_init();
         }
+    }
+
+    // KV-P0-B1: exact swap and paged block swap cannot share one fixed-slot backing store in
+    // this stage (exact addresses by physical cell id, paged addresses the same physical-cell
+    // id space one block at a time - reusing the same n_slots=kv_size layout would work
+    // arithmetically, but the two paths have never been validated to swap-out/in the same cell
+    // concurrently without racing each other's SWAPPED/RESIDENT bookkeeping). If both are
+    // requested, keep paged swap and disable exact - never pick silently.
+    if (kv_swap_want_exact && paged_swap_enabled) {
+        LLAMA_LOG_WARN("%s: KV exact swap (LLAMA_KV_SWAP_MODE=exact) and KV paged block swap "
+                "(LLAMA_KV_PAGED_SWAP=1) were both requested; a single fixed-slot backing store "
+                "cannot safely serve both in this stage - keeping paged block swap, disabling "
+                "exact swap\n", __func__);
+        kv_swap_want_exact = false;
     }
 
     const uint32_t n_layer_kv = hparams.n_layer_kv();
@@ -713,6 +849,94 @@ llama_kv_cache::llama_kv_cache(
         map_layer_ids[il] = layers.size();
 
         layers.push_back({ il, k, v, k_stream, v_stream, });
+    }
+
+    // KV-P0-B1: deferred fixed-slot backing-store construction. cell_stride is the full K/V
+    // byte width of one physical cell across all layers - the same formula swap_out_cell() /
+    // paged_swap_out_block_impl() already use for their staging buffer, computed here from the
+    // just-built layer tensors (nb[1] is set at tensor-creation time, independent of whether the
+    // backing buffer has been allocated yet). n_slots = kv_size, i.e. one slot per physical
+    // cell; paged block swap-out still writes/reads one cell at a time into this same fixed
+    // layout (no block aggregation in this stage).
+    if (kv_swap_want_exact || paged_swap_enabled) {
+        size_t cell_stride = 0;
+        bool cell_stride_overflow = false;
+        for (const auto & layer : layers) {
+            if (!layer.k_stream.empty() && layer.k_stream[0]) {
+                const size_t row_size = layer.k_stream[0]->nb[1];
+                if (row_size > std::numeric_limits<size_t>::max() - cell_stride) {
+                    cell_stride_overflow = true;
+                    break;
+                }
+                cell_stride += row_size;
+            }
+            if (layer.v && !layer.v_stream.empty() && layer.v_stream[0]) {
+                const size_t row_size = layer.v_stream[0]->nb[1];
+                if (row_size > std::numeric_limits<size_t>::max() - cell_stride) {
+                    cell_stride_overflow = true;
+                    break;
+                }
+                cell_stride += row_size;
+            }
+        }
+
+        if (cell_stride_overflow) {
+            LLAMA_LOG_ERROR("%s: KV swap disabled: per-cell K/V byte stride overflow (errno=%d)\n",
+                    __func__, EOVERFLOW);
+            if (kv_swap_want_exact) {
+                kv_swap_backend_failures += 1;
+            }
+            if (paged_swap_enabled) {
+                paged_swap_backend_failures += 1;
+                paged_swap_enabled = false;
+            }
+            kv_swap_want_exact = false;
+        } else if (cell_stride == 0) {
+            LLAMA_LOG_WARN("%s: KV swap disabled: could not determine a non-zero per-cell K/V byte stride\n",
+                    __func__);
+            if (kv_swap_want_exact) {
+                kv_swap_backend_failures += 1;
+            }
+            if (paged_swap_enabled) {
+                paged_swap_backend_failures += 1;
+                paged_swap_enabled = false;
+            }
+            kv_swap_want_exact = false;
+        } else {
+            auto store = std::make_unique<llama_kv_backing_store_file>(kv_swap_dir, kv_size, cell_stride);
+            if (!store->is_enabled()) {
+                const auto & st = store->get_stats();
+                LLAMA_LOG_WARN("%s: KV swap backing store unavailable (dir=%s errno=%d) - swap disabled\n",
+                        __func__, (kv_swap_dir.empty() ? "/tmp" : kv_swap_dir.c_str()), st.last_errno);
+                if (kv_swap_want_exact) {
+                    kv_swap_backend_failures += 1;
+                }
+                if (paged_swap_enabled) {
+                    paged_swap_backend_failures += 1;
+                    paged_swap_enabled = false;
+                }
+                kv_swap_want_exact = false;
+            } else {
+                LLAMA_LOG_INFO("%s: KV swap backing store ready (dir=%s o_tmpfile=%d n_slots=%u "
+                        "cell_stride=%zu capacity=%.2f MiB)\n",
+                        __func__, store->get_dir().c_str(), store->used_o_tmpfile() ? 1 : 0,
+                        store->get_n_slots(), store->get_cell_stride(),
+                        (double) store->get_capacity() / 1024.0 / 1024.0);
+
+                kv_swap_store = std::move(store);
+
+                if (kv_swap_want_exact) {
+                    kv_swap_enabled = true;
+                    kv_swap_mode_   = kv_swap_mode::exact;
+                    kv_swap_madvise = kv_swap_madvise_requested;
+                    LLAMA_LOG_INFO("%s: KV swap exact mode enabled (backend=file, window=%u, sink=%u)\n",
+                            __func__, kv_swap_window, kv_swap_sink);
+                }
+                if (paged_swap_enabled) {
+                    LLAMA_LOG_INFO("%s: KV paged block swap enabled (backend=file, release=disabled)\n", __func__);
+                }
+            }
+        }
     }
 
     if (reuse) {
@@ -2353,8 +2577,8 @@ bool llama_kv_cache::paged_swap_in_block(uint32_t physical_block) const {
         if (cell >= cells.size()) {
             paged_swap_in_fail_bad_size += 1;
             paged_swap_backend_failures += 1;
-            LLAMA_LOG_ERROR("%s: KV paged swap-in cell OOB: block=%u cell=%u cell_in_block=%u cells=%zu expected=%zu state=%d\n",
-                    __func__, physical_block, cell, cell_in_block, cells.size(), total_size,
+            LLAMA_LOG_ERROR("%s: KV paged swap-in cell OOB: block=%u cell=%u cell_in_block=%u cells=%u expected=%zu state=%d\n",
+                    __func__, physical_block, cell, cell_in_block, static_cast<unsigned>(cells.size()), total_size,
                     (int) paged_block_states[physical_block]);
             return false;
         }
