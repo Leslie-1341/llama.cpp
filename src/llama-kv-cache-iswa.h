@@ -114,6 +114,9 @@ public:
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
+    void clear_paged_swap_error() override;
+    bool has_paged_swap_error() const override;
+    llama_paged_swap_error get_paged_swap_error() const override;
 
     //
     // llama_kv_cache_iswa_context specific API

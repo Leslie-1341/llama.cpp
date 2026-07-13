@@ -396,9 +396,9 @@ public:
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
 
-    void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
-    void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
-    void set_input_paged_row_idx(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    bool set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
+    bool set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
+    bool set_input_paged_row_idx(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
@@ -504,12 +504,24 @@ private:
     void paged_note_cells(const slot_info & sinfo);
     uint32_t paged_resolve(uint32_t cell) const;
     uint32_t paged_write_resolve(uint32_t cell) const;
-    void paged_ensure_write_resident(uint32_t phys_cell) const;
-    void paged_check_read_resident(uint32_t phys_cell, bool active) const;
-    void paged_check_read_resident_impl(uint32_t phys_cell, bool active) const;
+    bool paged_ensure_write_resident(uint32_t phys_cell) const;
+    bool paged_check_read_resident(uint32_t phys_cell, bool required_by_active) const;
+    bool paged_check_read_resident_impl(uint32_t phys_cell, bool required_by_active) const;
     void paged_swap_out_block(uint32_t physical_block, bool do_madvise = true) const;
     void paged_swap_out_block_impl(uint32_t physical_block, bool do_madvise) const;
-    bool paged_swap_in_block(uint32_t physical_block) const;
+    bool paged_swap_in_block(
+            uint32_t physical_block,
+            bool fatal_on_failure,
+            llama_paged_swap_error_reason failure_reason) const;
+    void clear_paged_swap_error();
+    void set_paged_swap_error(
+            llama_paged_swap_error_reason reason,
+            uint32_t physical_block,
+            uint32_t physical_cell,
+            int backend_status = 0,
+            int backend_errno = 0) const;
+    bool has_paged_swap_error() const;
+    llama_paged_swap_error get_paged_swap_error() const;
     uint64_t paged_madvise_block(
             uint32_t physical_block,
             const std::vector<uint8_t> * active,
@@ -668,6 +680,12 @@ private:
     mutable uint64_t paged_prefetch_seq_last_released_blocks = 0;
     mutable uint64_t paged_prefetch_seq_last_invalid_cells = 0;
     mutable uint64_t paged_prefetch_seq_last_failures = 0;
+
+    // Synchronous decode-path error latch for paged KV swap-in. This is diagnostic/control
+    // state only, not a second block-state machine; RESIDENT/SWAPPED/RELEASED/UNUSED remain
+    // authoritative. There is no async worker in this path, so no mutex/atomic is used.
+    // process_ubatch clears this exactly once at ubatch start and checks it before graph_compute.
+    mutable llama_paged_swap_error paged_swap_error;
 
     // Stage 5E-1: read-only KV resident page telemetry via mincore(2). Off unless
     // LLAMA_KV_PAGED_MINCORE=1 (Linux + CPU + kv_paged_enabled && !v_trans && n_stream==1).
@@ -1046,6 +1064,9 @@ public:
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
+    void clear_paged_swap_error() override;
+    bool has_paged_swap_error() const override;
+    llama_paged_swap_error get_paged_swap_error() const override;
 
     //
     // llama_kv_cache_context specific API
@@ -1081,9 +1102,9 @@ public:
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
 
-    void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
-    void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
-    void set_input_paged_row_idx(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    bool set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    bool set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    bool set_input_paged_row_idx(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;

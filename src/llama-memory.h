@@ -3,6 +3,7 @@
 #include "llama.h"
 #include "llama-graph.h"
 
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <functional>
@@ -31,6 +32,25 @@ enum llama_memory_status {
     LLAMA_MEMORY_STATUS_FAILED_PREPARE,
     LLAMA_MEMORY_STATUS_FAILED_COMPUTE,
 };
+
+enum class llama_paged_swap_error_reason : uint8_t {
+    NONE = 0,
+    SWAP_IN_IO_FAILURE,
+    ACTIVE_VISIBLE_RESTORE_FAILURE,
+    NO_DUMMY_RESTORE_FAILURE,
+    ACTIVE_READ_RELEASED_BLOCK,
+};
+
+struct llama_paged_swap_error {
+    bool pending = false;
+    llama_paged_swap_error_reason reason = llama_paged_swap_error_reason::NONE;
+    uint32_t physical_block = UINT32_MAX;
+    uint32_t physical_cell  = UINT32_MAX;
+    int backend_status = 0;
+    int backend_errno  = 0;
+};
+
+const char * llama_paged_swap_error_reason_name(llama_paged_swap_error_reason reason);
 
 // helper function for combining the status of two memory contexts
 // useful for implementing hybrid memory types (e.g. iSWA)
@@ -62,6 +82,13 @@ struct llama_memory_context_i {
 
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
+
+    // Internal paged-KV synchronous decode error state. Default memory contexts do not
+    // participate. Implementations that do use it must clear it once at ubatch start and leave
+    // first-error-wins state pending until llama_context::process_ubatch checks it before compute.
+    virtual void clear_paged_swap_error() {}
+    virtual bool has_paged_swap_error() const { return false; }
+    virtual llama_paged_swap_error get_paged_swap_error() const { return {}; }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;

@@ -1251,6 +1251,10 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    if (mctx) {
+        mctx->clear_paged_swap_error();
+    }
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1308,6 +1312,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->set_inputs(&ubatch);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+    }
+
+    if (mctx && mctx->has_paged_swap_error()) {
+        const llama_paged_swap_error err = mctx->get_paged_swap_error();
+        LLAMA_LOG_ERROR(
+                "%s: paged KV swap-in failed before graph_compute: reason=%s physical_block=%u physical_cell=%u backend_status=%d backend_errno=%d\n",
+                __func__,
+                llama_paged_swap_error_reason_name(err.reason),
+                err.physical_block,
+                err.physical_cell,
+                err.backend_status,
+                err.backend_errno);
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);

@@ -317,6 +317,31 @@ const llama_ubatch & llama_kv_cache_iswa_context::get_ubatch() const {
     return ubatches[i_next];
 }
 
+void llama_kv_cache_iswa_context::clear_paged_swap_error() {
+    if (ctx_base) {
+        ctx_base->clear_paged_swap_error();
+    }
+    if (ctx_swa) {
+        ctx_swa->clear_paged_swap_error();
+    }
+}
+
+bool llama_kv_cache_iswa_context::has_paged_swap_error() const {
+    return (ctx_base && ctx_base->has_paged_swap_error()) ||
+           (ctx_swa  && ctx_swa->has_paged_swap_error());
+}
+
+llama_paged_swap_error llama_kv_cache_iswa_context::get_paged_swap_error() const {
+    if (ctx_base && ctx_base->has_paged_swap_error()) {
+        return ctx_base->get_paged_swap_error();
+    }
+    if (ctx_swa && ctx_swa->has_paged_swap_error()) {
+        return ctx_swa->get_paged_swap_error();
+    }
+
+    return {};
+}
+
 const llama_kv_cache_context * llama_kv_cache_iswa_context::get_base() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 

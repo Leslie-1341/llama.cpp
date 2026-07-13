@@ -1,5 +1,17 @@
 #include "llama-memory.h"
 
+const char * llama_paged_swap_error_reason_name(llama_paged_swap_error_reason reason) {
+    switch (reason) {
+        case llama_paged_swap_error_reason::NONE:                           return "NONE";
+        case llama_paged_swap_error_reason::SWAP_IN_IO_FAILURE:             return "SWAP_IN_IO_FAILURE";
+        case llama_paged_swap_error_reason::ACTIVE_VISIBLE_RESTORE_FAILURE: return "ACTIVE_VISIBLE_RESTORE_FAILURE";
+        case llama_paged_swap_error_reason::NO_DUMMY_RESTORE_FAILURE:       return "NO_DUMMY_RESTORE_FAILURE";
+        case llama_paged_swap_error_reason::ACTIVE_READ_RELEASED_BLOCK:      return "ACTIVE_READ_RELEASED_BLOCK";
+    }
+
+    return "UNKNOWN";
+}
+
 llama_memory_status llama_memory_status_combine(llama_memory_status s0, llama_memory_status s1) {
     bool has_update = false;
 
