@@ -132,12 +132,84 @@ static void print_usage(int, char ** argv) {
     fprintf(stderr, "\n");
 }
 
-static bool decode_batch(llama_context * ctx, llama_batch & batch, const char * stage) {
-    if (llama_decode(ctx, batch) != 0) {
-        fprintf(stderr, "%s: llama_decode() failed during %s\n", __func__, stage);
-        return false;
+struct kv_test_state {
+    bool test_mode_enabled = false;
+    bool expect_prefetch_failure = false;
+    bool expect_active_decode_failure = false;
+    bool retry_active_decode = false;
+    bool expected_prefetch_failure_seen = false;
+    bool expected_active_decode_failure_seen = false;
+    uint64_t decode_calls = 0;
+    uint64_t prefetch_failures_observed = 0;
+    uint64_t active_decode_failures_observed = 0;
+    uint64_t active_decode_retries = 0;
+    uint64_t active_decode_retry_successes = 0;
+};
+
+static bool parse_test_bool(const char * name, bool & value) {
+    const char * env = std::getenv(name);
+    if (env == nullptr || std::strcmp(env, "0") == 0) {
+        value = false;
+        return true;
     }
-    return true;
+    if (std::strcmp(env, "1") == 0) {
+        value = true;
+        return true;
+    }
+
+    fprintf(stderr, "%s: invalid %s=%s; expected 0 or 1\n", __func__, name, env);
+    return false;
+}
+
+static int decode_batch(
+        llama_context * ctx,
+        llama_batch & batch,
+        const char * stage,
+        kv_test_state & test_state) {
+    const int ret = llama_decode(ctx, batch);
+    test_state.decode_calls += 1;
+    if (test_state.test_mode_enabled) {
+        fprintf(stderr, "KV_TEST_DECODE_RESULT call_index=%llu ret=%d\n",
+                (unsigned long long) test_state.decode_calls, ret);
+    }
+    if (ret != 0) {
+        fprintf(stderr, "%s: llama_decode() failed during %s\n", __func__, stage);
+    }
+    return ret;
+}
+
+static void print_test_summary(const kv_test_state & test_state) {
+    if (!test_state.test_mode_enabled) {
+        return;
+    }
+
+    fprintf(stderr,
+            "KV_TEST_SUMMARY decode_calls=%llu prefetch_failures_observed=%llu "
+            "active_decode_failures_observed=%llu active_decode_retries=%llu "
+            "active_decode_retry_successes=%llu\n",
+            (unsigned long long) test_state.decode_calls,
+            (unsigned long long) test_state.prefetch_failures_observed,
+            (unsigned long long) test_state.active_decode_failures_observed,
+            (unsigned long long) test_state.active_decode_retries,
+            (unsigned long long) test_state.active_decode_retry_successes);
+}
+
+static bool handle_prefetch_result(int32_t ret, kv_test_state & test_state) {
+    if (ret >= 0) {
+        return true;
+    }
+
+    test_state.prefetch_failures_observed += 1;
+    if (ret == -1 && test_state.expect_prefetch_failure && !test_state.expected_prefetch_failure_seen) {
+        test_state.expected_prefetch_failure_seen = true;
+        if (test_state.test_mode_enabled) {
+            fprintf(stderr, "KV_TEST_EXPECTED_PREFETCH_FAILURE\n");
+        }
+        return true;
+    }
+
+    print_test_summary(test_state);
+    return false;
 }
 
 static void cleanup(
@@ -175,6 +247,24 @@ int main(int argc, char ** argv) {
     params.n_parallel = std::max<int32_t>(params.n_parallel, 2);
     params.kv_unified = true;
     params.sampling.backend_sampling = false;
+
+    kv_test_state test_state;
+    if (!parse_test_bool("LLAMA_KV_TEST_EXPECT_PREFETCH_FAILURE", test_state.expect_prefetch_failure) ||
+            !parse_test_bool("LLAMA_KV_TEST_EXPECT_ACTIVE_DECODE_FAILURE", test_state.expect_active_decode_failure) ||
+            !parse_test_bool("LLAMA_KV_TEST_RETRY_ACTIVE_DECODE", test_state.retry_active_decode)) {
+        return 1;
+    }
+    test_state.test_mode_enabled =
+        test_state.expect_prefetch_failure ||
+        test_state.expect_active_decode_failure ||
+        test_state.retry_active_decode;
+    if (test_state.retry_active_decode && !test_state.expect_active_decode_failure) {
+        fprintf(stderr,
+                "%s: LLAMA_KV_TEST_RETRY_ACTIVE_DECODE=1 requires "
+                "LLAMA_KV_TEST_EXPECT_ACTIVE_DECODE_FAILURE=1\n",
+                __func__);
+        return 1;
+    }
 
     const int n_decode = params.n_predict < 0 ? 32 : params.n_predict;
     const llama_seq_id active_seq = 1;
@@ -366,7 +456,7 @@ int main(int argc, char ** argv) {
         batch.logits[batch.n_tokens - 1] = true;
 
         const auto prefill_t0 = perf_clock::now();
-        if (!decode_batch(ctx, batch, seq_id == 0 ? "seq0-idle-prefill" : "multi-idle-prefill")) {
+        if (decode_batch(ctx, batch, seq_id == 0 ? "seq0-idle-prefill" : "multi-idle-prefill", test_state) != 0) {
             if (seq_id != 0) {
                 common_sampler_free(smpl);
             }
@@ -400,7 +490,7 @@ int main(int argc, char ** argv) {
             common_batch_clear(batch);
             common_batch_add(batch, warm_token, warm_pos++, { seq_id }, true);
 
-            if (!decode_batch(ctx, batch, seq_id == 0 ? "seq0-idle-warmup" : "multi-idle-warmup")) {
+            if (decode_batch(ctx, batch, seq_id == 0 ? "seq0-idle-warmup" : "multi-idle-warmup", test_state) != 0) {
                 if (seq_id != 0) {
                     common_sampler_free(smpl);
                 }
@@ -437,7 +527,7 @@ int main(int argc, char ** argv) {
     batch.logits[batch.n_tokens - 1] = true;
     const auto seq1_active_t0 = perf_clock::now();
     const auto seq1_prefill_t0 = perf_clock::now();
-    if (!decode_batch(ctx, batch, "seq1-active-prefill")) {
+    if (decode_batch(ctx, batch, "seq1-active-prefill", test_state) != 0) {
         cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
         return 1;
     }
@@ -454,7 +544,7 @@ int main(int argc, char ** argv) {
         prefetch_protect_enabled = 1;
 
         const int32_t prefetch_auto_probe_blocks = llama_memory_prefetch_seq_step(llama_get_memory(ctx), 0, 0);
-        if (prefetch_auto_probe_blocks < 0) {
+        if (!handle_prefetch_result(prefetch_auto_probe_blocks, test_state)) {
             fprintf(stderr, "%s: llama_memory_prefetch_seq_step() auto probe failed for seq0\n", __func__);
             return false;
         }
@@ -544,7 +634,7 @@ int main(int argc, char ** argv) {
         common_batch_add(batch, token, seq1_pos++, { active_seq }, true);
         sample_idx = batch.n_tokens - 1;
 
-        if (!decode_batch(ctx, batch, "seq1-active-decode")) {
+        if (decode_batch(ctx, batch, "seq1-active-decode", test_state) != 0) {
             cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
             return 1;
         }
@@ -594,7 +684,7 @@ int main(int argc, char ** argv) {
             }
             rss_after_active_prefetch_kb = current_rss_kb();
 
-            if (restored < 0) {
+            if (!handle_prefetch_result(restored, test_state)) {
                 fprintf(stderr, "%s: llama_memory_prefetch_seq_step() failed for seq0 during seq1 active decode\n", __func__);
                 cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
                 return 1;
@@ -610,7 +700,7 @@ int main(int argc, char ** argv) {
 
     rss_before_prefetch_kb = current_rss_kb();
     const int32_t prefetch_probe_blocks = llama_memory_prefetch_seq_step(llama_get_memory(ctx), 0, 0);
-    if (prefetch_probe_blocks < 0) {
+    if (!handle_prefetch_result(prefetch_probe_blocks, test_state)) {
         fprintf(stderr, "%s: llama_memory_prefetch_seq_step() probe failed for seq0\n", __func__);
         cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
         return 1;
@@ -641,7 +731,7 @@ int main(int argc, char ** argv) {
                 &prefetch_invalid_cells,
                 &prefetch_failures);
         rss_after_prefetch_kb = current_rss_kb();
-        if (prefetch_blocks < 0) {
+        if (!handle_prefetch_result(prefetch_blocks, test_state)) {
             fprintf(stderr, "%s: llama_memory_prefetch_seq() failed for seq0\n", __func__);
             cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
             return 1;
@@ -675,9 +765,41 @@ int main(int argc, char ** argv) {
         common_batch_add(batch, seq0_token, seq0_pos++, { 0 }, true);
         sample_idx = batch.n_tokens - 1;
 
-        if (!decode_batch(ctx, batch, "seq0-resume-decode")) {
-            cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
-            return 1;
+        int decode_ret = decode_batch(ctx, batch, "seq0-resume-decode", test_state);
+        if (decode_ret == -3) {
+            test_state.active_decode_failures_observed += 1;
+        }
+        if (decode_ret != 0) {
+            if (decode_ret == -3 && test_state.expect_active_decode_failure &&
+                    !test_state.expected_active_decode_failure_seen) {
+                test_state.expected_active_decode_failure_seen = true;
+                fprintf(stderr, "KV_TEST_EXPECTED_ACTIVE_DECODE_FAILURE call_index=%llu\n",
+                        (unsigned long long) test_state.decode_calls);
+                if (!test_state.retry_active_decode) {
+                    fprintf(stderr, "KV_TEST_TERMINATING_AFTER_EXPECTED_FAILURE\n");
+                    print_test_summary(test_state);
+                    cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
+                    return 1;
+                }
+
+                test_state.active_decode_retries += 1;
+                fprintf(stderr, "KV_TEST_RETRY_SAME_BATCH\n");
+                decode_ret = decode_batch(ctx, batch, "seq0-resume-decode-retry", test_state);
+                if (decode_ret == -3) {
+                    test_state.active_decode_failures_observed += 1;
+                }
+                if (decode_ret != 0) {
+                    print_test_summary(test_state);
+                    cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
+                    return 1;
+                }
+                test_state.active_decode_retry_successes += 1;
+                fprintf(stderr, "KV_TEST_RETRY_SUCCEEDED\n");
+            } else {
+                print_test_summary(test_state);
+                cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
+                return 1;
+            }
         }
 
         seq0_token = common_sampler_sample(seq0_smpl, ctx, sample_idx);
@@ -696,6 +818,31 @@ int main(int argc, char ** argv) {
     // swap-out policy applies again to seq0-owned blocks.
     if (prefetch_protect_enabled) {
         llama_kv_cache_set_seq_prefetch_protected(llama_get_memory(ctx), 0, false);
+    }
+
+    bool test_expectations_met = true;
+    if (test_state.expect_prefetch_failure && !test_state.expected_prefetch_failure_seen) {
+        fprintf(stderr, "%s: expected prefetch failure -1 was not observed\n", __func__);
+        test_expectations_met = false;
+    }
+    if (test_state.expect_active_decode_failure && !test_state.expected_active_decode_failure_seen) {
+        fprintf(stderr, "%s: expected seq0 resume decode failure -3 was not observed\n", __func__);
+        test_expectations_met = false;
+    }
+    if (test_state.retry_active_decode &&
+            (test_state.active_decode_retries != 1 || test_state.active_decode_retry_successes != 1)) {
+        fprintf(stderr,
+                "%s: expected exactly one active decode retry and one retry success; "
+                "observed retries=%llu successes=%llu\n",
+                __func__,
+                (unsigned long long) test_state.active_decode_retries,
+                (unsigned long long) test_state.active_decode_retry_successes);
+        test_expectations_met = false;
+    }
+    if (!test_expectations_met) {
+        print_test_summary(test_state);
+        cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
+        return 1;
     }
 
     printf("idle_seq=0\n");
@@ -801,6 +948,7 @@ int main(int argc, char ** argv) {
             (unsigned long long) rss_before_resume_kb,
             (unsigned long long) rss_after_resume_kb);
 
+    print_test_summary(test_state);
     cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
     return 0;
 }

@@ -681,6 +681,28 @@ private:
     mutable uint64_t paged_prefetch_seq_last_invalid_cells = 0;
     mutable uint64_t paged_prefetch_seq_last_failures = 0;
 
+    enum class paged_test_swapin_fail_scope : uint8_t {
+        OFF,
+        PREFETCH,
+        ACTIVE,
+    };
+
+    struct paged_test_swapin_fault {
+        paged_test_swapin_fail_scope scope = paged_test_swapin_fail_scope::OFF;
+        uint64_t fail_after_cells = 0;
+        bool fail_once = true;
+        bool consumed = false;
+        uint64_t matching_attempts = 0;
+        uint64_t trigger_count = 0;
+        uint64_t prefetch_trigger_count = 0;
+        uint64_t active_trigger_count = 0;
+    };
+
+    // KV-P0-B2B-1: context-local, environment-configured test fault for paged swap-in reads.
+    // Parsed once during construction and off by default. This is deliberately separate from
+    // the backing store so exact swap and backing-store telemetry are unaffected.
+    mutable paged_test_swapin_fault paged_test_swapin_fault_;
+
     // Synchronous decode-path error latch for paged KV swap-in. This is diagnostic/control
     // state only, not a second block-state machine; RESIDENT/SWAPPED/RELEASED/UNUSED remain
     // authoritative. There is no async worker in this path, so no mutex/atomic is used.
