@@ -34,6 +34,12 @@
 #define LLAMA_KV_REFAULT_TRACE_SUPPORTED 1
 #endif
 
+#if defined(__GNUC__) || defined(__clang__)
+#define LLAMA_KV_USED __attribute__((used))
+#else
+#define LLAMA_KV_USED
+#endif
+
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
@@ -65,6 +71,9 @@ static bool llama_kv_parse_u64_strict(const char * value, uint64_t & result) {
     result = parsed;
     return true;
 }
+
+static const char llama_kv_stability_binary_markers[] LLAMA_KV_USED =
+    "KV_STABILITY_SUMMARY llama_kv_cache_paged_stability_cycle target_blocks backing_stat_valid";
 
 // orthonormal Walsh-Hadamard rotation matrix
 // note: res^2 == I
@@ -257,34 +266,37 @@ llama_kv_backing_store_file::~llama_kv_backing_store_file() {
 #endif
 }
 
-uint64_t llama_kv_backing_store_file::get_actual_file_size() const {
+bool llama_kv_backing_store_file::stat_actual(uint64_t & actual_file_size, uint64_t & actual_blocks_512) const {
+    actual_file_size = 0;
+    actual_blocks_512 = 0;
 #if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
     if (fd < 0) {
-        return 0;
+        return false;
     }
     struct stat st;
     if (fstat(fd, &st) != 0) {
-        return 0;
+        return false;
     }
-    return (uint64_t) st.st_size;
+    actual_file_size = (uint64_t) st.st_size;
+    actual_blocks_512 = (uint64_t) st.st_blocks;
+    return true;
 #else
-    return 0;
+    return false;
 #endif
 }
 
+uint64_t llama_kv_backing_store_file::get_actual_file_size() const {
+    uint64_t actual_file_size = 0;
+    uint64_t actual_blocks_512 = 0;
+    (void) stat_actual(actual_file_size, actual_blocks_512);
+    return actual_file_size;
+}
+
 uint64_t llama_kv_backing_store_file::get_actual_blocks_512() const {
-#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
-    if (fd < 0) {
-        return 0;
-    }
-    struct stat st;
-    if (fstat(fd, &st) != 0) {
-        return 0;
-    }
-    return (uint64_t) st.st_blocks;
-#else
-    return 0;
-#endif
+    uint64_t actual_file_size = 0;
+    uint64_t actual_blocks_512 = 0;
+    (void) stat_actual(actual_file_size, actual_blocks_512);
+    return actual_blocks_512;
 }
 
 llama_kv_backing_store_status llama_kv_backing_store_file::write_cell(
@@ -1758,6 +1770,199 @@ extern "C" bool llama_kv_cache_defer_idle_swapout(
         return false;
     }
     kv->defer_idle_swapout(n_steps);
+    return true;
+}
+
+void llama_kv_cache::paged_stability_stats_for_seq(
+        llama_seq_id seq_id,
+        llama_kv_stability_stats & stats) const {
+    stats = {};
+    stats.swap_out_calls = paged_swap_out_calls;
+    stats.swap_in_calls  = paged_swap_in_calls;
+    stats.fatal_counters =
+        paged_swapped_active_visible_violation +
+        paged_swapped_active_visible_violation_rows +
+        paged_swapped_active_visible_violation_blocks +
+        paged_row_mapping_invalid_fatal +
+        paged_write_mapping_invalid_fatal +
+        paged_active_row_nonresident_fatal +
+        paged_input_setup_fatal +
+        paged_write_to_swapped_block +
+        paged_write_to_swapped_block_seq;
+    stats.pending_error = has_paged_swap_error() ? 1 : 0;
+
+    if (kv_swap_store) {
+        if (const auto * store = dynamic_cast<const llama_kv_backing_store_file *>(kv_swap_store.get())) {
+            stats.backing_capacity = store->get_capacity();
+            stats.backing_stat_valid =
+                store->stat_actual(stats.backing_size, stats.backing_blocks_512) ? 1 : 0;
+        }
+    }
+
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size() ||
+            !kv_paged_enabled || paged_block_size == 0 || v_cells.empty()) {
+        return;
+    }
+
+    const auto & cells = v_cells[seq_to_stream[seq_id]];
+    std::set<uint32_t> target_blocks;
+    std::set<uint32_t> shared_blocks;
+    for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+        if (cells.is_empty(cell)) {
+            continue;
+        }
+
+        const uint32_t phys_cell = paged_resolve(cell);
+        if (phys_cell == PAGED_BLOCK_INVALID) {
+            continue;
+        }
+
+        const uint32_t physical_block = phys_cell / paged_block_size;
+        if (physical_block < paged_block_states.size()) {
+            if (cells.seq_has(cell, seq_id)) {
+                target_blocks.insert(physical_block);
+                if (cells.seq_count(cell) > 1) {
+                    shared_blocks.insert(physical_block);
+                }
+            } else if (cells.seq_count(cell) > 0) {
+                shared_blocks.insert(physical_block);
+            }
+        }
+    }
+
+    for (const uint32_t block : target_blocks) {
+        if (shared_blocks.count(block)) {
+            continue;
+        }
+        if (paged_block_states[block] == paged_block_state::SWAPPED) {
+            stats.swapped_blocks += 1;
+        } else if (paged_block_states[block] == paged_block_state::RESIDENT) {
+            stats.resident_blocks += 1;
+        }
+    }
+    stats.target_blocks = stats.swapped_blocks + stats.resident_blocks;
+}
+
+bool llama_kv_cache::paged_stability_cycle(
+        llama_seq_id seq_id,
+        llama_kv_stability_stats & after_swap_out,
+        llama_kv_stability_stats & after_swap_in) {
+    after_swap_out = {};
+    after_swap_in  = {};
+
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size() ||
+            !kv_paged_enabled || !paged_swap_enabled || !kv_swap_store ||
+            v_trans || n_stream != 1 || paged_block_size == 0 ||
+            v_cells.empty() || paged_block_states.size() != paged_n_blocks) {
+        return false;
+    }
+
+    const auto & cells = v_cells[seq_to_stream[seq_id]];
+    const auto collect_resident_blocks = [&]() {
+        std::set<uint32_t> blocks;
+        std::set<uint32_t> rejected;
+        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+            if (cells.is_empty(cell)) {
+                continue;
+            }
+
+            const uint32_t phys_cell = paged_resolve(cell);
+            if (phys_cell == PAGED_BLOCK_INVALID) {
+                blocks.clear();
+                return blocks;
+            }
+
+            const uint32_t physical_block = phys_cell / paged_block_size;
+            if (physical_block >= paged_block_states.size() ||
+                    paged_block_states[physical_block] != paged_block_state::RESIDENT) {
+                continue;
+            }
+
+            if (cells.seq_has(cell, seq_id)) {
+                if (cells.seq_count(cell) > 1) {
+                    blocks.erase(physical_block);
+                    rejected.insert(physical_block);
+                } else if (!rejected.count(physical_block)) {
+                    blocks.insert(physical_block);
+                }
+                continue;
+            }
+
+            if (cells.seq_count(cell) > 0) {
+                blocks.erase(physical_block);
+                rejected.insert(physical_block);
+            }
+        }
+        return blocks;
+    };
+
+    std::set<uint32_t> blocks = collect_resident_blocks();
+    if (blocks.empty()) {
+        llama_kv_stability_stats current;
+        paged_stability_stats_for_seq(seq_id, current);
+        if (current.swapped_blocks > 0 && prefetch_seq(seq_id) > 0) {
+            blocks = collect_resident_blocks();
+        }
+    }
+
+    if (blocks.empty()) {
+        return false;
+    }
+
+    const uint64_t swap_out_before = paged_swap_out_calls;
+    for (const uint32_t physical_block : blocks) {
+        paged_swap_out_block(physical_block);
+    }
+    paged_stability_stats_for_seq(seq_id, after_swap_out);
+    if (after_swap_out.swap_out_calls <= swap_out_before ||
+            after_swap_out.target_blocks != blocks.size() ||
+            after_swap_out.swapped_blocks != blocks.size() ||
+            after_swap_out.pending_error != 0) {
+        return false;
+    }
+
+    const uint64_t swap_in_before = paged_swap_in_calls;
+    const int32_t restored = prefetch_seq(seq_id);
+    paged_stability_stats_for_seq(seq_id, after_swap_in);
+    if (restored <= 0 ||
+            after_swap_in.swap_in_calls <= swap_in_before ||
+            after_swap_in.target_blocks != blocks.size() ||
+            after_swap_in.resident_blocks != blocks.size() ||
+            after_swap_in.swapped_blocks != 0 ||
+            after_swap_in.pending_error != 0) {
+        return false;
+    }
+
+    return true;
+}
+
+extern "C" bool llama_kv_cache_paged_stability_cycle(
+        llama_memory_t mem,
+        llama_seq_id   seq_id,
+        llama_kv_stability_stats * after_swap_out,
+        llama_kv_stability_stats * after_swap_in) {
+    if (llama_kv_stability_binary_markers[0] == '\0') {
+        return false;
+    }
+    auto * kv = dynamic_cast<llama_kv_cache *>(mem);
+    if (!kv || !after_swap_out || !after_swap_in) {
+        return false;
+    }
+    return kv->paged_stability_cycle(seq_id, *after_swap_out, *after_swap_in);
+}
+
+extern "C" bool llama_kv_cache_paged_stability_stats(
+        llama_memory_t mem,
+        llama_seq_id   seq_id,
+        llama_kv_stability_stats * stats) {
+    if (llama_kv_stability_binary_markers[0] == '\0') {
+        return false;
+    }
+    auto * kv = dynamic_cast<llama_kv_cache *>(mem);
+    if (!kv || !stats) {
+        return false;
+    }
+    kv->paged_stability_stats_for_seq(seq_id, *stats);
     return true;
 }
 

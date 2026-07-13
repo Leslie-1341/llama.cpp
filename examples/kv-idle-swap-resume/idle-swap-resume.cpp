@@ -2,11 +2,13 @@
 #include "common.h"
 #include "llama.h"
 #include "sampling.h"
+#include "../../src/llama-kv-cache-stability.h"
 
 #include <algorithm>
 #include <chrono>
 #include <clocale>
 #include <cstdint>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -66,6 +68,46 @@ static uint64_t current_rss_kb() {
 #else
     return 0;
 #endif
+}
+
+static bool parse_env_u64_strict(const char * name, uint64_t fallback, uint64_t & value) {
+    const char * env = std::getenv(name);
+    if (env == nullptr || env[0] == '\0') {
+        value = fallback;
+        return true;
+    }
+
+    uint64_t parsed = 0;
+    for (const char * p = env; *p != '\0'; ++p) {
+        if (*p < '0' || *p > '9') {
+            fprintf(stderr, "%s: invalid %s=%s\n", __func__, name, env);
+            return false;
+        }
+
+        const uint64_t digit = (uint64_t) (*p - '0');
+        if (parsed > (std::numeric_limits<uint64_t>::max() - digit) / 10) {
+            fprintf(stderr, "%s: overflow in %s=%s\n", __func__, name, env);
+            return false;
+        }
+        parsed = parsed * 10 + digit;
+    }
+
+    value = parsed;
+    return true;
+}
+
+static bool parse_env_i32_nonnegative_strict(const char * name, uint64_t fallback, int32_t & value) {
+    uint64_t parsed = 0;
+    if (!parse_env_u64_strict(name, fallback, parsed)) {
+        return false;
+    }
+    if (parsed > (uint64_t) std::numeric_limits<int32_t>::max()) {
+        fprintf(stderr, "%s: %s=%llu exceeds int32_t max\n",
+                __func__, name, (unsigned long long) parsed);
+        return false;
+    }
+    value = (int32_t) parsed;
+    return true;
 }
 
 enum class prefetch_pressure_mode {
@@ -242,6 +284,20 @@ int main(int argc, char ** argv) {
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_BATCHED, print_usage)) {
         return 1;
+    }
+
+    uint64_t stability_cycles = 0;
+    uint64_t stability_progress_every = 0;
+    uint64_t stability_rss_limit_mb = 0;
+    int32_t stability_verify_tokens = 0;
+    if (!parse_env_u64_strict("LLAMA_KV_STABILITY_CYCLES", 0, stability_cycles) ||
+            !parse_env_u64_strict("LLAMA_KV_STABILITY_PROGRESS_EVERY", 50, stability_progress_every) ||
+            !parse_env_u64_strict("LLAMA_KV_STABILITY_RSS_LIMIT_MB", 256, stability_rss_limit_mb) ||
+            !parse_env_i32_nonnegative_strict("LLAMA_KV_STABILITY_VERIFY_TOKENS", 128, stability_verify_tokens)) {
+        return 1;
+    }
+    if (stability_cycles > 0) {
+        params.n_predict = stability_verify_tokens;
     }
 
     params.n_parallel = std::max<int32_t>(params.n_parallel, 2);
@@ -692,6 +748,209 @@ int main(int argc, char ** argv) {
         }
     }
     seq1_active_ms = elapsed_ms(seq1_active_t0, perf_clock::now());
+
+    uint64_t stability_cycles_completed = 0;
+    uint64_t stability_swap_out_delta = 0;
+    uint64_t stability_swap_in_delta = 0;
+    uint64_t stability_target_blocks = 0;
+    uint64_t stability_backing_stat_valid = 0;
+    uint64_t stability_backing_capacity = 0;
+    uint64_t stability_backing_size_first = 0;
+    uint64_t stability_backing_size_final = 0;
+    uint64_t stability_backing_size_changed = 0;
+    uint64_t stability_backing_blocks_final = 0;
+    uint64_t stability_rss_baseline_kb = 0;
+    uint64_t stability_rss_final_kb = 0;
+    uint64_t stability_rss_max_kb = 0;
+    uint64_t stability_fatal_counter_delta = 0;
+    uint64_t stability_pending_error_count = 0;
+    double stability_elapsed_ms = 0.0;
+
+    if (stability_cycles > 0) {
+        llama_kv_stability_stats initial_stats;
+        if (!llama_kv_cache_paged_stability_stats(llama_get_memory(ctx), 0, &initial_stats)) {
+            fprintf(stderr, "%s: failed to read initial KV stability stats\n", __func__);
+            cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
+            return 1;
+        }
+
+        const uint64_t initial_swap_out = initial_stats.swap_out_calls;
+        const uint64_t initial_swap_in  = initial_stats.swap_in_calls;
+        const uint64_t initial_fatal    = initial_stats.fatal_counters;
+        stability_target_blocks = initial_stats.target_blocks;
+        stability_backing_capacity = initial_stats.backing_capacity;
+        const auto stability_t0 = perf_clock::now();
+        bool stability_ok = true;
+
+        for (uint64_t cycle = 1; cycle <= stability_cycles; ++cycle) {
+            llama_kv_stability_stats after_swap_out;
+            llama_kv_stability_stats after_swap_in;
+            const uint64_t swap_out_before = cycle == 1 ? initial_swap_out : stability_swap_out_delta + initial_swap_out;
+            const uint64_t swap_in_before  = cycle == 1 ? initial_swap_in  : stability_swap_in_delta  + initial_swap_in;
+
+            if (!llama_kv_cache_paged_stability_cycle(
+                        llama_get_memory(ctx), 0, &after_swap_out, &after_swap_in)) {
+                fprintf(stderr, "%s: KV stability cycle failed at cycle=%llu\n",
+                        __func__, (unsigned long long) cycle);
+                stability_pending_error_count = after_swap_in.pending_error + after_swap_out.pending_error;
+                stability_ok = false;
+                break;
+            }
+
+            if (after_swap_out.swap_out_calls <= swap_out_before ||
+                    after_swap_in.swap_in_calls <= swap_in_before ||
+                    after_swap_out.target_blocks == 0 ||
+                    after_swap_out.swapped_blocks != after_swap_out.target_blocks ||
+                    after_swap_in.resident_blocks != after_swap_out.target_blocks ||
+                    after_swap_in.swapped_blocks != 0 ||
+                    after_swap_in.target_blocks != after_swap_out.target_blocks ||
+                    after_swap_out.pending_error != 0 ||
+                    after_swap_in.pending_error != 0 ||
+                    after_swap_out.backing_stat_valid == 0 ||
+                    after_swap_in.backing_stat_valid == 0 ||
+                    after_swap_out.backing_capacity == 0 ||
+                    after_swap_out.backing_size != after_swap_out.backing_capacity ||
+                    after_swap_in.backing_size != after_swap_out.backing_capacity ||
+                    after_swap_in.backing_capacity != after_swap_out.backing_capacity ||
+                    after_swap_out.fatal_counters != initial_fatal ||
+                    after_swap_in.fatal_counters != initial_fatal) {
+                fprintf(stderr,
+                        "%s: KV stability assertion failed at cycle=%llu "
+                        "swap_out_before=%llu swap_out_after=%llu swap_in_before=%llu swap_in_after=%llu "
+                        "target_blocks=%llu swapped_after_out=%llu resident_after_in=%llu swapped_after_in=%llu "
+                        "backing_valid_out=%llu backing_valid_in=%llu backing_capacity_out=%llu "
+                        "backing_size_out=%llu backing_size_in=%llu pending_out=%llu pending_in=%llu "
+                        "fatal_initial=%llu fatal_out=%llu fatal_in=%llu\n",
+                        __func__, (unsigned long long) cycle,
+                        (unsigned long long) swap_out_before,
+                        (unsigned long long) after_swap_out.swap_out_calls,
+                        (unsigned long long) swap_in_before,
+                        (unsigned long long) after_swap_in.swap_in_calls,
+                        (unsigned long long) after_swap_out.target_blocks,
+                        (unsigned long long) after_swap_out.swapped_blocks,
+                        (unsigned long long) after_swap_in.resident_blocks,
+                        (unsigned long long) after_swap_in.swapped_blocks,
+                        (unsigned long long) after_swap_out.backing_stat_valid,
+                        (unsigned long long) after_swap_in.backing_stat_valid,
+                        (unsigned long long) after_swap_out.backing_capacity,
+                        (unsigned long long) after_swap_out.backing_size,
+                        (unsigned long long) after_swap_in.backing_size,
+                        (unsigned long long) after_swap_out.pending_error,
+                        (unsigned long long) after_swap_in.pending_error,
+                        (unsigned long long) initial_fatal,
+                        (unsigned long long) after_swap_out.fatal_counters,
+                        (unsigned long long) after_swap_in.fatal_counters);
+                stability_pending_error_count = after_swap_in.pending_error + after_swap_out.pending_error;
+                stability_ok = false;
+                break;
+            }
+
+            if (cycle == 1) {
+                stability_target_blocks = after_swap_out.target_blocks;
+                stability_backing_stat_valid = after_swap_in.backing_stat_valid;
+                stability_backing_capacity = after_swap_in.backing_capacity;
+                stability_backing_size_first = after_swap_in.backing_size;
+            } else if (after_swap_out.backing_size != stability_backing_size_first ||
+                    after_swap_in.backing_size != stability_backing_size_first ||
+                    after_swap_out.backing_capacity != stability_backing_capacity ||
+                    after_swap_in.backing_capacity != stability_backing_capacity) {
+                stability_backing_size_changed = 1;
+                fprintf(stderr,
+                        "%s: backing store changed at cycle=%llu capacity=%llu/%llu/%llu size_first=%llu size_out=%llu size_in=%llu\n",
+                        __func__, (unsigned long long) cycle,
+                        (unsigned long long) stability_backing_capacity,
+                        (unsigned long long) after_swap_out.backing_capacity,
+                        (unsigned long long) after_swap_in.backing_capacity,
+                        (unsigned long long) stability_backing_size_first,
+                        (unsigned long long) after_swap_out.backing_size,
+                        (unsigned long long) after_swap_in.backing_size);
+                stability_ok = false;
+                break;
+            }
+
+            stability_cycles_completed = cycle;
+            stability_swap_out_delta = after_swap_in.swap_out_calls - initial_swap_out;
+            stability_swap_in_delta  = after_swap_in.swap_in_calls  - initial_swap_in;
+            stability_backing_size_final = after_swap_in.backing_size;
+            stability_backing_blocks_final = after_swap_in.backing_blocks_512;
+            stability_fatal_counter_delta = after_swap_in.fatal_counters - initial_fatal;
+            stability_pending_error_count = after_swap_in.pending_error;
+
+            const uint64_t rss_now = current_rss_kb();
+            stability_rss_final_kb = rss_now;
+            stability_rss_max_kb = std::max<uint64_t>(stability_rss_max_kb, rss_now);
+            if (cycle == 10 || (stability_cycles < 10 && cycle == stability_cycles)) {
+                stability_rss_baseline_kb = rss_now;
+            }
+            if (stability_progress_every > 0 && cycle % stability_progress_every == 0) {
+                fprintf(stderr,
+                        "KV_STABILITY_PROGRESS cycle=%llu swap_out_delta=%llu swap_in_delta=%llu "
+                        "target_blocks=%llu backing_capacity=%llu backing_size=%llu "
+                        "backing_blocks_512=%llu rss_kb=%llu\n",
+                        (unsigned long long) cycle,
+                        (unsigned long long) stability_swap_out_delta,
+                        (unsigned long long) stability_swap_in_delta,
+                        (unsigned long long) stability_target_blocks,
+                        (unsigned long long) stability_backing_capacity,
+                        (unsigned long long) stability_backing_size_final,
+                        (unsigned long long) stability_backing_blocks_final,
+                        (unsigned long long) rss_now);
+            }
+        }
+
+        stability_elapsed_ms = elapsed_ms(stability_t0, perf_clock::now());
+        if (stability_rss_baseline_kb == 0) {
+            stability_rss_baseline_kb = stability_rss_final_kb;
+        }
+        const uint64_t rss_growth_kb =
+            stability_rss_final_kb > stability_rss_baseline_kb ?
+            stability_rss_final_kb - stability_rss_baseline_kb : 0;
+        const uint64_t rss_limit_kb =
+            std::max<uint64_t>(stability_rss_limit_mb * 1024ull, stability_rss_baseline_kb / 20ull);
+        if (stability_ok && rss_growth_kb > rss_limit_kb) {
+            fprintf(stderr,
+                    "%s: KV stability RSS growth too high baseline_kb=%llu final_kb=%llu "
+                    "growth_kb=%llu limit_kb=%llu\n",
+                    __func__,
+                    (unsigned long long) stability_rss_baseline_kb,
+                    (unsigned long long) stability_rss_final_kb,
+                    (unsigned long long) rss_growth_kb,
+                    (unsigned long long) rss_limit_kb);
+            stability_ok = false;
+        }
+
+        fprintf(stderr,
+                "KV_STABILITY_SUMMARY cycles_requested=%llu cycles_completed=%llu "
+                "swap_out_delta=%llu swap_in_delta=%llu target_blocks=%llu "
+                "backing_stat_valid=%llu backing_capacity=%llu backing_size_first=%llu "
+                "backing_size_final=%llu backing_size_changed=%llu backing_blocks_512_final=%llu "
+                "rss_baseline_kb=%llu rss_final_kb=%llu rss_max_kb=%llu rss_growth_kb=%llu "
+                "rss_limit_kb=%llu fatal_counter_delta=%llu pending_error_count=%llu elapsed_ms=%.3f\n",
+                (unsigned long long) stability_cycles,
+                (unsigned long long) stability_cycles_completed,
+                (unsigned long long) stability_swap_out_delta,
+                (unsigned long long) stability_swap_in_delta,
+                (unsigned long long) stability_target_blocks,
+                (unsigned long long) stability_backing_stat_valid,
+                (unsigned long long) stability_backing_capacity,
+                (unsigned long long) stability_backing_size_first,
+                (unsigned long long) stability_backing_size_final,
+                (unsigned long long) stability_backing_size_changed,
+                (unsigned long long) stability_backing_blocks_final,
+                (unsigned long long) stability_rss_baseline_kb,
+                (unsigned long long) stability_rss_final_kb,
+                (unsigned long long) stability_rss_max_kb,
+                (unsigned long long) rss_growth_kb,
+                (unsigned long long) rss_limit_kb,
+                (unsigned long long) stability_fatal_counter_delta,
+                (unsigned long long) stability_pending_error_count,
+                stability_elapsed_ms);
+
+        if (!stability_ok) {
+            cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
+            return 1;
+        }
+    }
 
     std::string seq0_resume_generated;
     llama_token seq0_token = seq0_warmed > 0 ? seq0_warm_token : seq0_resume_first;

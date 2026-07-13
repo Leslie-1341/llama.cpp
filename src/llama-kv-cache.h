@@ -3,6 +3,7 @@
 #include "llama-batch.h"
 #include "llama-graph.h"
 #include "llama-kv-cells.h"
+#include "llama-kv-cache-stability.h"
 #include "llama-memory.h"
 
 #include <cstddef>
@@ -166,6 +167,7 @@ public:
     // actual on-disk size/allocation of the backing file (fstat-based). Used to verify the
     // fixed-capacity invariant (actual_file_size() == get_capacity() at all times) and that
     // repeated in-place overwrites of the same slots do not grow disk usage.
+    bool stat_actual(uint64_t & actual_file_size, uint64_t & actual_blocks_512) const;
     uint64_t get_actual_file_size() const;
     uint64_t get_actual_blocks_512() const;
 
@@ -309,6 +311,8 @@ public:
             uint64_t & released_blocks,
             uint64_t & invalid_cells,
             uint64_t & failures) const;
+    bool paged_stability_cycle(llama_seq_id seq_id, llama_kv_stability_stats & after_swap_out, llama_kv_stability_stats & after_swap_in);
+    void paged_stability_stats_for_seq(llama_seq_id seq_id, llama_kv_stability_stats & stats) const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
