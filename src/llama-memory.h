@@ -39,6 +39,10 @@ enum class llama_paged_swap_error_reason : uint8_t {
     ACTIVE_VISIBLE_RESTORE_FAILURE,
     NO_DUMMY_RESTORE_FAILURE,
     ACTIVE_READ_RELEASED_BLOCK,
+    PAGED_ROW_MAPPING_INVALID,
+    PAGED_WRITE_MAPPING_INVALID,
+    ACTIVE_ROW_NOT_RESIDENT,
+    INPUT_SETUP_FAILURE,
 };
 
 struct llama_paged_swap_error {

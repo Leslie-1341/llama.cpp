@@ -451,11 +451,27 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
-    mctx->set_input_k_idxs(self_k_idxs, ubatch);
-    mctx->set_input_v_idxs(self_v_idxs, ubatch);
+    if (!mctx->set_input_k_idxs(self_k_idxs, ubatch)) {
+        if (!mctx->has_paged_swap_error()) {
+            mctx->set_paged_input_setup_error();
+        }
+        return;
+    }
+
+    if (!mctx->set_input_v_idxs(self_v_idxs, ubatch)) {
+        if (!mctx->has_paged_swap_error()) {
+            mctx->set_paged_input_setup_error();
+        }
+        return;
+    }
 
     if (paged_row_idx) {
-        mctx->set_input_paged_row_idx(paged_row_idx, ubatch);
+        if (!mctx->set_input_paged_row_idx(paged_row_idx, ubatch)) {
+            if (!mctx->has_paged_swap_error()) {
+                mctx->set_paged_input_setup_error();
+            }
+            return;
+        }
     }
 
     mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);

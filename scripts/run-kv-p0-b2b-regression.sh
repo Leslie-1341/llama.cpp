@@ -12,6 +12,7 @@ RUNNER="$BUILD_DIR/bin/llama-kv-idle-swap-resume"
 CASES_PASSED=0
 EXACT_SEQ1_MATCH=0
 EXACT_SEQ0_MATCH=0
+MODEL_RUNS=0
 
 COMMON_ARGS=(
     -m "$MODEL"
@@ -136,6 +137,9 @@ FAULT_ENV=(
     LLAMA_KV_PAGED_TEST_SWAPIN_FAIL_SCOPE
     LLAMA_KV_PAGED_TEST_SWAPIN_FAIL_AFTER_CELLS
     LLAMA_KV_PAGED_TEST_SWAPIN_FAIL_ONCE
+    LLAMA_KV_PAGED_TEST_MAPPING_FAIL_SCOPE
+    LLAMA_KV_PAGED_TEST_MAPPING_FAIL_SEQ_ID
+    LLAMA_KV_PAGED_TEST_MAPPING_FAIL_ONCE
     LLAMA_KV_TEST_EXPECT_PREFETCH_FAILURE
     LLAMA_KV_TEST_EXPECT_ACTIVE_DECODE_FAILURE
     LLAMA_KV_TEST_RETRY_ACTIVE_DECODE
@@ -188,6 +192,31 @@ fault_line_contains() {
     shift
     local faults
     faults="$(grep -F "TEST FAULT INJECTION attempt_id=" "$file" 2>/dev/null || true)"
+    [[ -n "$faults" ]] || return 1
+
+    local line
+    while IFS= read -r line; do
+        local ok=1
+        local needle
+        for needle in "$@"; do
+            if [[ "$line" != *"$needle"* ]]; then
+                ok=0
+                break
+            fi
+        done
+        if [[ "$ok" -eq 1 ]]; then
+            return 0
+        fi
+    done <<< "$faults"
+
+    return 1
+}
+
+mapping_fault_line_contains() {
+    local file="$1"
+    shift
+    local faults
+    faults="$(grep -F "TEST MAPPING FAULT INJECTION" "$file" 2>/dev/null || true)"
     [[ -n "$faults" ]] || return 1
 
     local line
@@ -273,6 +302,15 @@ assert_fault_line() {
     fi
 }
 
+assert_mapping_fault_line() {
+    local file="$1"
+    shift
+    if ! mapping_fault_line_contains "$file" "$@"; then
+        printf 'missing single TEST MAPPING FAULT INJECTION line containing: %s' "$*"
+        return 1
+    fi
+}
+
 assert_tokens() {
     local file="$1"
     local key="$2"
@@ -320,6 +358,7 @@ run_case() {
     local name="$1"
     shift
     local dir="$OUTPUT_ROOT/$name"
+    MODEL_RUNS=$((MODEL_RUNS + 1))
     rm -rf "$dir"
     mkdir -p "$dir"
 
@@ -362,7 +401,7 @@ validate_case1() {
     reason="$(assert_exit "$dir" 0)" || { report_fail "$name" "$reason"; return 1; }
     reason="$(assert_tokens "$dir/run.out" seq1_decoded_tokens 128)" || { report_fail "$name" "$reason"; return 1; }
     reason="$(assert_tokens "$dir/run.out" seq0_resume_decoded_tokens 128)" || { report_fail "$name" "$reason"; return 1; }
-    for needle in "TEST FAULT" "KV_TEST_" "ret = -3" "failed before graph_compute"; do
+    for needle in "TEST FAULT" "TEST MAPPING FAULT INJECTION" "KV_TEST_" "ret = -3" "failed before graph_compute"; do
         reason="$(assert_not_contains "$all" "$needle")" || { report_fail "$name" "$reason"; return 1; }
     done
 
@@ -394,6 +433,7 @@ validate_case2() {
         "active_decode_failures_observed=0" \
         "active_decode_retries=0" \
         "active_decode_retry_successes=0")" || { report_fail "$name" "$reason"; return 1; }
+    reason="$(assert_not_contains "$all" "TEST MAPPING FAULT INJECTION")" || { report_fail "$name" "$reason"; return 1; }
     for needle in "ret = -3" "failed before graph_compute"; do
         reason="$(assert_not_contains "$all" "$needle")" || { report_fail "$name" "$reason"; return 1; }
     done
@@ -426,6 +466,7 @@ validate_case3() {
         "active_decode_failures_observed=1" \
         "active_decode_retries=0" \
         "active_decode_retry_successes=0")" || { report_fail "$name" "$reason"; return 1; }
+    reason="$(assert_not_contains "$all" "TEST MAPPING FAULT INJECTION")" || { report_fail "$name" "$reason"; return 1; }
     reason="$(assert_not_contains "$all" "KV_TEST_RETRY_SAME_BATCH")" || { report_fail "$name" "$reason"; return 1; }
 
     report_pass "$name"
@@ -457,8 +498,62 @@ validate_case4() {
         "active_decode_failures_observed=1" \
         "active_decode_retries=1" \
         "active_decode_retry_successes=1")" || { report_fail "$name" "$reason"; return 1; }
+    reason="$(assert_not_contains "$all" "TEST MAPPING FAULT INJECTION")" || { report_fail "$name" "$reason"; return 1; }
 
     report_pass "$name"
+}
+
+validate_mapping_retry_case() {
+    local name="$1"
+    local scope="$2"
+    local failure_reason="$3"
+    local fatal_counter="$4"
+    local dir="$OUTPUT_ROOT/$name"
+    local all
+    all="$(case_file "$dir")"
+    local reason
+
+    reason="$(assert_exit "$dir" 0)" || { report_fail "$name" "$reason"; return 1; }
+    reason="$(assert_tokens "$dir/run.out" seq1_decoded_tokens 128)" || { report_fail "$name" "$reason"; return 1; }
+    reason="$(assert_tokens "$dir/run.out" seq0_resume_decoded_tokens 128)" || { report_fail "$name" "$reason"; return 1; }
+    reason="$(assert_count "$all" "TEST MAPPING FAULT INJECTION scope=$scope" 1)" || { report_fail "$name" "$reason"; return 1; }
+    reason="$(assert_mapping_fault_line "$all" \
+        "scope=$scope" \
+        "target_seq=0" \
+        "failure_reason=$failure_reason" \
+        "fatal_counter=$fatal_counter" \
+        "fatal_counter_next=1" \
+        "trigger_count=1")" || { report_fail "$name" "$reason"; return 1; }
+    reason="$(assert_count "$all" "failure_reason=$failure_reason" 1)" || { report_fail "$name" "$reason"; return 1; }
+    reason="$(assert_count "$all" "failed before graph_compute: reason=$failure_reason" 1)" || { report_fail "$name" "$reason"; return 1; }
+    reason="$(assert_count "$all" "backend_status=0 backend_errno=0" 1)" || { report_fail "$name" "$reason"; return 1; }
+    reason="$(assert_not_contains "$all" "failed before graph_compute: reason=INPUT_SETUP_FAILURE")" || { report_fail "$name" "$reason"; return 1; }
+    reason="$(assert_count "$all" "llama_decode: failed to decode, ret = -3" 1)" || { report_fail "$name" "$reason"; return 1; }
+    reason="$(assert_count "$all" "KV_TEST_EXPECTED_ACTIVE_DECODE_FAILURE" 1)" || { report_fail "$name" "$reason"; return 1; }
+    reason="$(assert_count "$all" "KV_TEST_RETRY_SAME_BATCH" 1)" || { report_fail "$name" "$reason"; return 1; }
+    reason="$(assert_count "$all" "KV_TEST_RETRY_SUCCEEDED" 1)" || { report_fail "$name" "$reason"; return 1; }
+    reason="$(assert_summary_line "$all" \
+        "active_decode_failures_observed=1" \
+        "active_decode_retries=1" \
+        "active_decode_retry_successes=1")" || { report_fail "$name" "$reason"; return 1; }
+
+    report_pass "$name"
+}
+
+validate_case5() {
+    validate_mapping_retry_case \
+        case5_read_mapping_fail_retry_same_batch \
+        read \
+        PAGED_ROW_MAPPING_INVALID \
+        paged_row_mapping_invalid_fatal
+}
+
+validate_case6() {
+    validate_mapping_retry_case \
+        case6_write_mapping_fail_retry_same_batch \
+        write \
+        PAGED_WRITE_MAPPING_INVALID \
+        paged_write_mapping_invalid_fatal
 }
 
 validate_case4_control() {
@@ -471,26 +566,28 @@ validate_case4_control() {
     reason="$(assert_exit "$dir" 0)" || { report_fail "$name" "$reason"; return 1; }
     reason="$(assert_tokens "$dir/run.out" seq1_decoded_tokens 128)" || { report_fail "$name" "$reason"; return 1; }
     reason="$(assert_tokens "$dir/run.out" seq0_resume_decoded_tokens 128)" || { report_fail "$name" "$reason"; return 1; }
-    for needle in "TEST FAULT" "KV_TEST_"; do
+    for needle in "TEST FAULT" "TEST MAPPING FAULT INJECTION" "KV_TEST_"; do
         reason="$(assert_not_contains "$all" "$needle")" || { report_fail "$name" "$reason"; return 1; }
     done
 
     report_control_pass "$name"
 }
 
-validate_case4_exact_match() {
+validate_exact_match_against_control() {
+    local label="$1"
+    local target_name="$2"
     local control="$OUTPUT_ROOT/case4_control_no_fault"
-    local retry="$OUTPUT_ROOT/case4_active_partial_retry_same_batch"
+    local target="$OUTPUT_ROOT/$target_name"
     local reason
 
-    for file in "$control/run.out" "$retry/run.out"; do
+    for file in "$control/run.out" "$target/run.out"; do
         for marker in \
             "===SEQ1_ACTIVE_BEGIN===" \
             "===SEQ1_ACTIVE_END===" \
             "===SEQ0_RESUME_BEGIN===" \
             "===SEQ0_RESUME_END==="; do
             reason="$(assert_marker_count "$file" "$marker")" || {
-                printf '[FAIL] case4_exact_match: %s\n' "$reason" >&2
+                printf '[FAIL] %s: %s\n' "$label" "$reason" >&2
                 return 1
             }
         done
@@ -498,31 +595,35 @@ validate_case4_exact_match() {
 
     extract_section "$control/run.out" "===SEQ1_ACTIVE_BEGIN===" "===SEQ1_ACTIVE_END===" "$control/seq1.txt"
     extract_section "$control/run.out" "===SEQ0_RESUME_BEGIN===" "===SEQ0_RESUME_END===" "$control/seq0.txt"
-    extract_section "$retry/run.out" "===SEQ1_ACTIVE_BEGIN===" "===SEQ1_ACTIVE_END===" "$retry/seq1.txt"
-    extract_section "$retry/run.out" "===SEQ0_RESUME_BEGIN===" "===SEQ0_RESUME_END===" "$retry/seq0.txt"
+    extract_section "$target/run.out" "===SEQ1_ACTIVE_BEGIN===" "===SEQ1_ACTIVE_END===" "$target/seq1.txt"
+    extract_section "$target/run.out" "===SEQ0_RESUME_BEGIN===" "===SEQ0_RESUME_END===" "$target/seq0.txt"
 
-    for file in "$control/seq1.txt" "$control/seq0.txt" "$retry/seq1.txt" "$retry/seq0.txt"; do
+    for file in "$control/seq1.txt" "$control/seq0.txt" "$target/seq1.txt" "$target/seq0.txt"; do
         reason="$(assert_nonempty_file "$file")" || {
-            printf '[FAIL] case4_exact_match: %s\n' "$reason" >&2
+            printf '[FAIL] %s: %s\n' "$label" "$reason" >&2
             return 1
         }
     done
 
-    if cmp -s "$control/seq1.txt" "$retry/seq1.txt"; then
+    if cmp -s "$control/seq1.txt" "$target/seq1.txt"; then
         EXACT_SEQ1_MATCH=1
     else
-        printf '[FAIL] case4_exact_match: SEQ1_EXACT_MATCH=0\n' >&2
-        diff -u "$control/seq1.txt" "$retry/seq1.txt" | head -n 100 >&2 || true
+        printf '[FAIL] %s: SEQ1_EXACT_MATCH=0\n' "$label" >&2
+        diff -u "$control/seq1.txt" "$target/seq1.txt" | head -n 100 >&2 || true
         return 1
     fi
 
-    if cmp -s "$control/seq0.txt" "$retry/seq0.txt"; then
+    if cmp -s "$control/seq0.txt" "$target/seq0.txt"; then
         EXACT_SEQ0_MATCH=1
     else
-        printf '[FAIL] case4_exact_match: SEQ0_EXACT_MATCH=0\n' >&2
-        diff -u "$control/seq0.txt" "$retry/seq0.txt" | head -n 100 >&2 || true
+        printf '[FAIL] %s: SEQ0_EXACT_MATCH=0\n' "$label" >&2
+        diff -u "$control/seq0.txt" "$target/seq0.txt" | head -n 100 >&2 || true
         return 1
     fi
+}
+
+validate_case4_exact_match() {
+    validate_exact_match_against_control case4_exact_match case4_active_partial_retry_same_batch
 }
 
 check_prereqs() {
@@ -546,6 +647,23 @@ check_prereqs() {
         KV_TEST_SUMMARY; do
         grep -F -q -- "$marker" "$strings_file" || \
             fail_global "runner missing string marker: $marker"
+    done
+    rm -f "$strings_file"
+
+    local libllama="$BUILD_DIR/bin/libllama.so"
+    [[ -f "$libllama" ]] || fail_global "libllama not found: $libllama"
+
+    strings_file="$(mktemp "$OUTPUT_ROOT/libllama.strings.XXXXXX")" || \
+        fail_global "failed to create temporary strings file"
+    strings "$libllama" > "$strings_file" || \
+        fail_global "strings failed for libllama: $libllama"
+
+    for marker in \
+        "TEST MAPPING FAULT INJECTION" \
+        "PAGED_ROW_MAPPING_INVALID" \
+        "PAGED_WRITE_MAPPING_INVALID"; do
+        grep -F -q -- "$marker" "$strings_file" || \
+            fail_global "libllama missing string marker: $marker"
     done
     rm -f "$strings_file"
 }
@@ -592,12 +710,42 @@ main() {
 
     validate_case4_exact_match || failed=1
 
+    run_case case5_read_mapping_fail_retry_same_batch \
+        export "${KV_ENV_ACTIVE_PREFETCH_OFF[@]}" \
+            LLAMA_KV_PAGED_TEST_MAPPING_FAIL_SCOPE=read \
+            LLAMA_KV_PAGED_TEST_MAPPING_FAIL_SEQ_ID=0 \
+            LLAMA_KV_PAGED_TEST_MAPPING_FAIL_ONCE=1 \
+            LLAMA_KV_TEST_EXPECT_ACTIVE_DECODE_FAILURE=1 \
+            LLAMA_KV_TEST_RETRY_ACTIVE_DECODE=1
+    validate_case5 || failed=1
+    validate_exact_match_against_control case5_exact_match case5_read_mapping_fail_retry_same_batch || failed=1
+
+    run_case case6_write_mapping_fail_retry_same_batch \
+        export "${KV_ENV_ACTIVE_PREFETCH_OFF[@]}" \
+            LLAMA_KV_PAGED_TEST_MAPPING_FAIL_SCOPE=write \
+            LLAMA_KV_PAGED_TEST_MAPPING_FAIL_SEQ_ID=0 \
+            LLAMA_KV_PAGED_TEST_MAPPING_FAIL_ONCE=1 \
+            LLAMA_KV_TEST_EXPECT_ACTIVE_DECODE_FAILURE=1 \
+            LLAMA_KV_TEST_RETRY_ACTIVE_DECODE=1
+    validate_case6 || failed=1
+    validate_exact_match_against_control case6_exact_match case6_write_mapping_fail_retry_same_batch || failed=1
+
+    if [[ "$MODEL_RUNS" -ne 7 ]]; then
+        report_fail final "expected MODEL_RUNS=7, got $MODEL_RUNS"
+        failed=1
+    fi
+    if [[ "$CASES_PASSED" -ne 6 ]]; then
+        report_fail final "expected CASES_PASSED=6, got $CASES_PASSED"
+        failed=1
+    fi
+
     if [[ "$failed" -ne 0 ]]; then
         exit 1
     fi
 
     printf 'KV_P0_B2B_REGRESSION_PASS\n'
     printf 'cases_passed=%d\n' "$CASES_PASSED"
+    printf 'model_runs=%d\n' "$MODEL_RUNS"
     printf 'exact_seq1_match=%d\n' "$EXACT_SEQ1_MATCH"
     printf 'exact_seq0_match=%d\n' "$EXACT_SEQ0_MATCH"
     printf 'log_root=%s\n' "$OUTPUT_ROOT"

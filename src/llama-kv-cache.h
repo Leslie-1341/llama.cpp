@@ -504,6 +504,16 @@ private:
     void paged_note_cells(const slot_info & sinfo);
     uint32_t paged_resolve(uint32_t cell) const;
     uint32_t paged_write_resolve(uint32_t cell) const;
+    uint32_t paged_write_resolve_input(uint32_t cell, const llama_ubatch * ubatch, uint32_t token) const;
+    bool paged_validate_write_mapping(uint32_t phys_cell) const;
+    bool paged_test_mapping_fault_token_matches(const llama_ubatch * ubatch, uint32_t token) const;
+    bool paged_test_mapping_fault_should_inject_read(uint32_t logical_cell) const;
+    bool paged_test_mapping_fault_should_inject_write(const llama_ubatch * ubatch, uint32_t token) const;
+    void paged_test_mapping_fault_log_and_consume(
+            bool read_scope,
+            uint32_t logical_cell,
+            llama_paged_swap_error_reason reason,
+            uint64_t fatal_counter_next) const;
     bool paged_ensure_write_resident(uint32_t phys_cell) const;
     bool paged_check_read_resident(uint32_t phys_cell, bool required_by_active) const;
     bool paged_check_read_resident_impl(uint32_t phys_cell, bool required_by_active) const;
@@ -585,6 +595,9 @@ private:
     mutable uint64_t paged_write_resolve_checks  = 0;
     mutable uint64_t paged_write_resolve_fail    = 0;
     mutable uint64_t paged_write_resolve_changed = 0;
+    mutable uint64_t paged_test_mapping_fault_triggers       = 0;
+    mutable uint64_t paged_test_mapping_fault_read_triggers  = 0;
+    mutable uint64_t paged_test_mapping_fault_write_triggers = 0;
     mutable uint64_t paged_shadow_gather_calls    = 0;
     mutable uint64_t paged_shadow_gather_changed  = 0;
     mutable uint64_t paged_shadow_gather_mismatch = 0;
@@ -702,6 +715,23 @@ private:
     // Parsed once during construction and off by default. This is deliberately separate from
     // the backing store so exact swap and backing-store telemetry are unaffected.
     mutable paged_test_swapin_fault paged_test_swapin_fault_;
+
+    enum class paged_test_mapping_fail_scope : uint8_t {
+        OFF,
+        READ,
+        WRITE,
+    };
+
+    struct paged_test_mapping_fault {
+        paged_test_mapping_fail_scope scope = paged_test_mapping_fail_scope::OFF;
+        llama_seq_id target_seq = -1;
+        bool fail_once = true;
+        bool consumed = false;
+    };
+
+    // Context-local deterministic test fault for paged logical->physical mapping. Off by
+    // default and parsed once at construction; production mapping paths only read this state.
+    mutable paged_test_mapping_fault paged_test_mapping_fault_;
 
     // Synchronous decode-path error latch for paged KV swap-in. This is diagnostic/control
     // state only, not a second block-state machine; RESIDENT/SWAPPED/RELEASED/UNUSED remain
@@ -904,6 +934,12 @@ private:
     mutable uint64_t paged_swapped_active_visible_not_in_read_window = 0;
     mutable uint64_t paged_swapped_active_visible_masked = 0;
     mutable uint64_t paged_swapped_active_visible_unmasked = 0;
+    mutable uint64_t paged_row_mapping_invalid_fatal = 0;
+    mutable uint64_t paged_write_mapping_invalid_fatal = 0;
+    mutable uint64_t paged_active_row_nonresident_fatal = 0;
+    mutable uint64_t paged_input_setup_fatal = 0;
+    mutable uint64_t paged_no_dummy_restore_sync = 0;
+    mutable uint64_t paged_active_row_dummy_redirect_blocked = 0;
     // Stage 7C-F: invariant telemetry. A block that is SWAPPED must not contain rows that
     // are currently active-visible and unmasked. These counters distinguish stale active
     // ownership, later active writes, and logical resolution to an already-swapped block.
@@ -1127,6 +1163,7 @@ public:
     bool set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     bool set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     bool set_input_paged_row_idx(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_paged_input_setup_error() const;
 
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
