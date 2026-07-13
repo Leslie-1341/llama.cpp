@@ -17,6 +17,10 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+#include <sys/types.h>
+#endif
+
 struct llama_cparams;
 struct llama_hparams;
 struct llama_model;
@@ -50,9 +54,23 @@ struct llama_kv_backing_store_stats {
     uint64_t read_calls     = 0;
     uint64_t release_calls  = 0;
     int      last_errno     = 0;
+    llama_kv_backing_store_status last_status = llama_kv_backing_store_status::ok;
+    uint64_t syscall_attempts  = 0;
+    uint64_t eintr_retries     = 0;
+    uint64_t short_io_events   = 0;
+    uint64_t terminal_failures = 0;
     // fixed logical capacity (n_slots * cell_stride) of the fixed-slot backing store. Set once
     // at construction; unlike the counters above this never grows and is preserved by reset().
     uint64_t bytes_capacity = 0;
+};
+
+struct llama_kv_backing_store_faults {
+    bool read_eintr_once    = false;
+    bool write_eintr_once   = false;
+    bool read_short_once    = false;
+    bool write_short_once   = false;
+    bool read_eof_once      = false;
+    bool write_enospc_once  = false;
 };
 
 class llama_kv_backing_store_i {
@@ -164,6 +182,12 @@ public:
         return stats;
     }
 
+    void set_test_faults(const llama_kv_backing_store_faults & faults);
+    void clear_test_faults();
+    const llama_kv_backing_store_faults & get_test_faults() const {
+        return faults;
+    }
+
     // actual on-disk size/allocation of the backing file (fstat-based). Used to verify the
     // fixed-capacity invariant (actual_file_size() == get_capacity() at all times) and that
     // repeated in-place overwrites of the same slots do not grow disk usage.
@@ -179,6 +203,11 @@ private:
     uint64_t capacity    = 0;
     bool     used_o_tmpfile_ = false;
     llama_kv_backing_store_stats stats;
+    llama_kv_backing_store_faults faults;
+
+    int64_t pwrite_once(const char * data, size_t size, uint64_t offset);
+    int64_t pread_once(char * data, size_t size, uint64_t offset);
+    llama_kv_backing_store_status finish_status(llama_kv_backing_store_status status, int err);
 };
 
 class llama_kv_cache : public llama_memory_i {

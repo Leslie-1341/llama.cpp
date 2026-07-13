@@ -299,6 +299,109 @@ uint64_t llama_kv_backing_store_file::get_actual_blocks_512() const {
     return actual_blocks_512;
 }
 
+void llama_kv_backing_store_file::set_test_faults(const llama_kv_backing_store_faults & faults_) {
+    faults = faults_;
+}
+
+void llama_kv_backing_store_file::clear_test_faults() {
+    faults = {};
+}
+
+llama_kv_backing_store_status llama_kv_backing_store_file::finish_status(
+        llama_kv_backing_store_status status,
+        int err) {
+    stats.last_status = status;
+
+    switch (status) {
+        case llama_kv_backing_store_status::ok:
+        case llama_kv_backing_store_status::bad_slot:
+            stats.last_errno = 0;
+            break;
+        case llama_kv_backing_store_status::io_error:
+            stats.last_errno = err != 0 ? err : EIO;
+            stats.terminal_failures += 1;
+            break;
+        case llama_kv_backing_store_status::disabled:
+            stats.last_errno = err;
+            break;
+    }
+
+    return status;
+}
+
+int64_t llama_kv_backing_store_file::pwrite_once(const char * data, size_t size, uint64_t offset) {
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+    stats.syscall_attempts += 1;
+    if (faults.write_eintr_once) {
+        faults.write_eintr_once = false;
+        errno = EINTR;
+        return -1;
+    }
+
+    size_t request = size;
+    if (faults.write_short_once && size > 1) {
+        faults.write_short_once = false;
+        request = std::max<size_t>(1, size / 2);
+        if (request >= size) {
+            request = size - 1;
+        }
+    }
+    if (request == size && faults.write_enospc_once) {
+        faults.write_enospc_once = false;
+        errno = ENOSPC;
+        return -1;
+    }
+
+    const ssize_t ret = pwrite(fd, data, request, (off_t) offset);
+    if (ret > 0 && (size_t) ret < size) {
+        stats.short_io_events += 1;
+    }
+    return (int64_t) ret;
+#else
+    (void) data;
+    (void) size;
+    (void) offset;
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+int64_t llama_kv_backing_store_file::pread_once(char * data, size_t size, uint64_t offset) {
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+    stats.syscall_attempts += 1;
+    if (faults.read_eintr_once) {
+        faults.read_eintr_once = false;
+        errno = EINTR;
+        return -1;
+    }
+
+    size_t request = size;
+    if (faults.read_short_once && size > 1) {
+        faults.read_short_once = false;
+        request = std::max<size_t>(1, size / 2);
+        if (request >= size) {
+            request = size - 1;
+        }
+    }
+    if (request == size && faults.read_eof_once) {
+        faults.read_eof_once = false;
+        return 0;
+    }
+
+    const ssize_t ret = pread(fd, data, request, (off_t) offset);
+    if (ret > 0 && (size_t) ret < size) {
+        stats.short_io_events += 1;
+    }
+    return (int64_t) ret;
+#else
+    (void) data;
+    (void) size;
+    (void) offset;
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
 llama_kv_backing_store_status llama_kv_backing_store_file::write_cell(
         uint32_t   strm,
         uint32_t   cell,
@@ -310,10 +413,10 @@ llama_kv_backing_store_status llama_kv_backing_store_file::write_cell(
     offset_out = 0;
 
     if (fd < 0) {
-        return llama_kv_backing_store_status::disabled;
+        return finish_status(llama_kv_backing_store_status::disabled, stats.last_errno);
     }
     if (!data || size == 0 || cell >= n_slots || size != cell_stride) {
-        return llama_kv_backing_store_status::bad_slot;
+        return finish_status(llama_kv_backing_store_status::bad_slot, 0);
     }
 
 #if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
@@ -321,23 +424,25 @@ llama_kv_backing_store_status llama_kv_backing_store_file::write_cell(
     // overwrite the same fixed slot, so the file never grows past n_slots * cell_stride.
     uint64_t offset = 0;
     if (!llama_kv_fixed_slot_bounds(cell, n_slots, cell_stride, capacity, offset)) {
-        return llama_kv_backing_store_status::bad_slot;
+        return finish_status(llama_kv_backing_store_status::bad_slot, 0);
     }
     const char * ptr = static_cast<const char *>(data);
     size_t written = 0;
 
     while (written < size) {
-        const ssize_t ret = pwrite(fd, ptr + written, size - written, (off_t) (offset + written));
+        if (offset + written > (uint64_t) std::numeric_limits<off_t>::max()) {
+            return finish_status(llama_kv_backing_store_status::io_error, EOVERFLOW);
+        }
+        const int64_t ret = pwrite_once(ptr + written, size - written, offset + written);
         if (ret < 0) {
             if (errno == EINTR) {
+                stats.eintr_retries += 1;
                 continue;
             }
-            stats.last_errno = errno;
-            return llama_kv_backing_store_status::io_error;
+            return finish_status(llama_kv_backing_store_status::io_error, errno);
         }
         if (ret == 0) {
-            stats.last_errno = EIO;
-            return llama_kv_backing_store_status::io_error;
+            return finish_status(llama_kv_backing_store_status::io_error, EIO);
         }
         written += (size_t) ret;
     }
@@ -347,10 +452,9 @@ llama_kv_backing_store_status llama_kv_backing_store_file::write_cell(
     stats.write_calls += 1;
     stats.last_errno = 0;
 
-    return llama_kv_backing_store_status::ok;
+    return finish_status(llama_kv_backing_store_status::ok, 0);
 #else
-    stats.last_errno = ENOSYS;
-    return llama_kv_backing_store_status::disabled;
+    return finish_status(llama_kv_backing_store_status::disabled, ENOSYS);
 #endif
 }
 
@@ -363,10 +467,10 @@ llama_kv_backing_store_status llama_kv_backing_store_file::read_cell(
     (void) strm;
 
     if (fd < 0) {
-        return llama_kv_backing_store_status::disabled;
+        return finish_status(llama_kv_backing_store_status::disabled, stats.last_errno);
     }
     if (!data || size == 0 || cell >= n_slots || size != cell_stride) {
-        return llama_kv_backing_store_status::bad_slot;
+        return finish_status(llama_kv_backing_store_status::bad_slot, 0);
     }
 
     uint64_t expected_offset = 0;
@@ -374,7 +478,7 @@ llama_kv_backing_store_status llama_kv_backing_store_file::read_cell(
             offset != expected_offset || size > capacity - expected_offset) {
         // caller-supplied offset does not match this cell's fixed slot address (stale/corrupt
         // metadata) - refuse rather than trusting it.
-        return llama_kv_backing_store_status::bad_slot;
+        return finish_status(llama_kv_backing_store_status::bad_slot, 0);
     }
 
 #if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
@@ -382,17 +486,22 @@ llama_kv_backing_store_status llama_kv_backing_store_file::read_cell(
     size_t read_bytes = 0;
 
     while (read_bytes < size) {
-        const ssize_t ret = pread(fd, ptr + read_bytes, size - read_bytes, (off_t) (expected_offset + read_bytes));
+        if (expected_offset + read_bytes > (uint64_t) std::numeric_limits<off_t>::max()) {
+            std::memset(data, 0, size);
+            return finish_status(llama_kv_backing_store_status::io_error, EOVERFLOW);
+        }
+        const int64_t ret = pread_once(ptr + read_bytes, size - read_bytes, expected_offset + read_bytes);
         if (ret < 0) {
             if (errno == EINTR) {
+                stats.eintr_retries += 1;
                 continue;
             }
-            stats.last_errno = errno;
-            return llama_kv_backing_store_status::io_error;
+            std::memset(data, 0, size);
+            return finish_status(llama_kv_backing_store_status::io_error, errno);
         }
         if (ret == 0) {
-            stats.last_errno = EIO;
-            return llama_kv_backing_store_status::io_error;
+            std::memset(data, 0, size);
+            return finish_status(llama_kv_backing_store_status::io_error, EIO);
         }
         read_bytes += (size_t) ret;
     }
@@ -401,27 +510,25 @@ llama_kv_backing_store_status llama_kv_backing_store_file::read_cell(
     stats.read_calls += 1;
     stats.last_errno = 0;
 
-    return llama_kv_backing_store_status::ok;
+    return finish_status(llama_kv_backing_store_status::ok, 0);
 #else
-    stats.last_errno = ENOSYS;
-    return llama_kv_backing_store_status::disabled;
+    return finish_status(llama_kv_backing_store_status::disabled, ENOSYS);
 #endif
 }
 
 llama_kv_backing_store_status llama_kv_backing_store_file::release(uint64_t offset, size_t size) {
     if (fd < 0) {
-        return llama_kv_backing_store_status::disabled;
+        return finish_status(llama_kv_backing_store_status::disabled, stats.last_errno);
     }
     if (size == 0 || size != cell_stride || cell_stride == 0 ||
             offset % cell_stride != 0 || offset > capacity || size > capacity - offset) {
-        return llama_kv_backing_store_status::bad_slot;
+        return finish_status(llama_kv_backing_store_status::bad_slot, 0);
     }
 
     stats.bytes_released += size;
     stats.release_calls += 1;
-    stats.last_errno = 0;
 
-    return llama_kv_backing_store_status::ok;
+    return finish_status(llama_kv_backing_store_status::ok, 0);
 }
 
 llama_kv_backing_store_status llama_kv_backing_store_file::reset() {
@@ -429,7 +536,7 @@ llama_kv_backing_store_status llama_kv_backing_store_file::reset() {
     // slot geometry (n_slots/cell_stride/capacity) is structural and survives reset so the
     // store can be reused immediately with the same addressing.
     if (fd < 0) {
-        return llama_kv_backing_store_status::io_error;
+        return finish_status(llama_kv_backing_store_status::io_error, stats.last_errno);
     }
 
 #if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
@@ -437,14 +544,13 @@ llama_kv_backing_store_status llama_kv_backing_store_file::reset() {
     // same fixed size (portable across tmpfs/regular filesystems; avoids relying on
     // FALLOC_FL_PUNCH_HOLE support).
     if (ftruncate(fd, 0) != 0) {
-        stats.last_errno = errno;
-        return llama_kv_backing_store_status::io_error;
+        return finish_status(llama_kv_backing_store_status::io_error, errno);
     }
     if (ftruncate(fd, (off_t) capacity) != 0) {
-        stats.last_errno = errno;
+        const int err = errno;
         close(fd);
         fd = -1;
-        return llama_kv_backing_store_status::io_error;
+        return finish_status(llama_kv_backing_store_status::io_error, err);
     }
 
     stats.bytes_written  = 0;
@@ -453,11 +559,14 @@ llama_kv_backing_store_status llama_kv_backing_store_file::reset() {
     stats.write_calls    = 0;
     stats.read_calls     = 0;
     stats.release_calls  = 0;
+    stats.syscall_attempts  = 0;
+    stats.eintr_retries     = 0;
+    stats.short_io_events   = 0;
+    stats.terminal_failures = 0;
     stats.last_errno = 0;
-    return llama_kv_backing_store_status::ok;
+    return finish_status(llama_kv_backing_store_status::ok, 0);
 #else
-    stats.last_errno = ENOSYS;
-    return llama_kv_backing_store_status::disabled;
+    return finish_status(llama_kv_backing_store_status::disabled, ENOSYS);
 #endif
 }
 

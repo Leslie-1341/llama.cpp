@@ -37,6 +37,23 @@ static std::vector<uint8_t> make_pattern(size_t size, uint32_t seed) {
     return buf;
 }
 
+static void check_bytes_equal(
+        const std::vector<uint8_t> & expected,
+        const std::vector<uint8_t> & actual,
+        const std::string & msg) {
+    check(expected.size() == actual.size(), msg + " size");
+    check(std::memcmp(expected.data(), actual.data(), expected.size()) == 0, msg);
+}
+
+static bool all_bytes_are(const std::vector<uint8_t> & data, uint8_t value) {
+    for (const uint8_t b : data) {
+        if (b != value) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // 1) same slot, 1000x write/read, byte-identical each time; capacity never changes.
 static void test_same_slot_repeated_roundtrip() {
     const uint32_t n_slots     = 4;
@@ -253,6 +270,195 @@ static void test_off_t_overflow_rejected_when_applicable() {
     check(store.get_stats().last_errno == EOVERFLOW, "off_t capacity overflow reports EOVERFLOW");
 }
 
+static void test_fault_free_observability() {
+    const uint32_t n_slots     = 2;
+    const size_t   cell_stride = 96;
+
+    llama_kv_backing_store_file store("", n_slots, cell_stride);
+    check(store.is_enabled(), "fault_free_observability: store enabled");
+
+    auto payload = make_pattern(cell_stride, 300);
+    uint64_t offset = 0;
+    const auto ws = store.write_cell(0, 1, payload.data(), payload.size(), offset);
+    check(ws == llama_kv_backing_store_status::ok, "fault-free write succeeds");
+
+    std::vector<uint8_t> restored(cell_stride, 0);
+    const auto rs = store.read_cell(0, 1, offset, restored.data(), restored.size());
+    check(rs == llama_kv_backing_store_status::ok, "fault-free read succeeds");
+    check_bytes_equal(payload, restored, "fault-free data roundtrip");
+
+    const auto & stats = store.get_stats();
+    check(stats.syscall_attempts == 2, "fault-free records one write and one read syscall attempt");
+    check(stats.eintr_retries == 0, "fault-free records no EINTR retries");
+    check(stats.short_io_events == 0, "fault-free records no short I/O events");
+    check(stats.terminal_failures == 0, "fault-free records no terminal failures");
+    check(stats.last_status == llama_kv_backing_store_status::ok, "fault-free last status ok");
+    check(stats.last_errno == 0, "fault-free last errno zero");
+    check(store.get_actual_file_size() == store.get_capacity(), "fault-free file size remains fixed");
+}
+
+static void test_eintr_once_retries_and_preserves_data() {
+    const uint32_t n_slots     = 2;
+    const size_t   cell_stride = 128;
+
+    llama_kv_backing_store_file store("", n_slots, cell_stride);
+    check(store.is_enabled(), "eintr_once: store enabled");
+
+    auto payload = make_pattern(cell_stride, 301);
+    uint64_t offset = 0;
+
+    llama_kv_backing_store_faults faults;
+    faults.write_eintr_once = true;
+    store.set_test_faults(faults);
+    const auto ws = store.write_cell(0, 0, payload.data(), payload.size(), offset);
+    check(ws == llama_kv_backing_store_status::ok, "write EINTR once retries and succeeds");
+    check(!store.get_test_faults().write_eintr_once, "write EINTR fault consumed");
+
+    std::vector<uint8_t> restored(cell_stride, 0);
+    faults = {};
+    faults.read_eintr_once = true;
+    store.set_test_faults(faults);
+    const auto rs = store.read_cell(0, 0, offset, restored.data(), restored.size());
+    check(rs == llama_kv_backing_store_status::ok, "read EINTR once retries and succeeds");
+    check(!store.get_test_faults().read_eintr_once, "read EINTR fault consumed");
+    check_bytes_equal(payload, restored, "EINTR roundtrip data identical");
+
+    const auto & stats = store.get_stats();
+    check(stats.eintr_retries == 2, "records both read and write EINTR retries");
+    check(stats.syscall_attempts == 4, "EINTR paths record retry attempts");
+    check(stats.terminal_failures == 0, "EINTR paths have no terminal failures");
+    check(store.get_actual_file_size() == store.get_capacity(), "EINTR file size remains fixed");
+}
+
+static void test_short_once_completes_remaining_io() {
+    const uint32_t n_slots     = 2;
+    const size_t   cell_stride = 256;
+
+    llama_kv_backing_store_file store("", n_slots, cell_stride);
+    check(store.is_enabled(), "short_once: store enabled");
+
+    auto payload = make_pattern(cell_stride, 302);
+    uint64_t offset = 0;
+
+    llama_kv_backing_store_faults faults;
+    faults.write_short_once = true;
+    store.set_test_faults(faults);
+    const auto ws = store.write_cell(0, 1, payload.data(), payload.size(), offset);
+    check(ws == llama_kv_backing_store_status::ok, "short write once completes remaining bytes");
+    check(!store.get_test_faults().write_short_once, "write short fault consumed");
+
+    std::vector<uint8_t> restored(cell_stride, 0);
+    faults = {};
+    faults.read_short_once = true;
+    store.set_test_faults(faults);
+    const auto rs = store.read_cell(0, 1, offset, restored.data(), restored.size());
+    check(rs == llama_kv_backing_store_status::ok, "short read once completes remaining bytes");
+    check(!store.get_test_faults().read_short_once, "read short fault consumed");
+    check_bytes_equal(payload, restored, "short I/O roundtrip data identical");
+
+    const auto & stats = store.get_stats();
+    check(stats.short_io_events == 2, "records both read and write short I/O events");
+    check(stats.syscall_attempts == 4, "short I/O paths record follow-up attempts");
+    check(stats.terminal_failures == 0, "short I/O paths have no terminal failures");
+    check(store.get_actual_file_size() == store.get_capacity(), "short I/O file size remains fixed");
+}
+
+static void test_read_eof_fails_without_exposing_partial_data() {
+    const uint32_t n_slots     = 2;
+    const size_t   cell_stride = 192;
+
+    llama_kv_backing_store_file store("", n_slots, cell_stride);
+    check(store.is_enabled(), "read_eof: store enabled");
+
+    auto payload = make_pattern(cell_stride, 303);
+    uint64_t offset = 0;
+    const auto ws = store.write_cell(0, 0, payload.data(), payload.size(), offset);
+    check(ws == llama_kv_backing_store_status::ok, "read EOF setup write succeeds");
+
+    std::vector<uint8_t> restored(cell_stride, 0xA5);
+    llama_kv_backing_store_faults faults;
+    faults.read_short_once = true;
+    faults.read_eof_once   = true;
+    store.set_test_faults(faults);
+    const auto rs = store.read_cell(0, 0, offset, restored.data(), restored.size());
+    check(rs == llama_kv_backing_store_status::io_error, "read EOF returns io_error");
+    check(store.get_stats().last_status == llama_kv_backing_store_status::io_error, "read EOF last status io_error");
+    check(store.get_stats().last_errno == EIO, "read EOF maps incomplete read to EIO");
+    check(store.get_stats().terminal_failures == 1, "read EOF records terminal failure");
+    check(store.get_stats().read_calls == 0, "read EOF does not count as successful read");
+    check(store.get_stats().short_io_events == 1, "read EOF after partial read records short event");
+    check(all_bytes_are(restored, 0x00), "read EOF clears partial restored data");
+    check(store.get_actual_file_size() == store.get_capacity(), "read EOF file size remains fixed");
+}
+
+static void test_write_enospc_fails_then_full_retry_overwrites_slot() {
+    const uint32_t n_slots     = 2;
+    const size_t   cell_stride = 256;
+
+    llama_kv_backing_store_file store("", n_slots, cell_stride);
+    check(store.is_enabled(), "write_enospc: store enabled");
+
+    auto payload_a = make_pattern(cell_stride, 304);
+    auto payload_b = make_pattern(cell_stride, 305);
+    uint64_t offset = 0;
+
+    llama_kv_backing_store_faults faults;
+    faults.write_short_once  = true;
+    faults.write_enospc_once = true;
+    store.set_test_faults(faults);
+    const auto failed = store.write_cell(0, 1, payload_a.data(), payload_a.size(), offset);
+    check(failed == llama_kv_backing_store_status::io_error, "write ENOSPC returns io_error");
+    check(store.get_stats().last_status == llama_kv_backing_store_status::io_error, "write ENOSPC last status io_error");
+    check(store.get_stats().last_errno == ENOSPC, "write ENOSPC preserves errno");
+    check(store.get_stats().terminal_failures == 1, "write ENOSPC records terminal failure");
+    check(store.get_stats().write_calls == 0, "failed partial write is not counted as successful write");
+    check(store.get_stats().bytes_written == 0, "failed partial write does not add bytes_written");
+    check(store.get_stats().short_io_events == 1, "partial write before ENOSPC records short event");
+
+    store.clear_test_faults();
+    const auto retry = store.write_cell(0, 1, payload_b.data(), payload_b.size(), offset);
+    check(retry == llama_kv_backing_store_status::ok, "write succeeds after one-shot ENOSPC fault");
+
+    std::vector<uint8_t> restored(cell_stride, 0);
+    const auto rs = store.read_cell(0, 1, offset, restored.data(), restored.size());
+    check(rs == llama_kv_backing_store_status::ok, "read succeeds after ENOSPC retry");
+    check_bytes_equal(payload_b, restored, "retry overwrites slot from the first byte");
+    check(store.get_stats().syscall_attempts <= 5, "ENOSPC retry path has bounded syscall attempts");
+    check(store.get_actual_file_size() == store.get_capacity(), "ENOSPC retry file size remains fixed");
+}
+
+static void test_last_errno_cleared_after_error_status_changes() {
+    const uint32_t n_slots     = 2;
+    const size_t   cell_stride = 128;
+
+    llama_kv_backing_store_file store("", n_slots, cell_stride);
+    check(store.is_enabled(), "last_errno_status_changes: store enabled");
+
+    auto payload = make_pattern(cell_stride, 306);
+    uint64_t offset = 0;
+
+    llama_kv_backing_store_faults faults;
+    faults.write_enospc_once = true;
+    store.set_test_faults(faults);
+    const auto failed = store.write_cell(0, 0, payload.data(), payload.size(), offset);
+    check(failed == llama_kv_backing_store_status::io_error, "last_errno setup ENOSPC fails");
+    check(store.get_stats().last_status == llama_kv_backing_store_status::io_error,
+            "last_errno setup status io_error");
+    check(store.get_stats().last_errno == ENOSPC, "last_errno setup stores ENOSPC");
+
+    const auto bad = store.write_cell(0, n_slots, payload.data(), payload.size(), offset);
+    check(bad == llama_kv_backing_store_status::bad_slot, "bad_slot after ENOSPC fails as bad_slot");
+    check(store.get_stats().last_status == llama_kv_backing_store_status::bad_slot,
+            "bad_slot after ENOSPC updates last_status");
+    check(store.get_stats().last_errno == 0, "bad_slot after ENOSPC clears last_errno");
+
+    const auto ok = store.write_cell(0, 0, payload.data(), payload.size(), offset);
+    check(ok == llama_kv_backing_store_status::ok, "ok write after bad_slot succeeds");
+    check(store.get_stats().last_status == llama_kv_backing_store_status::ok,
+            "ok write after bad_slot updates last_status");
+    check(store.get_stats().last_errno == 0, "ok write after bad_slot keeps last_errno clear");
+}
+
 int main() {
     try {
         test_same_slot_repeated_roundtrip();
@@ -263,6 +469,12 @@ int main() {
         test_large_payload_roundtrip();
         test_capacity_overflow_rejected();
         test_off_t_overflow_rejected_when_applicable();
+        test_fault_free_observability();
+        test_eintr_once_retries_and_preserves_data();
+        test_short_once_completes_remaining_io();
+        test_read_eof_fails_without_exposing_partial_data();
+        test_write_enospc_fails_then_full_retry_overwrites_slot();
+        test_last_errno_cleared_after_error_status_changes();
     } catch (const std::exception & e) {
         fprintf(stderr, "%s\n", e.what());
         return 1;
