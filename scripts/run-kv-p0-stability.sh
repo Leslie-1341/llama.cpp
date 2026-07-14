@@ -7,6 +7,9 @@ BUILD_DIR="${BUILD_DIR:-$ROOT/build-kv-p0-stability}"
 MODEL="${MODEL:-/root/models/Meta-Llama-3-8B-Instruct/Meta-Llama-3-8B-Instruct-Q4_K_M.gguf}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/root/oscomp/kv_logs/kv_p0_stability}"
 CYCLES="${CYCLES:-1000}"
+DURATION_SEC="${DURATION_SEC:-0}"
+WARMUP_SEC="${WARMUP_SEC:-60}"
+SAMPLE_EVERY_SEC="${SAMPLE_EVERY_SEC:-60}"
 VERIFY_TOKENS="${VERIFY_TOKENS:-128}"
 CASE_TIMEOUT_SEC="${CASE_TIMEOUT_SEC:-1800}"
 RSS_LIMIT_MB="${RSS_LIMIT_MB:-256}"
@@ -54,6 +57,8 @@ KV_ENV_COMMON=(
     LLAMA_KV_STABILITY_VERIFY_TOKENS="$VERIFY_TOKENS"
     LLAMA_KV_STABILITY_PROGRESS_EVERY="$PROGRESS_EVERY"
     LLAMA_KV_STABILITY_RSS_LIMIT_MB="$RSS_LIMIT_MB"
+    LLAMA_KV_STABILITY_WARMUP_SEC="$WARMUP_SEC"
+    LLAMA_KV_STABILITY_SAMPLE_EVERY_SEC="$SAMPLE_EVERY_SEC"
 )
 
 fail() {
@@ -201,6 +206,9 @@ POLLUTION_ENV=(
     LLAMA_KV_TEST_EXPECT_ACTIVE_DECODE_FAILURE
     LLAMA_KV_TEST_RETRY_ACTIVE_DECODE
     LLAMA_KV_STABILITY_CYCLES
+    LLAMA_KV_STABILITY_DURATION_SEC
+    LLAMA_KV_STABILITY_WARMUP_SEC
+    LLAMA_KV_STABILITY_SAMPLE_EVERY_SEC
     LLAMA_KV_STABILITY_VERIFY_TOKENS
     LLAMA_KV_STABILITY_PROGRESS_EVERY
     LLAMA_KV_STABILITY_RSS_LIMIT_MB
@@ -209,6 +217,7 @@ POLLUTION_ENV=(
 run_case() {
     local name="$1"
     local cycles="$2"
+    local duration_sec="$3"
     local dir="$OUTPUT_ROOT/$name"
     rm -rf "$dir"
     mkdir -p "$dir"
@@ -219,6 +228,7 @@ run_case() {
         done
         export "${KV_ENV_COMMON[@]}"
         export LLAMA_KV_STABILITY_CYCLES="$cycles"
+        export LLAMA_KV_STABILITY_DURATION_SEC="$duration_sec"
         timeout "$CASE_TIMEOUT_SEC" "$RUNNER" "${COMMON_ARGS[@]}"
     ) > "$dir/run.out" 2> "$dir/run.err"
     local status=$?
@@ -243,18 +253,30 @@ assert_token_count() {
 
 main() {
     validate_u64_strict CYCLES "$CYCLES"
+    validate_u64_strict DURATION_SEC "$DURATION_SEC"
+    validate_u64_strict WARMUP_SEC "$WARMUP_SEC"
+    validate_u64_strict SAMPLE_EVERY_SEC "$SAMPLE_EVERY_SEC"
     validate_i32_strict VERIFY_TOKENS "$VERIFY_TOKENS"
     validate_u64_strict CASE_TIMEOUT_SEC "$CASE_TIMEOUT_SEC"
     validate_u64_strict RSS_LIMIT_MB "$RSS_LIMIT_MB"
     validate_u64_strict PROGRESS_EVERY "$PROGRESS_EVERY"
     validate_u64_strict SKIP_BUILD "$SKIP_BUILD"
     CYCLES="$(normalize_digits "$CYCLES")"
+    DURATION_SEC="$(normalize_digits "$DURATION_SEC")"
+    WARMUP_SEC="$(normalize_digits "$WARMUP_SEC")"
+    SAMPLE_EVERY_SEC="$(normalize_digits "$SAMPLE_EVERY_SEC")"
     VERIFY_TOKENS="$(normalize_digits "$VERIFY_TOKENS")"
     CASE_TIMEOUT_SEC="$(normalize_digits "$CASE_TIMEOUT_SEC")"
     RSS_LIMIT_MB="$(normalize_digits "$RSS_LIMIT_MB")"
     PROGRESS_EVERY="$(normalize_digits "$PROGRESS_EVERY")"
     SKIP_BUILD="$(normalize_digits "$SKIP_BUILD")"
-    [[ "$CYCLES" != "0" ]] || fail "CYCLES must be > 0"
+    [[ "$CYCLES" == "0" || "$DURATION_SEC" == "0" ]] || fail "CYCLES and DURATION_SEC cannot both be > 0"
+    if [[ "$DURATION_SEC" == "0" ]]; then
+        [[ "$CYCLES" != "0" ]] || fail "CYCLES must be > 0 when DURATION_SEC=0"
+    else
+        [[ "$DURATION_SEC" -gt "$WARMUP_SEC" ]] || fail "DURATION_SEC=$DURATION_SEC must be > WARMUP_SEC=$WARMUP_SEC"
+    fi
+    [[ "$SAMPLE_EVERY_SEC" != "0" ]] || fail "SAMPLE_EVERY_SEC must be > 0"
 
     [[ -f "$MODEL" ]] || fail "model not found: $MODEL"
 
@@ -285,8 +307,12 @@ main() {
     done
     rm -f "$strings_file"
 
-    run_case control 0
-    run_case stress "$CYCLES"
+    run_case control 0 0
+    if [[ "$DURATION_SEC" == "0" ]]; then
+        run_case stress "$CYCLES" 0
+    else
+        run_case stress 0 "$DURATION_SEC"
+    fi
 
     assert_exit_zero "$OUTPUT_ROOT/control"
     assert_exit_zero "$OUTPUT_ROOT/stress"
@@ -297,23 +323,52 @@ main() {
 
     grep -q 'KV_STABILITY_SUMMARY' "$OUTPUT_ROOT/stress/run.err" || fail "missing KV_STABILITY_SUMMARY"
 
-    local cycles_completed backing_changed fatal_delta pending swap_out_delta swap_in_delta rss_growth rss_limit
+    local mode cycles_completed backing_changed fatal_delta pending swap_out_delta swap_in_delta rss_growth rss_peak_growth rss_limit
     local target_blocks backing_stat_valid backing_capacity backing_size_first backing_size_final
+    local duration_requested duration_elapsed warmup_ms cycles_at_baseline cycles_after_baseline sample_count
+    local backing_blocks_baseline backing_blocks_final backing_blocks_max
+    mode="$(summary_value "$OUTPUT_ROOT/stress/run.err" mode)"
     cycles_completed="$(summary_value "$OUTPUT_ROOT/stress/run.err" cycles_completed)"
+    duration_requested="$(summary_value "$OUTPUT_ROOT/stress/run.err" duration_requested_ms)"
+    duration_elapsed="$(summary_value "$OUTPUT_ROOT/stress/run.err" duration_elapsed_ms)"
+    warmup_ms="$(summary_value "$OUTPUT_ROOT/stress/run.err" warmup_ms)"
+    cycles_at_baseline="$(summary_value "$OUTPUT_ROOT/stress/run.err" cycles_at_baseline)"
+    cycles_after_baseline="$(summary_value "$OUTPUT_ROOT/stress/run.err" cycles_after_baseline)"
+    sample_count="$(summary_value "$OUTPUT_ROOT/stress/run.err" sample_count)"
     backing_changed="$(summary_value "$OUTPUT_ROOT/stress/run.err" backing_size_changed)"
     fatal_delta="$(summary_value "$OUTPUT_ROOT/stress/run.err" fatal_counter_delta)"
     pending="$(summary_value "$OUTPUT_ROOT/stress/run.err" pending_error_count)"
     swap_out_delta="$(summary_value "$OUTPUT_ROOT/stress/run.err" swap_out_delta)"
     swap_in_delta="$(summary_value "$OUTPUT_ROOT/stress/run.err" swap_in_delta)"
     rss_growth="$(summary_value "$OUTPUT_ROOT/stress/run.err" rss_growth_kb)"
+    rss_peak_growth="$(summary_value "$OUTPUT_ROOT/stress/run.err" rss_peak_growth_kb)"
     rss_limit="$(summary_value "$OUTPUT_ROOT/stress/run.err" rss_limit_kb)"
     target_blocks="$(summary_value "$OUTPUT_ROOT/stress/run.err" target_blocks)"
     backing_stat_valid="$(summary_value "$OUTPUT_ROOT/stress/run.err" backing_stat_valid)"
     backing_capacity="$(summary_value "$OUTPUT_ROOT/stress/run.err" backing_capacity)"
     backing_size_first="$(summary_value "$OUTPUT_ROOT/stress/run.err" backing_size_first)"
     backing_size_final="$(summary_value "$OUTPUT_ROOT/stress/run.err" backing_size_final)"
+    backing_blocks_baseline="$(summary_value "$OUTPUT_ROOT/stress/run.err" backing_blocks_512_baseline)"
+    backing_blocks_final="$(summary_value "$OUTPUT_ROOT/stress/run.err" backing_blocks_512_final)"
+    backing_blocks_max="$(summary_value "$OUTPUT_ROOT/stress/run.err" backing_blocks_512_max)"
 
-    [[ "$cycles_completed" == "$CYCLES" ]] || fail "cycles_completed=$cycles_completed expected $CYCLES"
+    if [[ "$DURATION_SEC" == "0" ]]; then
+        [[ "$mode" == "cycles" ]] || fail "mode=$mode expected cycles"
+        [[ "$cycles_completed" == "$CYCLES" ]] || fail "cycles_completed=$cycles_completed expected $CYCLES"
+        [[ "$duration_requested" == "0" ]] || fail "duration_requested_ms=$duration_requested expected 0"
+    else
+        local expected_duration_ms expected_warmup_ms
+        expected_duration_ms=$(( DURATION_SEC * 1000 ))
+        expected_warmup_ms=$(( WARMUP_SEC * 1000 ))
+        [[ "$mode" == "duration" ]] || fail "mode=$mode expected duration"
+        [[ "$duration_requested" == "$expected_duration_ms" ]] || fail "duration_requested_ms=$duration_requested expected $expected_duration_ms"
+        [[ "$duration_elapsed" -ge "$expected_duration_ms" ]] || fail "duration_elapsed_ms=$duration_elapsed expected >= $expected_duration_ms"
+        [[ "$warmup_ms" == "$expected_warmup_ms" ]] || fail "warmup_ms=$warmup_ms expected $expected_warmup_ms"
+        [[ "${cycles_completed:-0}" -gt 0 ]] || fail "cycles_completed=$cycles_completed expected > 0"
+        [[ "${cycles_after_baseline:-0}" -gt 0 ]] || fail "cycles_after_baseline=$cycles_after_baseline expected > 0"
+        [[ "${sample_count:-0}" -ge 2 ]] || fail "sample_count=$sample_count expected >= 2"
+        [[ "${cycles_at_baseline:-0}" -gt 0 ]] || fail "cycles_at_baseline=$cycles_at_baseline expected > 0"
+    fi
     [[ "${target_blocks:-0}" -gt 0 ]] || fail "target_blocks=$target_blocks expected > 0"
     [[ "$backing_stat_valid" == "1" ]] || fail "backing_stat_valid=$backing_stat_valid"
     [[ "${backing_capacity:-0}" -gt 0 ]] || fail "backing_capacity=$backing_capacity expected > 0"
@@ -322,9 +377,17 @@ main() {
     [[ "$backing_changed" == "0" ]] || fail "backing_size_changed=$backing_changed"
     [[ "$fatal_delta" == "0" ]] || fail "fatal_counter_delta=$fatal_delta"
     [[ "$pending" == "0" ]] || fail "pending_error_count=$pending"
-    [[ "${swap_out_delta:-0}" -ge "$CYCLES" ]] || fail "swap_out_delta=$swap_out_delta expected >= $CYCLES"
-    [[ "${swap_in_delta:-0}" -ge "$CYCLES" ]] || fail "swap_in_delta=$swap_in_delta expected >= $CYCLES"
+    [[ "${backing_blocks_final:-0}" -le "${backing_blocks_max:-0}" ]] || fail "backing_blocks_512_final=$backing_blocks_final max=$backing_blocks_max"
+    [[ "${backing_blocks_baseline:-0}" -le "${backing_blocks_max:-0}" ]] || fail "backing_blocks_512_baseline=$backing_blocks_baseline max=$backing_blocks_max"
+    if [[ "$DURATION_SEC" == "0" ]]; then
+        [[ "${swap_out_delta:-0}" -ge "$CYCLES" ]] || fail "swap_out_delta=$swap_out_delta expected >= $CYCLES"
+        [[ "${swap_in_delta:-0}" -ge "$CYCLES" ]] || fail "swap_in_delta=$swap_in_delta expected >= $CYCLES"
+    else
+        [[ "${swap_out_delta:-0}" -ge "${cycles_completed:-0}" ]] || fail "swap_out_delta=$swap_out_delta expected >= cycles_completed=$cycles_completed"
+        [[ "${swap_in_delta:-0}" -ge "${cycles_completed:-0}" ]] || fail "swap_in_delta=$swap_in_delta expected >= cycles_completed=$cycles_completed"
+    fi
     [[ "${rss_growth:-0}" -le "${rss_limit:-0}" ]] || fail "rss_growth_kb=$rss_growth rss_limit_kb=$rss_limit"
+    [[ "${rss_peak_growth:-0}" -le "${rss_limit:-0}" ]] || fail "rss_peak_growth_kb=$rss_peak_growth rss_limit_kb=$rss_limit"
 
     local file marker
     for file in "$OUTPUT_ROOT/control/run.out" "$OUTPUT_ROOT/stress/run.out"; do
@@ -363,6 +426,10 @@ main() {
     [[ "$exact_seq0_match" == "1" ]] || fail "SEQ0_EXACT_MATCH=0"
 
     printf 'KV_P0_STABILITY_PASS\n'
+    printf 'stability_mode=%s\n' "$mode"
+    if [[ "$mode" == "duration" ]]; then
+        printf 'duration_reached=1\n'
+    fi
     printf 'cycles_completed=%s\n' "$cycles_completed"
     printf 'target_blocks=%s\n' "$target_blocks"
     printf 'backing_size_bounded=1\n'

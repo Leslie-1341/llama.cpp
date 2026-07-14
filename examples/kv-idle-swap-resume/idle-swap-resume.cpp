@@ -43,6 +43,10 @@ static double elapsed_ms(perf_clock::time_point t0, perf_clock::time_point t1) {
     return std::chrono::duration<double, std::milli>(t1 - t0).count();
 }
 
+static uint64_t elapsed_ms_u64(perf_clock::time_point t0, perf_clock::time_point t1) {
+    return (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+}
+
 static uint64_t current_rss_kb() {
 #if defined(__linux__)
     FILE * f = std::fopen("/proc/self/statm", "r");
@@ -290,16 +294,47 @@ int main(int argc, char ** argv) {
     }
 
     uint64_t stability_cycles = 0;
+    uint64_t stability_duration_sec = 0;
+    uint64_t stability_warmup_sec = 0;
+    uint64_t stability_sample_every_sec = 0;
     uint64_t stability_progress_every = 0;
     uint64_t stability_rss_limit_mb = 0;
     int32_t stability_verify_tokens = 0;
     if (!parse_env_u64_strict("LLAMA_KV_STABILITY_CYCLES", 0, stability_cycles) ||
+            !parse_env_u64_strict("LLAMA_KV_STABILITY_DURATION_SEC", 0, stability_duration_sec) ||
+            !parse_env_u64_strict("LLAMA_KV_STABILITY_WARMUP_SEC", 60, stability_warmup_sec) ||
+            !parse_env_u64_strict("LLAMA_KV_STABILITY_SAMPLE_EVERY_SEC", 60, stability_sample_every_sec) ||
             !parse_env_u64_strict("LLAMA_KV_STABILITY_PROGRESS_EVERY", 50, stability_progress_every) ||
             !parse_env_u64_strict("LLAMA_KV_STABILITY_RSS_LIMIT_MB", 256, stability_rss_limit_mb) ||
             !parse_env_i32_nonnegative_strict("LLAMA_KV_STABILITY_VERIFY_TOKENS", 128, stability_verify_tokens)) {
         return 1;
     }
-    if (stability_cycles > 0) {
+    if (stability_cycles > 0 && stability_duration_sec > 0) {
+        fprintf(stderr,
+                "%s: LLAMA_KV_STABILITY_CYCLES and LLAMA_KV_STABILITY_DURATION_SEC "
+                "cannot both be greater than zero\n",
+                __func__);
+        return 1;
+    }
+    if (stability_sample_every_sec == 0) {
+        fprintf(stderr, "%s: LLAMA_KV_STABILITY_SAMPLE_EVERY_SEC must be greater than zero\n", __func__);
+        return 1;
+    }
+    if (stability_duration_sec > 0 && stability_duration_sec <= stability_warmup_sec) {
+        fprintf(stderr,
+                "%s: LLAMA_KV_STABILITY_DURATION_SEC=%llu must be greater than "
+                "LLAMA_KV_STABILITY_WARMUP_SEC=%llu\n",
+                __func__,
+                (unsigned long long) stability_duration_sec,
+                (unsigned long long) stability_warmup_sec);
+        return 1;
+    }
+    if ((stability_duration_sec > 0 && stability_duration_sec > std::numeric_limits<uint64_t>::max() / 1000ull) ||
+            stability_warmup_sec > std::numeric_limits<uint64_t>::max() / 1000ull) {
+        fprintf(stderr, "%s: stability duration or warmup overflows milliseconds\n", __func__);
+        return 1;
+    }
+    if (stability_cycles > 0 || stability_duration_sec > 0) {
         params.n_predict = stability_verify_tokens;
     }
 
@@ -763,15 +798,26 @@ int main(int argc, char ** argv) {
     uint64_t stability_backing_size_first = 0;
     uint64_t stability_backing_size_final = 0;
     uint64_t stability_backing_size_changed = 0;
+    uint64_t stability_backing_blocks_baseline = 0;
     uint64_t stability_backing_blocks_final = 0;
+    uint64_t stability_backing_blocks_max = 0;
     uint64_t stability_rss_baseline_kb = 0;
     uint64_t stability_rss_final_kb = 0;
     uint64_t stability_rss_max_kb = 0;
     uint64_t stability_fatal_counter_delta = 0;
     uint64_t stability_pending_error_count = 0;
-    double stability_elapsed_ms = 0.0;
+    uint64_t stability_duration_requested_ms = stability_duration_sec * 1000ull;
+    uint64_t stability_duration_elapsed_ms = 0;
+    uint64_t stability_warmup_ms = stability_warmup_sec * 1000ull;
+    uint64_t stability_cycles_at_baseline = 0;
+    uint64_t stability_cycles_after_baseline = 0;
+    uint64_t stability_sample_count = 0;
+    uint64_t stability_last_sample_cycle = 0;
+    double stability_elapsed_ms_legacy = 0.0;
 
-    if (stability_cycles > 0) {
+    const bool stability_cycles_mode = stability_cycles > 0;
+    const bool stability_duration_mode = stability_duration_sec > 0;
+    if (stability_cycles_mode || stability_duration_mode) {
         llama_kv_stability_stats initial_stats;
         if (!llama_kv_cache_paged_stability_stats(llama_get_memory(ctx), 0, &initial_stats)) {
             fprintf(stderr, "%s: failed to read initial KV stability stats\n", __func__);
@@ -785,9 +831,10 @@ int main(int argc, char ** argv) {
         stability_target_blocks = initial_stats.target_blocks;
         stability_backing_capacity = initial_stats.backing_capacity;
         const auto stability_t0 = perf_clock::now();
+        auto stability_next_sample = stability_t0 + std::chrono::seconds(stability_warmup_sec);
         bool stability_ok = true;
 
-        for (uint64_t cycle = 1; cycle <= stability_cycles; ++cycle) {
+        for (uint64_t cycle = 1; stability_cycles_mode ? cycle <= stability_cycles : true; ++cycle) {
             llama_kv_stability_stats after_swap_out;
             llama_kv_stability_stats after_swap_in;
             const uint64_t swap_out_before = cycle == 1 ? initial_swap_out : stability_swap_out_delta + initial_swap_out;
@@ -878,18 +925,66 @@ int main(int argc, char ** argv) {
             stability_swap_in_delta  = after_swap_in.swap_in_calls  - initial_swap_in;
             stability_backing_size_final = after_swap_in.backing_size;
             stability_backing_blocks_final = after_swap_in.backing_blocks_512;
+            stability_backing_blocks_max = std::max<uint64_t>(
+                    stability_backing_blocks_max, stability_backing_blocks_final);
             stability_fatal_counter_delta = after_swap_in.fatal_counters - initial_fatal;
             stability_pending_error_count = after_swap_in.pending_error;
 
-            const uint64_t rss_now = current_rss_kb();
-            stability_rss_final_kb = rss_now;
-            stability_rss_max_kb = std::max<uint64_t>(stability_rss_max_kb, rss_now);
-            if (cycle == 10 || (stability_cycles < 10 && cycle == stability_cycles)) {
-                stability_rss_baseline_kb = rss_now;
+            const auto now = perf_clock::now();
+            if (stability_cycles_mode) {
+                const uint64_t rss_now = current_rss_kb();
+                stability_rss_final_kb = rss_now;
+                stability_rss_max_kb = std::max<uint64_t>(stability_rss_max_kb, rss_now);
+                stability_sample_count += 1;
+                stability_last_sample_cycle = cycle;
+                if (cycle == 10 || (stability_cycles < 10 && cycle == stability_cycles)) {
+                    stability_rss_baseline_kb = rss_now;
+                    stability_backing_blocks_baseline = stability_backing_blocks_final;
+                    stability_cycles_at_baseline = cycle;
+                }
+            } else if (now >= stability_t0 + std::chrono::seconds(stability_warmup_sec)) {
+                if (stability_sample_count == 0) {
+                    stability_cycles_at_baseline = cycle;
+                    stability_rss_baseline_kb = current_rss_kb();
+                    stability_rss_final_kb = stability_rss_baseline_kb;
+                    stability_rss_max_kb = stability_rss_baseline_kb;
+                    stability_backing_blocks_baseline = stability_backing_blocks_final;
+                    stability_backing_blocks_max = std::max<uint64_t>(
+                            stability_backing_blocks_max, stability_backing_blocks_final);
+                    stability_sample_count = 1;
+                    stability_last_sample_cycle = cycle;
+                    stability_next_sample = now + std::chrono::seconds(stability_sample_every_sec);
+                } else if (now >= stability_next_sample) {
+                    const uint64_t rss_now = current_rss_kb();
+                    stability_rss_final_kb = rss_now;
+                    stability_rss_max_kb = std::max<uint64_t>(stability_rss_max_kb, rss_now);
+                    stability_backing_blocks_max = std::max<uint64_t>(
+                            stability_backing_blocks_max, stability_backing_blocks_final);
+                    stability_sample_count += 1;
+                    stability_last_sample_cycle = cycle;
+                    fprintf(stderr,
+                            "KV_STABILITY_PROGRESS mode=duration cycle=%llu elapsed_ms=%llu "
+                            "swap_out_delta=%llu swap_in_delta=%llu target_blocks=%llu "
+                            "backing_capacity=%llu backing_size=%llu backing_blocks_512=%llu "
+                            "rss_kb=%llu sample_count=%llu\n",
+                            (unsigned long long) cycle,
+                            (unsigned long long) elapsed_ms_u64(stability_t0, now),
+                            (unsigned long long) stability_swap_out_delta,
+                            (unsigned long long) stability_swap_in_delta,
+                            (unsigned long long) stability_target_blocks,
+                            (unsigned long long) stability_backing_capacity,
+                            (unsigned long long) stability_backing_size_final,
+                            (unsigned long long) stability_backing_blocks_final,
+                            (unsigned long long) rss_now,
+                            (unsigned long long) stability_sample_count);
+                    do {
+                        stability_next_sample += std::chrono::seconds(stability_sample_every_sec);
+                    } while (now >= stability_next_sample);
+                }
             }
-            if (stability_progress_every > 0 && cycle % stability_progress_every == 0) {
+            if (stability_cycles_mode && stability_progress_every > 0 && cycle % stability_progress_every == 0) {
                 fprintf(stderr,
-                        "KV_STABILITY_PROGRESS cycle=%llu swap_out_delta=%llu swap_in_delta=%llu "
+                        "KV_STABILITY_PROGRESS mode=cycles cycle=%llu swap_out_delta=%llu swap_in_delta=%llu "
                         "target_blocks=%llu backing_capacity=%llu backing_size=%llu "
                         "backing_blocks_512=%llu rss_kb=%llu\n",
                         (unsigned long long) cycle,
@@ -899,40 +994,103 @@ int main(int argc, char ** argv) {
                         (unsigned long long) stability_backing_capacity,
                         (unsigned long long) stability_backing_size_final,
                         (unsigned long long) stability_backing_blocks_final,
-                        (unsigned long long) rss_now);
+                        (unsigned long long) stability_rss_final_kb);
+            }
+
+            if (stability_duration_mode &&
+                    now - stability_t0 >= std::chrono::seconds(stability_duration_sec)) {
+                break;
+            }
+            if (cycle == std::numeric_limits<uint64_t>::max()) {
+                fprintf(stderr, "%s: KV stability cycle counter reached uint64_t max\n", __func__);
+                stability_ok = false;
+                break;
             }
         }
 
-        stability_elapsed_ms = elapsed_ms(stability_t0, perf_clock::now());
+        const auto stability_t1 = perf_clock::now();
+        stability_duration_elapsed_ms = elapsed_ms_u64(stability_t0, stability_t1);
+        stability_elapsed_ms_legacy = elapsed_ms(stability_t0, stability_t1);
+        if (stability_duration_mode && stability_sample_count > 0 &&
+                stability_last_sample_cycle != stability_cycles_completed) {
+            const uint64_t rss_now = current_rss_kb();
+            stability_rss_final_kb = rss_now;
+            stability_rss_max_kb = std::max<uint64_t>(stability_rss_max_kb, rss_now);
+            stability_backing_blocks_max = std::max<uint64_t>(
+                    stability_backing_blocks_max, stability_backing_blocks_final);
+            stability_sample_count += 1;
+            stability_last_sample_cycle = stability_cycles_completed;
+        }
         if (stability_rss_baseline_kb == 0) {
             stability_rss_baseline_kb = stability_rss_final_kb;
         }
+        if (stability_cycles_at_baseline == 0 && stability_cycles_completed > 0) {
+            stability_cycles_at_baseline = stability_cycles_completed;
+        }
+        if (stability_backing_blocks_baseline == 0) {
+            stability_backing_blocks_baseline = stability_backing_blocks_final;
+        }
+        stability_cycles_after_baseline =
+            stability_cycles_completed > stability_cycles_at_baseline ?
+            stability_cycles_completed - stability_cycles_at_baseline : 0;
         const uint64_t rss_growth_kb =
             stability_rss_final_kb > stability_rss_baseline_kb ?
             stability_rss_final_kb - stability_rss_baseline_kb : 0;
+        const uint64_t rss_peak_growth_kb =
+            stability_rss_max_kb > stability_rss_baseline_kb ?
+            stability_rss_max_kb - stability_rss_baseline_kb : 0;
         const uint64_t rss_limit_kb =
             std::max<uint64_t>(stability_rss_limit_mb * 1024ull, stability_rss_baseline_kb / 20ull);
-        if (stability_ok && rss_growth_kb > rss_limit_kb) {
+        if (stability_ok && rss_peak_growth_kb > rss_limit_kb) {
             fprintf(stderr,
-                    "%s: KV stability RSS growth too high baseline_kb=%llu final_kb=%llu "
-                    "growth_kb=%llu limit_kb=%llu\n",
+                    "%s: KV stability peak RSS growth too high baseline_kb=%llu max_kb=%llu "
+                    "peak_growth_kb=%llu limit_kb=%llu final_kb=%llu final_growth_kb=%llu\n",
                     __func__,
                     (unsigned long long) stability_rss_baseline_kb,
+                    (unsigned long long) stability_rss_max_kb,
+                    (unsigned long long) rss_peak_growth_kb,
+                    (unsigned long long) rss_limit_kb,
                     (unsigned long long) stability_rss_final_kb,
-                    (unsigned long long) rss_growth_kb,
-                    (unsigned long long) rss_limit_kb);
+                    (unsigned long long) rss_growth_kb);
+            stability_ok = false;
+        }
+        if (stability_duration_mode &&
+                (stability_duration_elapsed_ms < stability_duration_requested_ms ||
+                 stability_cycles_completed == 0 ||
+                 stability_cycles_after_baseline == 0 ||
+                 stability_sample_count < 2)) {
+            fprintf(stderr,
+                    "%s: KV duration stability requirements failed elapsed_ms=%llu requested_ms=%llu "
+                    "cycles_completed=%llu cycles_after_baseline=%llu sample_count=%llu\n",
+                    __func__,
+                    (unsigned long long) stability_duration_elapsed_ms,
+                    (unsigned long long) stability_duration_requested_ms,
+                    (unsigned long long) stability_cycles_completed,
+                    (unsigned long long) stability_cycles_after_baseline,
+                    (unsigned long long) stability_sample_count);
             stability_ok = false;
         }
 
         fprintf(stderr,
-                "KV_STABILITY_SUMMARY cycles_requested=%llu cycles_completed=%llu "
+                "KV_STABILITY_SUMMARY mode=%s cycles_requested=%llu cycles_completed=%llu "
+                "duration_requested_ms=%llu duration_elapsed_ms=%llu warmup_ms=%llu "
+                "cycles_at_baseline=%llu cycles_after_baseline=%llu sample_count=%llu "
                 "swap_out_delta=%llu swap_in_delta=%llu target_blocks=%llu "
                 "backing_stat_valid=%llu backing_capacity=%llu backing_size_first=%llu "
                 "backing_size_final=%llu backing_size_changed=%llu backing_blocks_512_final=%llu "
+                "backing_blocks_512_baseline=%llu backing_blocks_512_max=%llu "
                 "rss_baseline_kb=%llu rss_final_kb=%llu rss_max_kb=%llu rss_growth_kb=%llu "
-                "rss_limit_kb=%llu fatal_counter_delta=%llu pending_error_count=%llu elapsed_ms=%.3f\n",
+                "rss_peak_growth_kb=%llu rss_limit_kb=%llu fatal_counter_delta=%llu "
+                "pending_error_count=%llu elapsed_ms=%.3f\n",
+                stability_duration_mode ? "duration" : "cycles",
                 (unsigned long long) stability_cycles,
                 (unsigned long long) stability_cycles_completed,
+                (unsigned long long) stability_duration_requested_ms,
+                (unsigned long long) stability_duration_elapsed_ms,
+                (unsigned long long) stability_warmup_ms,
+                (unsigned long long) stability_cycles_at_baseline,
+                (unsigned long long) stability_cycles_after_baseline,
+                (unsigned long long) stability_sample_count,
                 (unsigned long long) stability_swap_out_delta,
                 (unsigned long long) stability_swap_in_delta,
                 (unsigned long long) stability_target_blocks,
@@ -942,14 +1100,17 @@ int main(int argc, char ** argv) {
                 (unsigned long long) stability_backing_size_final,
                 (unsigned long long) stability_backing_size_changed,
                 (unsigned long long) stability_backing_blocks_final,
+                (unsigned long long) stability_backing_blocks_baseline,
+                (unsigned long long) stability_backing_blocks_max,
                 (unsigned long long) stability_rss_baseline_kb,
                 (unsigned long long) stability_rss_final_kb,
                 (unsigned long long) stability_rss_max_kb,
                 (unsigned long long) rss_growth_kb,
+                (unsigned long long) rss_peak_growth_kb,
                 (unsigned long long) rss_limit_kb,
                 (unsigned long long) stability_fatal_counter_delta,
                 (unsigned long long) stability_pending_error_count,
-                stability_elapsed_ms);
+                stability_elapsed_ms_legacy);
 
         if (!stability_ok) {
             cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
