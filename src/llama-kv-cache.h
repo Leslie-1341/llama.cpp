@@ -766,6 +766,36 @@ private:
     // default and parsed once at construction; production mapping paths only read this state.
     mutable paged_test_mapping_fault paged_test_mapping_fault_;
 
+    enum class paged_test_io_fail_scope : uint8_t {
+        OFF,
+        SWAP_OUT,
+        ACTIVE_SWAP_IN,
+    };
+
+    enum class paged_test_io_fail_kind : uint8_t {
+        NONE,
+        WRITE_ENOSPC_ONCE,
+        READ_EOF_ONCE,
+    };
+
+    struct paged_test_io_fault {
+        paged_test_io_fail_scope scope = paged_test_io_fail_scope::OFF;
+        paged_test_io_fail_kind kind = paged_test_io_fail_kind::NONE;
+        llama_seq_id target_seq = -1;
+        bool fail_once = true;
+        bool consumed = false;
+        uint64_t matching_attempts = 0;
+        uint64_t trigger_count = 0;
+        uint32_t failed_block = PAGED_BLOCK_INVALID;
+        uint64_t failed_attempt_id = 0;
+        uint64_t retry_success_count = 0;
+    };
+
+    // KV-P0-B4B: context-local model-level backing-store I/O fault. The cache layer decides
+    // when the target seq/block is on a real paged swap path, then arms the store-local B4A
+    // one-shot fault immediately before calling write_cell/read_cell.
+    mutable paged_test_io_fault paged_test_io_fault_;
+
     // Synchronous decode-path error latch for paged KV swap-in. This is diagnostic/control
     // state only, not a second block-state machine; RESIDENT/SWAPPED/RELEASED/UNUSED remain
     // authoritative. There is no async worker in this path, so no mutex/atomic is used.

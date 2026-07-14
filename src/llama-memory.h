@@ -36,6 +36,7 @@ enum llama_memory_status {
 enum class llama_paged_swap_error_reason : uint8_t {
     NONE = 0,
     SWAP_IN_IO_FAILURE,
+    PAGED_SWAP_IN_IO_ERROR,
     ACTIVE_VISIBLE_RESTORE_FAILURE,
     NO_DUMMY_RESTORE_FAILURE,
     ACTIVE_READ_RELEASED_BLOCK,

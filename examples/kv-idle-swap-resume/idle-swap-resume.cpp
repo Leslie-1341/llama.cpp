@@ -176,6 +176,7 @@ static void print_usage(int, char ** argv) {
 
 struct kv_test_state {
     bool test_mode_enabled = false;
+    bool expect_swap_out_io_failure = false;
     bool expect_prefetch_failure = false;
     bool expect_active_decode_failure = false;
     bool retry_active_decode = false;
@@ -226,10 +227,12 @@ static void print_test_summary(const kv_test_state & test_state) {
     }
 
     fprintf(stderr,
-            "KV_TEST_SUMMARY decode_calls=%llu prefetch_failures_observed=%llu "
+            "KV_TEST_SUMMARY decode_calls=%llu expected_swap_out_io_failure=%d "
+            "prefetch_failures_observed=%llu "
             "active_decode_failures_observed=%llu active_decode_retries=%llu "
             "active_decode_retry_successes=%llu\n",
             (unsigned long long) test_state.decode_calls,
+            test_state.expect_swap_out_io_failure ? 1 : 0,
             (unsigned long long) test_state.prefetch_failures_observed,
             (unsigned long long) test_state.active_decode_failures_observed,
             (unsigned long long) test_state.active_decode_retries,
@@ -305,12 +308,14 @@ int main(int argc, char ** argv) {
     params.sampling.backend_sampling = false;
 
     kv_test_state test_state;
-    if (!parse_test_bool("LLAMA_KV_TEST_EXPECT_PREFETCH_FAILURE", test_state.expect_prefetch_failure) ||
+    if (!parse_test_bool("LLAMA_KV_TEST_EXPECT_SWAP_OUT_IO_FAILURE", test_state.expect_swap_out_io_failure) ||
+            !parse_test_bool("LLAMA_KV_TEST_EXPECT_PREFETCH_FAILURE", test_state.expect_prefetch_failure) ||
             !parse_test_bool("LLAMA_KV_TEST_EXPECT_ACTIVE_DECODE_FAILURE", test_state.expect_active_decode_failure) ||
             !parse_test_bool("LLAMA_KV_TEST_RETRY_ACTIVE_DECODE", test_state.retry_active_decode)) {
         return 1;
     }
     test_state.test_mode_enabled =
+        test_state.expect_swap_out_io_failure ||
         test_state.expect_prefetch_failure ||
         test_state.expect_active_decode_failure ||
         test_state.retry_active_decode;
