@@ -332,6 +332,7 @@ llama_kv_backing_store_status llama_kv_backing_store_file::finish_status(
 int64_t llama_kv_backing_store_file::pwrite_once(const char * data, size_t size, uint64_t offset) {
 #if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
     stats.syscall_attempts += 1;
+    stats.write_syscalls += 1;
     if (faults.write_eintr_once) {
         faults.write_eintr_once = false;
         errno = EINTR;
@@ -369,6 +370,7 @@ int64_t llama_kv_backing_store_file::pwrite_once(const char * data, size_t size,
 int64_t llama_kv_backing_store_file::pread_once(char * data, size_t size, uint64_t offset) {
 #if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
     stats.syscall_attempts += 1;
+    stats.read_syscalls += 1;
     if (faults.read_eintr_once) {
         faults.read_eintr_once = false;
         errno = EINTR;
@@ -560,6 +562,8 @@ llama_kv_backing_store_status llama_kv_backing_store_file::reset() {
     stats.read_calls     = 0;
     stats.release_calls  = 0;
     stats.syscall_attempts  = 0;
+    stats.read_syscalls     = 0;
+    stats.write_syscalls    = 0;
     stats.eintr_retries     = 0;
     stats.short_io_events   = 0;
     stats.terminal_failures = 0;
@@ -915,6 +919,7 @@ llama_kv_cache::llama_kv_cache(
         const char * LLAMA_KV_PAGED_REFAULT_TRACE_MAX       = std::getenv("LLAMA_KV_PAGED_REFAULT_TRACE_MAX");
         const char * LLAMA_KV_PAGED_REFAULT_TRACE_BACKTRACE = std::getenv("LLAMA_KV_PAGED_REFAULT_TRACE_BACKTRACE");
         const char * LLAMA_KV_PAGED_REFAULT_TRACE_ONCE      = std::getenv("LLAMA_KV_PAGED_REFAULT_TRACE_ONCE");
+        const char * LLAMA_KV_PAGED_IO_STATS                = std::getenv("LLAMA_KV_PAGED_IO_STATS");
         const int block_size_env = LLAMA_KV_PAGED_BLOCK_SIZE ? std::atoi(LLAMA_KV_PAGED_BLOCK_SIZE) : 16;
         const int shift_env      = LLAMA_KV_PAGED_SHIFT      ? std::atoi(LLAMA_KV_PAGED_SHIFT)      : 0;
         const bool release_env   = LLAMA_KV_PAGED_RELEASE && std::strcmp(LLAMA_KV_PAGED_RELEASE, "1") == 0;
@@ -965,6 +970,9 @@ llama_kv_cache::llama_kv_cache(
             paged_shadow_validate_enabled =
                 LLAMA_KV_PAGED_SHADOW_VALIDATE &&
                 std::strcmp(LLAMA_KV_PAGED_SHADOW_VALIDATE, "1") == 0;
+            paged_io_stats_enabled =
+                LLAMA_KV_PAGED_IO_STATS &&
+                std::strcmp(LLAMA_KV_PAGED_IO_STATS, "1") == 0;
             paged_mincore_requested = LLAMA_KV_PAGED_MINCORE && std::strcmp(LLAMA_KV_PAGED_MINCORE, "1") == 0;
 #if defined(__linux__)
             // kv_paged_enabled already implies n_stream==1 && !v_trans (checked above). CPU host
@@ -1021,6 +1029,9 @@ llama_kv_cache::llama_kv_cache(
             }
             if (paged_base_timing_enabled) {
                 LLAMA_LOG_INFO("%s: KV paged base timing enabled (telemetry only)\n", __func__);
+            }
+            if (paged_io_stats_enabled) {
+                LLAMA_LOG_INFO("%s: KV paged block I/O stats enabled (telemetry only)\n", __func__);
             }
             if (paged_idle_swap_requested) {
                 LLAMA_LOG_INFO("%s: KV paged idle swap requested (safe-candidate probe only)\n", __func__);
@@ -3186,6 +3197,10 @@ void llama_kv_cache::paged_swap_out_block_impl(uint32_t physical_block, bool do_
     const uint64_t retry_swap_out_before = paged_blocks_swapped_out;
     const uint64_t retry_madvise_before = paged_swap_madvise_calls;
     const paged_block_state retry_state_before = paged_block_states[physical_block];
+    if (paged_io_stats_enabled && total_size > paged_io_staging_buffer_bytes) {
+        paged_io_staging_buffer_bytes = total_size;
+    }
+    const uint64_t io_stats_start_us = paged_io_stats_enabled ? llama_paged_timing_now_us() : 0;
 
     for (uint32_t cell = begin; cell < end; ++cell) {
         if (cell >= cells.size()) {
@@ -3284,6 +3299,14 @@ void llama_kv_cache::paged_swap_out_block_impl(uint32_t physical_block, bool do_
     paged_swap_out_calls += 1;
     paged_blocks_swapped_out += 1;
     paged_swap_bytes_out += block_bytes;
+    if (paged_io_stats_enabled) {
+        const uint64_t elapsed_us = llama_paged_timing_now_us() - io_stats_start_us;
+        paged_io_swap_out_latency_us += elapsed_us;
+        paged_io_swap_out_timed_calls += 1;
+        if (elapsed_us > paged_io_swap_out_latency_max_us) {
+            paged_io_swap_out_latency_max_us = elapsed_us;
+        }
+    }
 
     if (!do_madvise) {
         return;
@@ -3423,6 +3446,10 @@ bool llama_kv_cache::paged_swap_in_block(
     std::vector<uint8_t> staging(total_size);
     uint64_t block_bytes = 0;
     uint64_t successful_cells = 0;
+    if (paged_io_stats_enabled && total_size > paged_io_staging_buffer_bytes) {
+        paged_io_staging_buffer_bytes = total_size;
+    }
+    const uint64_t io_stats_start_us = paged_io_stats_enabled ? llama_paged_timing_now_us() : 0;
 
     auto block_state_name = [](paged_block_state state) {
         switch (state) {
@@ -3654,6 +3681,14 @@ bool llama_kv_cache::paged_swap_in_block(
     paged_blocks_swapped_in += 1;
     paged_swap_bytes_in += block_bytes;
     paged_swap_in_last_block = physical_block;
+    if (paged_io_stats_enabled) {
+        const uint64_t elapsed_us = llama_paged_timing_now_us() - io_stats_start_us;
+        paged_io_swap_in_latency_us += elapsed_us;
+        paged_io_swap_in_timed_calls += 1;
+        if (elapsed_us > paged_io_swap_in_latency_max_us) {
+            paged_io_swap_in_latency_max_us = elapsed_us;
+        }
+    }
     if (retry_success_candidate) {
         paged_test_io_fault_.retry_success_count += 1;
         LLAMA_LOG_ERROR(
@@ -4886,6 +4921,34 @@ void llama_kv_cache::paged_log_stats() const {
             (unsigned long long) paged_refault_unprotected_pages,
             (unsigned long long) paged_refault_protect_failures,
             (unsigned long long) paged_refault_unprotect_failures);
+
+    if (paged_io_stats_enabled) {
+        static const llama_kv_backing_store_stats empty_stats;
+        const auto & backing_stats = kv_swap_store ? kv_swap_store->get_stats() : empty_stats;
+        const uint64_t avg_out_us = paged_io_swap_out_timed_calls > 0 ?
+            paged_io_swap_out_latency_us / paged_io_swap_out_timed_calls : 0;
+        const uint64_t avg_in_us = paged_io_swap_in_timed_calls > 0 ?
+            paged_io_swap_in_latency_us / paged_io_swap_in_timed_calls : 0;
+        fprintf(stderr,
+                "KV_PAGED_IO_STATS "
+                "block_swap_out_calls=%llu block_swap_in_calls=%llu "
+                "backing_read_syscalls=%llu backing_write_syscalls=%llu "
+                "bytes_read=%llu bytes_written=%llu "
+                "avg_block_swap_out_latency_us=%llu max_block_swap_out_latency_us=%llu "
+                "avg_block_swap_in_latency_us=%llu max_block_swap_in_latency_us=%llu "
+                "staging_buffer_bytes=%llu\n",
+                (unsigned long long) paged_swap_out_calls,
+                (unsigned long long) paged_swap_in_calls,
+                (unsigned long long) backing_stats.read_syscalls,
+                (unsigned long long) backing_stats.write_syscalls,
+                (unsigned long long) backing_stats.bytes_read,
+                (unsigned long long) backing_stats.bytes_written,
+                (unsigned long long) avg_out_us,
+                (unsigned long long) paged_io_swap_out_latency_max_us,
+                (unsigned long long) avg_in_us,
+                (unsigned long long) paged_io_swap_in_latency_max_us,
+                (unsigned long long) paged_io_staging_buffer_bytes);
+    }
 }
 
 void llama_kv_cache::swap_out_cell(uint32_t cell) {

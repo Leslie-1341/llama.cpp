@@ -15,6 +15,7 @@ CASE_TIMEOUT_SEC="${CASE_TIMEOUT_SEC:-1800}"
 RSS_LIMIT_MB="${RSS_LIMIT_MB:-256}"
 PROGRESS_EVERY="${PROGRESS_EVERY:-50}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
+IO_STATS="${IO_STATS:-0}"
 
 RUNNER="$BUILD_DIR/bin/llama-kv-idle-swap-resume"
 
@@ -133,6 +134,60 @@ summary_value() {
     ' "$file"
 }
 
+io_stats_value() {
+    local line="$1"
+    local key="$2"
+    awk -v key="$key" '
+        {
+            for (i = 1; i <= NF; ++i) {
+                split($i, kv, "=")
+                if (kv[1] == key) {
+                    print kv[2]
+                    exit
+                }
+            }
+        }
+    ' <<< "$line"
+}
+
+validate_io_stats_line() {
+    local file="$1"
+    local count line
+    count="$(grep -c '^KV_PAGED_IO_STATS ' "$file" || true)"
+    [[ "$count" == "1" ]] || fail "expected exactly one KV_PAGED_IO_STATS line in $file, got $count"
+    line="$(grep '^KV_PAGED_IO_STATS ' "$file")"
+
+    local fields=(
+        block_swap_out_calls
+        block_swap_in_calls
+        backing_read_syscalls
+        backing_write_syscalls
+        bytes_read
+        bytes_written
+        avg_block_swap_out_latency_us
+        max_block_swap_out_latency_us
+        avg_block_swap_in_latency_us
+        max_block_swap_in_latency_us
+        staging_buffer_bytes
+    )
+    local field value
+    for field in "${fields[@]}"; do
+        value="$(io_stats_value "$line" "$field")"
+        [[ -n "$value" ]] || fail "missing $field in KV_PAGED_IO_STATS"
+        validate_u64_strict "KV_PAGED_IO_STATS.$field" "$value"
+    done
+
+    [[ "$(io_stats_value "$line" block_swap_out_calls)" != "0" ]] || fail "KV_PAGED_IO_STATS block_swap_out_calls is zero"
+    [[ "$(io_stats_value "$line" block_swap_in_calls)" != "0" ]] || fail "KV_PAGED_IO_STATS block_swap_in_calls is zero"
+    [[ "$(io_stats_value "$line" backing_read_syscalls)" != "0" ]] || fail "KV_PAGED_IO_STATS backing_read_syscalls is zero"
+    [[ "$(io_stats_value "$line" backing_write_syscalls)" != "0" ]] || fail "KV_PAGED_IO_STATS backing_write_syscalls is zero"
+    [[ "$(io_stats_value "$line" bytes_read)" != "0" ]] || fail "KV_PAGED_IO_STATS bytes_read is zero"
+    [[ "$(io_stats_value "$line" bytes_written)" != "0" ]] || fail "KV_PAGED_IO_STATS bytes_written is zero"
+    [[ "$(io_stats_value "$line" staging_buffer_bytes)" != "0" ]] || fail "KV_PAGED_IO_STATS staging_buffer_bytes is zero"
+
+    IO_STATS_LINE_RESULT="$line"
+}
+
 POLLUTION_ENV=(
     LLAMA_FLEX
     LLAMA_FLEX_AHEAD
@@ -162,6 +217,7 @@ POLLUTION_ENV=(
     LLAMA_KV_PAGED_IDLE_SWAP_MIN_IDLE_STEPS
     LLAMA_KV_PAGED_IDLE_TRACE
     LLAMA_KV_PAGED_INGRAPH
+    LLAMA_KV_PAGED_IO_STATS
     LLAMA_KV_PAGED_MINCORE
     LLAMA_KV_PAGED_PREFETCH_AFTER_ACTIVE_TOKENS
     LLAMA_KV_PAGED_PREFETCH_AUTO_BLOCKS_PER_STEP
@@ -227,6 +283,9 @@ run_case() {
             unset "$key"
         done
         export "${KV_ENV_COMMON[@]}"
+        if [[ "$IO_STATS" == "1" ]]; then
+            export LLAMA_KV_PAGED_IO_STATS=1
+        fi
         export LLAMA_KV_STABILITY_CYCLES="$cycles"
         export LLAMA_KV_STABILITY_DURATION_SEC="$duration_sec"
         timeout "$CASE_TIMEOUT_SEC" "$RUNNER" "${COMMON_ARGS[@]}"
@@ -261,6 +320,7 @@ main() {
     validate_u64_strict RSS_LIMIT_MB "$RSS_LIMIT_MB"
     validate_u64_strict PROGRESS_EVERY "$PROGRESS_EVERY"
     validate_u64_strict SKIP_BUILD "$SKIP_BUILD"
+    validate_u64_strict IO_STATS "$IO_STATS"
     CYCLES="$(normalize_digits "$CYCLES")"
     DURATION_SEC="$(normalize_digits "$DURATION_SEC")"
     WARMUP_SEC="$(normalize_digits "$WARMUP_SEC")"
@@ -270,6 +330,9 @@ main() {
     RSS_LIMIT_MB="$(normalize_digits "$RSS_LIMIT_MB")"
     PROGRESS_EVERY="$(normalize_digits "$PROGRESS_EVERY")"
     SKIP_BUILD="$(normalize_digits "$SKIP_BUILD")"
+    IO_STATS="$(normalize_digits "$IO_STATS")"
+    [[ "$SKIP_BUILD" == "0" || "$SKIP_BUILD" == "1" ]] || fail "SKIP_BUILD must be 0 or 1"
+    [[ "$IO_STATS" == "0" || "$IO_STATS" == "1" ]] || fail "IO_STATS must be 0 or 1"
     [[ "$CYCLES" == "0" || "$DURATION_SEC" == "0" ]] || fail "CYCLES and DURATION_SEC cannot both be > 0"
     if [[ "$DURATION_SEC" == "0" ]]; then
         [[ "$CYCLES" != "0" ]] || fail "CYCLES must be > 0 when DURATION_SEC=0"
@@ -322,6 +385,16 @@ main() {
     assert_token_count "$OUTPUT_ROOT/stress/run.out" seq0_resume_decoded_tokens "$VERIFY_TOKENS"
 
     grep -q 'KV_STABILITY_SUMMARY' "$OUTPUT_ROOT/stress/run.err" || fail "missing KV_STABILITY_SUMMARY"
+    local io_stats_line=""
+    if [[ "$IO_STATS" == "1" ]]; then
+        IO_STATS_LINE_RESULT=""
+        validate_io_stats_line "$OUTPUT_ROOT/stress/run.err"
+        io_stats_line="$IO_STATS_LINE_RESULT"
+    else
+        if grep -q '^KV_PAGED_IO_STATS ' "$OUTPUT_ROOT/stress/run.err"; then
+            fail "KV_PAGED_IO_STATS present while IO_STATS=0"
+        fi
+    fi
 
     local mode cycles_completed backing_changed fatal_delta pending swap_out_delta swap_in_delta rss_growth rss_peak_growth rss_limit
     local target_blocks backing_stat_valid backing_capacity backing_size_first backing_size_final
@@ -426,6 +499,9 @@ main() {
     [[ "$exact_seq0_match" == "1" ]] || fail "SEQ0_EXACT_MATCH=0"
 
     printf 'KV_P0_STABILITY_PASS\n'
+    if [[ "$IO_STATS" == "1" ]]; then
+        printf '%s\n' "$io_stats_line"
+    fi
     printf 'stability_mode=%s\n' "$mode"
     if [[ "$mode" == "duration" ]]; then
         printf 'duration_reached=1\n'

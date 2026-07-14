@@ -289,6 +289,8 @@ static void test_fault_free_observability() {
 
     const auto & stats = store.get_stats();
     check(stats.syscall_attempts == 2, "fault-free records one write and one read syscall attempt");
+    check(stats.write_syscalls == 1, "fault-free records one write syscall");
+    check(stats.read_syscalls == 1, "fault-free records one read syscall");
     check(stats.eintr_retries == 0, "fault-free records no EINTR retries");
     check(stats.short_io_events == 0, "fault-free records no short I/O events");
     check(stats.terminal_failures == 0, "fault-free records no terminal failures");
@@ -326,6 +328,8 @@ static void test_eintr_once_retries_and_preserves_data() {
     const auto & stats = store.get_stats();
     check(stats.eintr_retries == 2, "records both read and write EINTR retries");
     check(stats.syscall_attempts == 4, "EINTR paths record retry attempts");
+    check(stats.write_syscalls == 2, "EINTR write path records retry attempts");
+    check(stats.read_syscalls == 2, "EINTR read path records retry attempts");
     check(stats.terminal_failures == 0, "EINTR paths have no terminal failures");
     check(store.get_actual_file_size() == store.get_capacity(), "EINTR file size remains fixed");
 }
@@ -359,6 +363,8 @@ static void test_short_once_completes_remaining_io() {
     const auto & stats = store.get_stats();
     check(stats.short_io_events == 2, "records both read and write short I/O events");
     check(stats.syscall_attempts == 4, "short I/O paths record follow-up attempts");
+    check(stats.write_syscalls == 2, "short write path records follow-up attempt");
+    check(stats.read_syscalls == 2, "short read path records follow-up attempt");
     check(stats.terminal_failures == 0, "short I/O paths have no terminal failures");
     check(store.get_actual_file_size() == store.get_capacity(), "short I/O file size remains fixed");
 }

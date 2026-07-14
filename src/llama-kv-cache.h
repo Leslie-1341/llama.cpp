@@ -56,6 +56,8 @@ struct llama_kv_backing_store_stats {
     int      last_errno     = 0;
     llama_kv_backing_store_status last_status = llama_kv_backing_store_status::ok;
     uint64_t syscall_attempts  = 0;
+    uint64_t read_syscalls     = 0;
+    uint64_t write_syscalls    = 0;
     uint64_t eintr_retries     = 0;
     uint64_t short_io_events   = 0;
     uint64_t terminal_failures = 0;
@@ -726,6 +728,14 @@ private:
     mutable uint64_t paged_prefetch_seq_last_released_blocks = 0;
     mutable uint64_t paged_prefetch_seq_last_invalid_cells = 0;
     mutable uint64_t paged_prefetch_seq_last_failures = 0;
+    bool     paged_io_stats_enabled = false;
+    mutable uint64_t paged_io_swap_out_latency_us = 0;
+    mutable uint64_t paged_io_swap_in_latency_us = 0;
+    mutable uint64_t paged_io_swap_out_latency_max_us = 0;
+    mutable uint64_t paged_io_swap_in_latency_max_us = 0;
+    mutable uint64_t paged_io_swap_out_timed_calls = 0;
+    mutable uint64_t paged_io_swap_in_timed_calls = 0;
+    mutable uint64_t paged_io_staging_buffer_bytes = 0;
 
     enum class paged_test_swapin_fail_scope : uint8_t {
         OFF,
