@@ -257,6 +257,27 @@ static bool llama_kv_fixed_slot_bounds(
     return true;
 }
 
+static bool llama_kv_fixed_slot_range_bounds(
+        uint32_t begin_cell, uint32_t cell_count, uint32_t n_slots, size_t cell_stride,
+        uint64_t capacity, uint64_t & offset_out, size_t & total_size_out) {
+    offset_out = 0;
+    total_size_out = 0;
+    if (cell_count == 0 || begin_cell >= n_slots || cell_count > n_slots - begin_cell || cell_stride == 0 ||
+            cell_count > std::numeric_limits<size_t>::max() / cell_stride) {
+        return false;
+    }
+    if (!llama_kv_fixed_slot_bounds(begin_cell, n_slots, cell_stride, capacity, offset_out)) {
+        return false;
+    }
+    total_size_out = (size_t) cell_count * cell_stride;
+    if ((uint64_t) total_size_out > capacity - offset_out ||
+            offset_out > (uint64_t) std::numeric_limits<off_t>::max() ||
+            (uint64_t) total_size_out > (uint64_t) std::numeric_limits<off_t>::max() - offset_out) {
+        return false;
+    }
+    return true;
+}
+
 llama_kv_backing_store_file::~llama_kv_backing_store_file() {
 #if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
     if (fd >= 0) {
@@ -410,32 +431,31 @@ llama_kv_backing_store_status llama_kv_backing_store_file::write_cell(
         const void * data,
         size_t     size,
         uint64_t & offset_out) {
+    return write_cells(strm, cell, 1, data, size, offset_out);
+}
+
+llama_kv_backing_store_status llama_kv_backing_store_file::write_cells(
+        uint32_t strm, uint32_t begin_cell, uint32_t cell_count, const void * data,
+        size_t total_size, uint64_t & offset_out) {
     (void) strm;
-
     offset_out = 0;
-
-    if (fd < 0) {
-        return finish_status(llama_kv_backing_store_status::disabled, stats.last_errno);
-    }
-    if (!data || size == 0 || cell >= n_slots || size != cell_stride) {
-        return finish_status(llama_kv_backing_store_status::bad_slot, 0);
-    }
-
-#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
-    // offset is a pure function of cell: repeat swap-outs of the same physical cell always
-    // overwrite the same fixed slot, so the file never grows past n_slots * cell_stride.
+    if (fd < 0) return finish_status(llama_kv_backing_store_status::disabled, stats.last_errno);
     uint64_t offset = 0;
-    if (!llama_kv_fixed_slot_bounds(cell, n_slots, cell_stride, capacity, offset)) {
+    size_t expected_size = 0;
+    if (!data || !llama_kv_fixed_slot_range_bounds(
+            begin_cell, cell_count, n_slots, cell_stride, capacity, offset, expected_size) ||
+            total_size != expected_size) {
         return finish_status(llama_kv_backing_store_status::bad_slot, 0);
     }
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
     const char * ptr = static_cast<const char *>(data);
     size_t written = 0;
 
-    while (written < size) {
+    while (written < total_size) {
         if (offset + written > (uint64_t) std::numeric_limits<off_t>::max()) {
             return finish_status(llama_kv_backing_store_status::io_error, EOVERFLOW);
         }
-        const int64_t ret = pwrite_once(ptr + written, size - written, offset + written);
+        const int64_t ret = pwrite_once(ptr + written, total_size - written, offset + written);
         if (ret < 0) {
             if (errno == EINTR) {
                 stats.eintr_retries += 1;
@@ -450,7 +470,7 @@ llama_kv_backing_store_status llama_kv_backing_store_file::write_cell(
     }
 
     offset_out = offset;
-    stats.bytes_written += size;
+    stats.bytes_written += total_size;
     stats.write_calls += 1;
     stats.last_errno = 0;
 
@@ -466,20 +486,19 @@ llama_kv_backing_store_status llama_kv_backing_store_file::read_cell(
         uint64_t offset,
         void *   data,
         size_t   size) {
+    return read_cells(strm, cell, 1, offset, data, size);
+}
+
+llama_kv_backing_store_status llama_kv_backing_store_file::read_cells(
+        uint32_t strm, uint32_t begin_cell, uint32_t cell_count, uint64_t offset,
+        void * data, size_t total_size) {
     (void) strm;
-
-    if (fd < 0) {
-        return finish_status(llama_kv_backing_store_status::disabled, stats.last_errno);
-    }
-    if (!data || size == 0 || cell >= n_slots || size != cell_stride) {
-        return finish_status(llama_kv_backing_store_status::bad_slot, 0);
-    }
-
+    if (fd < 0) return finish_status(llama_kv_backing_store_status::disabled, stats.last_errno);
     uint64_t expected_offset = 0;
-    if (!llama_kv_fixed_slot_bounds(cell, n_slots, cell_stride, capacity, expected_offset) ||
-            offset != expected_offset || size > capacity - expected_offset) {
-        // caller-supplied offset does not match this cell's fixed slot address (stale/corrupt
-        // metadata) - refuse rather than trusting it.
+    size_t expected_size = 0;
+    if (!data || !llama_kv_fixed_slot_range_bounds(
+            begin_cell, cell_count, n_slots, cell_stride, capacity, expected_offset, expected_size) ||
+            offset != expected_offset || total_size != expected_size) {
         return finish_status(llama_kv_backing_store_status::bad_slot, 0);
     }
 
@@ -487,28 +506,28 @@ llama_kv_backing_store_status llama_kv_backing_store_file::read_cell(
     char * ptr = static_cast<char *>(data);
     size_t read_bytes = 0;
 
-    while (read_bytes < size) {
+    while (read_bytes < total_size) {
         if (expected_offset + read_bytes > (uint64_t) std::numeric_limits<off_t>::max()) {
-            std::memset(data, 0, size);
+            std::memset(data, 0, total_size);
             return finish_status(llama_kv_backing_store_status::io_error, EOVERFLOW);
         }
-        const int64_t ret = pread_once(ptr + read_bytes, size - read_bytes, expected_offset + read_bytes);
+        const int64_t ret = pread_once(ptr + read_bytes, total_size - read_bytes, expected_offset + read_bytes);
         if (ret < 0) {
             if (errno == EINTR) {
                 stats.eintr_retries += 1;
                 continue;
             }
-            std::memset(data, 0, size);
+            std::memset(data, 0, total_size);
             return finish_status(llama_kv_backing_store_status::io_error, errno);
         }
         if (ret == 0) {
-            std::memset(data, 0, size);
+            std::memset(data, 0, total_size);
             return finish_status(llama_kv_backing_store_status::io_error, EIO);
         }
         read_bytes += (size_t) ret;
     }
 
-    stats.bytes_read += size;
+    stats.bytes_read += total_size;
     stats.read_calls += 1;
     stats.last_errno = 0;
 
@@ -3123,6 +3142,7 @@ void llama_kv_cache::paged_swap_out_block_impl(uint32_t physical_block, bool do_
             paged_block_states[physical_block] != paged_block_state::RESIDENT) {
         return;
     }
+    const uint64_t validate_start_us = paged_io_stats_enabled ? llama_paged_timing_now_us() : 0;
 
     size_t total_size = 0;
     for (const auto & layer : layers) {
@@ -3143,11 +3163,6 @@ void llama_kv_cache::paged_swap_out_block_impl(uint32_t physical_block, bool do_
     if (end > paged_swap_offsets.size() || end > paged_swap_sizes.size()) {
         paged_swap_backend_failures += 1;
         return;
-    }
-
-    for (uint32_t cell = begin; cell < end; ++cell) {
-        paged_swap_offsets[cell] = 0;
-        paged_swap_sizes[cell] = 0;
     }
 
     auto clear_block_entries = [&]() {
@@ -3182,8 +3197,13 @@ void llama_kv_cache::paged_swap_out_block_impl(uint32_t physical_block, bool do_
         }
     }
 
-    std::vector<uint8_t> staging(total_size);
-    uint64_t block_bytes = 0;
+    const uint32_t cell_count = end - begin;
+    if (cell_count == 0 || cell_count > std::numeric_limits<size_t>::max() / total_size) {
+        paged_swap_backend_failures += 1;
+        return;
+    }
+    const size_t block_size = (size_t) cell_count * total_size;
+    if (paged_io_staging.size() < block_size) paged_io_staging.resize(block_size);
     bool io_fault_armed = false;
     uint64_t io_fault_attempt_id = 0;
     uint64_t io_fault_swap_out_before = 0;
@@ -3197,56 +3217,67 @@ void llama_kv_cache::paged_swap_out_block_impl(uint32_t physical_block, bool do_
     const uint64_t retry_swap_out_before = paged_blocks_swapped_out;
     const uint64_t retry_madvise_before = paged_swap_madvise_calls;
     const paged_block_state retry_state_before = paged_block_states[physical_block];
-    if (paged_io_stats_enabled && total_size > paged_io_staging_buffer_bytes) {
-        paged_io_staging_buffer_bytes = total_size;
+    if (paged_io_stats_enabled && block_size > paged_io_staging_buffer_bytes) {
+        paged_io_staging_buffer_bytes = block_size;
     }
-    const uint64_t io_stats_start_us = paged_io_stats_enabled ? llama_paged_timing_now_us() : 0;
+    if (paged_io_stats_enabled) {
+        paged_io_block_out_validate_us += llama_paged_timing_now_us() - validate_start_us;
+        paged_io_block_out_validate_calls += 1;
+    }
 
+    const uint64_t pack_start_us = paged_io_stats_enabled ? llama_paged_timing_now_us() : 0;
     for (uint32_t cell = begin; cell < end; ++cell) {
         if (cell >= cells.size()) {
             paged_swap_backend_failures += 1;
             clear_block_entries();
             return;
         }
-
-        size_t cursor = 0;
+    }
+    for (uint32_t cell = begin; cell < end; ++cell) {
+        size_t cursor = (size_t) (cell - begin) * total_size;
         for (const auto & layer : layers) {
-            if (!layer.k_stream.empty() && layer.k_stream[0]) {
-                auto * k = layer.k_stream[0];
-                const size_t row_size = k->nb[1];
-                ggml_backend_tensor_get(k, staging.data() + cursor, (size_t) cell * row_size, row_size);
-                cursor += row_size;
-            }
-            if (layer.v && !layer.v_stream.empty() && layer.v_stream[0]) {
-                auto * v = layer.v_stream[0];
-                const size_t row_size = v->nb[1];
-                ggml_backend_tensor_get(v, staging.data() + cursor, (size_t) cell * row_size, row_size);
+            for (ggml_tensor * tensor : {
+                    layer.k_stream.empty() ? nullptr : layer.k_stream[0],
+                    (!layer.v || layer.v_stream.empty()) ? nullptr : layer.v_stream[0] }) {
+                if (!tensor) continue;
+                const size_t row_size = tensor->nb[1];
+                ggml_backend_tensor_get(
+                        tensor, paged_io_staging.data() + cursor, (size_t) cell * row_size, row_size);
                 cursor += row_size;
             }
         }
-        GGML_ASSERT(cursor == total_size);
+        GGML_ASSERT(cursor == (size_t) (cell - begin + 1) * total_size);
+    }
+    if (paged_io_stats_enabled) {
+        paged_io_block_out_pack_us += llama_paged_timing_now_us() - pack_start_us;
+        paged_io_block_out_pack_calls += 1;
+    }
 
-        uint64_t offset = 0;
-        if (io_fault_candidate && !io_fault_armed) {
-            if (auto * store_file = dynamic_cast<llama_kv_backing_store_file *>(kv_swap_store.get())) {
-                llama_kv_backing_store_faults faults = store_file->get_test_faults();
-                faults.write_enospc_once = true;
-                store_file->set_test_faults(faults);
-                if (paged_test_io_fault_.fail_once) {
-                    paged_test_io_fault_.consumed = true;
-                }
-                paged_test_io_fault_.matching_attempts += 1;
-                paged_test_io_fault_.trigger_count += 1;
-                io_fault_attempt_id = paged_test_io_fault_.matching_attempts;
-                io_fault_swap_out_before = paged_blocks_swapped_out;
-                io_fault_madvise_before = paged_swap_madvise_calls;
-                io_fault_syscalls_before = kv_swap_store->get_stats().syscall_attempts;
-                io_fault_state_before = paged_block_states[physical_block];
-                io_fault_armed = true;
-            }
+    if (io_fault_candidate) {
+        if (auto * store_file = dynamic_cast<llama_kv_backing_store_file *>(kv_swap_store.get())) {
+            llama_kv_backing_store_faults faults = store_file->get_test_faults();
+            faults.write_enospc_once = true;
+            store_file->set_test_faults(faults);
+            if (paged_test_io_fault_.fail_once) paged_test_io_fault_.consumed = true;
+            paged_test_io_fault_.matching_attempts += 1;
+            paged_test_io_fault_.trigger_count += 1;
+            io_fault_attempt_id = paged_test_io_fault_.matching_attempts;
+            io_fault_swap_out_before = paged_blocks_swapped_out;
+            io_fault_madvise_before = paged_swap_madvise_calls;
+            io_fault_syscalls_before = kv_swap_store->get_stats().syscall_attempts;
+            io_fault_state_before = paged_block_states[physical_block];
+            io_fault_armed = true;
         }
-        const auto status = kv_swap_store->write_cell(0, cell, staging.data(), staging.size(), offset);
-        if (status != llama_kv_backing_store_status::ok) {
+    }
+    uint64_t block_offset = 0;
+    const uint64_t write_start_us = paged_io_stats_enabled ? llama_paged_timing_now_us() : 0;
+    const auto status = kv_swap_store->write_cells(
+            0, begin, cell_count, paged_io_staging.data(), block_size, block_offset);
+    if (paged_io_stats_enabled) {
+        paged_io_block_out_write_us += llama_paged_timing_now_us() - write_start_us;
+        paged_io_block_out_write_calls += 1;
+    }
+    if (status != llama_kv_backing_store_status::ok) {
             paged_swap_backend_failures += 1;
             if (io_fault_armed) {
                 const auto & stats = kv_swap_store->get_stats();
@@ -3259,7 +3290,7 @@ void llama_kv_cache::paged_swap_out_block_impl(uint32_t physical_block, bool do_
                         "pwrite_attempts_after=%llu trigger_count=%llu attempt_id=%llu\n",
                         (int) paged_test_io_fault_.target_seq,
                         physical_block,
-                        cell,
+                        begin,
                         block_state_name(io_fault_state_before),
                         block_state_name(paged_block_states[physical_block]),
                         (unsigned long long) io_fault_swap_out_before,
@@ -3280,38 +3311,36 @@ void llama_kv_cache::paged_swap_out_block_impl(uint32_t physical_block, bool do_
                 paged_swap_out_block_impl(physical_block, do_madvise);
             }
             return;
-        }
-
-        paged_swap_offsets[cell] = offset;
-        paged_swap_sizes[cell] = staging.size();
-        block_bytes += staging.size();
     }
 
+    const uint64_t metadata_start_us = paged_io_stats_enabled ? llama_paged_timing_now_us() : 0;
+    // Publication is all-or-nothing: no cell exposes a slot until the full contiguous write
+    // completed. This also makes a failed range retry overwrite from block_offset.
     for (uint32_t cell = begin; cell < end; ++cell) {
-        if (paged_swap_sizes[cell] != total_size) {
-            paged_swap_backend_failures += 1;
-            clear_block_entries();
-            return;
-        }
+        paged_swap_offsets[cell] = block_offset + (uint64_t) (cell - begin) * total_size;
+        paged_swap_sizes[cell] = total_size;
     }
 
     paged_block_states[physical_block] = paged_block_state::SWAPPED;
     paged_swap_out_calls += 1;
     paged_blocks_swapped_out += 1;
-    paged_swap_bytes_out += block_bytes;
+    paged_swap_bytes_out += block_size;
     if (paged_io_stats_enabled) {
-        const uint64_t elapsed_us = llama_paged_timing_now_us() - io_stats_start_us;
-        paged_io_swap_out_latency_us += elapsed_us;
-        paged_io_swap_out_timed_calls += 1;
-        if (elapsed_us > paged_io_swap_out_latency_max_us) {
-            paged_io_swap_out_latency_max_us = elapsed_us;
-        }
+        paged_io_block_out_metadata_us += llama_paged_timing_now_us() - metadata_start_us;
+        paged_io_block_out_metadata_calls += 1;
     }
 
     if (!do_madvise) {
+        if (paged_io_stats_enabled) {
+            const uint64_t elapsed_us = llama_paged_timing_now_us() - validate_start_us;
+            paged_io_swap_out_latency_us += elapsed_us;
+            paged_io_swap_out_timed_calls += 1;
+            paged_io_swap_out_latency_max_us = std::max(paged_io_swap_out_latency_max_us, elapsed_us);
+        }
         return;
     }
 
+    const uint64_t madvise_start_us = paged_io_stats_enabled ? llama_paged_timing_now_us() : 0;
     const uint64_t rss_before_kb = get_current_rss_kb();
     const uint64_t skip_no_full_before = paged_swap_madvise_skip_no_full_page;
     const uint64_t skip_neighbor_before = paged_swap_madvise_skip_neighbor;
@@ -3380,6 +3409,14 @@ void llama_kv_cache::paged_swap_out_block_impl(uint32_t physical_block, bool do_
     // exactly the event we want to catch); doing it before madvise would also work but would not
     // reflect the post-madvise state we are measuring. No-op unless refault tracing is enabled.
     paged_refault_protect_block(physical_block);
+    if (paged_io_stats_enabled) {
+        paged_io_block_out_madvise_us += llama_paged_timing_now_us() - madvise_start_us;
+        paged_io_block_out_madvise_calls += 1;
+        const uint64_t elapsed_us = llama_paged_timing_now_us() - validate_start_us;
+        paged_io_swap_out_latency_us += elapsed_us;
+        paged_io_swap_out_timed_calls += 1;
+        paged_io_swap_out_latency_max_us = std::max(paged_io_swap_out_latency_max_us, elapsed_us);
+    }
 }
 
 bool llama_kv_cache::paged_swap_in_block(
@@ -3419,11 +3456,7 @@ bool llama_kv_cache::paged_swap_in_block(
             paged_block_states[physical_block] != paged_block_state::SWAPPED) {
         return fail(UINT32_MAX, llama_kv_backing_store_status::bad_slot);
     }
-
-    // Stage 7D-A: a legitimate swap-in is about to ggml_backend_tensor_set into this block's
-    // pages, so restore access first. This is the sanctioned writer; it must NOT trap. No-op
-    // unless refault tracing is enabled / the block was protected.
-    paged_refault_unprotect_block(physical_block);
+    const uint64_t validate_start_us = paged_io_stats_enabled ? llama_paged_timing_now_us() : 0;
 
     size_t total_size = 0;
     for (const auto & layer : layers) {
@@ -3443,13 +3476,16 @@ bool llama_kv_cache::paged_swap_in_block(
     const auto & cells = v_cells[0];
     const uint32_t begin = physical_block * paged_block_size;
     const uint32_t end = std::min<uint32_t>(begin + paged_block_size, paged_kv_size);
-    std::vector<uint8_t> staging(total_size);
-    uint64_t block_bytes = 0;
-    uint64_t successful_cells = 0;
-    if (paged_io_stats_enabled && total_size > paged_io_staging_buffer_bytes) {
-        paged_io_staging_buffer_bytes = total_size;
+    const uint32_t cell_count = end - begin;
+    if (cell_count == 0 || cell_count > std::numeric_limits<size_t>::max() / total_size) {
+        paged_swap_in_fail_bad_size += 1;
+        paged_swap_backend_failures += 1;
+        return fail(UINT32_MAX, llama_kv_backing_store_status::bad_slot);
     }
-    const uint64_t io_stats_start_us = paged_io_stats_enabled ? llama_paged_timing_now_us() : 0;
+    const size_t block_size = (size_t) cell_count * total_size;
+    if (paged_io_stats_enabled && block_size > paged_io_staging_buffer_bytes) {
+        paged_io_staging_buffer_bytes = block_size;
+    }
 
     auto block_state_name = [](paged_block_state state) {
         switch (state) {
@@ -3511,93 +3547,79 @@ bool llama_kv_cache::paged_swap_in_block(
                 (unsigned long long) test_fault_swap_in_calls_before);
     }
 
+    // Validate every published slot before issuing I/O or touching a tensor. A corrupt later
+    // cell must not leave an earlier cell restored.
+    uint64_t block_offset = 0;
     for (uint32_t cell = begin; cell < end; ++cell) {
-        if (cell >= cells.size()) {
+        if (cell >= cells.size() || cell >= paged_swap_offsets.size() || cell >= paged_swap_sizes.size() ||
+                paged_swap_sizes[cell] != total_size) {
             paged_swap_in_fail_bad_size += 1;
             paged_swap_backend_failures += 1;
             return fail(cell, llama_kv_backing_store_status::bad_slot);
         }
-
-        if (cell >= paged_swap_offsets.size() || cell >= paged_swap_sizes.size()) {
+        const uint64_t expected = (uint64_t) cell * total_size;
+        if (paged_swap_offsets[cell] != expected || (cell > begin && paged_swap_offsets[cell] != block_offset +
+                (uint64_t) (cell - begin) * total_size)) {
             paged_swap_in_fail_no_offset += 1;
             paged_swap_backend_failures += 1;
             return fail(cell, llama_kv_backing_store_status::bad_slot);
         }
+        if (cell == begin) block_offset = paged_swap_offsets[cell];
+    }
+    if (paged_io_staging.size() < block_size) paged_io_staging.resize(block_size);
+    if (paged_io_stats_enabled) {
+        paged_io_block_in_validate_us += llama_paged_timing_now_us() - validate_start_us;
+        paged_io_block_in_validate_calls += 1;
+    }
 
-        const uint64_t offset = paged_swap_offsets[cell];
-        const size_t swap_size = paged_swap_sizes[cell];
-        if (swap_size == 0) {
-            paged_swap_in_fail_no_offset += 1;
-            paged_swap_backend_failures += 1;
-            return fail(cell, llama_kv_backing_store_status::bad_slot);
+    if (test_fault_attempt &&
+            (!paged_test_swapin_fault_.fail_once || !paged_test_swapin_fault_.consumed)) {
+        if (paged_test_swapin_fault_.fail_once) paged_test_swapin_fault_.consumed = true;
+        paged_test_swapin_fault_.trigger_count += 1;
+        if (fatal_on_failure) paged_test_swapin_fault_.active_trigger_count += 1;
+        else paged_test_swapin_fault_.prefetch_trigger_count += 1;
+        uint64_t metadata_present_cells = 0;
+        for (uint32_t metadata_cell = begin; metadata_cell < end; ++metadata_cell) {
+            if (paged_swap_sizes[metadata_cell] != 0) metadata_present_cells += 1;
         }
-        if (swap_size != total_size) {
-            paged_swap_in_fail_bad_size += 1;
-            paged_swap_backend_failures += 1;
-            return fail(cell, llama_kv_backing_store_status::bad_slot);
+        LLAMA_LOG_ERROR(
+                "TEST FAULT INJECTION attempt_id=%llu scope=%s physical_block=%u physical_cell=%u "
+                "successful_cells_before_failure=0 backend_status=io_error backend_errno=EIO(%d) "
+                "failure_reason=%s block_state=%d metadata_present_cells=%llu "
+                "paged_swap_in_calls_before=%llu\n",
+                (unsigned long long) test_fault_attempt_id, test_fault_scope_name, physical_block, begin, EIO,
+                llama_paged_swap_error_reason_name(failure_reason), (int) paged_block_states[physical_block],
+                (unsigned long long) metadata_present_cells,
+                (unsigned long long) test_fault_swap_in_calls_before);
+        paged_swap_in_fail_read_cell += 1;
+        paged_swap_backend_failures += 1;
+        return fail(begin, llama_kv_backing_store_status::io_error, EIO);
+    }
+
+    if (io_fault_candidate) {
+        if (auto * store_file = dynamic_cast<llama_kv_backing_store_file *>(kv_swap_store.get())) {
+            llama_kv_backing_store_faults faults = store_file->get_test_faults();
+            faults.read_eof_once = true;
+            store_file->set_test_faults(faults);
+            if (paged_test_io_fault_.fail_once) paged_test_io_fault_.consumed = true;
+            paged_test_io_fault_.matching_attempts += 1;
+            paged_test_io_fault_.trigger_count += 1;
+            io_fault_attempt_id = paged_test_io_fault_.matching_attempts;
+            io_fault_swap_in_before = paged_blocks_swapped_in;
+            io_fault_syscalls_before = kv_swap_store->get_stats().syscall_attempts;
+            io_fault_state_before = paged_block_states[physical_block];
+            io_fault_armed = true;
         }
+    }
 
-        if (test_fault_attempt &&
-                (!paged_test_swapin_fault_.fail_once || !paged_test_swapin_fault_.consumed) &&
-                successful_cells == paged_test_swapin_fault_.fail_after_cells) {
-            if (paged_test_swapin_fault_.fail_once) {
-                paged_test_swapin_fault_.consumed = true;
-            }
-            paged_test_swapin_fault_.trigger_count += 1;
-            if (fatal_on_failure) {
-                paged_test_swapin_fault_.active_trigger_count += 1;
-            } else {
-                paged_test_swapin_fault_.prefetch_trigger_count += 1;
-            }
-
-            uint64_t metadata_present_cells = 0;
-            for (uint32_t metadata_cell = begin; metadata_cell < end; ++metadata_cell) {
-                if (metadata_cell < paged_swap_sizes.size() && paged_swap_sizes[metadata_cell] != 0) {
-                    metadata_present_cells += 1;
-                }
-            }
-
-            LLAMA_LOG_ERROR(
-                    "TEST FAULT INJECTION attempt_id=%llu scope=%s physical_block=%u physical_cell=%u "
-                    "successful_cells_before_failure=%llu backend_status=io_error backend_errno=EIO(%d) "
-                    "failure_reason=%s block_state=%d metadata_present_cells=%llu "
-                    "paged_swap_in_calls_before=%llu\n",
-                    (unsigned long long) test_fault_attempt_id,
-                    test_fault_scope_name,
-                    physical_block,
-                    cell,
-                    (unsigned long long) successful_cells,
-                    EIO,
-                    llama_paged_swap_error_reason_name(failure_reason),
-                    (int) paged_block_states[physical_block],
-                    (unsigned long long) metadata_present_cells,
-                    (unsigned long long) test_fault_swap_in_calls_before);
-
-            paged_swap_in_fail_read_cell += 1;
-            paged_swap_backend_failures += 1;
-            return fail(cell, llama_kv_backing_store_status::io_error, EIO);
-        }
-
-        if (io_fault_candidate && !io_fault_armed) {
-            if (auto * store_file = dynamic_cast<llama_kv_backing_store_file *>(kv_swap_store.get())) {
-                llama_kv_backing_store_faults faults = store_file->get_test_faults();
-                faults.read_eof_once = true;
-                store_file->set_test_faults(faults);
-                if (paged_test_io_fault_.fail_once) {
-                    paged_test_io_fault_.consumed = true;
-                }
-                paged_test_io_fault_.matching_attempts += 1;
-                paged_test_io_fault_.trigger_count += 1;
-                io_fault_attempt_id = paged_test_io_fault_.matching_attempts;
-                io_fault_swap_in_before = paged_blocks_swapped_in;
-                io_fault_syscalls_before = kv_swap_store->get_stats().syscall_attempts;
-                io_fault_state_before = paged_block_states[physical_block];
-                io_fault_armed = true;
-            }
-        }
-
-        const auto status = kv_swap_store->read_cell(0, cell, offset, staging.data(), staging.size());
-        if (status != llama_kv_backing_store_status::ok) {
+    const uint64_t read_start_us = paged_io_stats_enabled ? llama_paged_timing_now_us() : 0;
+    const auto status = kv_swap_store->read_cells(
+            0, begin, cell_count, block_offset, paged_io_staging.data(), block_size);
+    if (paged_io_stats_enabled) {
+        paged_io_block_in_read_us += llama_paged_timing_now_us() - read_start_us;
+        paged_io_block_in_read_calls += 1;
+    }
+    if (status != llama_kv_backing_store_status::ok) {
             paged_swap_in_fail_read_cell += 1;
             paged_swap_backend_failures += 1;
             int backend_errno = 0;
@@ -3623,7 +3645,7 @@ bool llama_kv_cache::paged_swap_in_block(
                         "failure_reason=%s trigger_count=%llu attempt_id=%llu\n",
                         (int) paged_test_io_fault_.target_seq,
                         physical_block,
-                        cell,
+                        begin,
                         block_state_name(io_fault_state_before),
                         block_state_name(paged_block_states[physical_block]),
                         (unsigned long long) io_fault_swap_in_before,
@@ -3639,50 +3661,45 @@ bool llama_kv_cache::paged_swap_in_block(
                 paged_test_io_fault_.failed_block = physical_block;
                 paged_test_io_fault_.failed_attempt_id = io_fault_attempt_id;
             }
-            return fail(cell, status, backend_errno);
-        }
-        successful_cells += 1;
-
-        size_t cursor = 0;
-        for (const auto & layer : layers) {
-            if (!layer.k_stream.empty() && layer.k_stream[0]) {
-                auto * k = layer.k_stream[0];
-                const size_t row_size = k->nb[1];
-                if (!k->data || cursor + row_size > staging.size()) {
-                    paged_swap_in_fail_tensor_set += 1;
-                    paged_swap_backend_failures += 1;
-                    return fail(cell, llama_kv_backing_store_status::bad_slot);
-                }
-                ggml_backend_tensor_set(k, staging.data() + cursor, (size_t) cell * row_size, row_size);
-                cursor += row_size;
-            }
-            if (layer.v && !layer.v_stream.empty() && layer.v_stream[0]) {
-                auto * v = layer.v_stream[0];
-                const size_t row_size = v->nb[1];
-                if (!v->data || cursor + row_size > staging.size()) {
-                    paged_swap_in_fail_tensor_set += 1;
-                    paged_swap_backend_failures += 1;
-                    return fail(cell, llama_kv_backing_store_status::bad_slot);
-                }
-                ggml_backend_tensor_set(v, staging.data() + cursor, (size_t) cell * row_size, row_size);
-                cursor += row_size;
-            }
-        }
-        if (cursor != total_size) {
-            paged_swap_in_fail_tensor_set += 1;
-            paged_swap_backend_failures += 1;
-            return fail(cell, llama_kv_backing_store_status::bad_slot);
-        }
-        block_bytes += staging.size();
+            return fail(begin, status, backend_errno);
     }
 
+    // Keep SWAPPED pages protected until the complete cell-major file image has been read into
+    // staging. A terminal read failure above therefore leaves refault protection intact.
+    paged_refault_unprotect_block(physical_block);
+    const uint64_t unpack_start_us = paged_io_stats_enabled ? llama_paged_timing_now_us() : 0;
+    for (uint32_t cell = begin; cell < end; ++cell) {
+        size_t cursor = (size_t) (cell - begin) * total_size;
+        for (const auto & layer : layers) {
+            for (ggml_tensor * tensor : {
+                    layer.k_stream.empty() ? nullptr : layer.k_stream[0],
+                    (!layer.v || layer.v_stream.empty()) ? nullptr : layer.v_stream[0] }) {
+                if (!tensor) continue;
+                const size_t row_size = tensor->nb[1];
+                ggml_backend_tensor_set(
+                        tensor, paged_io_staging.data() + cursor, (size_t) cell * row_size, row_size);
+                cursor += row_size;
+            }
+        }
+        GGML_ASSERT(cursor == (size_t) (cell - begin + 1) * total_size);
+    }
+    if (paged_io_stats_enabled) {
+        paged_io_block_in_unpack_us += llama_paged_timing_now_us() - unpack_start_us;
+        paged_io_block_in_unpack_calls += 1;
+    }
+
+    const uint64_t commit_start_us = paged_io_stats_enabled ? llama_paged_timing_now_us() : 0;
     paged_block_states[physical_block] = paged_block_state::RESIDENT;
     paged_swap_in_calls += 1;
     paged_blocks_swapped_in += 1;
-    paged_swap_bytes_in += block_bytes;
+    paged_swap_bytes_in += block_size;
     paged_swap_in_last_block = physical_block;
     if (paged_io_stats_enabled) {
-        const uint64_t elapsed_us = llama_paged_timing_now_us() - io_stats_start_us;
+        paged_io_block_in_commit_us += llama_paged_timing_now_us() - commit_start_us;
+        paged_io_block_in_commit_calls += 1;
+    }
+    if (paged_io_stats_enabled) {
+        const uint64_t elapsed_us = llama_paged_timing_now_us() - validate_start_us;
         paged_io_swap_in_latency_us += elapsed_us;
         paged_io_swap_in_timed_calls += 1;
         if (elapsed_us > paged_io_swap_in_latency_max_us) {
@@ -3715,7 +3732,7 @@ bool llama_kv_cache::paged_swap_in_block(
                 (unsigned long long) test_fault_attempt_id,
                 test_fault_scope_name,
                 physical_block,
-                (unsigned long long) successful_cells,
+                (unsigned long long) cell_count,
                 (int) paged_block_states[physical_block],
                 (unsigned long long) test_fault_swap_in_calls_before,
                 (unsigned long long) paged_swap_in_calls);
@@ -4929,6 +4946,7 @@ void llama_kv_cache::paged_log_stats() const {
             paged_io_swap_out_latency_us / paged_io_swap_out_timed_calls : 0;
         const uint64_t avg_in_us = paged_io_swap_in_timed_calls > 0 ?
             paged_io_swap_in_latency_us / paged_io_swap_in_timed_calls : 0;
+        const auto avg_phase = [](uint64_t total, uint64_t calls) { return calls ? total / calls : 0; };
         fprintf(stderr,
                 "KV_PAGED_IO_STATS "
                 "block_swap_out_calls=%llu block_swap_in_calls=%llu "
@@ -4936,7 +4954,16 @@ void llama_kv_cache::paged_log_stats() const {
                 "bytes_read=%llu bytes_written=%llu "
                 "avg_block_swap_out_latency_us=%llu max_block_swap_out_latency_us=%llu "
                 "avg_block_swap_in_latency_us=%llu max_block_swap_in_latency_us=%llu "
-                "staging_buffer_bytes=%llu\n",
+                "staging_buffer_bytes=%llu "
+                "block_out_validate_us=%llu avg_block_out_validate_us=%llu "
+                "block_out_pack_us=%llu avg_block_out_pack_us=%llu "
+                "block_out_write_us=%llu avg_block_out_write_us=%llu "
+                "block_out_metadata_us=%llu avg_block_out_metadata_us=%llu "
+                "block_out_madvise_us=%llu avg_block_out_madvise_us=%llu "
+                "block_in_validate_us=%llu avg_block_in_validate_us=%llu "
+                "block_in_read_us=%llu avg_block_in_read_us=%llu "
+                "block_in_unpack_us=%llu avg_block_in_unpack_us=%llu "
+                "block_in_commit_us=%llu avg_block_in_commit_us=%llu\n",
                 (unsigned long long) paged_swap_out_calls,
                 (unsigned long long) paged_swap_in_calls,
                 (unsigned long long) backing_stats.read_syscalls,
@@ -4947,7 +4974,25 @@ void llama_kv_cache::paged_log_stats() const {
                 (unsigned long long) paged_io_swap_out_latency_max_us,
                 (unsigned long long) avg_in_us,
                 (unsigned long long) paged_io_swap_in_latency_max_us,
-                (unsigned long long) paged_io_staging_buffer_bytes);
+                (unsigned long long) paged_io_staging_buffer_bytes,
+                (unsigned long long) paged_io_block_out_validate_us,
+                (unsigned long long) avg_phase(paged_io_block_out_validate_us, paged_io_block_out_validate_calls),
+                (unsigned long long) paged_io_block_out_pack_us,
+                (unsigned long long) avg_phase(paged_io_block_out_pack_us, paged_io_block_out_pack_calls),
+                (unsigned long long) paged_io_block_out_write_us,
+                (unsigned long long) avg_phase(paged_io_block_out_write_us, paged_io_block_out_write_calls),
+                (unsigned long long) paged_io_block_out_metadata_us,
+                (unsigned long long) avg_phase(paged_io_block_out_metadata_us, paged_io_block_out_metadata_calls),
+                (unsigned long long) paged_io_block_out_madvise_us,
+                (unsigned long long) avg_phase(paged_io_block_out_madvise_us, paged_io_block_out_madvise_calls),
+                (unsigned long long) paged_io_block_in_validate_us,
+                (unsigned long long) avg_phase(paged_io_block_in_validate_us, paged_io_block_in_validate_calls),
+                (unsigned long long) paged_io_block_in_read_us,
+                (unsigned long long) avg_phase(paged_io_block_in_read_us, paged_io_block_in_read_calls),
+                (unsigned long long) paged_io_block_in_unpack_us,
+                (unsigned long long) avg_phase(paged_io_block_in_unpack_us, paged_io_block_in_unpack_calls),
+                (unsigned long long) paged_io_block_in_commit_us,
+                (unsigned long long) avg_phase(paged_io_block_in_commit_us, paged_io_block_in_commit_calls));
     }
 }
 

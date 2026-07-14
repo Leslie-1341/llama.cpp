@@ -169,6 +169,15 @@ validate_io_stats_line() {
         avg_block_swap_in_latency_us
         max_block_swap_in_latency_us
         staging_buffer_bytes
+        block_out_validate_us avg_block_out_validate_us
+        block_out_pack_us avg_block_out_pack_us
+        block_out_write_us avg_block_out_write_us
+        block_out_metadata_us avg_block_out_metadata_us
+        block_out_madvise_us avg_block_out_madvise_us
+        block_in_validate_us avg_block_in_validate_us
+        block_in_read_us avg_block_in_read_us
+        block_in_unpack_us avg_block_in_unpack_us
+        block_in_commit_us avg_block_in_commit_us
     )
     local field value
     for field in "${fields[@]}"; do
@@ -184,6 +193,22 @@ validate_io_stats_line() {
     [[ "$(io_stats_value "$line" bytes_read)" != "0" ]] || fail "KV_PAGED_IO_STATS bytes_read is zero"
     [[ "$(io_stats_value "$line" bytes_written)" != "0" ]] || fail "KV_PAGED_IO_STATS bytes_written is zero"
     [[ "$(io_stats_value "$line" staging_buffer_bytes)" != "0" ]] || fail "KV_PAGED_IO_STATS staging_buffer_bytes is zero"
+
+    # Totals are integer microseconds. Allow 5% plus 5 us per block for timestamp and average
+    # rounding, but reject a whole phase being outside the reported operation latency.
+    local out_calls in_calls out_total in_total out_sum in_sum out_slack in_slack
+    out_calls="$(io_stats_value "$line" block_swap_out_calls)"
+    in_calls="$(io_stats_value "$line" block_swap_in_calls)"
+    out_total=$(( $(io_stats_value "$line" avg_block_swap_out_latency_us) * out_calls ))
+    in_total=$(( $(io_stats_value "$line" avg_block_swap_in_latency_us) * in_calls ))
+    out_sum=$(( $(io_stats_value "$line" block_out_validate_us) + $(io_stats_value "$line" block_out_pack_us) + $(io_stats_value "$line" block_out_write_us) + $(io_stats_value "$line" block_out_metadata_us) + $(io_stats_value "$line" block_out_madvise_us) ))
+    in_sum=$(( $(io_stats_value "$line" block_in_validate_us) + $(io_stats_value "$line" block_in_read_us) + $(io_stats_value "$line" block_in_unpack_us) + $(io_stats_value "$line" block_in_commit_us) ))
+    out_slack=$(( out_total / 20 + out_calls * 5 + 1 ))
+    in_slack=$(( in_total / 20 + in_calls * 5 + 1 ))
+    (( out_sum <= out_total + out_slack && out_total <= out_sum + out_slack )) ||
+        fail "swap-out phase sum=$out_sum total=$out_total exceeds timing tolerance=$out_slack"
+    (( in_sum <= in_total + in_slack && in_total <= in_sum + in_slack )) ||
+        fail "swap-in phase sum=$in_sum total=$in_total exceeds timing tolerance=$in_slack"
 
     IO_STATS_LINE_RESULT="$line"
 }

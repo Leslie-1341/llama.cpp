@@ -93,6 +93,20 @@ public:
         return llama_kv_backing_store_status::disabled;
     }
 
+    // Writes adjacent fixed physical-cell slots as one logical range. Implementations must
+    // preserve the fixed-slot address mapping and may retry short/EINTR I/O internally.
+    virtual llama_kv_backing_store_status write_cells(
+            uint32_t     strm,
+            uint32_t     begin_cell,
+            uint32_t     cell_count,
+            const void * data,
+            size_t       total_size,
+            uint64_t &   offset_out) {
+        (void) strm; (void) begin_cell; (void) cell_count; (void) data; (void) total_size;
+        offset_out = 0;
+        return llama_kv_backing_store_status::disabled;
+    }
+
     virtual llama_kv_backing_store_status read_cell(
             uint32_t strm,
             uint32_t cell,
@@ -104,6 +118,17 @@ public:
         (void) offset;
         (void) data;
         (void) size;
+        return llama_kv_backing_store_status::disabled;
+    }
+
+    virtual llama_kv_backing_store_status read_cells(
+            uint32_t strm,
+            uint32_t begin_cell,
+            uint32_t cell_count,
+            uint64_t offset,
+            void *   data,
+            size_t   total_size) {
+        (void) strm; (void) begin_cell; (void) cell_count; (void) offset; (void) data; (void) total_size;
         return llama_kv_backing_store_status::disabled;
     }
 
@@ -146,12 +171,28 @@ public:
             size_t     size,
             uint64_t & offset_out) override;
 
+    llama_kv_backing_store_status write_cells(
+            uint32_t     strm,
+            uint32_t     begin_cell,
+            uint32_t     cell_count,
+            const void * data,
+            size_t       total_size,
+            uint64_t &   offset_out) override;
+
     llama_kv_backing_store_status read_cell(
             uint32_t strm,
             uint32_t cell,
             uint64_t offset,
             void *   data,
             size_t   size) override;
+
+    llama_kv_backing_store_status read_cells(
+            uint32_t strm,
+            uint32_t begin_cell,
+            uint32_t cell_count,
+            uint64_t offset,
+            void *   data,
+            size_t   total_size) override;
 
     llama_kv_backing_store_status release(uint64_t offset, size_t size) override;
     llama_kv_backing_store_status reset() override;
@@ -736,6 +777,27 @@ private:
     mutable uint64_t paged_io_swap_out_timed_calls = 0;
     mutable uint64_t paged_io_swap_in_timed_calls = 0;
     mutable uint64_t paged_io_staging_buffer_bytes = 0;
+    mutable uint64_t paged_io_block_out_validate_us = 0;
+    mutable uint64_t paged_io_block_out_validate_calls = 0;
+    mutable uint64_t paged_io_block_out_pack_us = 0;
+    mutable uint64_t paged_io_block_out_pack_calls = 0;
+    mutable uint64_t paged_io_block_out_write_us = 0;
+    mutable uint64_t paged_io_block_out_write_calls = 0;
+    mutable uint64_t paged_io_block_out_metadata_us = 0;
+    mutable uint64_t paged_io_block_out_metadata_calls = 0;
+    mutable uint64_t paged_io_block_out_madvise_us = 0;
+    mutable uint64_t paged_io_block_out_madvise_calls = 0;
+    mutable uint64_t paged_io_block_in_validate_us = 0;
+    mutable uint64_t paged_io_block_in_validate_calls = 0;
+    mutable uint64_t paged_io_block_in_read_us = 0;
+    mutable uint64_t paged_io_block_in_read_calls = 0;
+    mutable uint64_t paged_io_block_in_unpack_us = 0;
+    mutable uint64_t paged_io_block_in_unpack_calls = 0;
+    mutable uint64_t paged_io_block_in_commit_us = 0;
+    mutable uint64_t paged_io_block_in_commit_calls = 0;
+    // The paged paths execute synchronously. Keep grow-only cell-major staging so a normal
+    // 16-cell swap does not allocate/free 4 MiB per operation.
+    mutable std::vector<uint8_t> paged_io_staging;
 
     enum class paged_test_swapin_fail_scope : uint8_t {
         OFF,

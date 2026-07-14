@@ -465,6 +465,33 @@ static void test_last_errno_cleared_after_error_status_changes() {
     check(store.get_stats().last_errno == 0, "ok write after bad_slot keeps last_errno clear");
 }
 
+static void test_contiguous_cell_range_roundtrip() {
+    const uint32_t n_slots = 5;
+    const size_t stride = 127;
+    llama_kv_backing_store_file store("", n_slots, stride);
+    check(store.is_enabled(), "range: store enabled");
+    std::vector<uint8_t> payload(3 * stride);
+    for (size_t i = 0; i < payload.size(); ++i) payload[i] = (uint8_t) i;
+    uint64_t offset = 0;
+    const uint64_t writes_before = store.get_stats().write_syscalls;
+    check(store.write_cells(0, 1, 3, payload.data(), payload.size(), offset) == llama_kv_backing_store_status::ok,
+            "range write succeeds");
+    check(offset == stride, "range write fixed base offset");
+    check(store.get_stats().write_syscalls == writes_before + 1, "range write uses one syscall normally");
+    std::vector<uint8_t> restored(payload.size());
+    const uint64_t reads_before = store.get_stats().read_syscalls;
+    check(store.read_cells(0, 1, 3, offset, restored.data(), restored.size()) == llama_kv_backing_store_status::ok,
+            "range read succeeds");
+    check(store.get_stats().read_syscalls == reads_before + 1, "range read uses one syscall normally");
+    check_bytes_equal(payload, restored, "range byte-identical");
+    check(store.write_cells(0, n_slots, 1, payload.data(), stride, offset) == llama_kv_backing_store_status::bad_slot,
+            "range rejects begin out of bounds");
+    check(store.write_cells(0, 4, 2, payload.data(), 2 * stride, offset) == llama_kv_backing_store_status::bad_slot,
+            "range rejects count out of bounds");
+    check(store.write_cells(0, 1, 3, payload.data(), payload.size() - 1, offset) == llama_kv_backing_store_status::bad_slot,
+            "range rejects bad total size");
+}
+
 int main() {
     try {
         test_same_slot_repeated_roundtrip();
@@ -481,6 +508,7 @@ int main() {
         test_read_eof_fails_without_exposing_partial_data();
         test_write_enospc_fails_then_full_retry_overwrites_slot();
         test_last_errno_cleared_after_error_status_changes();
+        test_contiguous_cell_range_roundtrip();
     } catch (const std::exception & e) {
         fprintf(stderr, "%s\n", e.what());
         return 1;
