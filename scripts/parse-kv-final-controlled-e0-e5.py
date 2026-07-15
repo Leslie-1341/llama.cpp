@@ -10,6 +10,7 @@ import json
 import math
 import re
 import statistics
+import sys
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -59,6 +60,60 @@ SUMMARY_METRICS = [
     "backing_file_logical_size", "backing_file_allocated_bytes",
 ]
 
+RUN_PLANS = {
+    1: [
+        (1, 1, "E0"), (1, 2, "E1"), (1, 3, "E2"),
+        (1, 4, "E3"), (1, 5, "E4"), (1, 6, "E5"),
+    ],
+    3: [
+        (1, 1, "E0"), (1, 2, "E3"), (1, 3, "E1"),
+        (1, 4, "E4"), (1, 5, "E2"), (1, 6, "E5"),
+        (2, 1, "E5"), (2, 2, "E2"), (2, 3, "E4"),
+        (2, 4, "E1"), (2, 5, "E3"), (2, 6, "E0"),
+        (3, 1, "E2"), (3, 2, "E5"), (3, 3, "E0"),
+        (3, 4, "E3"), (3, 5, "E1"), (3, 6, "E4"),
+    ],
+}
+
+MARKERS = {
+    "perf": "KV_IDLE_SWAP_RESUME_PERF ",
+    "active": "KV_ACTIVE_TOKEN_STATS ",
+    "metadata": "KV paged metadata stats:",
+    "io": "KV_PAGED_IO_STATS ",
+    "swap": "KV swap stats:",
+    "test": "KV_TEST_SUMMARY ",
+    "lazy_clear": "kv lazy-clear stats:",
+    "lazy_tail": "kv lazy-tail stats:",
+    "backing": "KV swap backing store ready",
+}
+
+COMMON_REQUIRED_METRICS = {
+    "active_token_count", "active_token_avg_ms", "active_token_p50_ms", "active_token_p95_ms",
+    "active_token_p99_ms", "active_token_max_ms", "decode_avg_ms", "active_phase_wall_ms",
+    "resume_first_token_ms", "total_wall_ms", "tps", "prefetch_calls", "prefetch_total_ms",
+    "prefetch_restored_blocks", "prefetch_max_ms", "fallback_blocks",
+    "rss_before_active_prefetch_kb", "rss_after_active_prefetch_kb", "rss_before_prefetch_kb",
+    "rss_after_prefetch_kb", "rss_before_resume_kb", "rss_after_resume_kb",
+    "process_vmrss_sampled_max_kb", "process_vmhwm_kb", "backend_io_failures",
+}
+
+PAGED_REQUIRED_METRICS = {
+    "active_visible_safety_violations", "active_visible_safety_violation_rows",
+    "active_visible_safety_violation_blocks", "active_restore_required_rows",
+    "active_restore_required_blocks", "write_swapped_violations", "fatal", "swapped_blocks",
+    "swap_out_calls", "swap_in_calls", "restored_blocks", "madvise_blocks", "madvise_bytes",
+    "prefetch_api_calls", "backing_io_write_bytes", "backing_io_read_bytes",
+    "swap_out_avg_us", "swap_out_max_us", "swap_in_avg_us", "swap_in_max_us",
+    "swap_out_validate_us", "swap_out_pack_us", "swap_out_write_us", "swap_out_metadata_us",
+    "swap_out_madvise_us", "swap_in_validate_us", "swap_in_read_us", "swap_in_unpack_us",
+    "swap_in_commit_us", "mincore_enabled", "ingraph_gather_layers", "nonidentity_enabled",
+    "nonidentity_remap_rows", "paged_release_enabled", "paged_swap_enabled", "idle_swap_enabled",
+}
+
+
+class ArtifactError(ValueError):
+    pass
+
 
 def read_text(path: Path) -> str:
     try:
@@ -67,13 +122,78 @@ def read_text(path: Path) -> str:
         return ""
 
 
-def last_line(text: str, marker: str) -> str:
+def unique_line(text: str, marker: str, required: bool = False) -> str:
     lines = [line for line in text.splitlines() if marker in line]
-    return lines[-1] if lines else ""
+    if len(lines) > 1:
+        raise ArtifactError(f"duplicate telemetry marker {marker.strip()!r}")
+    if required and not lines:
+        raise ArtifactError(f"missing telemetry marker {marker.strip()!r}")
+    return lines[0] if lines else ""
 
 
 def fields(line: str) -> dict[str, str]:
-    return dict(re.findall(r"(?:^|\s)([A-Za-z][A-Za-z0-9_]*)=([^\s]+)", line))
+    pairs = re.findall(r"(?:^|\s)([A-Za-z][A-Za-z0-9_]*)=([^\s]+)", line)
+    keys = [key for key, _ in pairs]
+    duplicates = sorted({key for key in keys if keys.count(key) > 1})
+    if duplicates:
+        raise ArtifactError(f"duplicate telemetry key(s): {', '.join(duplicates)}")
+    return dict(pairs)
+
+
+def run_tuple(meta: Any, source: str) -> tuple[int, int, str]:
+    if not isinstance(meta, dict):
+        raise ArtifactError(f"{source} must contain a JSON object")
+    missing = [key for key in ("round", "run_order", "case") if key not in meta]
+    if missing:
+        raise ArtifactError(f"{source} missing matrix field(s): {', '.join(missing)}")
+    try:
+        item = (int(meta["round"]), int(meta["run_order"]), str(meta["case"]))
+    except (TypeError, ValueError) as exc:
+        raise ArtifactError(f"{source} has invalid round/run_order") from exc
+    if item[2] not in CASES:
+        raise ArtifactError(f"{source} has unknown case {item[2]!r}")
+    return item
+
+
+def validate_matrix(root: Path, manifest: dict[str, Any]) -> list[Path]:
+    try:
+        runs = int(manifest["workload"]["runs"])
+        planned = manifest["planned_runs"]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ArtifactError("manifest missing workload.runs or planned_runs") from exc
+    expected = RUN_PLANS.get(runs)
+    if expected is None:
+        raise ArtifactError(f"manifest workload.runs must be 1 or 3 (got {runs})")
+    if not isinstance(planned, list):
+        raise ArtifactError("manifest planned_runs must be a list")
+
+    planned_tuples = [run_tuple(meta, f"manifest planned_runs[{index}]") for index, meta in enumerate(planned)]
+    if len(set(planned_tuples)) != len(planned_tuples):
+        raise ArtifactError("manifest contains a duplicate (round, run_order, case) tuple")
+    if planned_tuples != expected:
+        raise ArtifactError(f"manifest run matrix does not match the fixed RUNS={runs} plan")
+
+    run_dirs = sorted(path for path in (root / "runs").glob("*") if path.is_dir())
+    actual_dirs: list[tuple[tuple[int, int, str], Path]] = []
+    for run_dir in run_dirs:
+        run_path = run_dir / "run.json"
+        if not run_path.is_file():
+            raise ArtifactError(f"run directory missing run.json: {run_dir}")
+        try:
+            meta = json.loads(read_text(run_path))
+        except json.JSONDecodeError as exc:
+            raise ArtifactError(f"invalid JSON in {run_path}") from exc
+        actual_dirs.append((run_tuple(meta, str(run_path)), run_dir))
+    actual_dirs.sort(key=lambda item: (item[0][0], item[0][1]))
+    actual = [item for item, _ in actual_dirs]
+    if len(set(actual)) != len(actual):
+        raise ArtifactError("runs contain a duplicate (round, run_order, case) tuple")
+    if actual != expected:
+        raise ArtifactError(f"artifact run matrix does not match the fixed RUNS={runs} plan")
+    for round_no in range(1, runs + 1):
+        if sum(item[0] == round_no and item[2] == "E0" for item in actual) != 1:
+            raise ArtifactError(f"round {round_no} must contain exactly one E0 reference")
+    return [run_dir for _, run_dir in actual_dirs]
 
 
 def value(source: dict[str, str], key: str) -> str:
@@ -262,21 +382,26 @@ def parse_run(run_dir: Path, references: dict[int, tuple[Path, Path]]) -> dict[s
     exit_code = read_text(run_dir / "exit_code").strip() or NA
     env = requested_env(run_dir)
 
-    perf = fields(last_line(stderr, "KV_IDLE_SWAP_RESUME_PERF "))
-    active = fields(last_line(stderr, "KV_ACTIVE_TOKEN_STATS "))
-    metadata_line = last_line(stderr, "KV paged metadata stats:")
+    for marker in MARKERS.values():
+        unique_line(stderr, marker)
+
+    perf = fields(unique_line(stderr, MARKERS["perf"], required=True))
+    active = fields(unique_line(stderr, MARKERS["active"], required=True))
+    metadata_line = unique_line(stderr, MARKERS["metadata"], required=case_id in {"E2", "E3", "E4", "E5"})
     metadata = fields(metadata_line)
-    io = fields(last_line(stderr, "KV_PAGED_IO_STATS "))
-    swap = fields(last_line(stderr, "KV swap stats:"))
-    test = fields(last_line(stderr, "KV_TEST_SUMMARY "))
-    lazy_clear_line = last_line(stderr, "kv lazy-clear stats:")
-    lazy_tail_line = last_line(stderr, "kv lazy-tail stats:")
-    backing_line = last_line(stderr, "KV swap backing store ready")
+    io = fields(unique_line(stderr, MARKERS["io"], required=case_id in {"E2", "E3", "E4", "E5"}))
+    swap = fields(unique_line(stderr, MARKERS["swap"], required=True))
+    test = fields(unique_line(stderr, MARKERS["test"]))
+    lazy_clear_line = unique_line(stderr, MARKERS["lazy_clear"], required=case_id == "E1")
+    lazy_tail_line = unique_line(stderr, MARKERS["lazy_tail"], required=case_id == "E1")
+    backing_line = unique_line(stderr, MARKERS["backing"], required=case_id in {"E3", "E4", "E5"})
+    lazy_clear = fields(lazy_clear_line)
+    lazy_tail = fields(lazy_tail_line)
     backing = fields(backing_line)
 
     paged_enabled = "1" if metadata_line else "0"
-    lazy_clear_enabled = "1" if lazy_clear_line and "enabled=1" in lazy_clear_line else "0"
-    lazy_tail_enabled = "1" if lazy_tail_line and "enabled=1" in lazy_tail_line else "0"
+    lazy_clear_enabled = "1" if integer(value(lazy_clear, "enabled")) == 1 else "0"
+    lazy_tail_enabled = "1" if integer(value(lazy_tail, "enabled")) == 1 else "0"
     paged_absent = paged_enabled == "0"
 
     fatal = sum_fields(metadata, [
@@ -389,17 +514,71 @@ def parse_run(run_dir: Path, references: dict[int, tuple[Path, Path]]) -> dict[s
         "warnings": " | ".join(warning_lines) if warning_lines else "none",
     })
 
-    correctness_checks = [
-        exit_code == "0", seq0_exact == "YES", seq1_exact == "YES",
-        integer(active_visible) == 0, integer(active_visible_rows) == 0,
-        integer(active_visible_blocks) == 0, integer(write_swapped) == 0,
-        integer(fatal) == 0, integer(backend_failures) == 0,
-        integer(value(test, "prefetch_failures_observed")) in (0, None),
-        "Segmentation fault" not in stderr, "GGML_ASSERT" not in stderr,
+    required_metrics = set(COMMON_REQUIRED_METRICS)
+    if case_id in {"E2", "E3", "E4", "E5"}:
+        required_metrics.update(PAGED_REQUIRED_METRICS)
+    if case_id in {"E3", "E4", "E5"}:
+        required_metrics.add("backing_capacity_bytes")
+    if integer(exit_code) is None:
+        required_metrics.add("exit_code")
+    missing_metrics = {name for name in required_metrics if numeric(row.get(name)) is None}
+    required_source_fields = {
+        "perf": {
+            "total_wall_ms", "seq1_active_ms", "seq0_resume_first_token_ms", "tokens_per_second",
+            "prefetch_during_active_blocks", "prefetch_during_active_ms_max", "prefetch_auto_started",
+            "resume_pending_fallback_blocks", "prefetch_failures", "rss_before_active_prefetch_kb",
+            "rss_after_active_prefetch_kb", "rss_before_prefetch_kb", "rss_after_prefetch_kb",
+            "rss_before_resume_kb", "rss_after_resume_kb",
+        },
+        "active": {
+            "active_token_count", "avg_ms", "p50_ms", "p95_ms", "p99_ms", "max_ms",
+            "decode_avg_ms", "prefetch_calls", "prefetch_total_ms",
+        },
+        "swap": {"backend_failures"},
+    }
+    sources = {"perf": perf, "active": active, "swap": swap, "metadata": metadata, "io": io}
+    if case_id in {"E2", "E3", "E4", "E5"}:
+        required_source_fields["metadata"] = {
+            "ingraph_gather_layers", "paged_nonidentity_enabled", "paged_nonidentity_remap_rows",
+            "paged_block_release_enabled", "paged_swap_enabled", "paged_idle_swap_enabled",
+            "paged_blocks_swapped_out", "paged_blocks_swapped_in", "paged_swap_out_calls",
+            "paged_swap_in_calls", "paged_swap_madvise_calls", "paged_swap_madvise_bytes",
+            "paged_prefetch_seq_calls", "kv_mincore_enabled", "paged_swapped_active_visible_violation",
+            "paged_swapped_active_visible_violation_rows", "paged_swapped_active_visible_violation_blocks",
+            "paged_swapped_active_violation_rows", "paged_swapped_active_violation_blocks",
+            "paged_write_to_swapped_block", "paged_row_mapping_invalid_fatal",
+            "paged_write_mapping_invalid_fatal", "paged_active_row_nonresident_fatal",
+            "paged_input_setup_fatal", "paged_swap_backend_failures", "paged_swap_read_swap_in_failures",
+            "paged_swap_write_swap_in_failures", "paged_swap_in_fail_no_offset", "paged_swap_in_fail_bad_size",
+            "paged_swap_in_fail_read_cell", "paged_swap_in_fail_tensor_set", "paged_prefetch_seq_failures",
+            "paged_block_release_fail", "paged_swap_madvise_failures",
+        }
+        required_source_fields["io"] = {
+            "block_swap_out_calls", "block_swap_in_calls", "bytes_read", "bytes_written",
+            "avg_block_swap_out_latency_us", "max_block_swap_out_latency_us",
+            "avg_block_swap_in_latency_us", "max_block_swap_in_latency_us", "block_out_validate_us",
+            "block_out_pack_us", "block_out_write_us", "block_out_metadata_us", "block_out_madvise_us",
+            "block_in_validate_us", "block_in_read_us", "block_in_unpack_us", "block_in_commit_us",
+        }
+    for source_name, names in required_source_fields.items():
+        for name in names:
+            if numeric(sources[source_name].get(name)) is None:
+                missing_metrics.add(f"{source_name}.{name}")
+    missing_metrics = sorted(missing_metrics)
+
+    zero_fields = [
+        active_visible, active_visible_rows, active_visible_blocks, write_swapped, fatal, backend_failures,
+        value(perf, "prefetch_failures"), value(test, "prefetch_failures_observed"),
     ]
-    if any(check is False for check in correctness_checks):
+    correctness_failed = (
+        (integer(exit_code) is not None and integer(exit_code) != 0) or
+        seq0_exact == "NO" or seq1_exact == "NO" or
+        any(number is not None and number != 0 for number in (integer(item) for item in zero_fields)) or
+        "Segmentation fault" in stderr or "GGML_ASSERT" in stderr
+    )
+    if correctness_failed:
         row["correctness"] = "FAIL"
-    elif any(item == NA for item in (seq0_exact, seq1_exact, fatal, backend_failures)):
+    elif missing_metrics or any(item == NA for item in (seq0_exact, seq1_exact, fatal, backend_failures)):
         row["correctness"] = "UNVERIFIED"
     else:
         row["correctness"] = "PASS"
@@ -424,6 +603,7 @@ def parse_run(run_dir: Path, references: dict[int, tuple[Path, Path]]) -> dict[s
         writer.writerow(row)
     (run_dir / "result").write_text(
         f"result={row['result']}\ncorrectness={row['correctness']}\n"
+        f"correctness_notes={'missing required metrics: ' + ', '.join(missing_metrics) if missing_metrics else 'all required metrics present'}\n"
         f"mechanism_verification={mechanism}\nmechanism_notes={'; '.join(mechanism_notes)}\n"
     )
     return row
@@ -542,25 +722,34 @@ def main() -> int:
     root = args.output_root.resolve()
     if not (root / "manifest.json").is_file():
         parser.error(f"manifest.json not found in {root}")
+    try:
+        manifest = json.loads(read_text(root / "manifest.json"))
+        run_dirs = validate_matrix(root, manifest)
+    except (ArtifactError, json.JSONDecodeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     if args.dry_run:
         dry_run(root)
         return 0
 
-    run_dirs = sorted(path for path in (root / "runs").glob("*") if (path / "run.json").is_file())
     references: dict[int, tuple[Path, Path]] = {}
     for run_dir in run_dirs:
         meta = json.loads(read_text(run_dir / "run.json"))
         if meta["case"] == "E0" and read_text(run_dir / "exit_code").strip() == "0":
             references[int(meta["round"])] = (run_dir / "seq0", run_dir / "seq1")
-    rows = [parse_run(run_dir, references) for run_dir in run_dirs]
+    try:
+        rows = [parse_run(run_dir, references) for run_dir in run_dirs]
+    except (ArtifactError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     rows.sort(key=lambda row: (int(row["round"]), int(row["run_order"])))
     with (root / "runs.tsv").open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=RUN_COLUMNS, delimiter="\t", lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
-    manifest = refresh_framework_manifest(root, json.loads(read_text(root / "manifest.json")))
+    manifest = refresh_framework_manifest(root, manifest)
     write_summaries(root, rows, manifest)
-    return 1 if any(row["result"] == "FAIL" for row in rows) else 0
+    return 1 if any(row["result"] != "PASS" for row in rows) else 0
 
 
 if __name__ == "__main__":
