@@ -1,0 +1,6 @@
+interface:
+  display_name: "OS Agent Task"
+  short_description: "受控的审计、实现、复审、实验与工程账本工作流"
+  default_prompt: "Use $os-agent-task with mode=contract|audit|implement|review|review-fix|script|memory, then provide a concise goal and acceptance criteria."
+policy:
+  allow_implicit_invocation: false
