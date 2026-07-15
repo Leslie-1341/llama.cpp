@@ -47,6 +47,22 @@ static uint64_t elapsed_ms_u64(perf_clock::time_point t0, perf_clock::time_point
     return (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
 }
 
+struct active_token_stat {
+    int32_t token = 0;
+    bool prefetched = false;
+    uint32_t requested_blocks = 0;
+    int32_t restored_blocks = 0;
+    double decode_ms = 0.0;
+    double prefetch_ms = 0.0;
+    double total_ms = 0.0;
+};
+
+static double active_token_percentile(const std::vector<double> & sorted_samples, size_t percentile) {
+    // Nearest-rank: for N sorted samples, percentile P selects ceil(P * N / 100), using a 1-based rank.
+    const size_t rank = (percentile * sorted_samples.size() + 99) / 100;
+    return sorted_samples[rank - 1];
+}
+
 static uint64_t current_rss_kb() {
 #if defined(__linux__)
     FILE * f = std::fopen("/proc/self/statm", "r");
@@ -472,6 +488,13 @@ int main(int argc, char ** argv) {
     const char * prefetch_during_active_env = std::getenv("LLAMA_KV_PAGED_PREFETCH_DURING_ACTIVE");
     const bool prefetch_during_active =
         prefetch_during_active_env != nullptr && std::atoi(prefetch_during_active_env) != 0;
+    const char * active_token_stats_env = std::getenv("LLAMA_KV_ACTIVE_TOKEN_STATS");
+    const bool active_token_stats_enabled =
+        active_token_stats_env != nullptr && std::strcmp(active_token_stats_env, "1") == 0;
+    std::vector<active_token_stat> active_token_stats;
+    if (active_token_stats_enabled) {
+        active_token_stats.reserve(n_decode);
+    }
     int32_t prefetch_after_active_tokens = 64;
     int32_t prefetch_every_tokens = 8;
     int32_t prefetch_blocks_per_step = 1;
@@ -730,12 +753,22 @@ int main(int argc, char ** argv) {
         common_batch_add(batch, token, seq1_pos++, { active_seq }, true);
         sample_idx = batch.n_tokens - 1;
 
+        perf_clock::time_point active_token_t0;
+        if (active_token_stats_enabled) {
+            active_token_t0 = perf_clock::now();
+        }
         if (decode_batch(ctx, batch, "seq1-active-decode", test_state) != 0) {
             cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
             return 1;
         }
+        const auto active_token_decode_t1 = active_token_stats_enabled ? perf_clock::now() : perf_clock::time_point();
+        auto active_token_total_t1 = active_token_decode_t1;
 
         const int32_t seq1_decoded_done = seq1_decoded + 1;
+        bool active_token_prefetched = false;
+        uint32_t active_token_requested_blocks = 0;
+        int32_t active_token_restored_blocks = 0;
+        double active_token_prefetch_ms = 0.0;
         if (prefetch_during_active && prefetch_auto_delayed &&
                 resume_pending_token > 0 &&
                 seq1_decoded_done >= resume_pending_token &&
@@ -764,7 +797,16 @@ int main(int argc, char ** argv) {
             const auto active_prefetch_t0 = perf_clock::now();
             const int32_t restored = llama_memory_prefetch_seq_step(
                     llama_get_memory(ctx), 0, blocks_this_step);
-            const double active_prefetch_ms = elapsed_ms(active_prefetch_t0, perf_clock::now());
+            const auto active_prefetch_t1 = perf_clock::now();
+            const double active_prefetch_ms = elapsed_ms(active_prefetch_t0, active_prefetch_t1);
+
+            active_token_prefetched = true;
+            active_token_requested_blocks = blocks_this_step;
+            active_token_restored_blocks = restored;
+            active_token_prefetch_ms = active_prefetch_ms;
+            if (active_token_stats_enabled) {
+                active_token_total_t1 = active_prefetch_t1;
+            }
 
             prefetch_during_active_calls += 1;
             prefetch_during_active_ms_total += active_prefetch_ms;
@@ -785,6 +827,19 @@ int main(int argc, char ** argv) {
                 cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
                 return 1;
             }
+        }
+
+        if (active_token_stats_enabled) {
+            const active_token_stat stat = {
+                seq1_decoded_done,
+                active_token_prefetched,
+                active_token_requested_blocks,
+                active_token_restored_blocks,
+                elapsed_ms(active_token_t0, active_token_decode_t1),
+                active_token_prefetch_ms,
+                elapsed_ms(active_token_t0, active_token_total_t1),
+            };
+            active_token_stats.push_back(stat);
         }
     }
     seq1_active_ms = elapsed_ms(seq1_active_t0, perf_clock::now());
@@ -1372,6 +1427,44 @@ int main(int argc, char ** argv) {
             (unsigned long long) rss_after_prefetch_kb,
             (unsigned long long) rss_before_resume_kb,
             (unsigned long long) rss_after_resume_kb);
+
+    if (active_token_stats_enabled && !active_token_stats.empty()) {
+        std::vector<double> total_samples;
+        total_samples.reserve(active_token_stats.size());
+        double total_ms_sum = 0.0;
+        double decode_ms_sum = 0.0;
+        double active_prefetch_ms_total = 0.0;
+        size_t active_prefetch_calls = 0;
+        for (const active_token_stat & stat : active_token_stats) {
+            total_samples.push_back(stat.total_ms);
+            total_ms_sum += stat.total_ms;
+            decode_ms_sum += stat.decode_ms;
+            if (stat.prefetched) {
+                active_prefetch_calls += 1;
+                active_prefetch_ms_total += stat.prefetch_ms;
+                fprintf(stderr,
+                        "KV_ACTIVE_TOKEN_PREFETCH token=%d requested_blocks=%u restored_blocks=%d "
+                        "decode_ms=%.3f prefetch_ms=%.3f total_ms=%.3f\n",
+                        stat.token, stat.requested_blocks, stat.restored_blocks,
+                        stat.decode_ms, stat.prefetch_ms, stat.total_ms);
+            }
+        }
+        std::sort(total_samples.begin(), total_samples.end());
+
+        fprintf(stderr,
+                "KV_ACTIVE_TOKEN_STATS active_token_count=%zu avg_ms=%.3f p50_ms=%.3f "
+                "p95_ms=%.3f p99_ms=%.3f max_ms=%.3f decode_avg_ms=%.3f "
+                "prefetch_calls=%zu prefetch_total_ms=%.3f\n",
+                active_token_stats.size(),
+                total_ms_sum / (double) active_token_stats.size(),
+                active_token_percentile(total_samples, 50),
+                active_token_percentile(total_samples, 95),
+                active_token_percentile(total_samples, 99),
+                total_samples.back(),
+                decode_ms_sum / (double) active_token_stats.size(),
+                active_prefetch_calls,
+                active_prefetch_ms_total);
+    }
 
     print_test_summary(test_state);
     cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
