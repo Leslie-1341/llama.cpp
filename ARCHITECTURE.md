@@ -3,8 +3,8 @@
 > 记录当前源码可验证的稳定结构。讨论方案必须标记为 proposed，不得混入已实现架构。
 
 - Last verified: 2026-07-16
-- Evidence commit: `a9faa532be58c9d821fca77df9b6bf449db3fe7b`
-- Verification scope: 当前源码、Git 历史、KV docs、Stage 1 parser 合成回归与 runner shell 语法；未运行构建、当前 HEAD dry-run 或模型实验
+- Evidence commit: `a744830e90969a2298785cdd994901f8f448995a`
+- Verification scope: 当前源码、Git diff、clean-HEAD E2I 功能 artifact 与三轮 E2G/E2I controlled A/B artifact；本轮未运行构建、测试或实验
 
 ## System Boundary
 
@@ -50,6 +50,24 @@ resume/read/write requires block
   -> attention/decode continues
 ```
 
+### Static paged identity fast path
+
+```text
+context construction
+  -> resolve eligibility once for the context lifetime
+  -> eligible static identity mapping: no paged_row_idx input, continuous K/V views
+  -> otherwise: paged_row_idx input, per-step row fill, K/V GET_ROWS gather
+
+graph cache reuse
+  -> compare cached graph row-index topology with current context topology
+  -> topology matches: normal shape checks may permit reuse
+  -> topology differs: reject reuse and rebuild the graph
+```
+
+- Eligibility is context-lifetime state, not a per-token speculation. It requires explicit fast-path request, paged and in-graph modes, `n_stream == 1`, `!v_trans`, no approximate-dynamic view, F32 K/V layers, identity block mapping, and no requested dynamic remap, swap, release, madvise or mapping/swap-in/backing-I/O fault injection.
+- Eligible E2I omits `paged_row_idx` creation/fill and bypasses K/V `GET_ROWS`, exposing continuous K/V views. E2G and every rejected configuration retain the row-index/gather topology.
+- This optimization does not turn a dynamic mapping back into a continuous view. Any feature that may invalidate identity is rejected before the context starts and uses the existing gather path for the whole context lifetime.
+
 ## Module Responsibilities
 
 - `src/llama-model.cpp`, `src/llama-flex.*`：Dense layer 注册、ring sizing、stream/prefetch 与 compute callback 接入。
@@ -82,6 +100,9 @@ resume/read/write requires block
 - E0-E5 artifact 必须与 `RUNS=1/3` 固定计划精确一致；缺失/重复/乱序 tuple、缺失必要字段或指标、重复 marker/key、以及任一非 `PASS` run 都使 parser 非零退出。dry-run 只验证规划产物，不构成模型正确性或性能证据。
 - E2 `segment_ending_at_get_rows_wall_us` 的范围严格是“scheduler graph 中前一 callback 边界至目标 GET_ROWS 完成”；它是带 callback 的 outer segment，不是单个 GET_ROWS kernel、CPU backend 内层时间、单 token 时间或端到端 wall time。
 - E5 的 per-block phase 值是既有累计 swap-in 阶段计数器在一次 `prefetch_seq_step()` 恢复前后的差值；parser 要求每 block 的 phase sum 与四阶段相加一致，并与 token prefetch、全局 swap-in 与累计 I/O 字段对账。它描述被关联的恢复阶段，不等同于完整 decode latency。
+- Identity fast-path eligibility is immutable for a constructed context. `paged_identity_fast_path_enabled` and `paged_row_idx_enabled` select exactly one topology: continuous view without row input, or gather with row input.
+- Graph reuse must preserve topology, not only tensor sizes. `llm_graph_input_attn_kv::can_reuse()` requires `(cached graph has paged_row_idx) == context uses paged_row_idx`; a mismatch rejects reuse and forces rebuild. Within the same topology, existing `n_kv` and mask/shape checks still apply.
+- Enabling E2I must imply identity mapping for the full context lifetime. Dynamic remap, swap, release, madvise, non-identity/shifted mapping, approximate dynamic view, unsupported layout/layer type and injected fault scopes are fail-closed eligibility rejections, never runtime permission to keep using the continuous view.
 
 ## Modification Boundaries
 
@@ -90,6 +111,7 @@ resume/read/write requires block
 - 不应把 ShareGPT-backed synthetic trace 描述为真实线上 trace，也不应把 current RSS 收益描述为 peak RSS 收益。
 - public/memory-level API 仍属 experimental；在没有 backend 与错误语义设计前，不视为稳定 upstream API。
 - 修改 KV 状态机时必须同步核对 row mapping、active visibility、swap metadata 发布顺序和 graph 前错误传播。
+- Any future feature that can change logical-to-physical mapping or residency after construction must either remain incompatible with E2I or introduce a proven invalidation/rebuild contract before relaxing the context-lifetime gate.
 
 ## Known Limitations
 
@@ -99,4 +121,6 @@ resume/read/write requires block
 - 权重侧 Flex 与 MoE-Buffer 是分离路径，不是统一 shared weight/KV I/O budget scheduler。
 - `src/llama-kv-cache.cpp` deferred-construction 处仍有“block swap 每 cell I/O”的旧注释；当前实现实际使用 `write_cells()`/`read_cells()` 做 block range I/O，该注释已陈旧。
 - README/历史报告中的性能数字缺少仓库内原始 artifacts 与 commit/worktree 绑定，目前无法确认其对当前 HEAD 的适用性。
-- Stage 1 的 E2 outer segment 含 callback/scheduler 边界，存在观测扰动；它仅用于定位。性能比较必须改用未插桩 identity fast path 的端到端 A/B，且当前尚无此类 artifact。
+- Stage 1 的 E2 outer segment 含 callback/scheduler 边界，存在观测扰动；它仅用于定位。Stage 2 已改用未插桩 identity fast path 的端到端 A/B；该证据只支持当前阶段保留决策。
+- Static identity fast path is intentionally narrower than paged KV: it does not apply to swap/reclaim/madvise, non-identity mapping, multi-stream, `v_trans`, approximate-dynamic views, non-F32 K/V layers, fault-injection configurations, GPU/device KV, or any context that may remap after construction.
+- The current E2G/E2I evidence covers one CPU host, one F32-KV layout, one model and one fixed ctx-2048 example workload. It validates the topology and stage decision, not general backend or final-competition performance.

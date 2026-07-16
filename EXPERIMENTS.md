@@ -2,6 +2,64 @@
 
 > 追加式实验索引。只记录可追溯协议与证据入口，不复制大日志，不用未运行或失败结果支撑正式结论。
 
+## E-0005 — clean-HEAD paged identity E2I 功能门禁
+
+- Status: valid
+- Date: 2026-07-16
+- Commit/worktree: `a744830e90969a2298785cdd994901f8f448995a`；manifest 记录 clean worktree
+- Runner/parser: `scripts/kv-paged-identity-e2i.sh` / `scripts/parse-kv-paged-identity-e2i.py`
+- Raw artifact: `/root/oscomp/kv_logs/kv_paged_identity_e2i_smoke_20260716T135342Z`
+- Evidence hashes: manifest `feee0b1f8951a35b597ce9ccbbe82dd0fe492bb67f90d897352bd80c90d51c82`；summary `ad4276ec29f62a92d0d8b323892d29a889912c6285a59d9aa1f17c6890a55e8d`；runner `18fb84b4f3cfdbf7611c65f00f38475743ac698b9316091451ddce96929cebc0`；parser `2c3459d3db7136c3edb90c106b508201b36074d8d1fe735dc2150c8ef8e2587f`
+
+**Question and protocol**
+
+验证 E2I continuous-view topology、E2G gather fallback、graph reuse/no-reuse，以及 SHIFT/NONIDENTITY/SWAP/RELEASE/MADVISE 的 fail-closed eligibility。固定顺序为 E0、E2、E2I、E2I_NOREUSE、SHIFT、NONIDENTITY、SWAP、RELEASE、MADVISE，各运行一次；parser 对 commit/worktree、binary/model、固定计划、环境、artifact hash、唯一 marker、机制与安全字段 fail-closed。
+
+**Environment and workload**
+
+Binary SHA256 `ab31ba2b...b7a8be0`；Meta-Llama-3-8B-Instruct Q4_K_M，model SHA256 `b2f95e15...b47410ce`；ctx 2048、n-predict 128、batch/ubatch 128、parallel 4、seed 1、temp 0、K/V F32、unified KV；timeout 900 s，非 dry-run。
+
+**Correctness gate and result**
+
+全部 run exit 0、唯一 `KV_TEST_SUMMARY result=PASS`、安全/故障字段为零；所有输出相对 E0 byte-exact，E2I variants 同时相对 E2 byte-exact。9 case 全部 PASS；E2I 为 continuous view 且 `n_reused=762`，E2I_NOREUSE 为 continuous view 且 `n_reused=0`；五个动态/非 identity case 均以预期 reject reason 回退 gather。parser exit 0。
+
+**Supported conclusion and limits**
+
+Stage 2 identity eligibility、continuous/gather topology、reuse/no-reuse 和主要失效边界通过该 clean-HEAD 功能门禁。单次固定 example 功能矩阵不提供性能结论，也不覆盖 GPU、multi-stream、非 F32 K/V 或生产 server。
+
+## E-0006 — static identity E2G/E2I 三轮 controlled A/B
+
+- Status: valid
+- Date: 2026-07-16
+- Commit/worktree: `a744830e90969a2298785cdd994901f8f448995a`；manifest 记录 clean worktree
+- Runner/parser: `scripts/kv-paged-identity-controlled-ab.sh`、`scripts/kv-paged-identity-controlled-ab-runner.py` / `scripts/parse-kv-paged-identity-controlled-ab.py`
+- Raw artifact: `/root/oscomp/kv_logs/kv_paged_identity_controlled_ab_20260716T142722Z`
+- Evidence hashes: manifest `46dff8b8f42d87435e6a9bdab3b44600cdbc0cbb1d4509a6d2ad4ad8939372bf`；summary `5eb66dc2d48cc40924170ba3763ce0bd4c31e2344c7ce157fecc318f88bcbabe`；paired deltas `44c1f3066445673a9631ed2e4d80ea15baca5b3f057b310d06405a9a48a62f62`；runs `d7eb9c0a10616e4c90f955da1d5ebc861d70b7ed05a8780d97d72e626b5cb149`
+
+**Question, baseline and variant**
+
+比较 E2G（paged row-index + K/V `GET_ROWS` gather，identity fast path off）与 E2I（相同 paged identity 配置，fast path on、continuous K/V view）。唯一实验变量为 `LLAMA_KV_PAGED_IDENTITY_FAST_PATH=0/1`。
+
+**Protocol and environment**
+
+三轮成对交错：R1 G-I、R2 I-G、R3 G-I；每 case 每轮一次。固定 Llama-3-8B-Instruct Q4_K_M（SHA256 `b2f95e15...b47410ce`）、Release build、GCC 11.4、GGML CPU/OpenMP/native、12 logical CPU（Xeon Platinum 8358）、Ubuntu 22.04/Linux 5.15、约 24 GB RAM。workload 为 ctx 2048、n-predict 128、batch/ubatch 128、parallel 4、seed 1、temp 0、K/V F32、unified KV；无单独剔除的 warmup run。
+
+**Correctness gate and metrics**
+
+每次 exit 0；paired outputs byte-identical；唯一 `KV_TEST_SUMMARY result=PASS`；failure fields 为零；路径 telemetry 必须分别证明 E2G gather 与 E2I continuous view。指标来自同一 example telemetry：TPOT=`KV_ACTIVE_TOKEN_LATENCY avg_ms`，p95=`KV_ACTIVE_TOKEN_LATENCY p95_ms`，TPS=`KV_PERF tokens_per_second`，wall=`KV_PERF total_wall_ms`。低 TPOT/p95/wall、高 TPS 为有利；严格决策规则要求四指标三轮全部有利才标记 `FAST_PATH_FASTER`。
+
+**Results**
+
+- TPOT E2I-E2G：R1 `-2.490 ms`，R2 `-2.333 ms`，R3 `-1.480 ms`；3/3 有利。
+- TPS E2I-E2G：R1 `+0.275151`，R2 `+0.357052`，R3 `+0.271673 token/s`；3/3 有利。
+- wall E2I-E2G：R1 `-2251.650 ms`，R2 `-964.319 ms`，R3 `-734.402 ms`；3/3 有利。
+- p95 E2I-E2G：R1 `-11.043 ms`，R2 `-4.744 ms`，R3 `+2.285 ms`；2/3 有利。
+- parser exit 0，artifact `VALID`；因 p95 第三轮不利，严格 performance judgment 为 `MIXED`。
+
+**Supported conclusion and limits**
+
+该 artifact 是保留 static identity fast path 的决策级端到端证据：三个中心/总量指标在三轮中方向一致，p95 多数轮有利，且正确性门禁通过。它不是决赛正式性能结论；不能外推到更多模型、长上下文、server/continuous batching、不同硬件/backend/layout，且必须保留 p95 第三轮退化，不得改写为“四指标全面胜出”。
+
 ## E-0001 — 当前 HEAD 的 KV controlled E0-E5
 
 - Status: planned

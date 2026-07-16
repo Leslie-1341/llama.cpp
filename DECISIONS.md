@@ -227,3 +227,40 @@ Stage 1 需要区分 E2 paged gather 的调度/图构造开销与 E5 active pref
 
 - `a9faa532`：`examples/kv-idle-swap-resume/idle-swap-resume.cpp`、`src/llama-kv-cache.*`、`scripts/kv-e0-e2-e5-single-turn-diagnose.sh`、`scripts/parse-kv-e0-e2-e5-single-turn.py`。
 - 当前 HEAD：`tests/test-kv-e0-e2-e5-single-turn-parser.py` 11 tests 通过；runner `bash -n` 通过；未运行 build、模型或新的 dry-run。
+
+## D-0007 — 保留 context-lifetime static paged identity fast path
+
+- Date: 2026-07-16
+- Status: accepted
+- Evidence commit/worktree: `a744830e90969a2298785cdd994901f8f448995a`；功能与性能 artifacts 均记录 clean worktree
+- Supersedes: D-0006 中“identity fast path 尚未实现或运行”的状态描述
+- Superseded by: none
+
+**Context**
+
+E2 paged gather 在 logical-to-physical mapping 始终为 identity 时仍为每层 K/V 构造 `GET_ROWS`，增加 row-index input、gather 节点和调度开销。优化必须保证 graph cache reuse 不复用错误 topology，也不能让 swap/remap/reclaim 等动态配置错误进入连续视图。
+
+**Decision**
+
+保留 `a744830e9` 的 opt-in static identity fast path。eligibility 在 context 构造期一次性、fail-closed 地解析；合格 context 在整个生命周期使用 continuous K/V view 并省略 `paged_row_idx`，不合格 context 保持 E2G gather。graph reuse 显式比较 cached graph 与当前 context 是否都具有相同 row-index topology，拓扑变化时拒绝复用。
+
+**Alternatives rejected**
+
+- 删除 fast path、始终使用 E2G：放弃已由三轮配对端到端证据显示的稳定 TPOT/TPS/wall 方向收益。
+- 每 token 动态判断 identity：把状态检查和 topology 切换带入热路径，并扩大 graph reuse 与映射失效风险。
+- 在 swap/remap/release/madvise 中乐观启用 continuous view：这些机制可破坏 context-lifetime identity/residency，不具备安全失效契约。
+- 以当前结果宣称决赛正式性能胜出：严格四指标门槛的结论仍为 `MIXED`，p95 只有 2/3 轮有利，且 workload/模型/机器覆盖有限。
+
+**Consequences and limits**
+
+- 收益：移除 eligible identity context 的 row-index input/fill 与每层 K/V gather；controlled A/B 中 TPOT、TPS、wall 三轮均有利，p95 两轮有利。
+- 代价：增加 context eligibility 状态、reject telemetry、graph-topology reuse 检查和两套 graph topology；配置组合测试与维护面扩大。
+- 适用范围：显式请求、paged/in-graph、single-stream、非 `v_trans`、非 approximate-dynamic、F32 K/V、静态 identity mapping，且无 remap/swap/release/madvise/fault injection。
+- 失效边界：任何可能改变 mapping/residency 的新机制、unsupported layer/layout、multi-stream、GPU/device KV 或缺少 graph invalidation 契约的 topology 切换都必须回退 gather。
+- 当前是 Stage 2 决策级证据；正式决赛结论仍需扩展模型、长上下文、server/continuous batching、重复数与硬件覆盖，并如实保留 p95 退化轮次。
+
+**Evidence**
+
+- Functional artifact: `/root/oscomp/kv_logs/kv_paged_identity_e2i_smoke_20260716T135342Z`；manifest SHA256 `feee0b1f8951a35b597ce9ccbbe82dd0fe492bb67f90d897352bd80c90d51c82`；summary SHA256 `ad4276ec29f62a92d0d8b323892d29a889912c6285a59d9aa1f17c6890a55e8d`；parser exit 0。
+- Controlled A/B artifact: `/root/oscomp/kv_logs/kv_paged_identity_controlled_ab_20260716T142722Z`；manifest SHA256 `46dff8b8f42d87435e6a9bdab3b44600cdbc0cbb1d4509a6d2ad4ad8939372bf`；summary SHA256 `5eb66dc2d48cc40924170ba3763ce0bd4c31e2344c7ce157fecc318f88bcbabe`；parser exit 0、artifact `VALID`、performance judgment `MIXED`。
+- Source: `src/llama-kv-cache-identity.h`、`src/llama-kv-cache.cpp`、`src/llama-graph.cpp`；unit coverage: `tests/test-kv-paged-identity-fast-path.cpp`。
