@@ -625,16 +625,17 @@ static int decode_batch(
     return ret;
 }
 
-static void print_test_summary(const kv_test_state & test_state) {
+static void print_test_summary(const kv_test_state & test_state, bool passed) {
     if (!test_state.test_mode_enabled) {
         return;
     }
 
     fprintf(stderr,
-            "KV_TEST_SUMMARY decode_calls=%llu expected_swap_out_io_failure=%d "
+            "KV_TEST_SUMMARY result=%s decode_calls=%llu expected_swap_out_io_failure=%d "
             "prefetch_failures_observed=%llu "
             "active_decode_failures_observed=%llu active_decode_retries=%llu "
             "active_decode_retry_successes=%llu\n",
+            passed ? "PASS" : "FAIL",
             (unsigned long long) test_state.decode_calls,
             test_state.expect_swap_out_io_failure ? 1 : 0,
             (unsigned long long) test_state.prefetch_failures_observed,
@@ -657,7 +658,7 @@ static bool handle_prefetch_result(int32_t ret, kv_test_state & test_state) {
         return true;
     }
 
-    print_test_summary(test_state);
+    print_test_summary(test_state, false);
     return false;
 }
 
@@ -743,8 +744,10 @@ int main(int argc, char ** argv) {
     params.sampling.backend_sampling = false;
 
     kv_test_state test_state;
+    bool test_mode_requested = false;
     bool get_rows_profile_enabled = false;
-    if (!parse_test_bool("LLAMA_KV_TEST_EXPECT_SWAP_OUT_IO_FAILURE", test_state.expect_swap_out_io_failure) ||
+    if (!parse_test_bool("LLAMA_KV_TEST_MODE", test_mode_requested) ||
+            !parse_test_bool("LLAMA_KV_TEST_EXPECT_SWAP_OUT_IO_FAILURE", test_state.expect_swap_out_io_failure) ||
             !parse_test_bool("LLAMA_KV_TEST_EXPECT_PREFETCH_FAILURE", test_state.expect_prefetch_failure) ||
             !parse_test_bool("LLAMA_KV_TEST_EXPECT_ACTIVE_DECODE_FAILURE", test_state.expect_active_decode_failure) ||
             !parse_test_bool("LLAMA_KV_TEST_RETRY_ACTIVE_DECODE", test_state.retry_active_decode) ||
@@ -752,7 +755,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
     test_state.test_mode_enabled =
-        test_state.expect_swap_out_io_failure ||
+        test_mode_requested || test_state.expect_swap_out_io_failure ||
         test_state.expect_prefetch_failure ||
         test_state.expect_active_decode_failure ||
         test_state.retry_active_decode;
@@ -1667,7 +1670,7 @@ int main(int argc, char ** argv) {
                         (unsigned long long) test_state.decode_calls);
                 if (!test_state.retry_active_decode) {
                     fprintf(stderr, "KV_TEST_TERMINATING_AFTER_EXPECTED_FAILURE\n");
-                    print_test_summary(test_state);
+                    print_test_summary(test_state, false);
                     cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
                     return 1;
                 }
@@ -1680,14 +1683,14 @@ int main(int argc, char ** argv) {
                     test_state.active_decode_failures_observed += 1;
                 }
                 if (decode_ret != 0) {
-                    print_test_summary(test_state);
+                    print_test_summary(test_state, false);
                     cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
                     return 1;
                 }
                 test_state.active_decode_retry_successes += 1;
                 fprintf(stderr, "KV_TEST_RETRY_SUCCEEDED\n");
             } else {
-                print_test_summary(test_state);
+                print_test_summary(test_state, false);
                 cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
                 return 1;
             }
@@ -1731,7 +1734,7 @@ int main(int argc, char ** argv) {
         test_expectations_met = false;
     }
     if (!test_expectations_met) {
-        print_test_summary(test_state);
+        print_test_summary(test_state, false);
         cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
         return 1;
     }
@@ -1881,7 +1884,10 @@ int main(int argc, char ** argv) {
         get_rows_profiler.print();
     }
 
-    print_test_summary(test_state);
+    const llama_perf_context_data perf = llama_perf_context(ctx);
+    fprintf(stderr, "KV_GRAPH_REUSE_STATS n_reused=%d\n", perf.n_reused);
+
+    print_test_summary(test_state, true);
     cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
     return 0;
 }

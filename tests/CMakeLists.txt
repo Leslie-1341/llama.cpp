@@ -198,6 +198,7 @@ endif()
 # directly via the internal src/ header (same pattern as test-llama-archs.cpp above).
 if (UNIX)
     llama_build_and_test(test-kv-backing-store.cpp)
+    llama_build_and_test(test-kv-paged-identity-fast-path.cpp)
 endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)

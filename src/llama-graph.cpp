@@ -495,6 +495,7 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
+    res &= llama_kv_paged_row_idx_topology_matches(paged_row_idx != nullptr, mctx->uses_paged_row_idx());
     if (paged_row_idx) {
         res &= paged_row_idx->ne[0] == mctx->get_n_kv();
     }

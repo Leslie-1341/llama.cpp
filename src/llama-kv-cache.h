@@ -1,5 +1,7 @@
 #pragma once
 
+#include "llama-kv-cache-identity.h"
+
 #include "llama-batch.h"
 #include "llama-graph.h"
 #include "llama-kv-cells.h"
@@ -468,6 +470,7 @@ public:
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
     ggml_tensor * build_input_paged_row_idx(ggml_context * ctx, uint32_t n_kv) const;
+    bool uses_paged_row_idx() const;
 
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
@@ -653,6 +656,13 @@ private:
 
     bool     kv_paged_enabled  = false;
     bool     kv_paged_warned   = false;
+    bool     paged_ingraph_enabled = true;
+    bool     paged_row_idx_enabled = false;
+    bool     paged_nonidentity_probe_requested = false;
+    bool     paged_identity_fast_path_enabled = false;
+    uint32_t paged_identity_fast_path_layers = 0;
+    llama_kv_paged_identity_fast_path_reject paged_identity_fast_path_reject =
+        llama_kv_paged_identity_fast_path_reject::NOT_REQUESTED;
     uint32_t paged_block_size  = 16;
     uint32_t paged_n_blocks    = 0;
     uint32_t paged_kv_size     = 0;
@@ -689,6 +699,8 @@ private:
     mutable uint64_t paged_shadow_validate_fault_risk_skipped    = 0;
     mutable uint64_t paged_shadow_validate_bytes_skipped         = 0;
     mutable uint64_t paged_ingraph_gather_layers  = 0;
+    mutable uint64_t paged_row_idx_inputs_created = 0;
+    mutable uint64_t paged_row_idx_set_calls      = 0;
     mutable uint64_t paged_row_idx_changed        = 0;
     mutable uint64_t paged_row_idx_fail           = 0;
     mutable bool     paged_ingraph_warned         = false;
@@ -1295,6 +1307,7 @@ public:
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
     ggml_tensor * build_input_paged_row_idx(ggml_context * ctx) const;
+    bool uses_paged_row_idx() const;
 
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;

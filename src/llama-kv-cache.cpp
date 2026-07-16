@@ -906,6 +906,9 @@ llama_kv_cache::llama_kv_cache(
     }
 
     const char * LLAMA_KV_PAGED = std::getenv("LLAMA_KV_PAGED");
+    const char * LLAMA_KV_PAGED_INGRAPH = std::getenv("LLAMA_KV_PAGED_INGRAPH");
+    const char * LLAMA_KV_PAGED_GATHER_NONIDENTITY = std::getenv("LLAMA_KV_PAGED_GATHER_NONIDENTITY");
+    const char * LLAMA_KV_PAGED_IDENTITY_FAST_PATH = std::getenv("LLAMA_KV_PAGED_IDENTITY_FAST_PATH");
     const char * LLAMA_KV_PAGED_TIMING = std::getenv("LLAMA_KV_PAGED_TIMING");
     const char * LLAMA_KV_PAGED_RESUME_TIMING = std::getenv("LLAMA_KV_PAGED_RESUME_TIMING");
     const char * LLAMA_KV_PAGED_RESUME_TIMING_STEP = std::getenv("LLAMA_KV_PAGED_RESUME_TIMING_STEP");
@@ -919,6 +922,16 @@ llama_kv_cache::llama_kv_cache(
     paged_resume_timing_step_enabled =
         LLAMA_KV_PAGED_RESUME_TIMING_STEP && std::strcmp(LLAMA_KV_PAGED_RESUME_TIMING_STEP, "1") == 0;
     const bool kv_paged_requested = LLAMA_KV_PAGED && std::strcmp(LLAMA_KV_PAGED, "1") == 0;
+    const bool paged_identity_fast_path_requested =
+        LLAMA_KV_PAGED_IDENTITY_FAST_PATH && std::strcmp(LLAMA_KV_PAGED_IDENTITY_FAST_PATH, "1") == 0;
+    const bool paged_dynamic_remap_requested =
+        LLAMA_KV_PAGED_GATHER_NONIDENTITY && std::strcmp(LLAMA_KV_PAGED_GATHER_NONIDENTITY, "1") == 0;
+    paged_nonidentity_probe_requested = paged_dynamic_remap_requested;
+    paged_ingraph_enabled =
+        !(LLAMA_KV_PAGED_INGRAPH && std::strcmp(LLAMA_KV_PAGED_INGRAPH, "0") == 0);
+    bool paged_dynamic_swap_requested = false;
+    bool paged_dynamic_release_requested = false;
+    bool paged_dynamic_madvise_requested = false;
     if (kv_paged_requested) {
         const char * LLAMA_KV_PAGED_BLOCK_SIZE = std::getenv("LLAMA_KV_PAGED_BLOCK_SIZE");
         const char * LLAMA_KV_PAGED_SHIFT      = std::getenv("LLAMA_KV_PAGED_SHIFT");
@@ -946,6 +959,9 @@ llama_kv_cache::llama_kv_cache(
         const bool paged_swap_env = LLAMA_KV_PAGED_SWAP && std::strcmp(LLAMA_KV_PAGED_SWAP, "1") == 0;
         const bool idle_swap_env  = LLAMA_KV_PAGED_IDLE_SWAP && std::strcmp(LLAMA_KV_PAGED_IDLE_SWAP, "1") == 0;
         const bool idle_swap_madvise_env = LLAMA_KV_PAGED_IDLE_SWAP_MADVISE && std::strcmp(LLAMA_KV_PAGED_IDLE_SWAP_MADVISE, "1") == 0;
+        paged_dynamic_swap_requested = paged_swap_env || idle_swap_env;
+        paged_dynamic_release_requested = release_env;
+        paged_dynamic_madvise_requested = idle_swap_madvise_env;
         const long idle_swap_every_tokens_env =
             LLAMA_KV_PAGED_IDLE_SWAP_EVERY_TOKENS ? std::atol(LLAMA_KV_PAGED_IDLE_SWAP_EVERY_TOKENS) : 1;
         const long idle_swap_max_blocks_env =
@@ -1445,6 +1461,54 @@ llama_kv_cache::llama_kv_cache(
     if (kv_lazy_tail) {
         LLAMA_LOG_INFO("%s: KV lazy-tail madvise enabled (v_trans = %d, n_stream = %u) -- advises unused tail "
                 "[PAD(n_kv,256), %u) per step\n", __func__, (int) v_trans, n_stream, kv_size);
+    }
+
+    bool identity_mapping = kv_paged_enabled && !paged_non_identity_enabled && paged_block_mapping_changed == 0;
+    if (identity_mapping) {
+        for (uint32_t logical = 0; logical < paged_block_table.size(); ++logical) {
+            if (paged_block_table[logical] != logical) {
+                identity_mapping = false;
+                break;
+            }
+        }
+    }
+
+    bool layers_supported = !layers.empty();
+    for (const auto & layer : layers) {
+        layers_supported = layers_supported && layer.k && layer.v &&
+            layer.k->type == GGML_TYPE_F32 && layer.v->type == GGML_TYPE_F32;
+    }
+
+    const auto fast_path = llama_kv_paged_identity_fast_path_resolve({
+        /* .requested        = */ paged_identity_fast_path_requested,
+        /* .paged_enabled    = */ kv_paged_enabled,
+        /* .ingraph_enabled  = */ paged_ingraph_enabled,
+        /* .single_stream    = */ n_stream == 1,
+        /* .v_trans          = */ v_trans,
+        /* .approx_dynamic   = */ uses_approx_dynamic_view(),
+        /* .identity_mapping = */ identity_mapping,
+        /* .dynamic_remap    = */ paged_dynamic_remap_requested,
+        /* .swap             = */ kv_swap_requested || paged_dynamic_swap_requested,
+        /* .release          = */ paged_dynamic_release_requested,
+        /* .madvise          = */ kv_swap_madvise_requested || paged_dynamic_madvise_requested || kv_lazy_tail,
+        /* .mapping_read_fault  = */ paged_test_mapping_fault_.scope == paged_test_mapping_fail_scope::READ,
+        /* .mapping_write_fault = */ paged_test_mapping_fault_.scope == paged_test_mapping_fail_scope::WRITE,
+        /* .swapin_fault        = */ paged_test_swapin_fault_.scope != paged_test_swapin_fail_scope::OFF,
+        /* .backing_io_fault    = */ paged_test_io_fault_.scope != paged_test_io_fail_scope::OFF,
+        /* .layers_supported = */ layers_supported,
+    });
+    paged_identity_fast_path_enabled = fast_path.enabled;
+    paged_identity_fast_path_reject = fast_path.reject;
+    paged_identity_fast_path_layers = fast_path.enabled ? (uint32_t) map_layer_ids.size() : 0;
+    paged_row_idx_enabled = kv_paged_enabled && paged_ingraph_enabled && layers_supported && !fast_path.enabled;
+
+    if (kv_paged_enabled || paged_identity_fast_path_requested) {
+        LLAMA_LOG_INFO(
+                "%s: KV paged identity fast path: enabled=%d layers=%u reject_reason=%s\n",
+                __func__,
+                paged_identity_fast_path_enabled ? 1 : 0,
+                paged_identity_fast_path_layers,
+                llama_kv_paged_identity_fast_path_reject_name(paged_identity_fast_path_reject));
     }
 }
 
@@ -4689,7 +4753,10 @@ void llama_kv_cache::paged_log_stats() const {
             "shadow_validate_calls=%llu shadow_validate_blocks_checked=%llu "
             "shadow_validate_swapped_blocks_skipped=%llu shadow_validate_fault_risk_skipped=%llu "
             "shadow_validate_bytes_skipped=%llu "
-            "ingraph_gather_layers=%llu row_idx_changed=%llu row_idx_fail=%llu "
+            "ingraph_gather_layers=%llu paged_identity_fast_path_enabled=%d "
+            "paged_identity_fast_path_layers=%u paged_identity_fast_path_reject_reason=%s "
+            "paged_row_idx_inputs_created=%llu paged_row_idx_set_calls=%llu "
+            "row_idx_changed=%llu row_idx_fail=%llu "
             "non_identity_enabled=%d block_mapping_changed=%llu mapping_oob_fail=%llu "
             "logical_to_physical_checks=%llu logical_to_physical_fail=%llu "
             "paged_block_release_enabled=%d paged_block_release_calls=%llu paged_blocks_released=%llu "
@@ -4789,6 +4856,11 @@ void llama_kv_cache::paged_log_stats() const {
             (unsigned long long) paged_shadow_validate_fault_risk_skipped,
             (unsigned long long) paged_shadow_validate_bytes_skipped,
             (unsigned long long) paged_ingraph_gather_layers,
+            paged_identity_fast_path_enabled ? 1 : 0,
+            paged_identity_fast_path_layers,
+            llama_kv_paged_identity_fast_path_reject_name(paged_identity_fast_path_reject),
+            (unsigned long long) paged_row_idx_inputs_created,
+            (unsigned long long) paged_row_idx_set_calls,
             (unsigned long long) paged_row_idx_changed,
             (unsigned long long) paged_row_idx_fail,
             paged_non_identity_enabled ? 1 : 0,
@@ -5841,7 +5913,8 @@ ggml_tensor * llama_kv_cache::get_k(
         ++kv_approx_debug_get_k_visible_gt0_calls;
     }
 
-    if (row_idx && paged_ingraph_gather_supported(il) && ns == 1 && !approx_dynamic) {
+    if (!paged_identity_fast_path_enabled && row_idx &&
+            paged_ingraph_gather_supported(il) && ns == 1 && !approx_dynamic) {
         ggml_tensor * k2d = ggml_reshape_2d(ctx, k, n_embd_k_gqa, kv_size);
         ggml_tensor * rows = ggml_get_rows(ctx, k2d, row_idx);
         paged_ingraph_gather_layers += 1;
@@ -5892,7 +5965,8 @@ ggml_tensor * llama_kv_cache::get_v(
             ++kv_approx_debug_get_v_visible_gt0_calls;
         }
 
-        if (row_idx && paged_ingraph_gather_supported(il) && ns == 1 && !approx_dynamic) {
+        if (!paged_identity_fast_path_enabled && row_idx &&
+                paged_ingraph_gather_supported(il) && ns == 1 && !approx_dynamic) {
             ggml_tensor * v2d = ggml_reshape_2d(ctx, v, n_embd_v_gqa, kv_size);
             ggml_tensor * rows = ggml_get_rows(ctx, v2d, row_idx);
             paged_ingraph_gather_layers += 1;
@@ -6037,38 +6111,19 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
 }
 
 ggml_tensor * llama_kv_cache::build_input_paged_row_idx(ggml_context * ctx, uint32_t n_kv) const {
-    if (!kv_paged_enabled) {
-        return nullptr;
-    }
-
-    const char * LLAMA_KV_PAGED_INGRAPH = std::getenv("LLAMA_KV_PAGED_INGRAPH");
-    if (LLAMA_KV_PAGED_INGRAPH && std::strcmp(LLAMA_KV_PAGED_INGRAPH, "0") == 0) {
-        return nullptr;
-    }
-
-    bool supported = n_stream == 1 && !v_trans;
-    for (const auto & layer : layers) {
-        supported = supported &&
-            layer.k &&
-            layer.v &&
-            layer.k->type == GGML_TYPE_F32 &&
-            layer.v->type == GGML_TYPE_F32;
-    }
-
-    if (!supported) {
-        if (!paged_ingraph_warned) {
-            LLAMA_LOG_WARN("%s: KV paged in-graph gather requires n_stream==1, !v_trans, and F32 K/V cache "
-                    "(n_stream=%u, v_trans=%d) - falling back to continuous K/V views\n",
-                    __func__, n_stream, (int) v_trans);
-            paged_ingraph_warned = true;
-        }
+    if (!uses_paged_row_idx()) {
         return nullptr;
     }
 
     ggml_tensor * row_idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_kv);
     ggml_set_input(row_idx);
+    paged_row_idx_inputs_created += 1;
 
     return row_idx;
+}
+
+bool llama_kv_cache::uses_paged_row_idx() const {
+    return paged_row_idx_enabled;
 }
 
 ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
@@ -6308,6 +6363,8 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
         return true;
     }
 
+    paged_row_idx_set_calls += 1;
+
     GGML_ASSERT(dst->type == GGML_TYPE_I32);
     int32_t * data = (int32_t *) dst->data;
 
@@ -6359,10 +6416,7 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
     if (base_timing_enabled) {
         paged_base_timing_getenv_calls += 1;
     }
-    const char * LLAMA_KV_PAGED_GATHER_NONIDENTITY = std::getenv("LLAMA_KV_PAGED_GATHER_NONIDENTITY");
-    const bool nonidentity_probe =
-        LLAMA_KV_PAGED_GATHER_NONIDENTITY &&
-        std::strcmp(LLAMA_KV_PAGED_GATHER_NONIDENTITY, "1") == 0;
+    const bool nonidentity_probe = paged_nonidentity_probe_requested;
     paged_nonidentity_probe_enabled = nonidentity_probe;
 
     // Stage 10-E-F: idle swap execution no longer depends on the idle-trace print
@@ -8811,6 +8865,10 @@ ggml_tensor * llama_kv_cache_context::build_input_v_idxs(ggml_context * ctx, con
 
 ggml_tensor * llama_kv_cache_context::build_input_paged_row_idx(ggml_context * ctx) const {
     return kv->build_input_paged_row_idx(ctx, n_kv);
+}
+
+bool llama_kv_cache_context::uses_paged_row_idx() const {
+    return kv->uses_paged_row_idx();
 }
 
 ggml_tensor * llama_kv_cache_context::build_input_k_rot(ggml_context * ctx) const {
