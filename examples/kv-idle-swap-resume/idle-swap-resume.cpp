@@ -8,10 +8,12 @@
 #include <chrono>
 #include <clocale>
 #include <cstdint>
-#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <new>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -56,6 +58,376 @@ struct active_token_stat {
     double prefetch_ms = 0.0;
     double total_ms = 0.0;
 };
+
+enum class kv_get_rows_profile_error {
+    none,
+    allocation,
+    callback_pairing,
+    invalid_kv_node,
+    duplicate_kv_node,
+    incomplete_kv_nodes,
+    event_overflow,
+};
+
+struct kv_get_rows_profile_event {
+    uint64_t step = 0;
+    uint64_t n_kv = 0;
+    uint64_t row_bytes = 0;
+    uint64_t segment_ending_at_get_rows_wall_us = 0;
+    int32_t layer = 0;
+    char kv = '\0';
+    char src[GGML_MAX_NAME] = {};
+};
+
+struct kv_get_rows_profiler {
+    bool enabled = false;
+    kv_get_rows_profile_error error = kv_get_rows_profile_error::none;
+    uint64_t step = 0;
+    int32_t n_layers = 0;
+    int32_t n_kv_layers = 0;
+    size_t event_count = 0;
+    size_t step_event_begin = 0;
+    bool expected_nodes_initialized = false;
+    ggml_tensor * pending_node = nullptr;
+    perf_clock::time_point segment_t0;
+    std::vector<kv_get_rows_profile_event> events;
+    std::vector<uint8_t> step_seen;
+    std::vector<uint8_t> expected_seen;
+
+    static bool checked_add(size_t a, size_t b, size_t & result) {
+        if (a > std::numeric_limits<size_t>::max() - b) {
+            return false;
+        }
+        result = a + b;
+        return true;
+    }
+
+    static bool checked_mul(size_t a, size_t b, size_t & result) {
+        if (a != 0 && b > std::numeric_limits<size_t>::max() / a) {
+            return false;
+        }
+        result = a * b;
+        return true;
+    }
+
+    bool init(int32_t model_layers, int32_t num_idle_seqs, int32_t idle_warmup,
+            int32_t n_decode, bool allow_retry) {
+        n_layers = model_layers;
+        if (n_layers <= 0 || num_idle_seqs <= 0 || idle_warmup < 0 || n_decode < 0) {
+            error = kv_get_rows_profile_error::allocation;
+            return false;
+        }
+
+        size_t idle_steps = 0;
+        size_t max_steps = 0;
+        size_t nodes_per_step = 0;
+        size_t capacity = 0;
+        if (!checked_mul((size_t) num_idle_seqs, (size_t) idle_warmup + 1, idle_steps) ||
+                !checked_add(idle_steps, 1, max_steps) ||
+                !checked_add(max_steps, (size_t) n_decode, max_steps) ||
+                !checked_add(max_steps, (size_t) n_decode, max_steps) ||
+                (allow_retry && !checked_add(max_steps, 1, max_steps)) ||
+                !checked_mul((size_t) n_layers, 2, nodes_per_step) ||
+                !checked_mul(max_steps, nodes_per_step, capacity)) {
+            error = kv_get_rows_profile_error::allocation;
+            return false;
+        }
+
+        try {
+            events.resize(capacity);
+            step_seen.resize(nodes_per_step);
+            expected_seen.resize(nodes_per_step);
+        } catch (const std::bad_alloc &) {
+            error = kv_get_rows_profile_error::allocation;
+            return false;
+        } catch (const std::length_error &) {
+            error = kv_get_rows_profile_error::allocation;
+            return false;
+        }
+
+        enabled = true;
+        return true;
+    }
+
+    bool begin_step() {
+        if (!enabled || error != kv_get_rows_profile_error::none || pending_node != nullptr) {
+            if (error == kv_get_rows_profile_error::none) {
+                error = kv_get_rows_profile_error::callback_pairing;
+            }
+            return false;
+        }
+
+        if (step == std::numeric_limits<uint64_t>::max()) {
+            error = kv_get_rows_profile_error::event_overflow;
+            return false;
+        }
+        step += 1;
+        step_event_begin = event_count;
+        std::fill(step_seen.begin(), step_seen.end(), 0);
+        return true;
+    }
+
+    static bool parse_cache_source(const ggml_tensor * node, int32_t & layer, char & kv, const char *& src_name) {
+        if (node == nullptr || node->op != GGML_OP_GET_ROWS || node->src[0] == nullptr || node->src[1] == nullptr) {
+            return false;
+        }
+
+        const ggml_tensor * src = node->src[0];
+        while (src != nullptr && src->op == GGML_OP_RESHAPE) {
+            src = src->src[0];
+        }
+        if (src == nullptr) {
+            return false;
+        }
+
+        const char * digits = nullptr;
+        if (std::strncmp(src->name, "cache_k_l", 9) == 0) {
+            kv = 'K';
+            digits = src->name + 9;
+        } else if (std::strncmp(src->name, "cache_v_l", 9) == 0) {
+            kv = 'V';
+            digits = src->name + 9;
+        } else {
+            return false;
+        }
+
+        if (*digits < '0' || *digits > '9') {
+            return false;
+        }
+        int32_t parsed = 0;
+        for (const char * p = digits; *p != '\0'; ++p) {
+            if (*p < '0' || *p > '9') {
+                return false;
+            }
+            const int32_t digit = *p - '0';
+            if (parsed > (std::numeric_limits<int32_t>::max() - digit) / 10) {
+                return false;
+            }
+            parsed = parsed * 10 + digit;
+        }
+
+        layer = parsed;
+        src_name = src->name;
+        return true;
+    }
+
+    bool observe(ggml_tensor * node, bool ask) {
+        if (error != kv_get_rows_profile_error::none) {
+            return false;
+        }
+
+        if (ask) {
+            int32_t layer = 0;
+            char kv = '\0';
+            const char * src_name = nullptr;
+            if (!parse_cache_source(node, layer, kv, src_name)) {
+                return false;
+            }
+            if (pending_node != nullptr) {
+                error = kv_get_rows_profile_error::callback_pairing;
+                return true;
+            }
+            pending_node = node;
+            segment_t0 = perf_clock::now();
+            return true;
+        }
+
+        const auto t1 = perf_clock::now();
+        if (pending_node == nullptr || pending_node != node) {
+            error = kv_get_rows_profile_error::callback_pairing;
+            pending_node = nullptr;
+            return false;
+        }
+        pending_node = nullptr;
+
+        int32_t layer = 0;
+        char kv = '\0';
+        const char * src_name = nullptr;
+        if (!parse_cache_source(node, layer, kv, src_name)) {
+            return true;
+        }
+        if (layer < 0 || layer >= n_layers || node->src[1]->ne[0] <= 0 || node->src[0]->ne[0] <= 0) {
+            error = kv_get_rows_profile_error::invalid_kv_node;
+            return false;
+        }
+
+        const size_t seen_index = (size_t) layer * 2 + (kv == 'V' ? 1 : 0);
+        if (step_seen[seen_index] != 0) {
+            error = kv_get_rows_profile_error::duplicate_kv_node;
+            return false;
+        }
+        if (event_count >= events.size()) {
+            error = kv_get_rows_profile_error::event_overflow;
+            return false;
+        }
+
+        step_seen[seen_index] = 1;
+        kv_get_rows_profile_event & event = events[event_count++];
+        event.step = step;
+        event.layer = layer;
+        event.kv = kv;
+        event.n_kv = (uint64_t) node->src[1]->ne[0];
+        event.row_bytes = (uint64_t) ggml_row_size(node->src[0]->type, node->src[0]->ne[0]);
+        event.segment_ending_at_get_rows_wall_us = (uint64_t)
+            std::chrono::duration_cast<std::chrono::microseconds>(t1 - segment_t0).count();
+        std::snprintf(event.src, sizeof(event.src), "%s", src_name);
+        return true;
+    }
+
+    bool end_step(bool compute_succeeded) {
+        if (pending_node != nullptr) {
+            pending_node = nullptr;
+            if (compute_succeeded && error == kv_get_rows_profile_error::none) {
+                error = kv_get_rows_profile_error::callback_pairing;
+            }
+        }
+        if (!compute_succeeded) {
+            event_count = step_event_begin;
+            step_event_begin = event_count;
+            step -= 1;
+            std::fill(step_seen.begin(), step_seen.end(), 0);
+            return error == kv_get_rows_profile_error::none;
+        }
+        if (error != kv_get_rows_profile_error::none) {
+            return false;
+        }
+
+        if (!expected_nodes_initialized) {
+            for (int32_t layer = 0; layer < n_layers; ++layer) {
+                const uint8_t seen_k = step_seen[(size_t) layer * 2];
+                const uint8_t seen_v = step_seen[(size_t) layer * 2 + 1];
+                if (seen_k != seen_v) {
+                    error = kv_get_rows_profile_error::incomplete_kv_nodes;
+                    return false;
+                }
+                if (seen_k == 1) {
+                    n_kv_layers += 1;
+                }
+            }
+            if (n_kv_layers == 0) {
+                error = kv_get_rows_profile_error::incomplete_kv_nodes;
+                return false;
+            }
+            std::copy(step_seen.begin(), step_seen.end(), expected_seen.begin());
+            expected_nodes_initialized = true;
+        } else if (step_seen != expected_seen) {
+            error = kv_get_rows_profile_error::incomplete_kv_nodes;
+            return false;
+        }
+        if (event_count - step_event_begin != (size_t) n_kv_layers * 2) {
+            error = kv_get_rows_profile_error::incomplete_kv_nodes;
+            return false;
+        }
+        return true;
+    }
+
+    const char * error_name() const {
+        switch (error) {
+            case kv_get_rows_profile_error::none:                return "none";
+            case kv_get_rows_profile_error::allocation:          return "allocation";
+            case kv_get_rows_profile_error::callback_pairing:    return "callback_pairing";
+            case kv_get_rows_profile_error::invalid_kv_node:     return "invalid_kv_node";
+            case kv_get_rows_profile_error::duplicate_kv_node:   return "duplicate_kv_node";
+            case kv_get_rows_profile_error::incomplete_kv_nodes: return "incomplete_kv_nodes";
+            case kv_get_rows_profile_error::event_overflow:      return "event_overflow";
+        }
+        return "unknown";
+    }
+
+    void print() const {
+        for (size_t i = 0; i < event_count; ++i) {
+            const kv_get_rows_profile_event & event = events[i];
+            fprintf(stderr,
+                    "KV_E2_GET_ROWS_PROFILE step=%llu layer=%d kv=%c src=%s n_kv=%llu "
+                    "row_bytes=%llu segment_ending_at_get_rows_wall_us=%llu\n",
+                    (unsigned long long) event.step,
+                    event.layer,
+                    event.kv,
+                    event.src,
+                    (unsigned long long) event.n_kv,
+                    (unsigned long long) event.row_bytes,
+                    (unsigned long long) event.segment_ending_at_get_rows_wall_us);
+        }
+        fprintf(stderr,
+                "KV_E2_GET_ROWS_PROFILE_SUMMARY steps=%llu model_layers=%d kv_layers=%d "
+                "events=%zu capacity=%zu "
+                "scope=scheduler_graph_segment_from_previous_callback_boundary_through_target_get_rows_completion\n",
+                (unsigned long long) step, n_layers, n_kv_layers, event_count, events.size());
+    }
+};
+
+struct kv_eval_callback_chain {
+    ggml_backend_sched_eval_callback original = nullptr;
+    void * original_user_data = nullptr;
+    kv_get_rows_profiler * profiler = nullptr;
+    ggml_tensor * pending_node = nullptr;
+    bool pending_original = false;
+    bool pending_profiler = false;
+
+    bool begin_step() {
+        if (pending_node != nullptr) {
+            profiler->error = kv_get_rows_profile_error::callback_pairing;
+            return false;
+        }
+        return profiler->begin_step();
+    }
+
+    bool end_step(bool compute_succeeded) {
+        if (compute_succeeded && pending_node != nullptr) {
+            profiler->error = kv_get_rows_profile_error::callback_pairing;
+        }
+        pending_node = nullptr;
+        pending_original = false;
+        pending_profiler = false;
+        return profiler->end_step(compute_succeeded);
+    }
+
+    bool observe(ggml_tensor * node, bool ask) {
+        if (ask) {
+            if (pending_node != nullptr) {
+                profiler->error = kv_get_rows_profile_error::callback_pairing;
+                return true;
+            }
+
+            const bool original_requested = original != nullptr && original(node, true, original_user_data);
+            const bool profiler_requested = profiler->observe(node, true);
+            if (original_requested || profiler_requested) {
+                pending_node = node;
+                pending_original = original_requested;
+                pending_profiler = profiler_requested;
+            }
+            return original_requested || profiler_requested;
+        }
+
+        if (pending_node == nullptr || pending_node != node) {
+            profiler->error = kv_get_rows_profile_error::callback_pairing;
+            pending_node = nullptr;
+            pending_original = false;
+            pending_profiler = false;
+            return false;
+        }
+
+        const bool call_original = pending_original;
+        const bool call_profiler = pending_profiler;
+        pending_node = nullptr;
+        pending_original = false;
+        pending_profiler = false;
+
+        bool original_ok = true;
+        bool profiler_ok = true;
+        if (call_original) {
+            original_ok = original(node, false, original_user_data);
+        }
+        if (call_profiler) {
+            profiler_ok = profiler->observe(node, false);
+        }
+        return original_ok && profiler_ok;
+    }
+};
+
+static bool kv_eval_callback_chain_cb(ggml_tensor * node, bool ask, void * user_data) {
+    return static_cast<kv_eval_callback_chain *>(user_data)->observe(node, ask);
+}
 
 static double active_token_percentile(const std::vector<double> & sorted_samples, size_t percentile) {
     // Nearest-rank: for N sorted samples, percentile P selects ceil(P * N / 100), using a 1-based rank.
@@ -228,9 +600,21 @@ static int decode_batch(
         llama_context * ctx,
         llama_batch & batch,
         const char * stage,
-        kv_test_state & test_state) {
-    const int ret = llama_decode(ctx, batch);
+        kv_test_state & test_state,
+        kv_eval_callback_chain * callback_chain) {
+    if (callback_chain != nullptr && !callback_chain->begin_step()) {
+        fprintf(stderr, "%s: E2 GET_ROWS profiler failed before %s: %s\n",
+                __func__, stage, callback_chain->profiler->error_name());
+        return -1;
+    }
+
+    int ret = llama_decode(ctx, batch);
     test_state.decode_calls += 1;
+    if (callback_chain != nullptr && !callback_chain->end_step(ret == 0)) {
+        fprintf(stderr, "%s: E2 GET_ROWS profiler failed during %s at step=%llu: %s\n",
+                __func__, stage, (unsigned long long) callback_chain->profiler->step, callback_chain->profiler->error_name());
+        ret = -1;
+    }
     if (test_state.test_mode_enabled) {
         fprintf(stderr, "KV_TEST_DECODE_RESULT call_index=%llu ret=%d\n",
                 (unsigned long long) test_state.decode_calls, ret);
@@ -359,10 +743,12 @@ int main(int argc, char ** argv) {
     params.sampling.backend_sampling = false;
 
     kv_test_state test_state;
+    bool get_rows_profile_enabled = false;
     if (!parse_test_bool("LLAMA_KV_TEST_EXPECT_SWAP_OUT_IO_FAILURE", test_state.expect_swap_out_io_failure) ||
             !parse_test_bool("LLAMA_KV_TEST_EXPECT_PREFETCH_FAILURE", test_state.expect_prefetch_failure) ||
             !parse_test_bool("LLAMA_KV_TEST_EXPECT_ACTIVE_DECODE_FAILURE", test_state.expect_active_decode_failure) ||
-            !parse_test_bool("LLAMA_KV_TEST_RETRY_ACTIVE_DECODE", test_state.retry_active_decode)) {
+            !parse_test_bool("LLAMA_KV_TEST_RETRY_ACTIVE_DECODE", test_state.retry_active_decode) ||
+            !parse_test_bool("LLAMA_KV_E2_GET_ROWS_PROFILE", get_rows_profile_enabled)) {
         return 1;
     }
     test_state.test_mode_enabled =
@@ -445,6 +831,25 @@ int main(int argc, char ** argv) {
 
     const char * seq0_warmup_env = std::getenv("LLAMA_KV_IDLE_SEQ0_WARMUP_TOKENS");
     const int seq0_warmup = seq0_warmup_env ? std::max(0, std::atoi(seq0_warmup_env)) : 0;
+
+    kv_get_rows_profiler get_rows_profiler;
+    kv_eval_callback_chain eval_callback_chain;
+    if (get_rows_profile_enabled) {
+        if (!get_rows_profiler.init(
+                    llama_model_n_layer(model), num_idle_seqs, seq0_warmup,
+                    n_decode, test_state.retry_active_decode)) {
+            fprintf(stderr, "%s: failed to initialize E2 GET_ROWS profiler: %s\n",
+                    __func__, get_rows_profiler.error_name());
+            llama_model_free(model);
+            llama_backend_free();
+            return 1;
+        }
+        eval_callback_chain.original = params.cb_eval;
+        eval_callback_chain.original_user_data = params.cb_eval_user_data;
+        eval_callback_chain.profiler = &get_rows_profiler;
+        params.cb_eval = kv_eval_callback_chain_cb;
+        params.cb_eval_user_data = &eval_callback_chain;
+    }
 
     llama_context_params ctx_params = common_context_params_to_llama(params);
     const int32_t n_kv_req =
@@ -575,7 +980,8 @@ int main(int argc, char ** argv) {
         batch.logits[batch.n_tokens - 1] = true;
 
         const auto prefill_t0 = perf_clock::now();
-        if (decode_batch(ctx, batch, seq_id == 0 ? "seq0-idle-prefill" : "multi-idle-prefill", test_state) != 0) {
+        if (decode_batch(ctx, batch, seq_id == 0 ? "seq0-idle-prefill" : "multi-idle-prefill",
+                    test_state, get_rows_profile_enabled ? &eval_callback_chain : nullptr) != 0) {
             if (seq_id != 0) {
                 common_sampler_free(smpl);
             }
@@ -609,7 +1015,8 @@ int main(int argc, char ** argv) {
             common_batch_clear(batch);
             common_batch_add(batch, warm_token, warm_pos++, { seq_id }, true);
 
-            if (decode_batch(ctx, batch, seq_id == 0 ? "seq0-idle-warmup" : "multi-idle-warmup", test_state) != 0) {
+            if (decode_batch(ctx, batch, seq_id == 0 ? "seq0-idle-warmup" : "multi-idle-warmup",
+                        test_state, get_rows_profile_enabled ? &eval_callback_chain : nullptr) != 0) {
                 if (seq_id != 0) {
                     common_sampler_free(smpl);
                 }
@@ -646,7 +1053,8 @@ int main(int argc, char ** argv) {
     batch.logits[batch.n_tokens - 1] = true;
     const auto seq1_active_t0 = perf_clock::now();
     const auto seq1_prefill_t0 = perf_clock::now();
-    if (decode_batch(ctx, batch, "seq1-active-prefill", test_state) != 0) {
+    if (decode_batch(ctx, batch, "seq1-active-prefill", test_state,
+                get_rows_profile_enabled ? &eval_callback_chain : nullptr) != 0) {
         cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
         return 1;
     }
@@ -757,7 +1165,8 @@ int main(int argc, char ** argv) {
         if (active_token_stats_enabled) {
             active_token_t0 = perf_clock::now();
         }
-        if (decode_batch(ctx, batch, "seq1-active-decode", test_state) != 0) {
+        if (decode_batch(ctx, batch, "seq1-active-decode", test_state,
+                    get_rows_profile_enabled ? &eval_callback_chain : nullptr) != 0) {
             cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
             return 1;
         }
@@ -1245,7 +1654,8 @@ int main(int argc, char ** argv) {
         common_batch_add(batch, seq0_token, seq0_pos++, { 0 }, true);
         sample_idx = batch.n_tokens - 1;
 
-        int decode_ret = decode_batch(ctx, batch, "seq0-resume-decode", test_state);
+        int decode_ret = decode_batch(ctx, batch, "seq0-resume-decode", test_state,
+                get_rows_profile_enabled ? &eval_callback_chain : nullptr);
         if (decode_ret == -3) {
             test_state.active_decode_failures_observed += 1;
         }
@@ -1264,7 +1674,8 @@ int main(int argc, char ** argv) {
 
                 test_state.active_decode_retries += 1;
                 fprintf(stderr, "KV_TEST_RETRY_SAME_BATCH\n");
-                decode_ret = decode_batch(ctx, batch, "seq0-resume-decode-retry", test_state);
+                decode_ret = decode_batch(ctx, batch, "seq0-resume-decode-retry", test_state,
+                        get_rows_profile_enabled ? &eval_callback_chain : nullptr);
                 if (decode_ret == -3) {
                     test_state.active_decode_failures_observed += 1;
                 }
@@ -1464,6 +1875,10 @@ int main(int argc, char ** argv) {
                 decode_ms_sum / (double) active_token_stats.size(),
                 active_prefetch_calls,
                 active_prefetch_ms_total);
+    }
+
+    if (get_rows_profile_enabled) {
+        get_rows_profiler.print();
     }
 
     print_test_summary(test_state);

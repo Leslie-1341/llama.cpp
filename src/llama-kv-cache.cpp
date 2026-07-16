@@ -939,6 +939,7 @@ llama_kv_cache::llama_kv_cache(
         const char * LLAMA_KV_PAGED_REFAULT_TRACE_BACKTRACE = std::getenv("LLAMA_KV_PAGED_REFAULT_TRACE_BACKTRACE");
         const char * LLAMA_KV_PAGED_REFAULT_TRACE_ONCE      = std::getenv("LLAMA_KV_PAGED_REFAULT_TRACE_ONCE");
         const char * LLAMA_KV_PAGED_IO_STATS                = std::getenv("LLAMA_KV_PAGED_IO_STATS");
+        const char * LLAMA_KV_PAGED_PREFETCH_PHASE_TRACE    = std::getenv("LLAMA_KV_PAGED_PREFETCH_PHASE_TRACE");
         const int block_size_env = LLAMA_KV_PAGED_BLOCK_SIZE ? std::atoi(LLAMA_KV_PAGED_BLOCK_SIZE) : 16;
         const int shift_env      = LLAMA_KV_PAGED_SHIFT      ? std::atoi(LLAMA_KV_PAGED_SHIFT)      : 0;
         const bool release_env   = LLAMA_KV_PAGED_RELEASE && std::strcmp(LLAMA_KV_PAGED_RELEASE, "1") == 0;
@@ -992,6 +993,12 @@ llama_kv_cache::llama_kv_cache(
             paged_io_stats_enabled =
                 LLAMA_KV_PAGED_IO_STATS &&
                 std::strcmp(LLAMA_KV_PAGED_IO_STATS, "1") == 0;
+            paged_prefetch_phase_trace_enabled =
+                LLAMA_KV_PAGED_PREFETCH_PHASE_TRACE &&
+                std::strcmp(LLAMA_KV_PAGED_PREFETCH_PHASE_TRACE, "1") == 0;
+            if (paged_prefetch_phase_trace_enabled) {
+                paged_io_stats_enabled = true;
+            }
             paged_mincore_requested = LLAMA_KV_PAGED_MINCORE && std::strcmp(LLAMA_KV_PAGED_MINCORE, "1") == 0;
 #if defined(__linux__)
             // kv_paged_enabled already implies n_stream==1 && !v_trans (checked above). CPU host
@@ -1051,6 +1058,9 @@ llama_kv_cache::llama_kv_cache(
             }
             if (paged_io_stats_enabled) {
                 LLAMA_LOG_INFO("%s: KV paged block I/O stats enabled (telemetry only)\n", __func__);
+            }
+            if (paged_prefetch_phase_trace_enabled) {
+                LLAMA_LOG_INFO("%s: KV paged prefetch phase trace enabled (diagnostic only)\n", __func__);
             }
             if (paged_idle_swap_requested) {
                 LLAMA_LOG_INFO("%s: KV paged idle swap requested (safe-candidate probe only)\n", __func__);
@@ -1884,10 +1894,17 @@ int32_t llama_kv_cache::prefetch_seq_step(llama_seq_id seq_id, uint32_t max_bloc
         return 0;
     }
 
+    const bool phase_trace = paged_prefetch_phase_trace_enabled;
+    const uint64_t phase_call = phase_trace ? ++paged_prefetch_phase_trace_calls : 0;
     int32_t n_prefetched = 0;
+    uint32_t phase_events = 0;
     for (const uint32_t physical_block : blocks) {
         const paged_block_state state = paged_block_states[physical_block];
         if (state == paged_block_state::SWAPPED) {
+            const uint64_t validate_before = phase_trace ? paged_io_block_in_validate_us : 0;
+            const uint64_t read_before = phase_trace ? paged_io_block_in_read_us : 0;
+            const uint64_t unpack_before = phase_trace ? paged_io_block_in_unpack_us : 0;
+            const uint64_t commit_before = phase_trace ? paged_io_block_in_commit_us : 0;
             if (!paged_swap_in_block(
                         physical_block,
                         false,
@@ -1902,10 +1919,39 @@ int32_t llama_kv_cache::prefetch_seq_step(llama_seq_id seq_id, uint32_t max_bloc
             const uint32_t begin = physical_block * paged_block_size;
             const uint32_t end = std::min<uint32_t>(begin + paged_block_size, paged_kv_size);
             paged_prefetch_seq_bytes += bytes_per_cell * (end - begin);
+            if (phase_trace) {
+                const uint64_t validate_us = paged_io_block_in_validate_us - validate_before;
+                const uint64_t read_us = paged_io_block_in_read_us - read_before;
+                const uint64_t unpack_us = paged_io_block_in_unpack_us - unpack_before;
+                const uint64_t commit_us = paged_io_block_in_commit_us - commit_before;
+                fprintf(stderr,
+                        "KV_PAGED_PREFETCH_BLOCK_PHASE call=%llu block_index=%u physical_block=%u "
+                        "validate_us=%llu read_us=%llu unpack_us=%llu commit_us=%llu phase_sum_us=%llu\n",
+                        (unsigned long long) phase_call,
+                        phase_events,
+                        physical_block,
+                        (unsigned long long) validate_us,
+                        (unsigned long long) read_us,
+                        (unsigned long long) unpack_us,
+                        (unsigned long long) commit_us,
+                        (unsigned long long) (validate_us + read_us + unpack_us + commit_us));
+                phase_events += 1;
+            }
             if ((uint32_t) n_prefetched >= max_blocks) {
                 break;
             }
         }
+    }
+
+    if (phase_trace) {
+        fprintf(stderr,
+                "KV_PAGED_PREFETCH_PHASE_CALL call=%llu seq_id=%d requested_blocks=%u "
+                "restored_blocks=%d phase_events=%u\n",
+                (unsigned long long) phase_call,
+                (int) seq_id,
+                max_blocks,
+                n_prefetched,
+                phase_events);
     }
 
     return n_prefetched;

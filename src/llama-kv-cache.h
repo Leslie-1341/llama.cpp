@@ -770,6 +770,10 @@ private:
     mutable uint64_t paged_prefetch_seq_last_invalid_cells = 0;
     mutable uint64_t paged_prefetch_seq_last_failures = 0;
     bool     paged_io_stats_enabled = false;
+    // Diagnostic-only per-prefetch-call/block phase events. Off unless
+    // LLAMA_KV_PAGED_PREFETCH_PHASE_TRACE=1; the default path emits nothing.
+    bool     paged_prefetch_phase_trace_enabled = false;
+    mutable uint64_t paged_prefetch_phase_trace_calls = 0;
     mutable uint64_t paged_io_swap_out_latency_us = 0;
     mutable uint64_t paged_io_swap_in_latency_us = 0;
     mutable uint64_t paged_io_swap_out_latency_max_us = 0;
