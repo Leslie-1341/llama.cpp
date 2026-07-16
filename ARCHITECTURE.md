@@ -2,9 +2,9 @@
 
 > 记录当前源码可验证的稳定结构。讨论方案必须标记为 proposed，不得混入已实现架构。
 
-- Last verified: 2026-07-15
-- Evidence commit: `d9d2e3b80acff27b3ff793003bb1f47ee212613b`
-- Verification scope: 当前源码、Git 历史、README、KV docs、parser 合成回归与 runner dry-run；未运行构建或模型实验
+- Last verified: 2026-07-16
+- Evidence commit: `a9faa532be58c9d821fca77df9b6bf449db3fe7b`
+- Verification scope: 当前源码、Git 历史、KV docs、Stage 1 parser 合成回归与 runner shell 语法；未运行构建、当前 HEAD dry-run 或模型实验
 
 ## System Boundary
 
@@ -60,6 +60,9 @@ resume/read/write requires block
 - `src/llama-context.cpp`, `src/llama-memory.h`：memory-level experimental hook 与 paged 错误向 decode/graph 状态的传播。
 - `examples/kv-*`：构造 idle/resume/trace workload 和上层策略信号；不拥有 core swap 状态机。
 - `scripts/run-kv-p0-*.sh`、`scripts/kv-final-controlled-e0-e5.sh` 及 parser：回归、稳定性、受控消融和证据采集；E0-E5 parser 对固定矩阵、必要 telemetry/指标、唯一性和最终 `PASS` 状态执行 fail-closed 门禁。
+- `examples/kv-idle-swap-resume/idle-swap-resume.cpp`：Stage 1 的 E2 outer-segment profiler 通过已有 eval callback 链观察 cache K/V `GET_ROWS`；默认关闭，仅在 `LLAMA_KV_E2_GET_ROWS_PROFILE=1` 时启用。它预分配事件容量并对 callback 配对、K/V 完整性、节点唯一性和溢出 fail-closed。
+- `src/llama-kv-cache.*`：Stage 1 的 E5 prefetch block-phase trace 默认关闭，仅在 `LLAMA_KV_PAGED_PREFETCH_PHASE_TRACE=1` 时开启；每个实际恢复 block 输出 validate/read/unpack/commit 的差值，且该开关同时开启既有 I/O stats。
+- `scripts/kv-e0-e2-e5-single-turn-diagnose.sh` 与 `scripts/parse-kv-e0-e2-e5-single-turn.py`：固定 E0/E2/E5 顺序、环境去污染、artifact hash/identity、输出精确一致性、机制与安全字段、E2/E5 telemetry 对账均为 fail-closed；任一缺失、重复、失配或非零 run 均拒绝 artifact。
 
 ## Integration Points
 
@@ -77,10 +80,13 @@ resume/read/write requires block
 - 只有当前 active attention 不可见的 idle-owned block 才可进入 idle swap；write/read 路径均检查 mapping 与 resident 状态。
 - `mincore`、trace 和 fault injection 是诊断/测试机制，默认关闭；它们的观测不能替代正式 correctness gate。
 - E0-E5 artifact 必须与 `RUNS=1/3` 固定计划精确一致；缺失/重复/乱序 tuple、缺失必要字段或指标、重复 marker/key、以及任一非 `PASS` run 都使 parser 非零退出。dry-run 只验证规划产物，不构成模型正确性或性能证据。
+- E2 `segment_ending_at_get_rows_wall_us` 的范围严格是“scheduler graph 中前一 callback 边界至目标 GET_ROWS 完成”；它是带 callback 的 outer segment，不是单个 GET_ROWS kernel、CPU backend 内层时间、单 token 时间或端到端 wall time。
+- E5 的 per-block phase 值是既有累计 swap-in 阶段计数器在一次 `prefetch_seq_step()` 恢复前后的差值；parser 要求每 block 的 phase sum 与四阶段相加一致，并与 token prefetch、全局 swap-in 与累计 I/O 字段对账。它描述被关联的恢复阶段，不等同于完整 decode latency。
 
 ## Modification Boundaries
 
 - core 提供 block state、I/O、madvise、restore、prefetch 与诊断机制；session lifecycle、resume timing、pressure policy 保持在 server/application/example 层。
+- Stage 1 未向 ggml CPU backend 的 `GET_ROWS` 实现加入内层计时，也未修改 scheduler；诊断挂接在 example 的可选 eval callback 链和 KV prefetch telemetry，默认路径不输出这些事件。
 - 不应把 ShareGPT-backed synthetic trace 描述为真实线上 trace，也不应把 current RSS 收益描述为 peak RSS 收益。
 - public/memory-level API 仍属 experimental；在没有 backend 与错误语义设计前，不视为稳定 upstream API。
 - 修改 KV 状态机时必须同步核对 row mapping、active visibility、swap metadata 发布顺序和 graph 前错误传播。
@@ -93,3 +99,4 @@ resume/read/write requires block
 - 权重侧 Flex 与 MoE-Buffer 是分离路径，不是统一 shared weight/KV I/O budget scheduler。
 - `src/llama-kv-cache.cpp` deferred-construction 处仍有“block swap 每 cell I/O”的旧注释；当前实现实际使用 `write_cells()`/`read_cells()` 做 block range I/O，该注释已陈旧。
 - README/历史报告中的性能数字缺少仓库内原始 artifacts 与 commit/worktree 绑定，目前无法确认其对当前 HEAD 的适用性。
+- Stage 1 的 E2 outer segment 含 callback/scheduler 边界，存在观测扰动；它仅用于定位。性能比较必须改用未插桩 identity fast path 的端到端 A/B，且当前尚无此类 artifact。

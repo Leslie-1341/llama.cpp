@@ -43,23 +43,63 @@
 
 **Result**
 
-正式模型实验尚未运行，目前无法确认任何 E0-E5 模型正确性或性能结论。2026-07-15 已在 `d9d2e3b80` 上通过 parser 合成回归（5 tests）和 `DRY_RUN=1 RUNS=1` runner dry-run；后者生成并校验 6 个 planned runs，未启动模型。
+正式模型实验尚未运行，目前无法确认任何 E0-E5 模型正确性或性能结论。当前源码仍包含 parser 合成测试与 dry-run 路径；本轮未重跑它们，且 `/root/oscomp/kv_logs/` 中可见的 E0-E5 dry-run artifact 绑定 `a4cd67e61` 而非目标 `d9d2e3b80`，故不将旧账本中的 d9 dry-run 描述保留为可核对运行证据。
 
-**Resolved framework blockers**
+**Framework state (源码已实现；当前 HEAD 未重跑 E0-E5 验证)**
 
 - `d9d2e3b80` 已使任一 `UNVERIFIED`/非 `PASS` run 导致 parser 非零退出。
 - manifest planned runs、固定 `RUNS=1/3` 计划与实际 `(round, run_order, case)` 现做精确对账，缺失、重复、额外或乱序均硬失败。
 - common/paged 必要指标与 case-specific marker 现为显式 required set，缺失直接拒绝 artifact。
 - 同 marker 多行或单行重复 key 现直接硬失败，不再采用“最后值覆盖”。
-- 合成回归覆盖以上四类异常并通过；dry-run 同时验证固定 6-case 规划路径。
+- 当前源码包含覆盖以上异常的合成回归和固定 6-case dry-run 路径；它们在本轮未重跑，不能替代当前 HEAD 的模型证据。
 
 **Supported conclusion**
 
-可确认协议、runner 和 fail-closed parser 已提交，四类 parser 异常有合成负例覆盖，规划 dry-run 可成功完成。不能支持任何当前 HEAD 的模型正确性或性能结论；parser 单独零退出码也不能替代 build、P0 回归和正式模型运行。
+可确认协议、runner、fail-closed parser 及对应合成负例已提交。不能支持任何当前 HEAD 的模型正确性或性能结论；即使获得 parser 单独零退出码，也不能替代 build、P0 回归和正式模型运行。
 
 **Limitations**
 
 固定 example workload；不是 ShareGPT trace、HTTP server 或生产 continuous batching。正式模式要求 clean worktree；当前仍需先完成 `d9d2e3b80` 的 P0 build、backing-store unit、B2B、I/O-fault 与 stability 回归，再进入模型功能 smoke 和正式 `RUNS=3` 矩阵。
+
+## E-0004 — Stage 1 E0/E2/E5 单 token 诊断框架
+
+- Status: invalid（不能作为当前 HEAD 的有效模型实验或性能结论）
+- Date: 2026-07-16
+- Commit/worktree: 当前框架 commit `a9faa532be58c9d821fca77df9b6bf449db3fe7b`；核对开始时 worktree clean。既有运行 artifact 全部绑定 `3ecb212c3dc8f21c4a1d539eeda2659a54540c86`，不绑定当前 HEAD。
+- Runner/parser: `scripts/kv-e0-e2-e5-single-turn-diagnose.sh`；`scripts/parse-kv-e0-e2-e5-single-turn.py`
+- Framework sources: `examples/kv-idle-swap-resume/idle-swap-resume.cpp`；`src/llama-kv-cache.*`
+
+**Question**
+
+在不把诊断指标误写为 kernel 或端到端性能的前提下，E2 能否采集完整的 cache K/V `GET_ROWS` outer-segment 事件，E5 能否将 active-token prefetch 与逐 block swap-in validate/read/unpack/commit 阶段精确关联？
+
+**Protocol and metric scope**
+
+- E0、E2、E5 固定顺序；runner 记录 commit、工作树、binary/model、framework hash、环境和每个 raw artifact 的 hash，parser 对这些 identity、case 环境、输出、机制、安全字段及 telemetry 一律 fail-closed。
+- E2 只在 `LLAMA_KV_E2_GET_ROWS_PROFILE=1` 启用；`segment_ending_at_get_rows_wall_us` 是 scheduler graph 中前一 callback 边界至目标 GET_ROWS 完成的 outer segment，不是 GET_ROWS kernel、CPU backend 内层、单 token 或端到端 wall time。
+- E5 只在 `LLAMA_KV_PAGED_PREFETCH_PHASE_TRACE=1` 启用；逐 block 的 validate/read/unpack/commit 是 `prefetch_seq_step()` 中关联恢复的阶段差值，parser 要求与 token prefetch、全局 swap-in 和累计 I/O 对账。该值不等于完整 decode latency。
+- runner 将 scope 标为 `informal_diagnostic_not_a_controlled_performance_conclusion`；即使 parser 接受，也不得产生正式性能结论。
+
+**Current verification**
+
+- 当前 HEAD 已运行 `PYTHONDONTWRITEBYTECODE=1 python3 tests/test-kv-e0-e2-e5-single-turn-parser.py`：11 tests，PASS。
+- 当前 HEAD 已运行 `bash -n scripts/kv-e0-e2-e5-single-turn-diagnose.sh`：PASS。
+- 本阶段未运行 build、runner dry-run、模型运行或 A/B；因此没有当前 HEAD 的 runtime artifact。
+
+**Existing artifacts and status**
+
+- `/root/oscomp/kv_logs/kv_e0_e2_e5_single_turn_20260715T165518Z_104953`：非 dry-run，parser exit 1，summary `UNRESOLVED`；无效。
+- `/root/oscomp/kv_logs/kv_e0_e2_e5_single_turn_20260715T183236Z_116670`：非 dry-run，parser exit 1；虽然 summary 写 `PASS`，进程 exit 非零，按 fail-closed 规则无效。
+- `/root/oscomp/kv_logs/kv_e0_e2_e5_single_turn_20260716T024359Z_127924`：非 dry-run，parser exit 2，拒绝原因为 `E2 GET_ROWS CPU graph compute count 0 != outer event count 49344`；无效。
+- `/root/oscomp/kv_logs/kv_e0_e2_e5_single_turn_review_fix_20260716` 与 `/root/oscomp/kv_logs/kv_e0_e2_e5_single_turn_scope_fix_20260716`：dry-run，parser exit 0，明确未启动模型；只证明当时（旧 HEAD）的规划/解析路径，不是模型实验。
+
+**Supported conclusion**
+
+可确认当前源码具备默认关闭的 Stage 1 诊断结构，当前 parser fixture 和 shell 语法通过。不能支持 build 成功、模型正确性、CPU backend 内层耗时、scheduler 行为、identity fast path 收益或任何性能结论。
+
+**Next evidence required**
+
+先完成 paged identity fast path 审计；再以未插桩路径在当前 HEAD 采集可追溯的端到端 E0/E2/E5 A/B。P0 build/backing-store、B2B、I/O-fault 和 stability 证据仍是该 A/B 的前置正确性门槛。
 
 ## E-0002 — Stage 12-C ShareGPT-backed historical report
 

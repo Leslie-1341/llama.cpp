@@ -194,3 +194,36 @@ append 式 backing file 会随重复 swap 周期增长；逐 cell 直接发布�
 - Commit: `d9d2e3b80acff27b3ff793003bb1f47ee212613b`。
 - Parser: `scripts/parse-kv-final-controlled-e0-e5.py`，SHA256 `ea7d5702a89ea52bdec2bc333841bb0ccd9cb2444fcf544e120fd87b4e6b8f82`。
 - Synthetic regression: `tests/test-kv-final-controlled-e0-e5-parser.py`，SHA256 `10f19b1d37c03c4e1878d58521e31003d74debf13cffacf50b43775628c420e7`；`Ran 5 tests ... OK`。
+
+## D-0006 — 撤销 CPU backend GET_ROWS 内层计时，采用最小 identity fast path 的未插桩 A/B
+
+- Date: 2026-07-16
+- Status: accepted
+- Evidence commit/worktree: `a9faa532be58c9d821fca77df9b6bf449db3fe7b`；本决策入账前工作树 clean
+- Supersedes: none
+- Superseded by: none
+
+**Context**
+
+Stage 1 需要区分 E2 paged gather 的调度/图构造开销与 E5 active prefetch 的恢复阶段，但当前没有绑定真实模型、当前 HEAD 与完整 A/B 条件的证据表明 CPU backend 内层 `GET_ROWS` 是端到端瓶颈或值得为其引入计时。
+
+**Decision**
+
+撤销向 CPU backend `GET_ROWS` 内层插桩的方案。保留默认关闭的 E2 outer-segment profiler 和 E5 block-phase telemetry，仅用于结构定位和 fail-closed artifact 对账。下一步先审计最小 paged identity fast path；性能判断改为该 fast path 未插桩时的端到端 E0/E2/E5 A/B，并要求当前 HEAD、正确性门槛和原始 artifact 可追溯。
+
+**Alternatives rejected**
+
+- 在 CPU backend `GET_ROWS` 内层加入计时：热路径计时会改变待测路径，且目前缺少真实模型证据证明该内层是主要瓶颈。
+- 将 E2 outer-segment 或 E5 phase telemetry 直接解释为 kernel 或端到端收益：二者的采样范围不同，不能替代未插桩 A/B。
+- 修改 scheduler 以获得更细粒度事件：超出本阶段诊断与最小 fast-path 审计范围，并会改变被比较的调度行为。
+
+**Consequences and limits**
+
+- 当前源码没有 CPU backend 内层计时和 scheduler 改动；Stage 1 事件默认关闭。
+- E2 指标是 callback 边界到目标 GET_ROWS 完成的 outer segment；E5 指标是关联 block 的 validate/read/unpack/commit 阶段，不是完整 decode latency。
+- identity fast path 与未插桩 A/B 尚未实现或运行；本决策不构成性能结论。
+
+**Evidence**
+
+- `a9faa532`：`examples/kv-idle-swap-resume/idle-swap-resume.cpp`、`src/llama-kv-cache.*`、`scripts/kv-e0-e2-e5-single-turn-diagnose.sh`、`scripts/parse-kv-e0-e2-e5-single-turn.py`。
+- 当前 HEAD：`tests/test-kv-e0-e2-e5-single-turn-parser.py` 11 tests 通过；runner `bash -n` 通过；未运行 build、模型或新的 dry-run。
