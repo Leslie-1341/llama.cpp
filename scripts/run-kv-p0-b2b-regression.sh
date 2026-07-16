@@ -473,7 +473,7 @@ validate_case3() {
 }
 
 validate_case4() {
-    local name="case4_active_partial_retry_same_batch"
+    local name="case4_active_atomic_retry_same_batch"
     local dir="$OUTPUT_ROOT/$name"
     local all
     all="$(case_file "$dir")"
@@ -486,7 +486,7 @@ validate_case4() {
     reason="$(assert_count "$all" "llama_decode: failed to decode, ret = -3" 1)" || { report_fail "$name" "$reason"; return 1; }
     reason="$(assert_fault_line "$all" \
         "scope=active" \
-        "successful_cells_before_failure=1" \
+        "successful_cells_before_failure=0" \
         "backend_status=io_error" \
         "backend_errno=EIO(5)" \
         "failure_reason=ACTIVE_VISIBLE_RESTORE_FAILURE" \
@@ -623,7 +623,7 @@ validate_exact_match_against_control() {
 }
 
 validate_case4_exact_match() {
-    validate_exact_match_against_control case4_exact_match case4_active_partial_retry_same_batch
+    validate_exact_match_against_control case4_exact_match case4_active_atomic_retry_same_batch
 }
 
 check_prereqs() {
@@ -699,10 +699,10 @@ main() {
         export "${KV_ENV_ACTIVE_PREFETCH_OFF[@]}"
     validate_case4_control || failed=1
 
-    run_case case4_active_partial_retry_same_batch \
+    run_case case4_active_atomic_retry_same_batch \
         export "${KV_ENV_ACTIVE_PREFETCH_OFF[@]}" \
             LLAMA_KV_PAGED_TEST_SWAPIN_FAIL_SCOPE=active \
-            LLAMA_KV_PAGED_TEST_SWAPIN_FAIL_AFTER_CELLS=1 \
+            LLAMA_KV_PAGED_TEST_SWAPIN_FAIL_AFTER_CELLS=0 \
             LLAMA_KV_PAGED_TEST_SWAPIN_FAIL_ONCE=1 \
             LLAMA_KV_TEST_EXPECT_ACTIVE_DECODE_FAILURE=1 \
             LLAMA_KV_TEST_RETRY_ACTIVE_DECODE=1
