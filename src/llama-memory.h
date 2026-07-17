@@ -94,6 +94,9 @@ struct llama_memory_context_i {
     virtual void clear_paged_swap_error() {}
     virtual bool has_paged_swap_error() const { return false; }
     virtual llama_paged_swap_error get_paged_swap_error() const { return {}; }
+    // Complete or abort any fresh-write transaction opened while applying this ubatch.
+    virtual void finish_paged_kv_write(bool success) { GGML_UNUSED(success); }
+    virtual bool needs_paged_kv_post_graph_sync() const { return false; }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;

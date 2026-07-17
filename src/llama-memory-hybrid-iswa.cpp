@@ -299,6 +299,16 @@ llama_paged_swap_error llama_memory_hybrid_iswa_context::get_paged_swap_error() 
     return {};
 }
 
+void llama_memory_hybrid_iswa_context::finish_paged_kv_write(bool success) {
+    if (ctx_attn) ctx_attn->finish_paged_kv_write(success);
+    if (ctx_recr) ctx_recr->finish_paged_kv_write(success);
+}
+
+bool llama_memory_hybrid_iswa_context::needs_paged_kv_post_graph_sync() const {
+    return (ctx_attn && ctx_attn->needs_paged_kv_post_graph_sync()) ||
+           (ctx_recr && ctx_recr->needs_paged_kv_post_graph_sync());
+}
+
 const llama_kv_cache_iswa_context * llama_memory_hybrid_iswa_context::get_attn() const {
     return static_cast<const llama_kv_cache_iswa_context *>(ctx_attn.get());
 }

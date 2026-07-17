@@ -342,6 +342,16 @@ llama_paged_swap_error llama_kv_cache_iswa_context::get_paged_swap_error() const
     return {};
 }
 
+void llama_kv_cache_iswa_context::finish_paged_kv_write(bool success) {
+    if (ctx_base) ctx_base->finish_paged_kv_write(success);
+    if (ctx_swa)  ctx_swa->finish_paged_kv_write(success);
+}
+
+bool llama_kv_cache_iswa_context::needs_paged_kv_post_graph_sync() const {
+    return (ctx_base && ctx_base->needs_paged_kv_post_graph_sync()) ||
+           (ctx_swa  && ctx_swa->needs_paged_kv_post_graph_sync());
+}
+
 const llama_kv_cache_context * llama_kv_cache_iswa_context::get_base() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 

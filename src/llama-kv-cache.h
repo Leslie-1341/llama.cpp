@@ -602,6 +602,17 @@ private:
             uint32_t physical_block,
             bool fatal_on_failure,
             llama_paged_swap_error_reason failure_reason) const;
+    struct paged_release_range {
+        void * addr = nullptr;
+        size_t len = 0;
+        uint64_t before_resident = 0;
+        uint32_t block = UINT32_MAX;
+    };
+    void paged_finish_write_transaction(bool success, const slot_info & sinfo);
+    uint64_t paged_sample_release_ranges(
+            const std::vector<paged_release_range> & ranges,
+            uint64_t * total_bytes = nullptr) const;
+    void paged_verify_fresh_writes(const slot_info & sinfo) const;
     void clear_paged_swap_error();
     void set_paged_swap_error(
             llama_paged_swap_error_reason reason,
@@ -616,7 +627,8 @@ private:
             const std::vector<uint8_t> * active,
             uint64_t & failures,
             uint64_t & skipped,
-            uint64_t & skip_live) const;
+            uint64_t & skip_live,
+            std::vector<paged_release_range> * advised_ranges = nullptr) const;
     // Stage 5E-1: read-only KV resident page sampling via mincore(2). Walks every KV layer's
     // K/V tensor, page-aligns each tensor's [data, data+nbytes) interval (same align rule as
     // paged_madvise_block), and counts resident pages. Updates the kv_mincore_* counters and
@@ -647,11 +659,15 @@ private:
 
     static constexpr uint32_t PAGED_BLOCK_INVALID = UINT32_MAX;
 
+    // RELEASED is destructive: its tensor pages have no authoritative backing and old KV can
+    // never be recovered. Only a block with no live/owned cell may enter it; later reuse is a
+    // fresh allocation populated by new K/V writes. Recoverable idle/shared history is SWAPPED.
     enum class paged_block_state : uint8_t {
         UNUSED   = 0,
         RESIDENT = 1,
         RELEASED = 2,
         SWAPPED  = 3,
+        PENDING_WRITE = 4,
     };
 
     bool     kv_paged_enabled  = false;
@@ -673,6 +689,10 @@ private:
     mutable std::vector<paged_block_state> paged_block_states;
     mutable std::vector<uint64_t> paged_swap_offsets;
     mutable std::vector<size_t>   paged_swap_sizes;
+    mutable std::vector<uint8_t>  paged_pending_write_cells;
+    mutable std::vector<uint32_t> paged_pending_write_blocks;
+    mutable std::vector<paged_release_range> paged_release_post_ranges;
+    mutable std::vector<std::vector<paged_release_range>> paged_released_ranges_by_block;
     std::vector<uint32_t> paged_free_list;
     uint64_t paged_alloc_calls     = 0;
     uint64_t paged_blocks_in_use   = 0;
@@ -709,6 +729,7 @@ private:
     mutable uint64_t paged_logical_to_physical_checks = 0;
     mutable uint64_t paged_logical_to_physical_fail = 0;
     bool     paged_block_release_enabled = false;
+    bool     paged_block_release_requested = false;
     uint64_t paged_block_release_calls = 0;
     uint64_t paged_blocks_released = 0;
     uint64_t paged_blocks_released_unused = 0;
@@ -716,6 +737,13 @@ private:
     uint64_t paged_block_release_blocks_last = 0;
     uint64_t paged_block_release_bytes_last = 0;
     uint64_t paged_block_release_skip_live = 0;
+    uint64_t paged_block_release_skip_owned = 0;
+    uint64_t paged_block_release_skip_shared = 0;
+    uint64_t paged_block_release_ownership_invalid = 0;
+    uint64_t paged_block_release_metadata_cleared = 0;
+    uint64_t paged_block_release_metadata_stale = 0;
+    uint64_t paged_block_release_idempotent = 0;
+    uint64_t paged_blocks_released_dead = 0;
     uint64_t paged_block_release_skip_unaligned = 0;
     uint64_t paged_block_release_fail = 0;
     uint64_t paged_block_release_rss_samples = 0;
@@ -727,9 +755,42 @@ private:
     uint64_t paged_block_release_rss_drop_max_kb = 0;
     mutable uint64_t paged_block_ensure_calls = 0;
     mutable uint64_t paged_block_ensure_released = 0;
+    uint64_t paged_block_release_reuse_allocations = 0;
     mutable uint64_t paged_release_violation = 0;
     mutable uint64_t paged_active_release_violation = 0;
     mutable uint64_t paged_padded_release_violation = 0;
+    mutable uint64_t paged_released_redirect_rows = 0;
+    mutable uint64_t paged_released_redirect_blocks = 0;
+    mutable uint64_t paged_released_redirect_no_dummy = 0;
+    mutable uint64_t paged_release_mincore_samples = 0;
+    mutable uint64_t paged_release_mincore_before_last = 0;
+    mutable uint64_t paged_release_mincore_after_last = 0;
+    mutable uint64_t paged_release_mincore_post_graph_last = 0;
+    mutable uint64_t paged_release_mincore_total_last = 0;
+    mutable uint64_t paged_release_mincore_drop_max = 0;
+    mutable uint64_t paged_release_mincore_reaccess_last = 0;
+    mutable uint64_t paged_release_mincore_reaccess_total_last = 0;
+    mutable uint64_t paged_release_write_commits = 0;
+    mutable uint64_t paged_release_write_rollbacks = 0;
+    mutable uint64_t paged_release_fresh_verify_bytes = 0;
+    mutable uint64_t paged_release_fresh_verify_hash = 1469598103934665603ULL;
+    bool paged_release_fresh_verify_enabled = false;
+    bool paged_release_test_repeat = false;
+    bool paged_release_test_repeat_active = false;
+    bool paged_release_test_reuse = false;
+    bool paged_release_test_repeat_marker_emitted = false;
+    bool paged_release_test_reuse_marker_emitted = false;
+    bool paged_release_test_r5_marker_emitted = false;
+    uint32_t paged_release_test_reuse_block = PAGED_BLOCK_INVALID;
+    bool paged_release_test_reuse_pending_seen = false;
+    bool paged_release_test_reuse_metadata_absent = false;
+    uint64_t paged_release_test_reuse_fresh_bytes_before = 0;
+    mutable uint64_t paged_release_test_repeat_passes = 0;
+    mutable uint64_t paged_release_test_reuse_commits = 0;
+    bool paged_test_force_active_release = false;
+    llama_seq_id paged_test_force_active_release_seq = -1;
+    mutable bool paged_test_force_active_release_consumed = false;
+    mutable uint64_t paged_test_force_active_release_triggers = 0;
     bool     paged_swap_enabled = false;
     mutable uint64_t paged_swap_out_calls = 0;
     mutable uint64_t paged_swap_in_calls = 0;
@@ -1276,6 +1337,8 @@ public:
     void clear_paged_swap_error() override;
     bool has_paged_swap_error() const override;
     llama_paged_swap_error get_paged_swap_error() const override;
+    void finish_paged_kv_write(bool success) override;
+    bool needs_paged_kv_post_graph_sync() const override;
 
     //
     // llama_kv_cache_context specific API
@@ -1360,4 +1423,5 @@ private:
 
     bool     paged_shadow_pending = false;
     uint32_t paged_shadow_n_kv    = 0;
+    bool paged_write_transaction_open = false;
 };

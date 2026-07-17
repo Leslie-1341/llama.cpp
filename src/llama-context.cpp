@@ -1256,6 +1256,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     if (mctx && !mctx->apply()) {
+        mctx->finish_paged_kv_write(false);
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
@@ -1292,12 +1293,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
         if (!gf) {
+            if (mctx) {
+                mctx->finish_paged_kv_write(false);
+            }
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+            if (mctx) {
+                mctx->finish_paged_kv_write(false);
+            }
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
@@ -1324,18 +1331,34 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 err.physical_cell,
                 err.backend_status,
                 err.backend_errno);
+        LLAMA_LOG_ERROR(
+                "KV_PAGED_PRE_GRAPH_FAILURE reason=%s graph_compute_skipped=1\n",
+                llama_paged_swap_error_reason_name(err.reason));
+        mctx->finish_paged_kv_write(false);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
+        if (mctx) {
+            if (mctx->needs_paged_kv_post_graph_sync()) {
+                ggml_backend_sched_synchronize(sched.get());
+            }
+            mctx->finish_paged_kv_write(false);
+        }
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
     }
 
     ret = GGML_STATUS_SUCCESS;
+    if (mctx) {
+        if (mctx->needs_paged_kv_post_graph_sync()) {
+            ggml_backend_sched_synchronize(sched.get());
+        }
+        mctx->finish_paged_kv_write(true);
+    }
 
     return res;
 }

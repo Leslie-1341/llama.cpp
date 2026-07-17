@@ -746,11 +746,13 @@ int main(int argc, char ** argv) {
     kv_test_state test_state;
     bool test_mode_requested = false;
     bool get_rows_profile_enabled = false;
+    bool release_test_share_seq0 = false;
     if (!parse_test_bool("LLAMA_KV_TEST_MODE", test_mode_requested) ||
             !parse_test_bool("LLAMA_KV_TEST_EXPECT_SWAP_OUT_IO_FAILURE", test_state.expect_swap_out_io_failure) ||
             !parse_test_bool("LLAMA_KV_TEST_EXPECT_PREFETCH_FAILURE", test_state.expect_prefetch_failure) ||
             !parse_test_bool("LLAMA_KV_TEST_EXPECT_ACTIVE_DECODE_FAILURE", test_state.expect_active_decode_failure) ||
             !parse_test_bool("LLAMA_KV_TEST_RETRY_ACTIVE_DECODE", test_state.retry_active_decode) ||
+            !parse_test_bool("LLAMA_KV_RELEASE_TEST_SHARE_SEQ0", release_test_share_seq0) ||
             !parse_test_bool("LLAMA_KV_E2_GET_ROWS_PROFILE", get_rows_profile_enabled)) {
         return 1;
     }
@@ -759,6 +761,10 @@ int main(int argc, char ** argv) {
         test_state.expect_prefetch_failure ||
         test_state.expect_active_decode_failure ||
         test_state.retry_active_decode;
+    if (release_test_share_seq0 && !test_mode_requested) {
+        fprintf(stderr, "%s: LLAMA_KV_RELEASE_TEST_SHARE_SEQ0=1 requires LLAMA_KV_TEST_MODE=1\n", __func__);
+        return 1;
+    }
     if (test_state.retry_active_decode && !test_state.expect_active_decode_failure) {
         fprintf(stderr,
                 "%s: LLAMA_KV_TEST_RETRY_ACTIVE_DECODE=1 requires "
@@ -1047,6 +1053,18 @@ int main(int argc, char ** argv) {
             cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
             return 1;
         }
+    }
+
+    if (release_test_share_seq0) {
+        const llama_seq_id shared_seq = (llama_seq_id) (params.n_parallel - 1);
+        if (shared_seq <= active_seq ||
+                std::find(idle_seqs.begin(), idle_seqs.end(), shared_seq) != idle_seqs.end()) {
+            fprintf(stderr, "%s: no spare sequence available for release shared-owner fixture\n", __func__);
+            cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
+            return 1;
+        }
+        llama_memory_seq_cp(llama_get_memory(ctx), 0, shared_seq, -1, -1);
+        fprintf(stderr, "KV_RELEASE_TEST_SHARED_OWNER source_seq=0 shared_seq=%d\n", (int) shared_seq);
     }
 
     common_batch_clear(batch);
