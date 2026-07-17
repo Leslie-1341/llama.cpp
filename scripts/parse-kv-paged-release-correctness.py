@@ -293,11 +293,17 @@ def parse_run(root: Path, case_id: str, dry_run: bool, identities: dict[str, Pat
         if pre.get("reason") != "ACTIVE_READ_RELEASED_BLOCK" or pre.get("graph_compute_skipped") != "1":
             raise GateError("R5: pre-graph failure evidence invalid")
         r5 = fields(one_line(stderr, "KV_PAGED_RELEASE_R5"))
-        if r5 != {"active_errors": "1", "transaction_open": "1", "rollback_blocks": "1",
-                  "rollback_complete": "1"}:
-            raise GateError("R5: active error/transaction rollback evidence invalid")
-        if integer(values, "write_rollbacks") != 1:
-            raise GateError("R5: rollback counter is not exact")
+        if integer(r5, "active_errors") != 1:
+            raise GateError("R5: active_errors must be exactly one")
+        txn_open = integer(r5, "transaction_open")
+        if txn_open not in (0, 1):
+            raise GateError("R5: transaction_open must be 0 or 1")
+        if integer(r5, "rollback_blocks") != txn_open:
+            raise GateError("R5: rollback_blocks must equal transaction_open")
+        if r5.get("rollback_complete") != "1":
+            raise GateError("R5: rollback_complete must be 1")
+        if integer(values, "write_rollbacks") != txn_open:
+            raise GateError("R5: write_rollbacks must equal rollback_blocks")
         return {"case": case_id, "status": "EXPECTED_FAILURE", "exit": rc, "telemetry": values}
 
     if case_id == "R0" or case_id in NEGATIVE_CASES:

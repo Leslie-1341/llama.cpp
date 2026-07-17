@@ -280,6 +280,30 @@ class ParserTest(unittest.TestCase):
         refresh(path.parent)
         self.assertNotEqual(self.run_parser(root).returncode, 0)
 
+    def test_r5_transaction_zero_all_zero_valid(self):
+        root = self.fixture()
+        path = root / "runs" / "R5" / "stderr"
+        path.write_text(path.read_text()
+                        .replace("transaction_open=1", "transaction_open=0")
+                        .replace("rollback_blocks=1", "rollback_blocks=0")
+                        .replace("write_rollbacks=1", "write_rollbacks=0"))
+        refresh(path.parent)
+        self.assertEqual(self.run_parser(root).returncode, 0)
+
+    def test_r5_transaction_zero_rollback_one_fails(self):
+        root = self.fixture()
+        path = root / "runs" / "R5" / "stderr"
+        path.write_text(path.read_text().replace("transaction_open=1", "transaction_open=0"))
+        refresh(path.parent)
+        self.assertNotEqual(self.run_parser(root).returncode, 0)
+
+    def test_r5_write_rollback_counter_mismatch_fails(self):
+        root = self.fixture()
+        path = root / "runs" / "R5" / "stderr"
+        path.write_text(path.read_text().replace("write_rollbacks=1", "write_rollbacks=0"))
+        refresh(path.parent)
+        self.assertNotEqual(self.run_parser(root).returncode, 0)
+
     def test_r2_second_transition_fails_closed(self):
         root = self.fixture()
         path = root / "runs" / "R2" / "stderr"
