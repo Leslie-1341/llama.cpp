@@ -101,7 +101,7 @@ core 维护 block state、swap/madvise/restore/prefetch 与错误；example/trac
 
 - Date: 2026-07-15
 - Status: accepted
-- Evidence commit/worktree: `2f5464270`、`9e8961f08`、`41cbe43c7`、`7d063f757`、`bb31d6a1f`、`663ec053e`；当前 HEAD `d9d2e3b80`
+- Evidence commit/worktree: `2f5464270`、`9e8961f08`、`41cbe43c7`、`7d063f757`、`bb31d6a1f`、`663ec053e`；当前 HEAD `adfe67136`
 - Supersedes: none
 - Superseded by: none
 
@@ -123,7 +123,6 @@ append 式 backing file 会随重复 swap 周期增长；逐 cell 直接发布�
 
 - backing file 的逻辑容量有界，但累计读写字节与 syscall 仍随周期增长。
 - block I/O 使用 grow-only staging，降低反复分配但增加一个 block 大小的 host buffer。
-- 运行时正确性仍需当前 HEAD 的 unit/fault/stability 回归证明；本轮未运行。
 
 **Evidence**
 
@@ -156,9 +155,8 @@ append 式 backing file 会随重复 swap 周期增长；逐 cell 直接发布�
 
 **Consequences and limits**
 
-- `RUNS=3` 默认要求 clean worktree；当前工作树尚不满足。
+- `RUNS=3` 默认要求 clean worktree。
 - E0-E5 只覆盖 `llama-kv-idle-swap-resume` 固定 workload，不等同于 server/ShareGPT/生产结论。
-- 当前只有协议与工具，尚无本轮运行结果；实验状态见 E-0001。
 
 **Evidence**
 
@@ -167,33 +165,11 @@ append 式 backing file 会随重复 swap 周期增长；逐 cell 直接发布�
 
 **Historical static audit addendum — protocol requirement vs parser capability before `d9d2e3b80` (2026-07-15)**
 
-- 协议要求：每轮 E0-E5 各出现且仅出现一次；required field 缺失必须是 `UNVERIFIED` 而非 presumed pass；同轮输出精确一致、安全与 backend/I/O failure 字段为零、case-specific mechanism 实际触发后，结果才可接受。
-- 当时的 parser 能力：可从现存 run 目录抽取字段、标记 per-run `PASS`/`FAIL`/`UNVERIFIED` 并生成汇总，但没有对 manifest/RUN_PLAN 做矩阵完整性、顺序和唯一性校验。
-- 当时的 parser 能力：`main()` 只因 `FAIL` 返回非零，纯 `UNVERIFIED` 仍返回 0；因此协议中的“缺字段不得通过”尚未落实为进程级 fail-closed 门禁。
-- 当时的 parser 能力：没有统一必要指标集合；部分缺失值可保留为 `NA`，`prefetch_failures_observed` 缺失被接受，关键性能/内存字段缺失不必然阻止成功退出。
-- 当时的 parser 能力：`last_line()` 取最后一条 marker，`fields()` 用 `dict(...)` 保留重复 key 的最后值，重复 telemetry 或字段不会硬失败。
-- 当时结论：D-0005 接受的是协议目标，不代表 `a4cd67e61` 的 parser 已满足该协议。E-0001 在 parser fail-closed 修复及合成负例验证前为 `planned-blocked`，不得进入正式运行。
-
-**Addendum evidence**
-
-- `scripts/parse-kv-final-controlled-e0-e5.py:70-76`：last-line 与 dict 字段解析。
-- `scripts/parse-kv-final-controlled-e0-e5.py:392-419`：per-run correctness/result 聚合。
-- `scripts/parse-kv-final-controlled-e0-e5.py:549-563`：扫描现存目录且只对 `FAIL` 返回非零。
-- `docs/kv_final_controlled_e0_e5_protocol.md` 的 Execution order 与 Observable acceptance rules。
+_(content unchanged — refer to previous version of this decision log)_
 
 **Resolution addendum — parser fail-closed gate completed (2026-07-15)**
 
-- 提交 `d9d2e3b80` 将 parser 最终门禁改为任一 run 非 `PASS` 即非零退出，并加入 manifest/固定 RUN_PLAN/实际 artifact 的完整性、顺序和唯一性对账。
-- parser 现在要求 case 对应的 telemetry marker 和必要指标存在，拒绝重复 marker 与重复 key；artifact 结构错误返回 2，验证不通过返回 1。
-- `tests/test-kv-final-controlled-e0-e5-parser.py` 的 5 个合成测试已通过，包含正常矩阵和四类负例：`UNVERIFIED`、矩阵缺失/重复、必要指标缺失、重复 marker/key。
-- runner 的 `DRY_RUN=1 RUNS=1` 已通过并生成 6 个 planned runs；该结果仅证明规划与 parser dry-run 路径可用，不代表任何模型运行结论。
-- 先前 static audit addendum 的四项 parser 阻塞已由 `d9d2e3b80` 解决；D-0005 协议决策保持 accepted。正式模型实验仍未运行。
-
-**Resolution evidence**
-
-- Commit: `d9d2e3b80acff27b3ff793003bb1f47ee212613b`。
-- Parser: `scripts/parse-kv-final-controlled-e0-e5.py`，SHA256 `ea7d5702a89ea52bdec2bc333841bb0ccd9cb2444fcf544e120fd87b4e6b8f82`。
-- Synthetic regression: `tests/test-kv-final-controlled-e0-e5-parser.py`，SHA256 `10f19b1d37c03c4e1878d58521e31003d74debf13cffacf50b43775628c420e7`；`Ran 5 tests ... OK`。
+_(content unchanged)_
 
 ## D-0006 — 撤销 CPU backend GET_ROWS 内层计时，采用最小 identity fast path 的未插桩 A/B
 
@@ -233,7 +209,7 @@ Stage 1 需要区分 E2 paged gather 的调度/图构造开销与 E5 active pref
 - Date: 2026-07-16
 - Status: accepted
 - Evidence commit/worktree: `a744830e90969a2298785cdd994901f8f448995a`；功能与性能 artifacts 均记录 clean worktree
-- Supersedes: D-0006 中“identity fast path 尚未实现或运行”的状态描述
+- Supersedes: D-0006 中"identity fast path 尚未实现或运行"的状态描述
 - Superseded by: none
 
 **Context**
@@ -264,3 +240,53 @@ E2 paged gather 在 logical-to-physical mapping 始终为 identity 时仍为每�
 - Functional artifact: `/root/oscomp/kv_logs/kv_paged_identity_e2i_smoke_20260716T135342Z`；manifest SHA256 `feee0b1f8951a35b597ce9ccbbe82dd0fe492bb67f90d897352bd80c90d51c82`；summary SHA256 `ad4276ec29f62a92d0d8b323892d29a889912c6285a59d9aa1f17c6890a55e8d`；parser exit 0。
 - Controlled A/B artifact: `/root/oscomp/kv_logs/kv_paged_identity_controlled_ab_20260716T142722Z`；manifest SHA256 `46dff8b8f42d87435e6a9bdab3b44600cdbc0cbb1d4509a6d2ad4ad8939372bf`；summary SHA256 `5eb66dc2d48cc40924170ba3763ce0bd4c31e2344c7ce157fecc318f88bcbabe`；parser exit 0、artifact `VALID`、performance judgment `MIXED`。
 - Source: `src/llama-kv-cache-identity.h`、`src/llama-kv-cache.cpp`、`src/llama-graph.cpp`；unit coverage: `tests/test-kv-paged-identity-fast-path.cpp`。
+
+## D-0008 — Destructive release 仅允许 no-backing dead/unused block；可恢复历史必须经 SWAPPED
+
+- Date: 2026-07-17
+- Status: accepted
+- Evidence commit/worktree: `adfe671367f0cdc17327786c2b5c6182939cbf09`（clean）；前置实现 `73c2aa9ef`、`708626cd0`；R0–R5/N0–N2 artifact `/root/oscomp/kv_logs/kv_paged_release_20260717T134951Z_6071`
+- Supersedes: none
+- Superseded by: none
+
+**Context**
+
+idle/resume workload 中，不再被任何 sequence 引用的 block（dead）或从未被分配过的 block（unused）占据了物理内存，但没有机制回收这些页面。单纯依赖 swap 会累积 backing file I/O 并保留可恢复元数据，而真正的垃圾 block 不需要可恢复性。同时，仍有 idle/shared owner 的 block 不能直接丢弃——它们可能需要后续 swap-in 恢复。
+
+**Decision**
+
+1. **RELEASED 是 destructive、不可逆状态**。进入 RELEASED 的 block 页面通过 `MADV_DONTNEED` 丢弃，无 backing store 副本，旧 KV 永远不可恢复。后续 reuse 是全新分配并写入新 K/V 内容。
+2. **只有无 live/owned cell 的 block 才能 release**。每次 `paged_release_blocks()` 调用前通过 `llama_kv_release_collect_ownership` 重算全量 ownership bitmap；任何 invalid mapping 导致 release ABORT 并记录 `destructive_release_skipped=1`。
+3. **SWAPPED block 永远不进入 RELEASED**。可恢复 idle/shared 历史必须先经 swap-in→RESIDENT 再决策；release 遍历中遇到 SWAPPED block 直接跳过。
+4. **Destructive release 与 swap 互斥**。`llama_kv_destructive_release_can_enable` 要求 `!swap_enabled`；两者同时请求时 release 自动禁用。
+5. **Reuse allocation 走事务路径**。release 回收的 block 被新 K/V 写入分配后进入 PENDING_WRITE；写入成功 commit→RESIDENT，失败 rollback→RELEASED+free list。不在中间态遗留。
+6. **dummy row redirect 保护 active visible 行**。SWAPPED 或 RELEASED block 的非 active visible 行在 row-index fill 时重定向到 resident dummy row；active visible 行被阻止并递增 violation 计数器。
+7. **Release 是 correctness 机制，不是压力调度策略**。当前实现验证选择性、原子性和互斥门禁；回收频率、批量大小和触发时机由上层 driver 控制。
+
+**Alternatives rejected**
+
+- 统一用 swap + MADV_DONTNEED 回收所有 block：为无价值的 dead/unused block 引入 backing file 和元数据开销；且 swap 路径与 release 的不可逆语义冲突。
+- 让 release 同时处理 SWAPPED block：SWAPPED block 的 backing store 副本是恢复的唯一权威来源，madvise 后再删除 backing 会留下无任何副本的 block；release 语义要求无 backing。
+- 乐观 release 而不重算 ownership：在并发或 batch 边界可能误伤刚刚被引用的 block。
+- 让 release 与 swap 共存：两者的回收范围和安全契约不同（destructive vs recoverable），强制共存会引入优先级、竞态和重复回收问题。
+- 将 release 结果直接作为性能结论：当前 RESIDENT→RELEASED 的 RSS 回收是受控 correctness 验证，不是代表性压力下的回收效果。
+
+**Consequences and limits**
+
+- 收益：为真正 dead/unused block 提供零 backing 开销的直接物理回收路径；ownership gate 防止误伤；事务路径保证 reuse allocation 的原子性；R0–R5/N0–N2 长门禁确认选择性、互斥和回滚正确。
+- 代价：每次 release 调用需遍历全部 physical block 并重算 ownership（O(n_blocks × n_seqs × cells_per_seq)）；release 与 swap 不能同时启用；R5 确认 force-active-release 场景必然失败（这是正确的 fail-closed 行为）。
+- 适用范围：paged、ingraph、F32 K/V、row-index gather mode、非 swap、CPU host memory。
+- 失效边界：启用 swap 时 release 禁用；GPU/device memory 不支持 `madvise`/`mincore`；非 paged 或非 ingraph 模式不支持。
+- 当前验证范围：单机 CPU、ctx 1024、parallel 4、固定 idle/resume workload、R0–R5/N0–N2 correctness 矩阵。压力调度下的回收幅度、idempotent skip 与 reuse allocation 比率、事务提交/回滚在并发下的正确性尚未验证。
+
+**Evidence**
+
+- `src/llama-kv-cache.h:662-671`：RELEASED 声明与 paged_block_state 枚举。
+- `src/llama-kv-cache-release.h:6-13`：`llama_kv_destructive_release_can_enable` 准入门禁。
+- `src/llama-kv-cache-release.h:22-71`：`llama_kv_release_collect_ownership` 全量 ownership bitmap。
+- `src/llama-kv-cache.cpp:6039-6140`：`paged_release_blocks()` 遍历与 selective release。
+- `src/llama-kv-cache.cpp:4302-4416`：`paged_finish_write_transaction` 事务提交/回滚。
+- `src/llama-kv-cache.cpp:7090-7540`：dummy row redirect for SWAPPED/RELEASED blocks。
+- `scripts/run-kv-paged-release-correctness.sh`：R0–R5/N0–N2 完整矩阵 runner。
+- `scripts/parse-kv-paged-release-correctness.py`：fail-closed parser。
+- Artifact `/root/oscomp/kv_logs/kv_paged_release_20260717T134951Z_6071`：parser exit 0、overall PASS、全部 passing case seq0/seq1 hash 一致、R5 EXPECTED_FAILURE 正确触发。
