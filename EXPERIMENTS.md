@@ -2,6 +2,36 @@
 
 > 追加式实验索引。只记录可追溯协议与证据入口，不复制大日志，不用未运行或失败结果支撑正式结论。
 
+## E-0008 — Stage 3A-1B pressure sampler-only 单元、sanitizer 与严格 warning 验证
+
+- Status: valid（仅限 sampler-only 正确性/构建门禁）
+- Date: 2026-07-18
+- Commit/worktree: `befd7a8944f44528cc6a44d1968114fc1294c326`；提交时 clean
+- Target/source: `test-kv-pressure-sampler`；`src/llama-kv-pressure.*`、`tests/test-kv-pressure-sampler.cpp`
+- Registered result: 864/864 assertions PASS；ASan/UBSan PASS；sampler-only strict warning build PASS
+- Evidence entry: commit `befd7a894` message and committed test/CMake registration
+- Raw artifact: 未在工程账本登记独立原始日志或精确构建命令；本轮未重跑验证
+
+**Question and scope**
+
+验证默认关闭的 Linux pressure sampler 是否能在 fixture/synthetic 输入下正确处理 RSS/cgroup/PSI 读取与严格解析、cgroup v1/v2 路径解析、source 选择与动态切换、NORMAL/PRESSURE/CRITICAL/RECOVERY 转换、stale、滞回/cooldown、PSI 生命周期隔离及溢出边界；同时确认该独立目标通过 sanitizer 和严格 warning 构建。
+
+**Correctness/build gate**
+
+- 独立测试程序全部 assertions 通过：Total 864、Passed 864、Failed 0。
+- ASan/UBSan 运行通过，无已报告 sanitizer failure。
+- sampler-only 严格 warning build 通过，无已报告 warning failure。
+- `src/CMakeLists.txt` 将 `llama-kv-pressure.cpp` 编入 `llama`；`tests/CMakeLists.txt` 在 UNIX 下注册 `test-kv-pressure-sampler.cpp`。
+- 当前源码无 server/context/decode/reclaim 调用点；因此本条不得解释为运行时集成或内存回收验证。
+
+**Supported conclusion and limits**
+
+- 可支持：Stage 3A-1B sampler-only 节点已提交，提交绑定的单元、ASan/UBSan 与严格 warning 门禁记录为通过；默认关闭、source fail-closed、stale 和四态状态机具备代码与测试证据。
+- 证据限制：工程账本未保存原始 stdout/stderr、编译器版本、sanitizer flags 或精确命令，因此无法从本条独立复放当次构建；结论限定为 commit-bound 验证摘要，不外推为正式 server/性能实验。
+- **尚未验证真实模型状态转换。** 当前状态转换证据来自 synthetic/fixture，不代表真实 RSS/cgroup/PSI 序列。
+- **尚未验证 server 时延。** 未测 TTFT、TPOT、吞吐、p50/p95/p99 或不同采样频率的累计开销。
+- **尚未验证 bounded reclaim。** sampler 与 `paged_release_blocks()` 无运行时连接，未验证回收预算、RSS 降幅、并发干扰或 live/shared block 安全性。
+
 ## E-0007 — Stage 3A-0 RELEASED 生命周期 R0–R5/N0–N2 长门禁
 
 - Status: valid

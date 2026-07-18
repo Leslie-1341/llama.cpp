@@ -290,3 +290,44 @@ idle/resume workload 中，不再被任何 sequence 引用的 block（dead）或
 - `scripts/run-kv-paged-release-correctness.sh`：R0–R5/N0–N2 完整矩阵 runner。
 - `scripts/parse-kv-paged-release-correctness.py`：fail-closed parser。
 - Artifact `/root/oscomp/kv_logs/kv_paged_release_20260717T134951Z_6071`：parser exit 0、overall PASS、全部 passing case seq0/seq1 hash 一致、R5 EXPECTED_FAILURE 正确触发。
+
+## D-0009 — 压力采样与 reclaim 解耦，先做单 owner 限频只读 server 集成
+
+- Date: 2026-07-18
+- Status: accepted
+- Evidence commit/worktree: sampler-only `befd7a8944f44528cc6a44d1968114fc1294c326`（clean）；输入 probe `3b2502ca6f0d202f380b7efbcc8b18fe8f86e059`
+- Supersedes: D-0008 中“尚无真实压力采样”的阶段状态；不改变 D-0008 的 release correctness 契约
+- Superseded by: none
+
+**Context**
+
+Stage 3A-0 已验证 destructive release 的 ownership、事务和 fail-closed 语义，但没有真实压力输入。Stage 3A-1B 已实现 RSS/cgroup/PSI 采样与四态状态机，但 server runtime 尚无调用点。若在首次接入时同时触发 reclaim，状态误判、采样开销、request 生命周期竞态和回收副作用将无法独立归因。
+
+**Decision**
+
+1. **采样与 reclaim 解耦。** `kv_pressure_sampler` 只负责读取、source 选择、stale/滞回/状态转换和 telemetry，不直接调用 `paged_release_blocks()`、swap、prefetch 或 bounded-store policy。
+2. **先做只读 server 集成。** 下一门禁只在真实 server 生命周期中实例化并观测 sampler；任何压力状态均不得触发 reclaim。只有状态行为与时延开销通过后，才另立 bounded reclaim 门禁。
+3. **单线程 owner。** 一个 server/scheduler owner 独占 sampler 的初始化、`sample()` 调用和 telemetry 发布；request worker 不并发推进同一实例的 state/counters。跨线程消费者只读取 owner 发布的快照。
+4. **调用侧限频。** 不在 per-token、per-layer、attention 或 kernel 热路径采样；由 owner 按时间门限在调度/维护边界采样，并复用最近快照。具体采样周期必须由真实 server 采样时延与 TTFT/TPOT 回归决定，本决策不预设未经验证的数值。
+5. **默认关闭不变。** 未显式设置 `LLAMA_KV_PRESSURE_SAMPLER=1` 时不创建运行时压力行为；配置/source 无效或 stale 时不得触发后续 destructive action。
+
+**Alternatives rejected**
+
+- sampler 首次接入即绑定 bounded reclaim：无法区分状态机问题、生命周期问题和 reclaim correctness/性能问题，扩大 P0 风险。
+- 每个 request/worker 各自维护 sampler：会产生重复 procfs/cgroup 读取、状态分叉和 owner 不清晰的问题。
+- 每 token 或每层采样：文件读取和解析进入热路径，可能直接污染 TPOT/吞吐，且 probe 已表明读取代价需要单独预算。
+- 由 PSI 单独触发 reclaim：PSI 只作为持续主压力的确认/升级信号，不能替代 RSS/cgroup 主 source 与 ownership gate。
+
+**Consequences and limits**
+
+- 收益：把输入正确性、状态行为、运行时开销和 reclaim 副作用拆成可独立验收的门禁；单 owner 避免当前非线程安全 counters/state 被并发推进。
+- 代价：在只读阶段不会释放内存；需要维护 snapshot 发布与采样节流，压力变化的检测延迟受采样周期约束。
+- 当前实现状态：决策 1 和默认关闭已由 sampler-only 源码实现；决策 2–4 是下一阶段 server 集成约束，尚未实现和验证。
+- 失效条件：若后续 server 架构要求多 owner 或异步 sampler，必须先定义线程安全、clock、snapshot 一致性和重复采样去重契约，再以新决策 supersede 本条。
+
+**Evidence**
+
+- `src/llama-kv-pressure.h`：明确 sampler-only、默认关闭、无 reclaim，并定义 NORMAL/PRESSURE/CRITICAL/RECOVERY 与 telemetry。
+- `src/llama-kv-pressure.cpp`：直接文件读取、source fail-closed、stale、滞回、cooldown、PSI upgrade 和 source/basis 切换计数隔离。
+- `tests/test-kv-pressure-sampler.cpp`：864 assertions 的 fixture/synthetic 覆盖；提交摘要记录 ASan/UBSan 与 sampler-only strict warning build 通过。
+- 当前源码搜索仅发现 `src/CMakeLists.txt` 和 sampler 单测引用该组件；server/context/decode/reclaim 无调用点。

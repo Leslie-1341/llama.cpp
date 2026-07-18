@@ -2,15 +2,16 @@
 
 > 记录当前源码可验证的稳定结构。讨论方案必须标记为 proposed，不得混入已实现架构。
 
-- Last verified: 2026-07-17
-- Evidence commit: `adfe671367f0cdc17327786c2b5c6182939cbf09`
-- Verification scope: 当前源码、Git diff、clean-HEAD R0–R5/N0–N2 release correctness artifact；本轮未运行构建、测试或实验
+- Last verified: 2026-07-18
+- Evidence commit: `befd7a8944f44528cc6a44d1968114fc1294c326`
+- Verification scope: 当前源码、Git history、pressure sampler 单测与提交绑定验证摘要；本轮未运行构建、测试或实验
 
 ## System Boundary
 
 - 基础系统为 `llama.cpp` / `ggml`。项目扩展位于模型加载、CPU weight-stream callback、KV cache、attention graph 输入和独立 example/runner 层。
 - 当前已核对路径主要面向 Linux CPU/host memory。KV paged 路径要求 `n_stream == 1 && !v_trans`；`madvise`/`mincore` 不适用于 GPU device memory。
-- Dense Flex、MoE-Buffer/CLG、lazy KV、paged KV、destructive release 均由环境变量显式启用；普通未配置路径不主动进入这些实验机制。
+- Dense Flex、MoE-Buffer/CLG、lazy KV、paged KV、destructive release 和 pressure sampler 均由环境变量显式启用；普通未配置路径不主动进入这些实验机制。
+- Pressure sampler 当前是编入 `llama` 库的独立 Linux 组件，仅有单元测试调用；server、context、decode 和 KV reclaim 路径尚无生产调用点。
 
 ## Runtime Data Flow
 
@@ -77,6 +78,29 @@ PENDING_WRITE transaction (reuse allocation 写入新 K/V):
     -> push to free list
 ```
 
+### Pressure sampler-only 路径
+
+```text
+LLAMA_KV_PRESSURE_SAMPLER=1 + validated thresholds
+  -> resolve one unambiguous cgroup v1/v2 memory path
+  -> read selected primary source
+     - RSS_ABSOLUTE: /proc/self/statm
+     - CGROUP_ABSOLUTE: memory.current / memory.usage_in_bytes
+     - CGROUP_RATIO: memory.current ÷ finite memory.max
+  -> read telemetry-only memory.high and PSI
+     - /proc/pressure/memory
+     - cgroup v2 memory.pressure
+     - PSI upgrade signal uses max(system, cgroup)
+  -> validate selected-source sample
+  -> evaluate NORMAL/PRESSURE/CRITICAL/RECOVERY
+  -> publish read-only kv_pressure_telemetry
+  -X no reclaim / swap / prefetch / bounded-store action
+```
+
+- Source precedence is explicit RSS absolute > cgroup absolute > finite cgroup ratio；同时配置 RSS 与 cgroup absolute 视为歧义并 fail-closed 禁用 transition。
+- `memory.max` 在 finite 与 `max` 之间运行时变化时，可在 CGROUP_RATIO 与 NONE/telemetry-only 间切换；source、effective thresholds 或 ratio maximum 改变会清空 transition 累计计数，避免跨基准继承滞回。
+- 选中 source 的首个无效样本即 `stale=true`，保留现有状态且禁止自动降级；可选源失败不以零覆盖上次有效 telemetry。
+
 ### Static paged identity fast path
 
 ```text
@@ -94,6 +118,26 @@ graph cache reuse
 - Eligibility is context-lifetime state, not a per-token speculation.
 - Eligible E2I omits `paged_row_idx` creation/fill and bypasses K/V `GET_ROWS`, exposing continuous K/V views.
 - This optimization does not turn a dynamic mapping back into a continuous view.
+
+## Memory Pressure State Machine
+
+### States (`kv_pressure_state`)
+
+| State | 含义 |
+|-------|------|
+| NORMAL | 主压力源低于 pressure threshold；默认关闭时固定返回此状态 |
+| PRESSURE | 主压力源连续达到 pressure threshold，且满足滞回与 cooldown |
+| CRITICAL | 达到 critical threshold 时立即进入；也可由持续 PRESSURE + PSI 滞回升级 |
+| RECOVERY | PRESSURE/CRITICAL 连续低于 low-water 且满足滞回与 cooldown 后进入的恢复中间态 |
+
+### Transition invariants
+
+1. **CRITICAL entry 不受 cooldown 或普通滞回阻塞**：NORMAL、PRESSURE、RECOVERY 达到 critical threshold 时立即进入 CRITICAL。
+2. **降级必须 fail-closed**：PRESSURE/CRITICAL 只有连续有效样本低于 low-water，并满足 hysteresis + cooldown，才进入 RECOVERY；RECOVERY 再次满足独立 low-water hysteresis + cooldown 才回 NORMAL。
+3. **stale 不自动降级**：选中 source 读取失败时立即标记 stale，清空 pressure/low-water/PSI 连续计数，保持原状态。
+4. **PSI 不是独立 destructive trigger**：PSI 只在主 source 仍高于 pressure 且状态已为 PRESSURE 时，经过连续样本升级到 CRITICAL；PSI 单独升高不改变 NORMAL。
+5. **source/basis 切换隔离生命周期**：source、阈值、cgroup unlimited 标志或 ratio maximum 改变时重置累计计数；PSI 升级计数也只属于一次连续 PRESSURE 生命周期。
+6. **默认关闭且 sampler-only**：`LLAMA_KV_PRESSURE_SAMPLER` 未显式启用时 `sample()` 返回 NORMAL；状态机不拥有或调用 reclaim。
 
 ## KV Cache Block State Machine
 
@@ -134,6 +178,9 @@ graph cache reuse
 - `src/llama-window.*`：window 机制及 CLG predictor；CLG buffer mode 将预测结果转发给 MoE-Buffer。
 - `src/llama-kv-cache.*`：KV cell/block metadata、backing store、swap/madvise/restore/prefetch、**destructive release 状态机、ownership 收集、事务提交/回滚、dummy redirect**、错误状态和 telemetry。
 - `src/llama-kv-cache-release.h`：release 准入门禁（`llama_kv_destructive_release_can_enable`）与 ownership 收集（`llama_kv_release_collect_ownership`），与核心 KV 实现分离以便静态审计。
+- `src/llama-kv-pressure.*`：Linux RSS/cgroup/PSI 直接读取、严格解析、cgroup v1/v2 路径解析、source 选择、stale 处理、四态状态机和结构化 telemetry；不包含 reclaim policy 或 KV block 操作。
+- `scripts/probe-pressure-inputs.sh`、`tests/test-probe-pressure-inputs.sh`：Stage 3A-1A 只读输入探测与静态回归，不是运行时采样器调用链。
+- `tests/test-kv-pressure-sampler.cpp`：fixture/synthetic 状态机、解析、source 切换、stale、溢出与 cgroup 路径回归。
 - `src/llama-graph.cpp`：构造并填充 paged row index，将其传给 K/V attention 读取路径；**dummy row redirect 在此层发生**。
 - `src/llama-context.cpp`、`src/llama-memory.h`：memory-level experimental hook 与 paged 错误向 decode/graph 状态的传播。
 - `examples/kv-*`：构造 idle/resume/trace workload 和上层策略信号；不拥有 core swap/release 状态机。
@@ -147,10 +194,13 @@ graph cache reuse
 - KV graph input 在 `llama-graph.cpp` 调用 `build_input_paged_row_idx()` / `set_input_paged_row_idx()`，attention 的 `get_k()`/`get_v()` 接收 row index；**dummy redirect 在 row-index fill 中发生**。
 - 上层通过 `prefetch_seq()` / `prefetch_seq_step()` 等 memory hook 表达 resume 预取。
 - **Release 在 idle/resume boundary 由 example driver 调用**；core 不自动触发 release。
+- Pressure sampler 已通过 `src/CMakeLists.txt` 编入 `llama` library，但当前仅 `tests/test-kv-pressure-sampler.cpp` 实例化；server runtime 尚未集成。下一门禁是单 owner、限频、只读 telemetry 接入，不连接 reclaim。
 
 ## Invariants and Error Propagation
 
-- 默认关闭：未显式设置相关环境变量时，不启用 Flex/MoE/CLG/paged swap/madvise/release/prefetch。
+- 默认关闭：未显式设置相关环境变量时，不启用 Flex/MoE/CLG/paged swap/madvise/release/prefetch/pressure sampler。
+- Pressure sampler 配置、cgroup 路径或 selected source 无效时 transition fail-closed；telemetry 可保持 enabled，但 source 为 NONE，状态不得据此驱动 reclaim。
+- Pressure state 与 KV block state 当前完全解耦；不存在 NORMAL/PRESSURE/CRITICAL/RECOVERY → `paged_release_blocks()` 的自动边。
 - backing store 容量固定为物理 KV cell 数乘每 cell 全层 K/V stride。
 - paged block 写入整块成功后才发布 offsets 和 `SWAPPED`；失败时清除待发布 metadata，block 保持可重试状态。
 - swap-in 先读入 staging，再提交 tensor 与 `RESIDENT` 状态；active 必需的恢复失败记录 context-local error，并在 graph compute 前失败返回。
@@ -164,6 +214,8 @@ graph cache reuse
 ## Modification Boundaries
 
 - core 提供 block state、I/O、madvise、restore、prefetch、release 与诊断机制；session lifecycle、release timing、pressure policy 保持在 server/application/example 层。
+- `kv_pressure_sampler` 只提供输入采样、状态判定和 telemetry，不得在该组件内直接调用 destructive release；bounded reclaim 的预算、候选集、频率和生命周期 owner 属于后续 server policy。
+- 下一阶段 server 接入必须保持单线程 owner 与调用侧限频，避免多个 request 线程并发推进同一 sampler 的 counters/state，也避免 per-token/per-layer 文件读取；这些是已接受但尚未实现的集成约束。
 - 修改 `paged_block_state` 枚举或状态转换时必须同步核对：ownership collection、dummy redirect、事务提交/回滚、swap gate 和 release gate。
 - 任何可能改变 post-construction mapping/residency 的新机制必须与 release 的 ownership gate 互斥或提供经证明的失效契约。
 - 不应把 release correctness 协议结果描述为压力调度性能结论。
@@ -174,6 +226,9 @@ graph cache reuse
 - KV paged 主路径当前只接受兼容 layout（`n_stream == 1 && !v_trans`）；部分路径还限制 F32 K/V。
 - KV prefetch 由上层分步触发，不是独立异步恢复线程；真实 server queue/continuous batching 尚未接入。
 - 权重侧 Flex 与 MoE-Buffer 是分离路径，不是统一 shared weight/KV I/O budget scheduler。
-- Release 当前只在 example driver 的 idle/resume boundary 调用；没有请求级压力信号触发条件 release。
-- 当前证据覆盖单机 CPU、Llama-3-8B Q4_K_M、ctx 1024、parallel 4、固定 idle/resume workload。不覆盖多模型、长上下文、server/continuous batching 或不同 backend/layout。
+- Release 当前只在 example driver 的 idle/resume boundary 调用；pressure sampler 与 release 没有连接。
+- 尚未验证真实模型/server 请求下的四态转换、source 动态切换与 stale 恢复；当前状态机证据来自 synthetic/fixture 单测。
+- 尚未验证 server 集成后的采样开销与 TTFT/TPOT/吞吐/p95/p99；probe 的文件读取结果不能替代运行时端到端时延。
+- bounded reclaim 尚未实现，无法确认 PRESSURE/CRITICAL 下的回收预算、RSS 降幅、live/shared 安全性或并发干扰。
+- 当前 release 证据覆盖单机 CPU、Llama-3-8B Q4_K_M、ctx 1024、parallel 4、固定 idle/resume workload。不覆盖多模型、长上下文、server/continuous batching 或不同 backend/layout。
 - 历史 README 中的性能数字缺少仓库内原始 artifacts 与 commit/worktree 绑定，目前无法确认其对当前 HEAD 的适用性。
