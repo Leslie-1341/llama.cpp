@@ -200,6 +200,7 @@ if (UNIX)
     llama_build_and_test(test-kv-backing-store.cpp)
     llama_build_and_test(test-kv-paged-identity-fast-path.cpp)
     llama_build_and_test(test-kv-paged-release-ownership.cpp)
+    llama_build_and_test(test-kv-pressure-sampler.cpp)
 endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
