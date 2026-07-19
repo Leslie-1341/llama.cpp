@@ -395,6 +395,38 @@ class ParserSyntheticTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assert_rejected(mutation)
 
+    def test_plain_on_first_marker_before_completion_window_passes(self) -> None:
+        """Regression: real ab_r1_on first marker precedes completion window (sleep/resume NOT_APPLICABLE)."""
+        fixture = self.fixture()
+        case_dir = fixture.artifact / "cases/ab_r1_on"
+        prefix = b"server startup and health log lines\n"
+        suffix = b"\npost-completion log\n"
+        stderr = prefix + MARKER.encode() + suffix
+        (case_dir / "server.stderr").write_bytes(stderr)
+        dump(case_dir / "completion_window.json", {
+            "stderr_start": len(prefix) + len(MARKER.encode()),
+            "stderr_end": len(stderr),
+        })
+        fixture.seal()
+        result = fixture.run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads((fixture.artifact / "summary.json").read_text())
+        self.assertEqual(summary["artifact_status"], "VALID")
+
+    def test_plain_on_missing_first_and_late_first_fail_closed(self) -> None:
+        """Plain ON case with observed[0] lacking first, or first only at a later position."""
+        def no_first_at_all(f):
+            case_dir = f.artifact / "cases/ab_r1_on"
+            (case_dir / "server.stderr").write_text(
+                MARKER.replace("trigger=first,state,source", "trigger=state,source"))
+        def late_first(f):
+            case_dir = f.artifact / "cases/ab_r1_on"
+            (case_dir / "server.stderr").write_text(
+                MARKER.replace("trigger=first,state,source", "trigger=periodic") + MARKER)
+        for name, mutation in (("missing", no_first_at_all), ("late", late_first)):
+            with self.subTest(name=name):
+                self.assert_rejected(mutation)
+
     def test_static_pressure_integration_chain_has_no_kv_mutation(self) -> None:
         runtime = (ROOT / "tools/server/server-kv-pressure.cpp").read_text()
         header = (ROOT / "tools/server/server-kv-pressure.h").read_text()

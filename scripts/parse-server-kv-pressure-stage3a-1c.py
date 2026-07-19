@@ -579,9 +579,7 @@ def verify_case(root: pathlib.Path, spec: dict[str, Any], binary: pathlib.Path,
                 raise ArtifactError("resume lifecycle was not observed")
             verify_metrics(case_dir, "wake_completion")
         else:
-            require_lifecycle_first(initial, f"{spec['name']} lifecycle")
-            if sum("first" in trigger_set(marker) for marker in observed) != 1:
-                raise ArtifactError(f"duplicate or later first trigger: {spec['name']}")
+            require_lifecycle_first(observed, f"{spec['name']} lifecycle")
         if spec["kind"] == "idle_limit":
             window = load(case_dir / "idle_window.json")
             start, end = window.get("stderr_start"), window.get("stderr_end")
