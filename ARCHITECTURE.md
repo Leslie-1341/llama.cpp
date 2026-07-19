@@ -3,8 +3,8 @@
 > 记录当前源码可验证的稳定结构。讨论方案必须标记为 proposed，不得混入已实现架构。
 
 - Last verified: 2026-07-19
-- Evidence commit: `297eed939bb830ee85d426e54b67f78322955044`
-- Verification scope: 当前源码、Git history、server pressure telemetry 集成 diff 与测试注册；本轮未运行构建、测试或实验
+- Evidence commit: `726d977b26bba375edd8e79c1c04a46cece942e4`
+- Verification scope: 当前源码、Git history、server pressure telemetry 集成 diff、测试注册，以及真实 server + Meta-Llama-3-8B Q4_K_M 的 Stage 3A-1C VALID artifact（10/10 cases PASS）
 
 ## System Boundary
 
@@ -113,7 +113,10 @@ server update_slots() — single-threaded scheduler owner:
 - `maybe_sample_kv_pressure()` 在 idle 检查之前调用，但 idle 标记不影响 `sample_due()` 的时间门控——idle 不绕过限频、不持续采样。
 - sleep 时 sampler 与 runtime 完全销毁；resume 后从 `init_kv_pressure_sampler()` 重建，不跨 sleep 携带 pressure state、transition counters 或 sampling deadline。
 - 日志 marker 格式为 `kv_pressure_telemetry state=... source=... stale=... rss_kb=... sample_count=... skip_count=... idle=... trigger=...`，字段固定、结构化、fail-closed。
-- **压力状态与 KV block 操作完全解耦**：`maybe_sample_kv_pressure()` 不调用 `paged_release_blocks()`、swap、prefetch 或 madvise；6 静态集成检查与 9 parser 合成负例均验证此约束。
+- **压力状态与 KV block 操作完全解耦**：`maybe_sample_kv_pressure()` 不调用 `paged_release_blocks()`、swap、prefetch 或 madvise；6 静态集成检查、9 parser 合成负例以及真实 server 10-case VALID artifact 均验证此约束。
+- **strace 观测窗修复**（`726d977b2`）：strace attach 后在 post-attach wait 窗口内等待 `sample_period` 以确保至少一次采样被观测到；ON case 确认读取 `/proc/self/statm`、`/proc/pressure/memory`、cgroup `memory.{current,high,max,pressure}`，OFF case 零 sampler procfs/cgroup 路径。
+- **pre-request 首 marker 修复**（`31e81656d`）：`maybe_sample_kv_pressure()` 在第一个 client request 到达前即可触发首次采样；此前首样本只能在 request processing 边界产生。
+- **lifecycle 首 marker 修复**（`ad92e603f`）：resume 后 `init_kv_pressure_sampler()` 创建的 sampler 在首个 request 到达前即可产生 marker；此前 post-resume marker 的 `sample_count` 无法独立重置。
 
 ### Sampler-only 核心路径（`llama` 库内）
 
@@ -301,9 +304,9 @@ graph cache reuse
 - KV prefetch 由上层分步触发，不是独立异步恢复线程；真实 server queue/continuous batching 尚未接入。
 - 权重侧 Flex 与 MoE-Buffer 是分离路径，不是统一 shared weight/KV I/O budget scheduler。
 - Release 当前只在 example driver 的 idle/resume boundary 调用；pressure sampler 与 release 没有连接。
-- **Server telemetry 集成尚未在真实模型下运行**：当前证据为合成测试（9 C++ 集成、6 静态检查、9 parser 负例）和 py_compile 通过；无真实 procfs/cgroup 读取证据、无 strace 观测、无 TTFT/TPOT/吞吐/p95/p99 时延测量。
+- **Server telemetry 集成已通过真实模型验证**：Stage 3A-1C VALID artifact（`726d977b2`，Meta-Llama-3-8B Q4_K_M）确认 10/10 cases PASS、strace 归因正确、lifecycle 隔离、idle 限频。但性能结论为 EXPLORATORY_ONLY（n=3，单提示，无并发请求），不构成正式时延或吞吐收益声明。
 - Stage 3A-1C validation protocol 的 10-case 矩阵使用 1/2/3 KiB RSS 阈值，仅为 state lifecycle forced validation，不代表部署推荐值或经验性压力限制。
-- 尚未验证真实模型/server 请求下的四态转换、source 动态切换与 stale 恢复；当前状态机证据来自 synthetic/fixture 单测。
+- 尚未验证真实模型/server 请求下的四态转换、source 动态切换与 stale 恢复；当前状态机证据来自 synthetic/fixture 单测。3A-1C artifact 的 CRITICAL 状态由 3 KiB forced threshold 触发，不代表真实内存压力场景。
 - bounded reclaim 尚未实现，无法确认 PRESSURE/CRITICAL 下的回收预算、RSS 降幅、live/shared 安全性或并发干扰。
 - 当前 release 证据覆盖单机 CPU、Llama-3-8B Q4_K_M、ctx 1024、parallel 4、固定 idle/resume workload。不覆盖多模型、长上下文、server/continuous batching 或不同 backend/layout。
 - 历史 README 中的性能数字缺少仓库内原始 artifacts 与 commit/worktree 绑定，目前无法确认其对当前 HEAD 的适用性。

@@ -164,80 +164,73 @@ R1 mincore: `mincore_before_last=243,793,920` bytes (~232 MiB) 在 madvise 前 r
 - **尚未验证 server 时延。** 未测 TTFT、TPOT、吞吐、p50/p95/p99 或不同采样频率的累计开销。
 - **尚未验证 bounded reclaim。** sampler 与 `paged_release_blocks()` 无运行时连接，未验证回收预算、RSS 降幅、并发干扰或 live/shared block 安全性。
 
-## E-0009 — Stage 3A-1C server pressure telemetry 集成与验证协议（planned）
+## E-0009 — Stage 3A-1C server pressure telemetry 集成与验证协议
 
-- Status: planned（合成测试与静态检查已通过；真实模型实验尚未运行）
+- Status: **valid**（真实 server + Meta-Llama-3-8B Q4_K_M，10/10 cases PASS）
 - Date: 2026-07-19
-- Commit/worktree: `297eed939bb830ee85d426e54b67f78322955044`；clean
-- Runner: `scripts/run-server-kv-pressure-stage3a-1c.py`（10-case matrix）
-- Parser: `scripts/parse-server-kv-pressure-stage3a-1c.py`（fail-closed）
+- Commit/worktree: `726d977b26bba375edd8e79c1c04a46cece942e4`；clean
+- Runner: `scripts/run-server-kv-pressure-stage3a-1c.py`（10-case matrix；SHA256 `a01fabb2…`）
+- Parser: `scripts/parse-server-kv-pressure-stage3a-1c.py`（fail-closed；SHA256 `23f59e01…`）
 - Static checks: `tests/test-server-kv-pressure-static.py`（6 tests）
 - Parser synthetic negatives: `tests/test-server-kv-pressure-stage3a-1c-parser.py`（9 tests）
 - C++ integration: `tests/test-server-kv-pressure.cpp`（9 tests）
-- Raw artifacts: 尚未生成（planned only）
+- Raw artifact: `/root/oscomp/kv_logs/server_kv_pressure_stage3a_1c_20260719T134156Z_726d977b26bb`
+- Runner log: `/root/oscomp/kv_logs/server_kv_pressure_stage3a_1c_20260719T134156Z_726d977b26bb.runner.log`
+- Evidence hashes: manifest `inventory.sha256.json` 覆盖全部 10 cases × 13 files = 130 files SHA256；binary SHA256 `f0801153…`；model SHA256 `b2f95e15…`
 
-**Pre-experiment verification (已通过)**
+**Pre-experiment verification (已通过；与 planned 阶段一致)**
 
-- 6/6 静态集成检查通过：single owner、no reclaim calls、no thread/lock、structured marker fields、master switch preflight、sleep/resume lifecycle reset。
-- 9/9 parser 合成负例通过：valid artifact、trigger duplicates/first-set order、SSE malformation/terminal/timing/metrics conflict/timestamp missing/insufficient samples、case file set checksum、identity drift（runner/parser/binary/model/head/dirty）、OFF telemetry ban + structured action marker ban（含 prose false-positive 豁免）、timeout/residual process、request/exit/order/strace/idle boundary、static no-mutation chain。
-- 9 C++ 集成测试通过：default-off、interval config、rate-limit + idle path、first/critical/stale logging、change/periodic logging、deadline overflow、lifecycle reset、marker fields、init failure stays disabled。
+- 6/6 静态集成检查通过。
+- 9/9 parser 合成负例通过。
+- 9 C++ 集成测试通过。
 - py_compile: runner、parser、static tests、parser tests 全部通过。
 
-**Question and scope**
+**Result: VALID — correctness PASS**
 
-验证 Stage 3A-1C server pressure telemetry 集成在真实 Linux server 进程中的行为：默认关闭、OFF/ON master switch、sleep/resume 正确重建 sampler lifecycle、idle 不持续采样、strace 确认真实 procfs/cgroup openat/read/close 调用链，以及采样对 TTFT/TPOT/吞吐/p95/p99 的短回归。
+- Parser exit 0；artifact status `VALID`；10/10 cases PASS。
+- 6 A/B rounds (r1 OFF→ON, r2 ON→OFF, r3 OFF→ON)：OFF variant 零 `kv_pressure_telemetry` marker；ON variant 均产生 state=CRITICAL marker（`trigger=first,state,source`，`sample_valid=1, stale=0, config_valid=1`）。
+- Lifecycle (`on_lifecycle`)：pre-sleep marker `sample_count` 与 post-resume marker 独立（resume 后重置为 < pre-sleep 值）；post-sleep wake completion marker 含独立 `trigger=wake_completion`。
+- Idle limit (`on_idle_250ms`)：request-driven 首样本后 1.5s 持续 idle 窗口内无新 telemetry marker；idle 标记进入 event 但不绕过 `sample_due` 时间门控。
+- Strace ON: 6 条 sampler procfs/cgroup 路径确认（`/proc/self/statm`、`/proc/pressure/memory`、cgroup `memory.{current,high,max,pressure}`）。
+- Strace OFF: 零 sampler procfs/cgroup 路径。
+- 全部 cases: zero structured action marker（paged_release_blocks/swap/prefetch/madvise/reclaim）。
 
-**Planned matrix (10 cases)**
+**Performance result: EXPLORATORY_ONLY**
 
-| Case | kind | round | order | variant | 验证目标 |
-|------|------|-------|-------|---------|----------|
-| ab_r1_off | ab | 1 | 1 | OFF | 默认关闭：无 telemetry marker、无 procfs 访问 |
-| ab_r1_on | ab | 1 | 2 | ON | 默认打开：NORMAL→CRITICAL 转换、marker 字段完整 |
-| ab_r2_on | ab | 2 | 1 | ON | A/B 重排：不同于 r1 的 ordering 仍正确 |
-| ab_r2_off | ab | 2 | 2 | OFF | A/B 重排：OFF 仍无 marker |
-| ab_r3_off | ab | 3 | 1 | OFF | 第三轮 OFF 稳定性（无回归） |
-| ab_r3_on | ab | 3 | 2 | ON | 第三轮 ON marker 一致性 |
-| on_lifecycle | lifecycle | 0 | 0 | ON | sleep 时 sampler 销毁、resume 后重建、wake completion marker 独立 |
-| on_idle_250ms | idle_limit | 0 | 0 | ON | 250ms 采样间隔、idle 窗口内无新 marker |
-| strace_off_correctness | strace | 0 | 1 | OFF | strace 观察：仅 /etc/localtime 等非 sampler 路径 |
-| strace_on_correctness | strace | 0 | 2 | ON | strace 观察：含 /proc/self/statm、/proc/pressure/memory、cgroup memory.* |
+| Metric | OFF median | ON median | OFF range | ON range |
+|--------|-----------|----------|-----------|----------|
+| TTFT (ms) | 233.9 | 247.8 | 233.0–236.0 | 245.3–249.7 |
+| TPOT (ms) | 65.1 | 71.2 | 59.6–66.1 | 69.8–73.4 |
+| Throughput (tps) | 15.4 | 14.0 | 15.1–16.8 | 13.6–14.3 |
+| SSE chunk p95 (ms) | 73.6 | 75.9 | 63.4–76.8 | 75.8–78.5 |
+| SSE chunk p99 (ms) | 74.0 | 78.5 | 63.7–82.4 | 78.0–79.5 |
 
-**Forced lifecycle thresholds (NOT deployment values)**
+- n=3 per variant（3 轮 A/B）；tail quantiles NOT_REPORTED（n 过小不可靠）。
+- 性能结论 `EXPLORATORY_ONLY_NO_FORMAL_BENEFIT_CLAIM`：不作正式收益/退化声明。
+- 观测到的 ON vs OFF 差异（TTFT +14ms、TPOT +6ms、TPS −1.4）在单请求、32 token 输出、250ms 采样间隔下获取；不推广到并发/长上下文/不同模型。
 
-RSS thresholds 1/2/3 KiB 仅为强制 NORMAL→PRESSURE→CRITICAL 状态转换的验证值；不得作为经验性压力限制或部署推荐。`pressure_settings_purpose` marker 封印：`FORCED_LIFECYCLE_STATE_VALIDATION_ONLY_NOT_REAL_DEPLOYMENT_THRESHOLDS`。
+**Key correctness results**
 
-**Environment and workload**
+- `pressure_settings_purpose`: `FORCED_LIFECYCLE_STATE_VALIDATION_ONLY_NOT_REAL_DEPLOYMENT_THRESHOLDS`。
+- OFF variant: `config_valid=false, config_fail_reason=[not enabled]`；`sample_valid=0`。
+- ON variant: `source=RSS_ABSOLUTE, sample_valid=1, stale=0, config_valid=1`；state 转换 NORMAL→PRESSURE→CRITICAL（1/2/3 KiB forced thresholds）。
+- Lifecycle: sleep 期间 sampler destroyed + runtime disabled；resume 后全新 init；wake completion marker 为独立触发。
+- Idle: `idle=true` marker 存在但触发为 `periodic`（非 idle 专用）；idle 不产生持续采样。
 
-- Binary: 当前 HEAD Release build, GCC 11.4, GGML CPU/OpenMP/native, 12 logical CPU (Xeon Platinum 8358), Ubuntu 22.04/Linux 5.15, ~24 GB RAM。
-- Model: 待定（推荐 Meta-Llama-3-8B-Instruct Q4_K_M）。
-- Workload: ctx 1024, batch/ubatch 128, parallel 1, seed 1, temp 0, n-predict 32。
-- Prompt: "In one short sentence, explain why deterministic tests are useful."
-- Timeout: 430s/case total；startup 5s、health 180s、completion 180s、sleep 30s、resume 180s、shutdown 15s。
-- Clean worktree 要求：`LLAMA_KV_PAGED_RELEASE=0`、`LLAMA_KV_PAGED_SWAP=0` 及全部 KV mutation 环境变量强制为零。
+**Pre-fix INVALID artifacts (retained as diagnostic evidence)**
 
-**Correctness gate (parser fail-closed)**
+| Artifact | Commit | Failure reason |
+|----------|--------|---------------|
+| `…073412Z_4ac1919ec2ed` | `4ac1919ec2ed` | strace ON 无法观测 procfs/cgroup 路径（post-attach wait 不足 250ms sample period） |
+| `…082058Z_31e81656d1e6` | `31e81656d1e6` | pre-request 首 marker 缺失（`sample_due` 在首个 request 到达前不触发） |
+| `…125819Z_ad92e603f7b8` | `ad92e603f7b8` | ON strace lacks required sampler procfs reads（strace 在首次采样后 attach，采样周期 60000ms 导致 completion 结束前无后续采样；trace 文件全空） |
 
-- 每个 case exit 0（正常 shutdown）；无 SIGKILL 使用（`sigkill_used=false`）；无 residual process。
-- 所有 phase 状态为 PASS（或 lifecycle case 的 sleep/resume 为 NOT_APPLICABLE 豁免）。
-- OFF variant：server stderr 中零 `kv_pressure_telemetry` marker。
-- ON variant：至少一个 marker 含 `state=CRITICAL`、`trigger=first,state,source`、`sample_valid=1`、`stale=0`、`config_valid=1`。
-- lifecycle case：pre-sleep 和 post-resume 各至少一个 marker，且 post-resume marker 的 `sample_count` 重置为 < pre-sleep（证明 lifecycle 隔离）。
-- idle_limit case：idle 窗口（≥1500ms）内 stderr 无新增 marker。
-- strace_on_correctness：trace 含 `/proc/self/statm` 或 cgroup `memory.current` 路径。
-- strace_off_correctness：trace 不含 sampler procfs/cgroup 路径。
-- identity drift（manifest head/binary/model/runner/parser hash）、case 顺序/端口重复、SSE reconstruction、metrics/sse_chunk 一致性、structured action marker（paged_release_blocks/swap/prefetch/madvise/reclaim）零出现，全部 fail-closed。
-- 性能结论强制为 `EXPLORATORY_ONLY_NO_FORMAL_BENEFIT_CLAIM`；tail quantiles 记录为 `NOT_REPORTED`。
+三个 INVALID artifact 均为 runner 10/10 cases 完成但 parser 拒绝；保留为集成缺陷定位与修复验证的诊断证据。
 
-**Planned exit criteria**
+**Supported conclusion and limits**
 
-1. Parser exit 0、artifact status `VALID`。
-2. 全部 10 cases PASS（含 lifecycle 的 sleep/resume 和 idle 的 window check）。
-3. TTFT、TPOT、吞吐、p95/p99 在 OFF vs ON 之间无显著退化（短回归判据：中位数偏移 <5% 且 p95 偏移 <10%）。
-4. Strace 归因确认 ON 读取预期 procfs/cgroup 路径，OFF 不读取。
-5. 原始 artifact 含完整 inventory.sha256.json、manifest.json、per-case logs 和 summary.json。
-
-**Current status and next step**
-
-- 合成验证（9 parser + 6 static + 9 C++ integration + py_compile）已通过，标记为 planned 实验的前置门禁。
-- 真实 server + 真实模型尚未运行；需用户编译当前 HEAD、准备模型文件并执行 `run-server-kv-pressure-stage3a-1c.py`。
-- 本条在真实模型实验完成并取得 parser PASS 结果前不得升级为 valid。
+- Stage 3A-1C server pressure telemetry 集成正确性门禁已通过：真实 server + Meta-Llama-3-8B Q4_K_M 下默认关闭、OFF/ON master switch、sleep/resume lifecycle 隔离、idle 限频、strace 归因全部验证通过。
+- 全链路确认 pressure state 与 KV block 操作完全解耦：真实 server 下 zero structured action marker。
+- **性能结论为 EXPLORATORY_ONLY**（n=3，单模型、单提示、无并发请求、ctx 1024、32 token 输出）。不构成正式 TTFT/TPOT/吞吐收益或退化声明。
+- Pressure thresholds 1/2/3 KiB 为 forced lifecycle validation，非部署推荐值。
+- 不覆盖：并发请求、长上下文、真实内存压力下的 CRITICAL 状态转换、不同模型/quantization、GPU/device memory。

@@ -293,9 +293,9 @@ idle/resume workload 中，不再被任何 sequence 引用的 block（dead）或
 
 ## D-0009 — 压力采样与 reclaim 解耦，先做单 owner 限频只读 server 集成
 
-- Date: 2026-07-18（决策入账）；2026-07-19（server 集成与验证协议提交）
-- Status: accepted；server 集成（`6f59f66b6`）与验证协议（`297eed939`）已提交
-- Evidence commit/worktree: 当前 HEAD `297eed939bb830ee85d426e54b67f78322955044`（clean）；sampler-only `befd7a894`；输入 probe `3b2502ca6`
+- Date: 2026-07-18（决策入账）；2026-07-19（server 集成与验证协议提交；真实模型 VALID artifact 通过）
+- Status: accepted；server 集成（`6f59f66b6`）、验证协议（`297eed939`）、集成修复（`31e81656d`、`ad92e603f`、`726d977b2`）与真实模型 VALID artifact 全部就绪
+- Evidence commit/worktree: 当前 HEAD `726d977b26bba375edd8e79c1c04a46cece942e4`（clean）；VALID artifact `/root/oscomp/kv_logs/server_kv_pressure_stage3a_1c_20260719T134156Z_726d977b26bb`；sampler-only `befd7a894`；输入 probe `3b2502ca6`
 - Supersedes: D-0008 中”尚无真实压力采样”的阶段状态；不改变 D-0008 的 release correctness 契约
 - Superseded by: none
 
@@ -322,7 +322,7 @@ Stage 3A-0 已验证 destructive release 的 ownership、事务和 fail-closed �
 
 - 收益：把输入正确性、状态行为、运行时开销和 reclaim 副作用拆成可独立验收的门禁；单 owner 避免当前非线程安全 counters/state 被并发推进。
 - 代价：在只读阶段不会释放内存；需要维护 snapshot 发布与采样节流，压力变化的检测延迟受采样周期约束。
-- 当前实现状态：决策全部五项已由源码实现——1（sampler 与 reclaim 解耦）在 `befd7a894`；2–4（只读 server 集成、单 owner、限频）在 `6f59f66b6`；5（默认关闭）贯穿全部提交。验证协议（`297eed939`）已提交 runner/parser/合成负例但尚未在真实模型下运行。
+- 当前实现状态：决策全部五项已由源码实现——1（sampler 与 reclaim 解耦）在 `befd7a894`；2–4（只读 server 集成、单 owner、限频）在 `6f59f66b6`；5（默认关闭）贯穿全部提交。验证协议（`297eed939`）已提交 runner/parser/合成负例。**真实模型 VALID artifact 已通过**（HEAD `726d977b2`，`31e81656d`/`ad92e603f`/`726d977b2` 三笔修复后 10/10 cases PASS）；性能结论为 EXPLORATORY_ONLY。
 - 失效条件：若后续 server 架构要求多 owner 或异步 sampler，必须先定义线程安全、clock、snapshot 一致性和重复采样去重契约，再以新决策 supersede 本条。
 
 **Evidence**
@@ -336,3 +336,5 @@ Stage 3A-0 已验证 destructive release 的 ownership、事务和 fail-closed �
 - `tests/test-server-kv-pressure.cpp`：9 C++ 集成测试通过。
 - `tests/test-server-kv-pressure-static.py`：6 静态集成检查通过（single owner、no reclaim calls、no thread/lock、marker fields、master switch preflight、sleep/resume reset）。
 - `scripts/run-server-kv-pressure-stage3a-1c.py`、`scripts/parse-server-kv-pressure-stage3a-1c.py`、`tests/test-server-kv-pressure-stage3a-1c-parser.py`：9 合成负例通过、py_compile 通过。
+- **Stage 3A-1C VALID artifact**: `/root/oscomp/kv_logs/server_kv_pressure_stage3a_1c_20260719T134156Z_726d977b26bb` — parser exit 0、artifact status VALID、10/10 cases PASS。Strace ON 归因 6 条 sampler procfs/cgroup 路径、OFF 零路径；lifecycle post-resume sample_count 独立重置；idle 1.5s 窗口零 periodic marker。
+- 此前失败 artifacts 保留为 INVALID 诊断证据：`…073412Z_4ac1919ec2ed`（strace ON 无法观测 procfs 路径）、`…082058Z_31e81656d1e6`（pre-request marker 缺失）、`…125819Z_ad92e603f7b8`（ON strace lacks required sampler procfs reads；strace 在首次采样后 attach，60000ms 采样周期导致 completion 结束前无后续采样，trace 文件全空；与 lifecycle post-resume marker 无关）；均 runner 10/10 cases 完成但 parser 拒绝。
