@@ -3,6 +3,9 @@
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
+#if defined(__linux__)
+#include "server-kv-pressure.h"
+#endif
 #include "server-task.h"
 #include "server-queue.h"
 
@@ -689,6 +692,13 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+#if defined(__linux__)
+    // Owned and advanced only by the single-threaded update_slots() scheduler path.
+    // Pressure state is telemetry-only here and never drives KV mutations.
+    std::unique_ptr<kv_pressure_sampler> kv_pressure_sampler_owner;
+    server_kv_pressure_runtime kv_pressure_runtime;
+#endif
+
     server_metrics metrics;
 
     json json_ui_settings = json::object();    // Primary: new name
@@ -734,12 +744,21 @@ private:
         GGML_ASSERT(sleeping != new_state);
         if (new_state) {
             SRV_INF("%s", "server is entering sleeping state\n");
+#if defined(__linux__)
+            kv_pressure_sampler_owner.reset();
+            kv_pressure_runtime.disable();
+#endif
             destroy();
         } else {
             SRV_INF("%s", "server is exiting sleeping state\n");
             if (!load_model(params_base)) {
                 GGML_ABORT("failed to reload model after sleeping");
             }
+#if defined(__linux__)
+            // A reloaded model starts a new telemetry lifecycle. Do not carry
+            // pressure state, counters, or sampling deadlines across sleep.
+            init_kv_pressure_sampler();
+#endif
         }
         sleeping = new_state;
     }
@@ -1050,12 +1069,72 @@ private:
         return true;
     }
 
+#if defined(__linux__)
+    void init_kv_pressure_sampler() {
+        kv_pressure_sampler_owner.reset();
+        kv_pressure_runtime.disable();
+
+        const kv_pressure_enablement enablement = kv_pressure_sampler_environment_enablement();
+        if (enablement == kv_pressure_enablement::KV_PRESSURE_ENABLEMENT_DISABLED) {
+            return;
+        }
+        if (enablement == kv_pressure_enablement::KV_PRESSURE_ENABLEMENT_INVALID) {
+            SRV_WRN("%s", "invalid LLAMA_KV_PRESSURE_SAMPLER value; pressure telemetry disabled\n");
+            return;
+        }
+
+        server_kv_pressure_config config;
+        std::string error;
+        if (!server_kv_pressure_config_from_env(config, error)) {
+            SRV_WRN("KV pressure telemetry disabled: %s\n", error.c_str());
+            return;
+        }
+
+        try {
+            auto sampler = std::make_unique<kv_pressure_sampler>();
+            if (!sampler->init(enablement)) {
+                SRV_WRN("%s", "KV pressure sampler initialization failed; pressure telemetry disabled\n");
+                return;
+            }
+
+            kv_pressure_sampler_owner = std::move(sampler);
+            kv_pressure_runtime.enable(config);
+        } catch (const std::exception & e) {
+            SRV_WRN("KV pressure sampler initialization failed; pressure telemetry disabled: %s\n", e.what());
+        } catch (...) {
+            SRV_WRN("%s", "KV pressure sampler initialization failed; pressure telemetry disabled\n");
+        }
+    }
+
+    void maybe_sample_kv_pressure(bool idle) {
+        if (!kv_pressure_sampler_owner) {
+            return;
+        }
+
+        if (!kv_pressure_runtime.sample_due(server_kv_pressure_runtime::clock::now())) {
+            return;
+        }
+
+        kv_pressure_sampler_owner->sample();
+        const auto event = kv_pressure_runtime.record_sample(
+                server_kv_pressure_runtime::clock::now(), idle, kv_pressure_sampler_owner->telemetry());
+        if (event.should_log()) {
+            const std::string marker = server_kv_pressure_format_marker(event);
+            SRV_INF("%s\n", marker.c_str());
+        }
+    }
+#endif
+
     // unlike load_model(), this is only called once during initialization
     bool init() {
         GGML_ASSERT(ctx_tgt   != nullptr);
         GGML_ASSERT(model_tgt != nullptr);
 
         GGML_ASSERT(!sleeping);
+
+#if defined(__linux__)
+        init_kv_pressure_sampler();
+#endif
 
         // wiring up server queues
         queue_tasks.on_new_task([this](server_task && task) {
@@ -2216,22 +2295,23 @@ private:
     }
 
     void update_slots() {
-        // check if all slots are idle
-        {
-            bool all_idle = true;
-
-            for (auto & slot : slots) {
-                if (slot.is_processing()) {
-                    all_idle = false;
-                    break;
-                }
+        bool all_idle = true;
+        for (auto & slot : slots) {
+            if (slot.is_processing()) {
+                all_idle = false;
+                break;
             }
+        }
 
-            if (all_idle) {
-                SRV_INF("%s", "all slots are idle\n");
+#if defined(__linux__)
+        // The server queue invokes update_slots() on its single scheduler owner.
+        // Keep pressure sampling here, before the idle early return, and telemetry-only.
+        maybe_sample_kv_pressure(all_idle);
+#endif
 
-                return;
-            }
+        if (all_idle) {
+            SRV_INF("%s", "all slots are idle\n");
+            return;
         }
 
         {

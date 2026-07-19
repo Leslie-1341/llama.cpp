@@ -201,6 +201,12 @@ if (UNIX)
     llama_build_and_test(test-kv-paged-identity-fast-path.cpp)
     llama_build_and_test(test-kv-paged-release-ownership.cpp)
     llama_build_and_test(test-kv-pressure-sampler.cpp)
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        llama_build_and_test(test-server-kv-pressure.cpp ${PROJECT_SOURCE_DIR}/tools/server/server-kv-pressure.cpp)
+        target_include_directories(test-server-kv-pressure PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/src)
+        llama_test_cmd(python3 NAME test-server-kv-pressure-static
+            ARGS ${PROJECT_SOURCE_DIR}/tests/test-server-kv-pressure-static.py LABEL python)
+    endif()
 endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)

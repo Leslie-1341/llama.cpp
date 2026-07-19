@@ -93,14 +93,32 @@ static bool parse_env_uint64(const char * name, uint64_t default_val, uint64_t &
     return true;
 }
 
-// ── state / source names ────────────────────────────────────────────────────
+// ── public environment / name helpers ───────────────────────────────────────
 
-const char * kv_pressure_sampler::state_name(kv_pressure_state s) {
-    switch (s) {
+kv_pressure_enablement kv_pressure_sampler_environment_enablement() {
+    bool enabled = false;
+    if (!parse_env_bool("LLAMA_KV_PRESSURE_SAMPLER", false, enabled)) {
+        return kv_pressure_enablement::KV_PRESSURE_ENABLEMENT_INVALID;
+    }
+    return enabled ? kv_pressure_enablement::KV_PRESSURE_ENABLEMENT_ENABLED : kv_pressure_enablement::KV_PRESSURE_ENABLEMENT_DISABLED;
+}
+
+const char * kv_pressure_state_name(kv_pressure_state state) {
+    switch (state) {
         case kv_pressure_state::NORMAL:    return "NORMAL";
         case kv_pressure_state::PRESSURE:  return "PRESSURE";
         case kv_pressure_state::CRITICAL:  return "CRITICAL";
         case kv_pressure_state::RECOVERY:  return "RECOVERY";
+    }
+    return "UNKNOWN";
+}
+
+const char * kv_pressure_source_name(kv_pressure_source source) {
+    switch (source) {
+        case kv_pressure_source::NONE:            return "NONE";
+        case kv_pressure_source::CGROUP_RATIO:    return "CGROUP_RATIO";
+        case kv_pressure_source::RSS_ABSOLUTE:    return "RSS_ABSOLUTE";
+        case kv_pressure_source::CGROUP_ABSOLUTE: return "CGROUP_ABSOLUTE";
     }
     return "UNKNOWN";
 }
@@ -752,15 +770,18 @@ kv_pressure_sampler::kv_pressure_sampler(const kv_pressure_paths & paths)
 kv_pressure_sampler::~kv_pressure_sampler() = default;
 
 bool kv_pressure_sampler::init() {
-    bool enabled = false;
-    if (!parse_env_bool("LLAMA_KV_PRESSURE_SAMPLER", false, enabled)) {
+    return init(kv_pressure_sampler_environment_enablement());
+}
+
+bool kv_pressure_sampler::init(kv_pressure_enablement enablement) {
+    if (enablement == kv_pressure_enablement::KV_PRESSURE_ENABLEMENT_INVALID) {
         config_.enabled = false;
         config_valid_ = false;
         telemetry_.config_valid = false;
         disable_transitions("LLAMA_KV_PRESSURE_SAMPLER is not a complete boolean");
         return false;
     }
-    config_.enabled = enabled;
+    config_.enabled = enablement == kv_pressure_enablement::KV_PRESSURE_ENABLEMENT_ENABLED;
 
     if (!config_.enabled) {
         telemetry_.enabled = false;
@@ -835,8 +856,8 @@ void kv_pressure_sampler::set_state(kv_pressure_state new_state, const char * re
         int written = std::snprintf(telemetry_.transition_reason,
                                      sizeof(telemetry_.transition_reason),
                                      "%s→%s: %s",
-                                     state_name(telemetry_.previous_state),
-                                     state_name(new_state),
+                                     kv_pressure_state_name(telemetry_.previous_state),
+                                     kv_pressure_state_name(new_state),
                                      reason);
         if (written < 0 || (size_t) written >= sizeof(telemetry_.transition_reason)) {
             telemetry_.transition_reason[sizeof(telemetry_.transition_reason) - 1] = '\0';
@@ -846,7 +867,7 @@ void kv_pressure_sampler::set_state(kv_pressure_state new_state, const char * re
         std::snprintf(telemetry_.transition_reason,
                       sizeof(telemetry_.transition_reason),
                       "%s (no change): %s",
-                      state_name(telemetry_.state),
+                      kv_pressure_state_name(telemetry_.state),
                       reason);
     }
 }

@@ -25,6 +25,10 @@ endif()
 
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_sources(${TARGET} PRIVATE server-kv-pressure.cpp server-kv-pressure.h)
+    target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/src)
+endif()
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
 
 # llama-server-impl: server logic, reusable by app

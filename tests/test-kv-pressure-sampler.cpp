@@ -206,6 +206,7 @@ static void test_default_off() {
     // Without LLAMA_KV_PRESSURE_SAMPLER env, init() should return false
     // and sample() should return NORMAL with telemetry showing enabled=false.
     unsetenv("LLAMA_KV_PRESSURE_SAMPLER");
+    CHECK(kv_pressure_sampler_environment_enablement() == kv_pressure_enablement::KV_PRESSURE_ENABLEMENT_DISABLED);
     kv_pressure_sampler s;
     CHECK(!s.init());            // returns false when env not set
     CHECK(!s.enabled());
@@ -218,6 +219,7 @@ static void test_default_off() {
 
     // Also test with explicit disable
     setenv("LLAMA_KV_PRESSURE_SAMPLER", "0", 1);
+    CHECK(kv_pressure_sampler_environment_enablement() == kv_pressure_enablement::KV_PRESSURE_ENABLEMENT_DISABLED);
     kv_pressure_sampler s2;
     CHECK(!s2.init());
     CHECK(!s2.enabled());

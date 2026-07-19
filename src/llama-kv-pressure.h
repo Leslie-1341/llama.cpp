@@ -58,6 +58,19 @@ enum class kv_pressure_source : uint8_t {
     CGROUP_ABSOLUTE = 3,
 };
 
+enum class kv_pressure_enablement : uint8_t {
+    KV_PRESSURE_ENABLEMENT_DISABLED = 0,
+    KV_PRESSURE_ENABLEMENT_ENABLED  = 1,
+    KV_PRESSURE_ENABLEMENT_INVALID  = 2,
+};
+
+// Read only the existing master switch. This does not initialize the sampler
+// or open procfs/cgroup files.
+kv_pressure_enablement kv_pressure_sampler_environment_enablement();
+
+const char * kv_pressure_state_name(kv_pressure_state state);
+const char * kv_pressure_source_name(kv_pressure_source source);
+
 struct kv_pressure_telemetry {
     bool                enabled          = false;
     kv_pressure_source  source           = kv_pressure_source::NONE;
@@ -127,6 +140,10 @@ public:
     // unavailable/ambiguous cgroups disable transitions and record a reason;
     // telemetry may remain enabled.
     bool init();
+
+    // Initialize from a previously parsed master-switch snapshot. This keeps a
+    // single server initialization decision while preserving init() for other callers.
+    bool init(kv_pressure_enablement enablement);
 
     // Take a real pressure sample from /proc and cgroup, evaluate the state machine.
     // Returns the current state after the sample.
@@ -235,5 +252,4 @@ private:
     static void saturating_increment(uint32_t & value);
 
     static uint64_t get_time_ns();
-    static const char * state_name(kv_pressure_state s);
 };
