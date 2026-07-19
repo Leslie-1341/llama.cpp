@@ -293,10 +293,10 @@ idle/resume workload 中，不再被任何 sequence 引用的 block（dead）或
 
 ## D-0009 — 压力采样与 reclaim 解耦，先做单 owner 限频只读 server 集成
 
-- Date: 2026-07-18
-- Status: accepted
-- Evidence commit/worktree: sampler-only `befd7a8944f44528cc6a44d1968114fc1294c326`（clean）；输入 probe `3b2502ca6f0d202f380b7efbcc8b18fe8f86e059`
-- Supersedes: D-0008 中“尚无真实压力采样”的阶段状态；不改变 D-0008 的 release correctness 契约
+- Date: 2026-07-18（决策入账）；2026-07-19（server 集成与验证协议提交）
+- Status: accepted；server 集成（`6f59f66b6`）与验证协议（`297eed939`）已提交
+- Evidence commit/worktree: 当前 HEAD `297eed939bb830ee85d426e54b67f78322955044`（clean）；sampler-only `befd7a894`；输入 probe `3b2502ca6`
+- Supersedes: D-0008 中”尚无真实压力采样”的阶段状态；不改变 D-0008 的 release correctness 契约
 - Superseded by: none
 
 **Context**
@@ -322,7 +322,7 @@ Stage 3A-0 已验证 destructive release 的 ownership、事务和 fail-closed �
 
 - 收益：把输入正确性、状态行为、运行时开销和 reclaim 副作用拆成可独立验收的门禁；单 owner 避免当前非线程安全 counters/state 被并发推进。
 - 代价：在只读阶段不会释放内存；需要维护 snapshot 发布与采样节流，压力变化的检测延迟受采样周期约束。
-- 当前实现状态：决策 1 和默认关闭已由 sampler-only 源码实现；决策 2–4 是下一阶段 server 集成约束，尚未实现和验证。
+- 当前实现状态：决策全部五项已由源码实现——1（sampler 与 reclaim 解耦）在 `befd7a894`；2–4（只读 server 集成、单 owner、限频）在 `6f59f66b6`；5（默认关闭）贯穿全部提交。验证协议（`297eed939`）已提交 runner/parser/合成负例但尚未在真实模型下运行。
 - 失效条件：若后续 server 架构要求多 owner 或异步 sampler，必须先定义线程安全、clock、snapshot 一致性和重复采样去重契约，再以新决策 supersede 本条。
 
 **Evidence**
@@ -330,4 +330,9 @@ Stage 3A-0 已验证 destructive release 的 ownership、事务和 fail-closed �
 - `src/llama-kv-pressure.h`：明确 sampler-only、默认关闭、无 reclaim，并定义 NORMAL/PRESSURE/CRITICAL/RECOVERY 与 telemetry。
 - `src/llama-kv-pressure.cpp`：直接文件读取、source fail-closed、stale、滞回、cooldown、PSI upgrade 和 source/basis 切换计数隔离。
 - `tests/test-kv-pressure-sampler.cpp`：864 assertions 的 fixture/synthetic 覆盖；提交摘要记录 ASan/UBSan 与 sampler-only strict warning build 通过。
-- 当前源码搜索仅发现 `src/CMakeLists.txt` 和 sampler 单测引用该组件；server/context/decode/reclaim 无调用点。
+- `tools/server/server-kv-pressure.h`：`server_kv_pressure_runtime` 单 owner runtime——sample_due 限频、record_sample 事件发布、enable/disable lifecycle、无 thread/mutex。
+- `tools/server/server-kv-pressure.cpp`：cadence config 解析（最小 100ms 采样/1s 日志）、deadline 推进、should_log() trigger 判定、结构化 marker 格式。
+- `tools/server/server-context.cpp`：`init_kv_pressure_sampler()` master switch + fail-closed init、`maybe_sample_kv_pressure()` telemetry-only 调用、`handle_sleeping_state()` sleep/resume 重建、`#if defined(__linux__)` 条件编译。
+- `tests/test-server-kv-pressure.cpp`：9 C++ 集成测试通过。
+- `tests/test-server-kv-pressure-static.py`：6 静态集成检查通过（single owner、no reclaim calls、no thread/lock、marker fields、master switch preflight、sleep/resume reset）。
+- `scripts/run-server-kv-pressure-stage3a-1c.py`、`scripts/parse-server-kv-pressure-stage3a-1c.py`、`tests/test-server-kv-pressure-stage3a-1c-parser.py`：9 合成负例通过、py_compile 通过。

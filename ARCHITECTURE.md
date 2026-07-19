@@ -2,16 +2,16 @@
 
 > 记录当前源码可验证的稳定结构。讨论方案必须标记为 proposed，不得混入已实现架构。
 
-- Last verified: 2026-07-18
-- Evidence commit: `befd7a8944f44528cc6a44d1968114fc1294c326`
-- Verification scope: 当前源码、Git history、pressure sampler 单测与提交绑定验证摘要；本轮未运行构建、测试或实验
+- Last verified: 2026-07-19
+- Evidence commit: `297eed939bb830ee85d426e54b67f78322955044`
+- Verification scope: 当前源码、Git history、server pressure telemetry 集成 diff 与测试注册；本轮未运行构建、测试或实验
 
 ## System Boundary
 
-- 基础系统为 `llama.cpp` / `ggml`。项目扩展位于模型加载、CPU weight-stream callback、KV cache、attention graph 输入和独立 example/runner 层。
+- 基础系统为 `llama.cpp` / `ggml`。项目扩展位于模型加载、CPU weight-stream callback、KV cache、attention graph 输入、server scheduler 和独立 example/runner 层。
 - 当前已核对路径主要面向 Linux CPU/host memory。KV paged 路径要求 `n_stream == 1 && !v_trans`；`madvise`/`mincore` 不适用于 GPU device memory。
 - Dense Flex、MoE-Buffer/CLG、lazy KV、paged KV、destructive release 和 pressure sampler 均由环境变量显式启用；普通未配置路径不主动进入这些实验机制。
-- Pressure sampler 当前是编入 `llama` 库的独立 Linux 组件，仅有单元测试调用；server、context、decode 和 KV reclaim 路径尚无生产调用点。
+- Pressure sampler 已编入 `llama` 库，并在 server scheduler 的 `update_slots()` 中以单 owner、限频、telemetry-only 方式接入；server runtime 不连接 reclaim、swap、prefetch 或 bounded-store。
 
 ## Runtime Data Flow
 
@@ -78,7 +78,44 @@ PENDING_WRITE transaction (reuse allocation 写入新 K/V):
     -> push to free list
 ```
 
-### Pressure sampler-only 路径
+### Pressure sampler → server telemetry 路径
+
+```text
+server init:
+  -> kv_pressure_sampler_environment_enablement()  [master switch]
+  -> server_kv_pressure_config_from_env()           [cadence config]
+  -> kv_pressure_sampler::init(enablement)           [source 解析、cgroup 路径]
+  -> server_kv_pressure_runtime::enable(config)      [重置 counters/deadlines/state]
+
+server sleep:
+  -> kv_pressure_sampler_owner.reset()               [destroy sampler]
+  -> kv_pressure_runtime.disable()                   [清除 state/deadlines]
+
+server resume:
+  -> init_kv_pressure_sampler()                      [全新 lifecycle]
+
+server update_slots() — single-threaded scheduler owner:
+  -> maybe_sample_kv_pressure(all_idle)
+     if (!sampler_owner) return;
+     if (!runtime.sample_due(now)) { skip_count++; return; }
+     -> sampler_owner->sample()
+        -> read selected primary source (RSS_ABSOLUTE / CGROUP_ABSOLUTE / CGROUP_RATIO)
+        -> read telemetry-only PSI
+        -> evaluate NORMAL/PRESSURE/CRITICAL/RECOVERY
+     -> runtime.record_sample(now, idle, sampler_owner->telemetry())
+        -> publish server_kv_pressure_event (first/change/periodic triggers)
+     -> if event.should_log(): SRV_INF marker
+  -X no reclaim / swap / prefetch / bounded-store action
+```
+
+- Server 在 `update_slots()` 的单线程 owner 上下文中调用 `maybe_sample_kv_pressure()`；不创建 background thread、不持有 mutex。
+- `sample_due()` 按可配置间隔（默认 250ms，最小 100ms）限频；skip 计数递增在 telemetry marker 的 `skip_count` 字段可见。
+- `maybe_sample_kv_pressure()` 在 idle 检查之前调用，但 idle 标记不影响 `sample_due()` 的时间门控——idle 不绕过限频、不持续采样。
+- sleep 时 sampler 与 runtime 完全销毁；resume 后从 `init_kv_pressure_sampler()` 重建，不跨 sleep 携带 pressure state、transition counters 或 sampling deadline。
+- 日志 marker 格式为 `kv_pressure_telemetry state=... source=... stale=... rss_kb=... sample_count=... skip_count=... idle=... trigger=...`，字段固定、结构化、fail-closed。
+- **压力状态与 KV block 操作完全解耦**：`maybe_sample_kv_pressure()` 不调用 `paged_release_blocks()`、swap、prefetch 或 madvise；6 静态集成检查与 9 parser 合成负例均验证此约束。
+
+### Sampler-only 核心路径（`llama` 库内）
 
 ```text
 LLAMA_KV_PRESSURE_SAMPLER=1 + validated thresholds
@@ -137,7 +174,28 @@ graph cache reuse
 3. **stale 不自动降级**：选中 source 读取失败时立即标记 stale，清空 pressure/low-water/PSI 连续计数，保持原状态。
 4. **PSI 不是独立 destructive trigger**：PSI 只在主 source 仍高于 pressure 且状态已为 PRESSURE 时，经过连续样本升级到 CRITICAL；PSI 单独升高不改变 NORMAL。
 5. **source/basis 切换隔离生命周期**：source、阈值、cgroup unlimited 标志或 ratio maximum 改变时重置累计计数；PSI 升级计数也只属于一次连续 PRESSURE 生命周期。
-6. **默认关闭且 sampler-only**：`LLAMA_KV_PRESSURE_SAMPLER` 未显式启用时 `sample()` 返回 NORMAL；状态机不拥有或调用 reclaim。
+6. **默认关闭且 sampler/telemetry-only**：`LLAMA_KV_PRESSURE_SAMPLER` 未显式启用时 `sample()` 返回 NORMAL；server runtime 不创建 sampler。状态机不拥有或调用 reclaim。
+
+## Server Pressure Runtime State Machine
+
+### server_kv_pressure_runtime lifecycle
+
+| 事件 | 行为 |
+|------|------|
+| `enable(config)` | 重置 enabled=true, sample_count=0, skip_count=0, next_sample_=epoch, last_log_=epoch, last_state_=NORMAL, last_source_=NONE, last_stale_=false |
+| `disable()` | enabled=false, 清空所有 counters/deadlines/state 快照 |
+| `sample_due(now)` | enabled=false → false；首次调用 → true；now < next_sample_ → skip_count++ & false；否则 → true |
+| `record_sample(now, idle, telemetry)` | sample_count++，计算 first_sample/state_changed/source_changed/stale_changed/periodic，刷新 next_sample_ 和 last_* 快照，可能刷新 last_log_ |
+
+### Logging triggers (`should_log()`)
+
+- `first_sample`：首个样本
+- `state_changed`：状态转换（NORMAL↔PRESSURE↔CRITICAL↔RECOVERY）
+- `source_changed`：主 source 切换
+- `stale_changed`：stale 标记变化
+- `periodic`：距上次 log ≥ `log_interval`（默认 60s，最小 1s）
+
+不满足任一 trigger 时，sample 仍完成但不输出 marker；skip 和 sample 计数在下一个 triggered marker 中累积报告。
 
 ## KV Cache Block State Machine
 
@@ -179,8 +237,15 @@ graph cache reuse
 - `src/llama-kv-cache.*`：KV cell/block metadata、backing store、swap/madvise/restore/prefetch、**destructive release 状态机、ownership 收集、事务提交/回滚、dummy redirect**、错误状态和 telemetry。
 - `src/llama-kv-cache-release.h`：release 准入门禁（`llama_kv_destructive_release_can_enable`）与 ownership 收集（`llama_kv_release_collect_ownership`），与核心 KV 实现分离以便静态审计。
 - `src/llama-kv-pressure.*`：Linux RSS/cgroup/PSI 直接读取、严格解析、cgroup v1/v2 路径解析、source 选择、stale 处理、四态状态机和结构化 telemetry；不包含 reclaim policy 或 KV block 操作。
-- `scripts/probe-pressure-inputs.sh`、`tests/test-probe-pressure-inputs.sh`：Stage 3A-1A 只读输入探测与静态回归，不是运行时采样器调用链。
+- `tools/server/server-kv-pressure.*`：**server-side pressure runtime**——`server_kv_pressure_runtime` 管理 sampling deadline、skip/event 计数、状态快照和结构化 marker 输出；不包含 procfs 读取或状态转换逻辑。
+- `tools/server/server-context.cpp`：**single-threaded scheduler owner**——`maybe_sample_kv_pressure()` 在 `update_slots()` 中调用，`init_kv_pressure_sampler()` 在 server init 和 resume 中创建 sampler lifecycle，`handle_sleeping_state()` 在 sleep 时销毁。
+- `scripts/probe-pressure-inputs.sh`、`tests/test-probe-pressure-inputs.sh`：Stage 3A-1A 只读输入探测与静态回归，不是运行时 sampler 调用链。
 - `tests/test-kv-pressure-sampler.cpp`：fixture/synthetic 状态机、解析、source 切换、stale、溢出与 cgroup 路径回归。
+- `tests/test-server-kv-pressure.cpp`：server runtime（9 C++ 测试）——default-off、interval config、rate-limit、idle path、first/critical/stale logging、change/periodic、deadline overflow、lifecycle reset、marker fields、init failure stays disabled。
+- `tests/test-server-kv-pressure-static.py`：6 静态集成检查——single owner、no reclaim calls、no thread/lock、marker fields、master switch preflight、sleep/resume lifecycle reset。
+- `scripts/run-server-kv-pressure-stage3a-1c.py`：10-case server validation runner（OFF/ON A/B rounds、lifecycle、idle_limit、strace OFF/ON），含 bounded process cleanup 与 SIGKILL 兜底。
+- `scripts/parse-server-kv-pressure-stage3a-1c.py`：fail-closed artifact parser，验证 identity drift、case 完整性、SSE/metrics 一致性、strace 归因和 structured action marker 禁止。
+- `tests/test-server-kv-pressure-stage3a-1c-parser.py`：9 parser 合成负例——valid artifact、trigger duplicates、SSE malformation、case set checksum、identity drift、OFF telemetry ban、timeout/residual、order/strace/idle boundary、no-mutation chain。
 - `src/llama-graph.cpp`：构造并填充 paged row index，将其传给 K/V attention 读取路径；**dummy row redirect 在此层发生**。
 - `src/llama-context.cpp`、`src/llama-memory.h`：memory-level experimental hook 与 paged 错误向 decode/graph 状态的传播。
 - `examples/kv-*`：构造 idle/resume/trace workload 和上层策略信号；不拥有 core swap/release 状态机。
@@ -194,13 +259,21 @@ graph cache reuse
 - KV graph input 在 `llama-graph.cpp` 调用 `build_input_paged_row_idx()` / `set_input_paged_row_idx()`，attention 的 `get_k()`/`get_v()` 接收 row index；**dummy redirect 在 row-index fill 中发生**。
 - 上层通过 `prefetch_seq()` / `prefetch_seq_step()` 等 memory hook 表达 resume 预取。
 - **Release 在 idle/resume boundary 由 example driver 调用**；core 不自动触发 release。
-- Pressure sampler 已通过 `src/CMakeLists.txt` 编入 `llama` library，但当前仅 `tests/test-kv-pressure-sampler.cpp` 实例化；server runtime 尚未集成。下一门禁是单 owner、限频、只读 telemetry 接入，不连接 reclaim。
+- **Pressure sampler → server telemetry 集成点**：
+  - Server init: `init_kv_pressure_sampler()` 在 `server_context::init()` 末尾调用。
+  - Server scheduler: `maybe_sample_kv_pressure(all_idle)` 在 `update_slots()` 中、idle 检查前调用。
+  - Server sleep: `handle_sleeping_state(true)` 中 `kv_pressure_sampler_owner.reset()` + `kv_pressure_runtime.disable()`。
+  - Server resume: `handle_sleeping_state(false)` 中 `init_kv_pressure_sampler()` 重建。
+  - 调用侧为 `#if defined(__linux__)` 条件编译；非 Linux 平台无压力采样代码路径。
 
 ## Invariants and Error Propagation
 
 - 默认关闭：未显式设置相关环境变量时，不启用 Flex/MoE/CLG/paged swap/madvise/release/prefetch/pressure sampler。
 - Pressure sampler 配置、cgroup 路径或 selected source 无效时 transition fail-closed；telemetry 可保持 enabled，但 source 为 NONE，状态不得据此驱动 reclaim。
-- Pressure state 与 KV block state 当前完全解耦；不存在 NORMAL/PRESSURE/CRITICAL/RECOVERY → `paged_release_blocks()` 的自动边。
+- **Pressure state 与 KV block state 当前完全解耦**：不存在 NORMAL/PRESSURE/CRITICAL/RECOVERY → `paged_release_blocks()` 的自动边。server runtime 仅输出结构化 telemetry marker，不调用任何 KV mutation。
+- **Server owner 为单线程**：`update_slots()` 由 server queue 的单线程 scheduler 调用；`kv_pressure_sampler_owner` 和 `kv_pressure_runtime` 仅在此上下文中被访问，无 mutex 或 background thread。
+- **Sleep/resume 隔离**：sleep 时 sampler 销毁、runtime 清零；resume 时全新初始化，不继承旧 pressure state、transition counters、sampling deadlines 或 stale 状态。
+- **Idle 不绕过限频**：`maybe_sample_kv_pressure()` 在 idle 检查前调用，但 `sample_due()` 的时间门控与 idle 标记独立；idle 期间不持续读取 procfs/cgroup。
 - backing store 容量固定为物理 KV cell 数乘每 cell 全层 K/V stride。
 - paged block 写入整块成功后才发布 offsets 和 `SWAPPED`；失败时清除待发布 metadata，block 保持可重试状态。
 - swap-in 先读入 staging，再提交 tensor 与 `RESIDENT` 状态；active 必需的恢复失败记录 context-local error，并在 graph compute 前失败返回。
@@ -208,14 +281,15 @@ graph cache reuse
 - PENDING_WRITE 事务：commit 后 block 为 RESIDENT；rollback 后 block 为 RELEASED 并回收至 free list。不在中间态遗留。
 - Release 过程中不跳过任何 RESIDENT block 的 madvise；只有 owned、RELEASED 和 SWAPPED block 被跳过。
 - R0–R5/N0–N2 artifact 必须与 `RUN_PLAN=(R0 R1 R2 R3 R4 R5 N0 N1 N2)` 精确一致；parser 对 contract marker、安全字段、机制触发和最终 `PASS` 状态 fail-closed。
+- Stage 3A-1C validation protocol parser 对 manifest identity drift、case 缺失/额外、SSE 格式错误、OFF variant 出现 telemetry marker、structured action marker、timeout、residual process、case 顺序/端口重复和 strace 归因均 fail-closed。
 - Identity fast-path eligibility is immutable for a constructed context；graph reuse 必须 preserve topology。
 - **Release 是 correctness 机制，不是压力调度策略**。当前证据验证的是选择性（不误伤）、事务原子性和互斥门禁；不覆盖回收时机、并发 request interference 或与 swap 的融合调度。
 
 ## Modification Boundaries
 
 - core 提供 block state、I/O、madvise、restore、prefetch、release 与诊断机制；session lifecycle、release timing、pressure policy 保持在 server/application/example 层。
-- `kv_pressure_sampler` 只提供输入采样、状态判定和 telemetry，不得在该组件内直接调用 destructive release；bounded reclaim 的预算、候选集、频率和生命周期 owner 属于后续 server policy。
-- 下一阶段 server 接入必须保持单线程 owner 与调用侧限频，避免多个 request 线程并发推进同一 sampler 的 counters/state，也避免 per-token/per-layer 文件读取；这些是已接受但尚未实现的集成约束。
+- `kv_pressure_sampler` 只提供输入采样、状态判定和 telemetry；不得在该组件内直接调用 destructive release。server runtime (`server-kv-pressure.*`) 只管理 sampling cadence、event 发布和 marker 输出；同样不得调用 reclaim。
+- bounded reclaim 的预算、候选集、频率和生命周期 owner 属于后续 server policy，当前尚未实现。
 - 修改 `paged_block_state` 枚举或状态转换时必须同步核对：ownership collection、dummy redirect、事务提交/回滚、swap gate 和 release gate。
 - 任何可能改变 post-construction mapping/residency 的新机制必须与 release 的 ownership gate 互斥或提供经证明的失效契约。
 - 不应把 release correctness 协议结果描述为压力调度性能结论。
@@ -227,8 +301,9 @@ graph cache reuse
 - KV prefetch 由上层分步触发，不是独立异步恢复线程；真实 server queue/continuous batching 尚未接入。
 - 权重侧 Flex 与 MoE-Buffer 是分离路径，不是统一 shared weight/KV I/O budget scheduler。
 - Release 当前只在 example driver 的 idle/resume boundary 调用；pressure sampler 与 release 没有连接。
+- **Server telemetry 集成尚未在真实模型下运行**：当前证据为合成测试（9 C++ 集成、6 静态检查、9 parser 负例）和 py_compile 通过；无真实 procfs/cgroup 读取证据、无 strace 观测、无 TTFT/TPOT/吞吐/p95/p99 时延测量。
+- Stage 3A-1C validation protocol 的 10-case 矩阵使用 1/2/3 KiB RSS 阈值，仅为 state lifecycle forced validation，不代表部署推荐值或经验性压力限制。
 - 尚未验证真实模型/server 请求下的四态转换、source 动态切换与 stale 恢复；当前状态机证据来自 synthetic/fixture 单测。
-- 尚未验证 server 集成后的采样开销与 TTFT/TPOT/吞吐/p95/p99；probe 的文件读取结果不能替代运行时端到端时延。
 - bounded reclaim 尚未实现，无法确认 PRESSURE/CRITICAL 下的回收预算、RSS 降幅、live/shared 安全性或并发干扰。
 - 当前 release 证据覆盖单机 CPU、Llama-3-8B Q4_K_M、ctx 1024、parallel 4、固定 idle/resume workload。不覆盖多模型、长上下文、server/continuous batching 或不同 backend/layout。
 - 历史 README 中的性能数字缺少仓库内原始 artifacts 与 commit/worktree 绑定，目前无法确认其对当前 HEAD 的适用性。
