@@ -148,6 +148,9 @@ class Fixture:
         if spec["kind"] == "idle_limit":
             env.update({"LLAMA_KV_PRESSURE_SAMPLE_INTERVAL_MS": "250",
                         "LLAMA_KV_PRESSURE_LOG_INTERVAL_MS": "1000"})
+        if spec["kind"] == "strace":
+            env.update({"LLAMA_KV_PRESSURE_SAMPLE_INTERVAL_MS": "250",
+                        "LLAMA_KV_PRESSURE_LOG_INTERVAL_MS": "60000"})
         sleep = "2" if spec["kind"] == "lifecycle" else "-1"
         case_index = next(index for index, item in enumerate(PLAN) if item[0] == spec["name"])
         port = 12000 + case_index
@@ -193,10 +196,16 @@ class Fixture:
             size = (directory / "server.stderr").stat().st_size
             dump(directory / "idle_window.json", {"duration_ms": 1500.0, "stderr_start": size, "stderr_end": size})
         if spec["kind"] == "strace":
+            attach_ns = (case_index + 1) * 1_000_000_000 + 500_000_000
+            completion_ns = attach_ns + 500_000_000  # 500 ms ≥ 250 ms sample period
             dump(directory / "strace_process.json", {
                 "argv": ["/usr/bin/strace", "-ff", "-qq", "-yy", "-s", "4096",
                          "-e", "trace=openat,read,close", "-o", "strace", "-p", "123"],
                 "attached_to_pid": 123, "attach_after_health": True,
+                "attach_monotonic_ns": attach_ns,
+                "completion_start_monotonic_ns": completion_ns,
+                "post_attach_wait_requested_ms": 500,
+                "post_attach_wait_actual_ms": 500.0,
                 "shutdown_requested": True, "returncode": 0, "residual_process": False,
             })
             if spec["variant"] == "ON":
@@ -505,6 +514,86 @@ class ParserSyntheticTest(unittest.TestCase):
 
         for name, mutation in (("missing", no_startup_first), ("late", late_startup_first),
                                ("duplicate", duplicate_startup_first)):
+            with self.subTest(name=name):
+                self.assert_rejected(mutation)
+
+    def test_strace_wait_missing_insufficient_interval_and_timestamp_negatives_fail_closed(self) -> None:
+        """Attach→completion observation window must be ≥ sample period with bounded wait."""
+        def wait_missing(f):
+            path = f.artifact / "cases/strace_on_correctness/strace_process.json"
+            value = json.loads(path.read_text())
+            del value["post_attach_wait_requested_ms"]; del value["post_attach_wait_actual_ms"]
+            dump(path, value)
+        def wait_too_short(f):
+            path = f.artifact / "cases/strace_on_correctness/strace_process.json"
+            value = json.loads(path.read_text())
+            value["post_attach_wait_requested_ms"] = 200  # below 500 ms minimum
+            value["post_attach_wait_actual_ms"] = 200.0
+            dump(path, value)
+        def actual_below_95pct(f):
+            path = f.artifact / "cases/strace_on_correctness/strace_process.json"
+            value = json.loads(path.read_text())
+            value["post_attach_wait_requested_ms"] = 500
+            value["post_attach_wait_actual_ms"] = 450.0  # 90% < 95% tolerance floor
+            dump(path, value)
+        def attach_timestamp_missing(f):
+            path = f.artifact / "cases/strace_on_correctness/strace_process.json"
+            value = json.loads(path.read_text())
+            del value["attach_monotonic_ns"]
+            dump(path, value)
+        def completion_timestamp_missing(f):
+            path = f.artifact / "cases/strace_on_correctness/strace_process.json"
+            value = json.loads(path.read_text())
+            del value["completion_start_monotonic_ns"]
+            dump(path, value)
+        def interval_non_positive(f):
+            path = f.artifact / "cases/strace_on_correctness/strace_process.json"
+            value = json.loads(path.read_text())
+            value["completion_start_monotonic_ns"] = value["attach_monotonic_ns"]  # zero
+            dump(path, value)
+        def interval_below_sample_period(f):
+            path = f.artifact / "cases/strace_on_correctness/strace_process.json"
+            value = json.loads(path.read_text())
+            # sample period = 250 ms; set completion 100 ms after attach
+            value["completion_start_monotonic_ns"] = value["attach_monotonic_ns"] + 100_000_000
+            dump(path, value)
+        cases = (
+            ("wait_missing", wait_missing), ("wait_too_short", wait_too_short),
+            ("actual_below_95pct", actual_below_95pct),
+            ("attach_timestamp", attach_timestamp_missing),
+            ("completion_timestamp", completion_timestamp_missing),
+            ("interval_zero", interval_non_positive),
+            ("interval_short", interval_below_sample_period),
+        )
+        for name, mutation in cases:
+            with self.subTest(name=name):
+                self.assert_rejected(mutation)
+
+    def test_strace_off_on_environment_not_single_switch_fail_closed(self) -> None:
+        """Strace OFF/ON must differ only by LLAMA_KV_PRESSURE_SAMPLER."""
+        def interval_mismatch(f):
+            path = f.artifact / "cases/strace_on_correctness/execution.json"
+            value = json.loads(path.read_text())
+            on_env = dict(value["env"])
+            on_env["LLAMA_KV_PRESSURE_SAMPLE_INTERVAL_MS"] = "999"
+            value["env"] = on_env
+            dump(path, value)
+            # also fix environment.json so it matches execution.json
+            dump(f.artifact / "cases/strace_on_correctness/environment.json", on_env)
+            # and fix strace_process.json timestamps to still pass the per-case check
+            sp = f.artifact / "cases/strace_on_correctness/strace_process.json"
+            spv = json.loads(sp.read_text())
+            spv["completion_start_monotonic_ns"] = spv["attach_monotonic_ns"] + 1_000_000_000
+            dump(sp, spv)
+        def log_interval_mismatch(f):
+            path = f.artifact / "cases/strace_off_correctness/execution.json"
+            value = json.loads(path.read_text())
+            off_env = dict(value["env"])
+            off_env["LLAMA_KV_PRESSURE_LOG_INTERVAL_MS"] = "99999"
+            value["env"] = off_env
+            dump(path, value)
+            dump(f.artifact / "cases/strace_off_correctness/environment.json", off_env)
+        for name, mutation in (("interval", interval_mismatch), ("log", log_interval_mismatch)):
             with self.subTest(name=name):
                 self.assert_rejected(mutation)
 

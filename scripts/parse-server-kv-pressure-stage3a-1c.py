@@ -495,6 +495,39 @@ def verify_strace(case_dir: pathlib.Path, variant: str, server_pid: int) -> dict
             info.get("shutdown_requested") is not True or info.get("returncode") not in {0, -signal.SIGINT} or
             info.get("residual_process") is not False):
         raise ArtifactError("strace was not an independent bounded attach-after-ready run")
+    # Validate post-attach bounded wait and attach→completion observation window.
+    env = load(case_dir / "environment.json")
+    sample_interval_s = env.get("LLAMA_KV_PRESSURE_SAMPLE_INTERVAL_MS")
+    try:
+        sample_interval_ms = int(sample_interval_s)
+    except (ValueError, TypeError):
+        raise ArtifactError("strace case lacks a valid sample interval")
+    if sample_interval_ms <= 0:
+        raise ArtifactError("strace case sample interval is not positive")
+    attach_ns = info.get("attach_monotonic_ns")
+    completion_ns = info.get("completion_start_monotonic_ns")
+    if not isinstance(attach_ns, int) or isinstance(attach_ns, bool):
+        raise ArtifactError("strace_process missing or invalid attach_monotonic_ns")
+    if not isinstance(completion_ns, int) or isinstance(completion_ns, bool):
+        raise ArtifactError("strace_process missing or invalid completion_start_monotonic_ns")
+    if completion_ns <= attach_ns:
+        raise ArtifactError("attach→completion interval is non-positive")
+    obs_ms = (completion_ns - attach_ns) / 1e6
+    if obs_ms < sample_interval_ms:
+        raise ArtifactError(
+            f"attach→completion {obs_ms:.1f} ms below sample period {sample_interval_ms} ms")
+    wait_req = info.get("post_attach_wait_requested_ms")
+    wait_act = info.get("post_attach_wait_actual_ms")
+    if not isinstance(wait_req, (int, float)) or isinstance(wait_req, bool) or wait_req < 500:
+        raise ArtifactError(
+            f"post-attach wait requested {wait_req} ms < 500 ms minimum")
+    if not isinstance(wait_act, (int, float)) or isinstance(wait_act, bool):
+        raise ArtifactError("post_attach_wait_actual_ms missing or invalid")
+    # Tolerance: actual may be slightly below requested due to OS scheduling but
+    # must stay within a reasonable margin.
+    if wait_act < max(0.0, wait_req * 0.95):
+        raise ArtifactError(
+            f"post-attach actual wait {wait_act:.1f} ms < 95% of requested {wait_req} ms")
     paths, other_reads = trace_reads(case_dir)
     if variant == "OFF":
         if paths:
@@ -507,7 +540,11 @@ def verify_strace(case_dir: pathlib.Path, variant: str, server_pid: int) -> dict
         v1 = {"memory.usage_in_bytes", "memory.limit_in_bytes", "memory.soft_limit_in_bytes"}
         if not (v2 <= names or v1 <= names):
             raise ArtifactError("ON strace lacks a complete cgroup sampler read set")
-    return {"sampler_paths": sorted(paths), "other_read_count": other_reads}
+    return {"sampler_paths": sorted(paths), "other_read_count": other_reads,
+            "attach_completion_obs_ms": round(obs_ms, 3),
+            "sample_period_ms": sample_interval_ms,
+            "post_attach_wait_requested_ms": wait_req,
+            "post_attach_wait_actual_ms": round(wait_act, 3)}
 
 
 def manifest_repo_path(root: pathlib.Path) -> str:
@@ -564,12 +601,16 @@ def verify_case(root: pathlib.Path, spec: dict[str, Any], binary: pathlib.Path,
     observed = markers(combined_log)
     if spec["variant"] == "OFF":
         expected_off = dict(ON_ENV); expected_off["LLAMA_KV_PRESSURE_SAMPLER"] = "0"
+        if spec["kind"] == "strace":
+            expected_off["LLAMA_KV_PRESSURE_SAMPLE_INTERVAL_MS"] = "250"
         if any(env.get(key) != value for key, value in expected_off.items()) or observed:
             raise ArtifactError(f"OFF case emitted telemetry: {spec['name']}")
     else:
         expected_env = dict(ON_ENV)
         if spec["kind"] == "idle_limit":
             expected_env.update({"LLAMA_KV_PRESSURE_SAMPLE_INTERVAL_MS": "250", "LLAMA_KV_PRESSURE_LOG_INTERVAL_MS": "1000"})
+        if spec["kind"] == "strace":
+            expected_env.update({"LLAMA_KV_PRESSURE_SAMPLE_INTERVAL_MS": "250", "LLAMA_KV_PRESSURE_LOG_INTERVAL_MS": "60000"})
         if any(env.get(key) != value for key, value in expected_env.items()):
             raise ArtifactError(f"ON threshold/cadence mismatch: {spec['name']}")
         if spec["kind"] == "lifecycle":
@@ -695,6 +736,15 @@ def parse(root: pathlib.Path, dry_run: bool) -> dict[str, Any]:
             return argv
         if normalized_argv(off_exec) != normalized_argv(on_exec):
             raise ArtifactError(f"round {round_no} OFF/ON startup argv mismatch")
+    # Strace pair must differ only by sampler master switch.
+    strace_off_exec = load(root / "cases/strace_off_correctness/execution.json")
+    strace_on_exec = load(root / "cases/strace_on_correctness/execution.json")
+    strace_off_env = dict(strace_off_exec["env"])
+    strace_on_env = dict(strace_on_exec["env"])
+    if (strace_off_env.pop("LLAMA_KV_PRESSURE_SAMPLER", None) != "0" or
+            strace_on_env.pop("LLAMA_KV_PRESSURE_SAMPLER", None) != "1" or
+            strace_off_env != strace_on_env):
+        raise ArtifactError("strace OFF/ON environment is not single-switch")
     return {
         "artifact_status": "VALID", "protocol": manifest["protocol"],
         "correctness": "PASS: OFF/ON, independent startup/resume lifecycles, bounded attach strace, read-only structured guards",

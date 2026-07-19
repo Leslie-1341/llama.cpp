@@ -306,6 +306,9 @@ def case_environment(variant: str, kind: str) -> dict[str, str]:
     if kind == "idle_limit":
         env["LLAMA_KV_PRESSURE_SAMPLE_INTERVAL_MS"] = "250"
         env["LLAMA_KV_PRESSURE_LOG_INTERVAL_MS"] = "1000"
+    if kind == "strace":
+        env["LLAMA_KV_PRESSURE_SAMPLE_INTERVAL_MS"] = "250"
+        env["LLAMA_KV_PRESSURE_LOG_INTERVAL_MS"] = "60000"
     return env
 
 
@@ -377,7 +380,8 @@ def attach_strace(strace: pathlib.Path, proc: subprocess.Popen[bytes], prefix: p
             if attached.poll() is not None:
                 error = (attached.stderr.read() if attached.stderr else b"").decode(errors="replace")
                 fail(f"strace attach failed: {error.strip()}")
-            return attached, {"argv": argv, "attached_to_pid": proc.pid, "attach_after_health": True}
+            return attached, {"argv": argv, "attached_to_pid": proc.pid,
+                              "attach_after_health": True, "attach_monotonic_ns": time.monotonic_ns()}
         time.sleep(0.05)
     attached.kill()
     attached.wait(timeout=deadline.remaining(1.0))
@@ -426,8 +430,22 @@ def execute_case(case_dir: pathlib.Path, spec: dict[str, Any], head: str,
             if kind == "strace":
                 trace_proc, trace_info = attach_strace(strace, proc, case_dir / "strace", deadline)
                 write_json(case_dir / "strace_process.json", trace_info)
+                # Bounded post-attach wait: ensure the sampler has at least one
+                # sample window before the request begins.  250 ms interval +
+                # 250 ms safety margin = 500 ms minimum.
+                post_wait_requested_ms = 500
+                post_wait_start_ns = time.monotonic_ns()
+                post_wait_end = time.monotonic() + post_wait_requested_ms / 1000.0
+                while time.monotonic() < post_wait_end:
+                    time.sleep(min(0.05, max(0.0, post_wait_end - time.monotonic())))
+                post_wait_actual_ns = time.monotonic_ns()
+                trace_info["post_attach_wait_requested_ms"] = post_wait_requested_ms
+                trace_info["post_attach_wait_actual_ms"] = (post_wait_actual_ns - post_wait_start_ns) / 1e6
 
             completion_ns = time.monotonic_ns()
+            if kind == "strace":
+                trace_info["completion_start_monotonic_ns"] = completion_ns
+                write_json(case_dir / "strace_process.json", trace_info)
             stderr.flush(); log_start = stderr_path.stat().st_size
             metrics = stream_completion(port, case_dir / "completion.sse",
                                         case_dir / "completion.events.json", deadline,
