@@ -427,6 +427,87 @@ class ParserSyntheticTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assert_rejected(mutation)
 
+    def test_lifecycle_startup_first_marker_before_completion_window_passes(self) -> None:
+        """Regression: lifecycle startup first marker precedes completion window stderr_start."""
+        fixture = self.fixture()
+        case_dir = fixture.artifact / "cases/on_lifecycle"
+        marker_bytes = MARKER.encode()
+        prefix = b"server startup and health check log lines\n"
+        mid = b"\ncompletion request processing log\n"
+        suffix = b"\npost-shutdown log\n"
+        stderr = prefix + marker_bytes + mid + marker_bytes + suffix
+        (case_dir / "server.stderr").write_bytes(stderr)
+        # completion window starts AFTER the first (pre-request) marker
+        completion_end = len(prefix) + len(marker_bytes) + len(mid)
+        dump(case_dir / "completion_window.json", {
+            "stderr_start": len(prefix) + len(marker_bytes),
+            "stderr_end": completion_end,
+        })
+        # wake window covers the second (resume) marker
+        wake_start = completion_end
+        wake_end = completion_end + len(marker_bytes) + len(suffix)
+        dump(case_dir / "wake_completion_window.json", {
+            "stderr_start": wake_start,
+            "stderr_end": wake_end,
+        })
+        fixture.seal()
+        result = fixture.run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads((fixture.artifact / "summary.json").read_text())
+        self.assertEqual(summary["artifact_status"], "VALID")
+
+    def test_lifecycle_startup_missing_late_duplicate_first_fail_closed(self) -> None:
+        """Lifecycle startup must have exactly one earliest first with sample_count=1."""
+        def no_startup_first(f):
+            case_dir = f.artifact / "cases/on_lifecycle"
+            marker_bytes = MARKER.encode()
+            prefix = b"startup\n"
+            mid = b"\ncompletion\n"
+            suffix = b"\npost\n"
+            # startup marker lacks "first" trigger; resume marker is normal
+            no_first_marker = MARKER.replace("trigger=first,state,source", "trigger=periodic").encode()
+            stderr = prefix + no_first_marker + mid + marker_bytes + suffix
+            (case_dir / "server.stderr").write_bytes(stderr)
+            completion_end = len(prefix) + len(no_first_marker) + len(mid)
+            dump(case_dir / "completion_window.json", {"stderr_start": 0, "stderr_end": completion_end})
+            dump(case_dir / "wake_completion_window.json", {
+                "stderr_start": completion_end, "stderr_end": len(stderr)})
+
+        def late_startup_first(f):
+            case_dir = f.artifact / "cases/on_lifecycle"
+            marker_bytes = MARKER.encode()
+            periodic_bytes = MARKER.replace("trigger=first,state,source", "trigger=periodic").encode()
+            prefix = b"startup\n"
+            mid = b"\ncompletion\n"
+            suffix = b"\npost\n"
+            # periodic marker first, first marker later → first_positions != [0]
+            stderr = prefix + periodic_bytes + mid + marker_bytes + marker_bytes + suffix
+            (case_dir / "server.stderr").write_bytes(stderr)
+            completion_end = len(prefix) + len(periodic_bytes) + len(mid) + len(marker_bytes)
+            dump(case_dir / "completion_window.json", {"stderr_start": 0, "stderr_end": completion_end})
+            wake_start = completion_end
+            dump(case_dir / "wake_completion_window.json", {
+                "stderr_start": wake_start, "stderr_end": len(stderr)})
+
+        def duplicate_startup_first(f):
+            case_dir = f.artifact / "cases/on_lifecycle"
+            marker_bytes = MARKER.encode()
+            prefix = b"startup\n"
+            mid = b"\ncompletion\n"
+            suffix = b"\npost\n"
+            # two markers both with "first" in startup range
+            stderr = prefix + marker_bytes + mid + marker_bytes + marker_bytes + suffix
+            (case_dir / "server.stderr").write_bytes(stderr)
+            completion_end = len(prefix) + len(marker_bytes) + len(mid) + len(marker_bytes)
+            dump(case_dir / "completion_window.json", {"stderr_start": 0, "stderr_end": completion_end})
+            dump(case_dir / "wake_completion_window.json", {
+                "stderr_start": completion_end, "stderr_end": len(stderr)})
+
+        for name, mutation in (("missing", no_startup_first), ("late", late_startup_first),
+                               ("duplicate", duplicate_startup_first)):
+            with self.subTest(name=name):
+                self.assert_rejected(mutation)
+
     def test_static_pressure_integration_chain_has_no_kv_mutation(self) -> None:
         runtime = (ROOT / "tools/server/server-kv-pressure.cpp").read_text()
         header = (ROOT / "tools/server/server-kv-pressure.h").read_text()

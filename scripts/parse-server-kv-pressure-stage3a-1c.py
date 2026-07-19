@@ -199,6 +199,19 @@ def trigger_set(marker: dict[str, str]) -> set[str]:
     return set(marker["trigger"].split(","))
 
 
+def startup_lifecycle_markers(case_dir: pathlib.Path) -> list[dict[str, str]]:
+    """Return markers from server.stderr byte 0 through completion_window.stderr_end.
+
+    Covers pre-request startup samples that fire before the first request window begins.
+    """
+    window = load(case_dir / "completion_window.json")
+    end = window.get("stderr_end")
+    raw = (case_dir / "server.stderr").read_bytes()
+    if (not isinstance(end, int) or isinstance(end, bool) or end <= 0 or end > len(raw)):
+        raise ArtifactError("invalid completion window end for lifecycle startup span")
+    return markers(raw[:end].decode(errors="replace"))
+
+
 def require_lifecycle_first(sequence: list[dict[str, str]], label: str) -> None:
     first_positions = [index for index, marker in enumerate(sequence) if "first" in trigger_set(marker)]
     if first_positions != [0]:
@@ -549,7 +562,6 @@ def verify_case(root: pathlib.Path, spec: dict[str, Any], binary: pathlib.Path,
         if env.get(name) != "0":
             raise ArtifactError(f"destructive/prefetch environment not disabled: {name}")
     observed = markers(combined_log)
-    initial = window_markers(case_dir, "completion_window.json")
     if spec["variant"] == "OFF":
         expected_off = dict(ON_ENV); expected_off["LLAMA_KV_PRESSURE_SAMPLER"] = "0"
         if any(env.get(key) != value for key, value in expected_off.items()) or observed:
@@ -562,14 +574,15 @@ def verify_case(root: pathlib.Path, spec: dict[str, Any], binary: pathlib.Path,
             raise ArtifactError(f"ON threshold/cadence mismatch: {spec['name']}")
         if spec["kind"] == "lifecycle":
             wake = window_markers(case_dir, "wake_completion_window.json")
-            require_lifecycle_first(initial, "startup lifecycle")
+            startup = startup_lifecycle_markers(case_dir)
+            require_lifecycle_first(startup, "startup lifecycle")
             require_lifecycle_first(wake, "resume lifecycle")
             initial_window = load(case_dir / "completion_window.json")
             wake_window = load(case_dir / "wake_completion_window.json")
             if initial_window.get("stderr_end", -1) > wake_window.get("stderr_start", -2):
                 raise ArtifactError("startup and resume lifecycle log windows overlap or are out of order")
             global_first = sum("first" in trigger_set(marker) for marker in observed)
-            if global_first != 2 or sum("first" in trigger_set(marker) for marker in initial + wake) != 2:
+            if global_first != 2 or sum("first" in trigger_set(marker) for marker in startup + wake) != 2:
                 raise ArtifactError("old logs or an extra process supplied a lifecycle first marker")
             sleep, resume = load(case_dir / "sleep_observations.json"), load(case_dir / "resume_props.json")
             if (not sleep or sleep[-1].get("status_code") != 200 or
