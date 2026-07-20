@@ -1,0 +1,6 @@
+TARGET   SOURCE FSTYPE OPTIONS
+/dev/shm tmpfs  tmpfs  rw,nosuid,nodev,inode64
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/vda2        50G   42G  8.9G  83% /
+tmpfs            12G     0   12G   0% /dev/shm
+-rw-r--r-- 1 root root 2.0G Jul 19 14:36 /tmp/qwen-moe-mwq-v2-hier.sidecar

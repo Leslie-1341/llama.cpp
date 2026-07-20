@@ -1,0 +1,2 @@
+tag	rc	threads	fuse	pipeline	row_tile	ring	check	ppl	delta_vs_baseline	ffn_check_max_abs	ffn_check_max_rel	chunk_tail	tokens_per_second
+baseline_fuse0_t6	0	6	0	-	-	-	-	47948.2078				/root/llama.cpp/rss-stage-results/moe-ffn-pipeline-debug-20260719-154013/logs/baseline_fuse0_t6.err:0.13.991.100 I perplexity: 9.33 seconds per pass - ETA 0.14.034.676 I Final estimate: PPL = 47948.2078 +/- 16586.75780	

@@ -1,0 +1,13 @@
+llama_window_moe: indexed 0 expert slots, 0.00 MiB, window_tokens=4 dontneed=0 clg=1
+llama_window_clg: loaded 24/24 gate layers, 3.94 MiB FP32, delta=2 prefill_thr=4
+llama_window_v2: indexed=711.47 MiB layers=24 window=12 ahead=4 behind=7 workers=2 memory_limit=0.00 MiB dontneed=0 auto_tune=1
+llama_window_v2: graph=1 layer=0 ahead=4 behind=7 queued=0 prefetch=5 reclaim=0 rss=117.33 MiB failures=0/0
+llama_window_v2: graph=1 layer=1 ahead=4 behind=7 queued=1 prefetch=5 reclaim=0 rss=117.33 MiB failures=0/0
+llama_window_v2: graph=1 layer=2 ahead=4 behind=7 queued=1 prefetch=6 reclaim=0 rss=117.33 MiB failures=0/0
+llama_window_v2: graph=1 layer=3 ahead=4 behind=7 queued=1 prefetch=7 reclaim=0 rss=117.33 MiB failures=0/0
+llama_window_v2: graph=1 layer=4 ahead=4 behind=7 queued=1 prefetch=8 reclaim=0 rss=117.33 MiB failures=0/0
+llama_window_v2: graph=1 layer=5 ahead=4 behind=7 queued=1 prefetch=9 reclaim=0 rss=117.33 MiB failures=0/0
+llama_window_v2: graph=1 layer=6 ahead=4 behind=7 queued=1 prefetch=10 reclaim=0 rss=117.33 MiB failures=0/0
+llama_window_v2: graph=1 layer=7 ahead=4 behind=7 queued=1 prefetch=11 reclaim=0 rss=117.33 MiB failures=0/0
+llama_moe_buffer[teardown]: tensors=72 resident=2416.0 MiB pinned=0.0 MiB lru=2416.0 MiB streams=1317 hits=7562 evictions=0 enqueued=1167 dup=10011 dyn_bits={2:0,3:0,4:0,other:0} sidecar=0/0/0.0 MiB cache=0/0/0/0.0 MiB mwq_kernel=0/0/0.0 MiB group=0/0 optok=0/0 compat=0 sumcache=0/0 countsort=0 avx512_q2=0/0/0 dot=0/0/0 vnni_q2=0/0/0 dot=0/0/0 qx=0/0 fuse_gu=0/0/1296 fuse_swiglu=0/648/0 direct_swiglu=0/0/0 down_prefetch=0 fuse_ffn=0/0 runs=0 pairs=0 tiles=0 fallback=0 egroup_touch=7776 egroup_evict=0/0 pinned_hit=0 active_hit=13 belady=0 lru_fb=0 dyn_eff=0.0 MiB dyn_saved=0.0 MiB wait=179/146.3 ms mwq_actual_saved=0.0/0.0 MiB stream_fail_total=0 direct_swiglu_fail={precheck:0,byname:0,entry_missing:0,read:0,range:0,kernelpair:0,native_prep:0,other:0}
+llama_moe_profile: tokens=26 token_total_us=0 attention_us=0 moe_total_us=607649 route_us=0 cache_lookup_us=146346 victim_select_us=0 sidecar_submit_us=3114 sidecar_wait_us=146277 sidecar_read_us=3528598 sidecar_bytes=2533408768 sidecar_read_count=1317 q2_unpack_us=0 gate_dot_us=0 up_dot_us=0 swiglu_us=0 down_dot_us=0 graph_dispatch_us=0 worker_wait_us=0 barrier_us=0 cache_hit=6600 cache_miss=214 prefetch_hit=962 prefetch_late=149 prefetch_unused=0 evict_clean=0 evict_active_window=0 evict_reloaded_within_1_token=0 evict_reloaded_within_4_tokens=0

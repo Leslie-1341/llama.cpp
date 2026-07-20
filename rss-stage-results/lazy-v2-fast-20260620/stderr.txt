@@ -1,0 +1,53 @@
+0.00.004.275 I llama_completion: llama backend init
+0.00.004.289 I llama_completion: load the model and apply lora adapter, if any
+0.00.004.306 I common_init_result: fitting params to device memory ...
+0.00.004.306 I common_init_result: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+[DEBUG] init_mappings: prefetch=1, use_mmap=0, use_lazy_loading=0, files.size()=1
+0.00.453.124 I common_params_fit_impl: projected to use 2779 MiB of host memory vs. 24040 MiB of total host memory
+[DEBUG] init_mappings: prefetch=0, use_mmap=1, use_lazy_loading=0, files.size()=1
+llama_window_v2: indexed=3992.50 MiB layers=32 window=12 ahead=4 behind=7 workers=2 memory_limit=0.00 MiB dontneed=0 auto_tune=1
+0.01.304.787 I llama_completion: llama threadpool init, n_threads = 8
+0.01.304.832 I llama_completion: chat template is available, enabling conversation mode (disable it with -no-cnv)
+0.01.304.889 W *** User-specified prompt will pre-start conversation, did you mean to set --system-prompt (-sys) instead?
+0.01.305.390 I llama_completion: chat template example:
+<|start_header_id|>system<|end_header_id|>
+
+You are a helpful assistant<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+Hello<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+Hi there<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+How are you?<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+
+0.01.305.391 I 
+0.01.305.688 I system_info: n_threads = 8 (n_threads_batch = 8) / 2 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | AVX512 = 1 | AVX512_VBMI = 1 | AVX512_VNNI = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+0.01.305.689 I 
+0.01.307.098 I sampler seed: 1234
+0.01.307.342 I sampler params: 
+	repeat_last_n = 64, repeat_penalty = 1.000, frequency_penalty = 0.000, presence_penalty = 0.000
+	dry_multiplier = 0.000, dry_base = 1.750, dry_allowed_length = 2, dry_penalty_last_n = -1
+	top_k = 40, top_p = 0.900, min_p = 0.050, xtc_probability = 0.000, xtc_threshold = 0.100, typical_p = 1.000, top_n_sigma = -1.000, temp = 0.000
+	mirostat = 0, mirostat_lr = 0.100, mirostat_ent = 5.000, adaptive_target = -1.000, adaptive_decay = 0.900
+0.01.307.372 I sampler chain: logits -> logit-bias -> ?penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> min-p -> ?xtc -> temp-ext -> dist 
+0.01.307.386 I generate: n_ctx = 8192, n_batch = 2048, n_predict = 64, n_keep = 1
+0.01.307.398 I 
+llama_window_v2: graph=1 layer=0 ahead=4 behind=7 queued=0 prefetch=3 reclaim=0 rss=1099.91 MiB failures=0/0
+llama_window_v2: graph=1 layer=1 ahead=4 behind=7 queued=0 prefetch=3 reclaim=0 rss=1099.91 MiB failures=0/0
+llama_window_v2: graph=1 layer=2 ahead=4 behind=7 queued=0 prefetch=3 reclaim=0 rss=1099.91 MiB failures=0/0
+llama_window_v2: graph=1 layer=3 ahead=4 behind=7 queued=0 prefetch=3 reclaim=0 rss=1099.91 MiB failures=0/0
+llama_window_v2: graph=1 layer=4 ahead=4 behind=7 queued=0 prefetch=3 reclaim=0 rss=1099.91 MiB failures=0/0
+llama_window_v2: graph=1 layer=5 ahead=4 behind=7 queued=0 prefetch=3 reclaim=0 rss=1099.91 MiB failures=0/0
+llama_window_v2: graph=1 layer=6 ahead=4 behind=7 queued=0 prefetch=3 reclaim=0 rss=1099.91 MiB failures=0/0
+llama_window_v2: graph=1 layer=7 ahead=4 behind=7 queued=0 prefetch=3 reclaim=0 rss=1099.91 MiB failures=0/0
+llama_window_v2: graph=32 layer=0 ahead=4 behind=7 queued=0 prefetch=3 reclaim=0 rss=5494.50 MiB failures=0/0
+llama_window_v2: graph=64 layer=0 ahead=4 behind=7 queued=0 prefetch=3 reclaim=0 rss=5498.45 MiB failures=0/0
+0.26.387.578 I common_perf_print:    sampling time =      20.46 ms
+0.26.387.734 I common_perf_print:    samplers time =       6.36 ms /    84 tokens
+0.26.387.895 I common_perf_print:        load time =    3539.84 ms
+0.26.388.054 I common_perf_print: prompt eval time =    3537.17 ms /    20 tokens (  176.86 ms per token,     5.65 tokens per second)
+0.26.388.257 I common_perf_print:        eval time =   21511.33 ms /    63 runs   (  341.45 ms per token,     2.93 tokens per second)
+0.26.388.425 I common_perf_print:       total time =   25083.11 ms /    83 tokens
+0.26.388.591 I common_perf_print: unaccounted time =      14.15 ms /   0.1 %      (total - sampling - prompt eval - eval) / (total)
+0.26.388.761 I common_perf_print:    graphs reused =         62

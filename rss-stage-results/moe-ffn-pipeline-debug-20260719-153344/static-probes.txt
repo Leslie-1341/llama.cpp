@@ -1,0 +1,62 @@
+Static probes for likely pipeline drift sites
+
+[run_index]
+4667:        size_t                     run_index,
+4676:    auto it = per_op.find(run_index);
+4693:        it = per_op.emplace(run_index, ent).first;
+4701:        size_t                     run_index,
+4711:    op_it->second.erase(run_index);
+6193:    size_t run_index = 0;
+6214:        for (size_t mb = g0; mb < g1; mb += (size_t) micro_batch, ++run_index) {
+6244:                auto pipe = moe_ffn_pipe_acquire(*ctx, down_op, run_index, nth, batch,
+6317:                moe_ffn_pipe_release(*ctx, down_op, run_index, pipe);
+
+[pipeline shared maps]
+348:    std::unordered_map<const ggml_tensor *, moe_thread_barrier_entry> ffn_barrier_map; // guarded by mtx
+367:    std::unordered_map<const ggml_tensor *, std::unordered_map<size_t, std::shared_ptr<moe_ffn_pipe_entry>>> ffn_pipe_map; // guarded by mtx
+4664:static std::shared_ptr<llama_moe_buffer_context::moe_ffn_pipe_entry> moe_ffn_pipe_acquire(
+4675:    auto & per_op = ctx.ffn_pipe_map[op];
+4698:static void moe_ffn_pipe_release(
+4707:    auto op_it = ctx.ffn_pipe_map.find(op);
+4708:    if (op_it == ctx.ffn_pipe_map.end()) {
+4713:        ctx.ffn_pipe_map.erase(op_it);
+4722:    auto it = ctx.ffn_barrier_map.find(op);
+4723:    if (it == ctx.ffn_barrier_map.end()) {
+4724:        it = ctx.ffn_barrier_map.emplace(op, llama_moe_buffer_context::moe_thread_barrier_entry{}).first;
+4735:            it = ctx.ffn_barrier_map.find(op);
+4736:            if (it == ctx.ffn_barrier_map.end()) {
+4742:        ctx.ffn_barrier_map.erase(op);
+6244:                auto pipe = moe_ffn_pipe_acquire(*ctx, down_op, run_index, nth, batch,
+6317:                moe_ffn_pipe_release(*ctx, down_op, run_index, pipe);
+
+[dst writes]
+3138:        dsts[i][row] = acc[i];
+3315:        dsts[i][row] = acc[i];
+3794:        dsts[j][row] = mwq_hsum512_ps(accv[j]) + scalar_acc[j];
+3800:        const float got = dsts[0][row];
+4089:            dsts[jb + j][row] = mwq_hsum512_ps(accv[j]) + outlier_acc[j];
+4411:            dsts[i][row] = mwq_dot_row(mwq, bits, block_size, codec, scale_group, outlier_max, n_elem,
+4423:        dsts[i][row] = mwq_dot_row(mwq, bits, block_size, codec, scale_group, outlier_max, n_elem,
+4827:                dsts[jb + j][row] += mwq_hsum512_ps(accv[j]) + scalar_acc[j];
+4910:            dsts[j][row0 + r] = mwq_hsum512_ps(accv[r][j]) + scalar_acc[r][j];
+4946:            const double a = (double) dsts[j][row];
+4947:            const double b = (double) ref_dsts[j][row];
+4961:            max_j >= 0 && max_row >= 0 ? (double) dsts[max_j][max_row] : 0.0,
+4962:            max_j >= 0 && max_row >= 0 ? (double) ref_dsts[max_j][max_row] : 0.0);
+6252:                            std::fill(dsts[j] + row0, dsts[j] + row0 + n_rows, 0.0f);
+
+[pipeline slot state]
+353:        std::atomic<int> consumers_left{0};
+4689:            ent->slots[s].state.store(0, std::memory_order_relaxed);
+4691:            ent->slots[s].consumers_left.store(0, std::memory_order_relaxed);
+6261:                        while (ps.state.load(std::memory_order_acquire) != 0) {
+6264:                        ps.state.store(1, std::memory_order_release);
+6269:                        ps.block.store(ib, std::memory_order_release);
+6270:                        ps.consumers_left.store(consumer_threads, std::memory_order_release);
+6271:                        ps.state.store(2, std::memory_order_release);
+6274:                        while (pipe->slots[(size_t) s].state.load(std::memory_order_acquire) != 0) {
+6283:                            const int state = ps.state.load(std::memory_order_acquire);
+6284:                            const int block = ps.block.load(std::memory_order_acquire);
+6298:                        if (ps.consumers_left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+6299:                            ps.block.store(-1, std::memory_order_release);
+6300:                            ps.state.store(0, std::memory_order_release);

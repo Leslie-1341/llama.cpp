@@ -1,0 +1,4 @@
+status	ok
+out_dir	/root/llama.cpp/rss-stage-results/window-r128-64-20260620
+timeline_peak	ts=1781915537.047641924 rss_kb=5637264 hwm_kb=5637264 pss_kb=5640562
+stage_peak	seq= ts= stage= label= rss_kb=0 pss_kb=0 smaps= extra=
