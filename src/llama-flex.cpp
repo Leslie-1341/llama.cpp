@@ -86,6 +86,20 @@ struct llama_flex_context {
                 w.join();
             }
         }
+        if (params.debug_log && stats.read_ops > 0) {
+            const double phys_mib = stats.bytes_read_phys / 1048576.0;
+            const double log_mib  = stats.bytes_streamed  / 1048576.0;
+            const double io_s     = stats.total_io_us / 1e6;
+            const double bw       = io_s > 0 ? phys_mib / io_s : 0.0;          // per-thread achieved MiB/s
+            const double redun    = log_mib > 0 ? (phys_mib / log_mib - 1.0) * 100.0 : 0.0;
+            const double avg_read = stats.read_ops > 0 ? phys_mib * 1024.0 / stats.read_ops : 0.0; // KiB/read
+            std::fprintf(stderr,
+                "llama_flex IO: loads=%llu reads=%llu avg_read=%.1f KiB  logical=%.0f MiB phys=%.0f MiB "
+                "align_redundancy=%.2f%%  achieved_bw=%.0f MiB/s (per-thread)  waits=%llu wait=%.0f ms\n",
+                (unsigned long long) stats.layer_loads, (unsigned long long) stats.read_ops,
+                avg_read, log_mib, phys_mib, redun, bw,
+                (unsigned long long) stats.wait_events, stats.total_wait_us / 1000.0);
+        }
         for (void * p : slots) {
             free(p);
         }
@@ -135,7 +149,7 @@ static int flex_acquire_slot(llama_flex_context & ctx, int layer) {
 // loop is used. `bcap` is the bounce capacity. Returns true on success.
 static bool flex_read(llama_flex_context * ctx,
                       uint8_t * dst, uint16_t file_idx, size_t foff, size_t size,
-                      uint8_t * bounce, size_t bcap) {
+                      uint8_t * bounce, size_t bcap, size_t * phys_out = nullptr) {
     const int fd = ctx->fds[file_idx];
     if (!ctx->direct_io_active) {
         size_t left = size; off_t off = (off_t) foff; uint8_t * d = dst;
@@ -144,6 +158,7 @@ static bool flex_read(llama_flex_context * ctx,
             if (r <= 0) return false;
             d += r; off += r; left -= (size_t) r;
         }
+        if (phys_out) *phys_out = size;
         return true;
     }
     const size_t A    = ctx->align;
@@ -164,6 +179,7 @@ static bool flex_read(llama_flex_context * ctx,
         return false;
     }
     std::memcpy(dst, bounce + head, size);
+    if (phys_out) *phys_out = want;
     return true;
 }
 
@@ -215,15 +231,20 @@ static void flex_worker(llama_flex_context * ctx) {
         const uint64_t t0 = now_us();
         bool ok = true;
         size_t streamed = 0;
+        size_t phys     = 0;
+        size_t ops      = 0;
         for (const auto & t : L.tensors) {
             if (t.locked) {
                 continue; // locked tensors live permanently in the lock buffer
             }
-            if (!flex_read(ctx, base + t.buf_offset, t.file_idx, t.file_offset, t.size, bounce, bcap)) {
+            size_t p = 0;
+            if (!flex_read(ctx, base + t.buf_offset, t.file_idx, t.file_offset, t.size, bounce, bcap, &p)) {
                 ok = false;
                 break;
             }
             streamed += t.size;
+            phys     += p;
+            ops      += 1;
         }
         const uint64_t dt = now_us() - t0;
 
@@ -233,8 +254,10 @@ static void flex_worker(llama_flex_context * ctx) {
                 L.state    = layer_state::resident;
                 L.last_use = now_us();
                 ctx->stats.layer_loads++;
-                ctx->stats.bytes_streamed += streamed;
-                ctx->stats.total_io_us    += dt;
+                ctx->stats.bytes_streamed  += streamed;
+                ctx->stats.bytes_read_phys += phys;
+                ctx->stats.read_ops        += ops;
+                ctx->stats.total_io_us     += dt;
             } else {
                 // Failed: drop the slot back.
                 ctx->slot_layer[L.slot] = -1;

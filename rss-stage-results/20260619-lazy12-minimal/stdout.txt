@@ -1,0 +1,32 @@
+
+Loading model... |-\|/-\|/-\|/-\|/-\|/-\|/-\ 
+
+
+▄▄ ▄▄
+██ ██
+██ ██  ▀▀█▄ ███▄███▄  ▀▀█▄    ▄████ ████▄ ████▄
+██ ██ ▄█▀██ ██ ██ ██ ▄█▀██    ██    ██ ██ ██ ██
+██ ██ ▀█▄██ ██ ██ ██ ▀█▄██ ██ ▀████ ████▀ ████▀
+                                    ██    ██
+                                    ▀▀    ▀▀
+
+build      : b9298-96474584d
+model      : Meta-Llama-3-8B-Instruct-Q4_K_M-aligned.gguf
+modalities : text
+
+available commands:
+  /exit or Ctrl+C     stop or exit
+  /regen              regenerate the last response
+  /clear              clear the chat history
+  /read <file>        add a text file
+  /glob <pattern>     add text files using globbing pattern
+
+
+> The capital of France is
+
+|-\|/-\|/-\|/-\|/-\|/- illooreačetotchayaneggies]={
+odes
+
+[ Prompt: 6.8 t/s | Generation: 4.9 t/s ]
+
+Exiting...

@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <string>
 
 struct ggml_tensor;
 struct llama_moe_buffer_context;
@@ -28,10 +29,39 @@ struct llama_moe_buffer_params {
     bool   enabled      = false;
     bool   debug_log    = false;
     bool   direct_io    = false;     // O_DIRECT streaming reads (needs alignment)
+    bool   hebf_schedule = false;    // priority scheduling for async expert prefetch
+    bool   dynamic_bits  = false;    // policy-only bit-width selection (no data-format change)
+    bool   dynamic_bits_real = false; // require exact low-bit/MWQ data; fallback to full reads if unavailable
+    bool   strict_sidecar = false; // abort if the selected sidecar bit width is unavailable
+    bool   native_hot = false;       // allow target bits >= base_bits to use original GGUF quant slices in the op override
+    bool   fuse_gate_up = true;      // defer ffn_gate/up_exps MUL_MAT_ID until the sibling op is seen, then compute both together
+    bool   fuse_swiglu = true;       // override SWIGLU when its inputs are the just-fused gate/up expert outputs
+    bool   fuse_direct_swiglu = true; // compute dot(gate), dot(up), and silu*up inside the SWIGLU override without writing gate/up tensors
+    bool   fuse_expert_ffn = false;  // skip full SWIGLU tensor and fuse gate/up SWIGLU directly into down projection
+    bool   prefetch_down_with_swiglu = false; // when direct-SWIGLU ensures gate/up, also warm the same expert's down slice
+    bool   avx512_q2 = true;         // use the AVX512 q2 hierarchical direct-SWIGLU hot path when available
+    bool   avx512_q2_dot = true;     // use the AVX512 q2 hierarchical MUL_MAT_ID/down-projection dot path when available
+    bool   vnni_q2 = false;          // quantize F32 activations to int8 and use AVX512-VNNI for q2 hierarchical expert dots
+    bool   vnni_q2_down = true;      // allow the VNNI q2 path for MUL_MAT_ID/down-projection dots
+    bool   vnni_q2_swiglu = true;    // allow the VNNI q2 path for fused gate/up SWIGLU
+    int    vnni_block = 64;          // activation int8 quantization block; q2 VNNI currently uses 64-column chunks
+    int    avx512_prefetch = 0;      // q2-hier kernel prefetch distance in MWQ blocks; 0 disables explicit prefetch
     size_t budget_bytes = 0;         // resident-expert byte budget; 0 = unbounded
     int    n_workers    = 1;         // parallel prefetch workers (raise to lift effective
                                      // read bandwidth on NVMe: single-thread O_DIRECT
                                      // random reads under-utilise the device)
+    int    base_bits    = 4;         // current on-disk expert precision for dyn-bit accounting
+    int    hot_bits     = 4;         // target bits for rank-0/hot predicted experts
+    int    warm_bits    = 3;         // target bits for mid-rank predicted experts
+    int    cold_bits    = 2;         // target bits for low-rank predicted experts
+    int    gate_bits    = 0;         // optional exact target bits for ffn_gate_exps; 0 = use hot/warm/cold policy
+    int    up_bits      = 0;         // optional exact target bits for ffn_up_exps; 0 = use hot/warm/cold policy
+    int    down_bits    = 0;         // optional exact target bits for ffn_down_exps; 0 = use hot/warm/cold policy
+    int    fixed_bits   = 0;         // force every expert tensor/rank to this sidecar bit width; 0 = dynamic policy
+    int    gate_min_bits = 3;        // default sensitivity floor: gate logits should not use q2 unless explicitly requested
+    int    up_min_bits   = 0;        // up is the least sensitive expert projection; 0 = no floor
+    int    down_min_bits = 3;        // down projection feeds the residual path, keep at least q3 by default
+    int    sync_top_k   = 4;         // routed expert ids are assumed grouped by top-k rank
     float  hot_ratio    = 0.0f;      // relative hotness: an expert is pinned (never
                                      // LRU-evicted) when its activation count exceeds
                                      // hot_ratio * (tensor mean activation). 0 = pure
@@ -39,6 +69,15 @@ struct llama_moe_buffer_params {
                                      // routed more than hot_ratio× the per-tensor
                                      // average stay pinned, so the pin set cannot grow
                                      // to "all experts" as the sequence lengthens.
+    float  pinned_fraction = 0.35f;  // fraction of resident budget reserved for dynamic
+                                     // (layer, expert) hot groups. Pinned groups are
+                                     // excluded from eviction until demoted by the
+                                     // periodic top-score refresh.
+    float  pinned_layer_fraction = 0.18f; // max fraction of pinned budget one layer may use
+    int    active_window = 4;        // future-use distance protected by Belady-style eviction
+    int    group_cooldown_tokens = 0; // protect recently used (layer, expert) groups for N decode-token epochs
+    int    pin_refresh_interval = 128; // group touches between top-score pin refreshes
+    std::string sidecar_path;        // optional exact low-bit/MWQ sidecar data source
 };
 
 std::shared_ptr<llama_moe_buffer_context> llama_moe_buffer_create(const llama_moe_buffer_params & params);
@@ -72,6 +111,10 @@ bool llama_moe_buffer_register(
 // Returns true iff the op is managed (so the CPU backend issues a barrier).
 bool llama_moe_buffer_stream_callback(ggml_tensor * op, int ith, void * user_data);
 
+// CPU override for managed GGML_OP_MUL_MAT_ID ops whose selected experts are
+// resident as MWQ sidecar slices. Returns true when it completed the op.
+bool llama_moe_buffer_mul_mat_id_callback(ggml_tensor * op, int ith, int nth, void * user_data);
+
 // Asynchronous prefetch hint, issued by the CLG predictor while layer L computes
 // to give layer L+1's experts lead time. For every `*_exps` tensor of `layer`,
 // the listed experts are enqueued to a background worker that streams their
@@ -83,6 +126,16 @@ void llama_moe_buffer_prefetch(
         llama_moe_buffer_context * ctx,
         int                        layer,
         const int *                experts,
+        int                        n_experts);
+
+// Ranked prefetch hint. `scores` may be null; when present, higher scores are
+// scheduled first and used by the dynamic-bit policy for accounting. `experts`
+// should be ordered by predicted utility (rank 0 = hottest/most likely).
+void llama_moe_buffer_prefetch_ranked(
+        llama_moe_buffer_context * ctx,
+        int                        layer,
+        const int *                experts,
+        const float *              scores,
         int                        n_experts);
 
 void llama_moe_buffer_print_stats(const llama_moe_buffer_context & ctx);

@@ -1,0 +1,15 @@
+llama_moe_buffer: indexed 1440 sidecar expert slices from /tmp/qwen-moe-mwq-v2-hier.sidecar
+llama_moe_buffer: transcode cache ready, virtual size 2640.0 MiB
+llama_window_moe: indexed 0 expert slots, 0.00 MiB, window_tokens=4 dontneed=0 clg=1
+llama_window_clg: loaded 24/24 gate layers, 3.94 MiB FP32, delta=2 prefill_thr=4
+llama_window_v2: indexed=711.47 MiB layers=24 window=12 ahead=4 behind=7 workers=2 memory_limit=0.00 MiB dontneed=0 auto_tune=1
+llama_window_v2: graph=1 layer=0 ahead=4 behind=7 queued=0 prefetch=5 reclaim=0 rss=117.27 MiB failures=0/0
+llama_window_v2: graph=1 layer=1 ahead=4 behind=7 queued=1 prefetch=5 reclaim=0 rss=117.27 MiB failures=0/0
+llama_window_v2: graph=1 layer=2 ahead=4 behind=7 queued=1 prefetch=6 reclaim=0 rss=117.27 MiB failures=0/0
+llama_window_v2: graph=1 layer=3 ahead=4 behind=7 queued=1 prefetch=7 reclaim=0 rss=117.27 MiB failures=0/0
+llama_window_v2: graph=1 layer=4 ahead=4 behind=7 queued=1 prefetch=8 reclaim=0 rss=117.27 MiB failures=0/0
+llama_window_v2: graph=1 layer=5 ahead=4 behind=7 queued=1 prefetch=9 reclaim=0 rss=117.27 MiB failures=0/0
+llama_window_v2: graph=1 layer=6 ahead=4 behind=7 queued=1 prefetch=10 reclaim=0 rss=117.27 MiB failures=0/0
+llama_window_v2: graph=1 layer=7 ahead=4 behind=7 queued=1 prefetch=11 reclaim=0 rss=117.27 MiB failures=0/0
+llama_moe_buffer[teardown]: tensors=72 resident=1532.2 MiB pinned=537.0 MiB lru=995.2 MiB streams=2004 hits=7319 evictions=894 enqueued=1713 dup=9465 dyn_bits={2:0,3:0,4:0,other:0} sidecar=2004/0/2766.3 MiB cache=0/0/0/0.0 MiB mwq_kernel=1944/7776/2766.3 MiB group=0/0 optok=0/1944 compat=0 sumcache=0/0 countsort=0 avx512_q2=0/0/0 dot=3151872/3151872/12607488 vnni_q2=0/0/0 dot=0/0/0 qx=0/0 fuse_gu=648/648/0 fuse_swiglu=0/0/0 direct_swiglu=0/0/0 down_prefetch=0 fuse_ffn=0/0 runs=0 pairs=0 tiles=0 fallback=0 egroup_touch=7776 egroup_evict=298/894 pinned_hit=3798 active_hit=7 belady=0 lru_fb=298 dyn_eff=2364.6 MiB dyn_saved=774.4 MiB wait=49/27.3 ms mwq_actual_saved=932.5/3698.8 MiB stream_fail_total=0 direct_swiglu_fail={precheck:0,byname:0,entry_missing:0,read:0,range:0,kernelpair:0,native_prep:0,other:0}
+llama_moe_profile: tokens=26 token_total_us=0 attention_us=0 moe_total_us=406450 route_us=6 cache_lookup_us=27345 victim_select_us=91336 sidecar_submit_us=8964 sidecar_wait_us=27338 sidecar_read_us=1613913 sidecar_bytes=2900637696 sidecar_read_count=2004 q2_unpack_us=0 gate_dot_us=0 up_dot_us=0 swiglu_us=0 down_dot_us=0 graph_dispatch_us=0 worker_wait_us=0 barrier_us=0 cache_hit=6195 cache_miss=457 prefetch_hit=1124 prefetch_late=32 prefetch_unused=231 evict_clean=894 evict_active_window=210 evict_reloaded_within_1_token=270 evict_reloaded_within_4_tokens=535

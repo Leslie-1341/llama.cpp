@@ -1,0 +1,17 @@
+# MoE TG Profile
+
+- model: `/root/models/Qwen1.5-MoE-A2.7B-20-experts-SFT-trained.Q4_K_M.gguf`
+- bench: `/root/llama.cpp/build/bin/llama-bench`
+- output: `/root/llama.cpp/rss-stage-results/moe-token-profile-20260720-063836`
+- columns: `summary.tsv` includes timing counters and reload-within-1/4-token thrash indicators.
+
+```tsv
+tag       rc  budget_mb  workers  peak_mb  pp_tps  tg_tps  streams  hits  evictions  resident_mib  bytes_read_mib  sidecar_read_mib  sidecar_read_count  moe_total_us  cache_lookup_us  victim_select_us  sidecar_submit_us  sidecar_wait_us  sidecar_read_us  q2_unpack_us  cache_hit  cache_miss  prefetch_hit  prefetch_late  prefetch_unused  evict_clean  evict_active_window  reload_1tok  reload_4tok  thrash_4tok_per_evict
+b512_w1   0   512        1        944      0.00    0.00    8301     3896  8019       511.8         0.0             15245.828         8301                7926062       210116           839596            17739              210026           16621048         0             3057       3880        839           116            3546             8019         384                  3910         5845         0.728894
+b512_w4   0   512        4        639      0.00    0.00    11328    4027  11052      506.0         0.0             20803.062         11328               8907705       282248           1305100           45900              282145           28678247         0             2796       3749        1231          305            6345             11052        1710                 6149         8806         0.796779
+b2432_w1  0   2432       1        2528     0.00    0.00    1317     7285  0          2416.0        0.0             2416.047          1317                1137380       58171            0                 2005               58106            2820818          0             6600       491         685           30             0                0            0                    0            0            0
+b2432_w4  0   2432       4        2543     0.00    0.00    1317     7562  0          2416.0        0.0             2416.047          1317                607649        146346           0                 3114               146277           3528598          0             6600       214         962           149            0                0            0                    0            0            0
+```
+
+- b512_w1: reload_4tok/evict_clean = 0.729, clear cache thrashing signal.
+- b512_w4: reload_4tok/evict_clean = 0.797, clear cache thrashing signal.

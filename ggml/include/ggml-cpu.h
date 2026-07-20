@@ -175,6 +175,11 @@ extern "C" {
     typedef bool (*ggml_cpu_weight_stream_callback)(struct ggml_tensor * op, int ith, void * user_data);
     GGML_BACKEND_API void ggml_cpu_set_weight_stream_callback(ggml_cpu_weight_stream_callback cb, void * user_data);
 
+    // Optional CPU op override. Invoked after the weight-stream hook and before
+    // the built-in CPU kernel. Return true when the callback completed the op.
+    typedef bool (*ggml_cpu_op_override_callback)(struct ggml_tensor * op, int ith, int nth, void * user_data);
+    GGML_BACKEND_API void ggml_cpu_set_op_override_callback(ggml_cpu_op_override_callback cb, void * user_data);
+
     GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cpu_reg(void);
 
     GGML_BACKEND_API void ggml_cpu_fp32_to_fp32(const float *,       float *, int64_t);

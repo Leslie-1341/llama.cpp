@@ -1,0 +1,5 @@
+[DEBUG] init_mappings: prefetch=1, use_mmap=0, use_lazy_loading=0, files.size()=1
+[DEBUG] init_mappings: prefetch=1, use_mmap=1, use_lazy_loading=0, files.size()=1
+llama_vm: gallocr_alloc_graph mode=prefill gallocr_alloc_graph_us=198 work_size=287836160 work_size_mib=274.50 vm_subgraph=0
+llama_vm: gallocr_alloc_graph mode=prefill gallocr_alloc_graph_us=479 work_size=287836160 work_size_mib=274.50 vm_subgraph=0
+llama_vm: gallocr_alloc_graph mode=decode gallocr_alloc_graph_us=382 work_size=287836160 work_size_mib=274.50 vm_subgraph=0

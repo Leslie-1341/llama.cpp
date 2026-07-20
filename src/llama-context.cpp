@@ -13,6 +13,7 @@
 #include "llama-rss.h"
 #include "llama-window.h"
 #include "llama-flex.h"
+#include "llama-moe-buffer.h"
 #include "llama-ext.h"
 #include "llama.h"
 
@@ -2355,13 +2356,20 @@ ggml_status llama_context::graph_compute(
         }
     }
 
-    // FlexInfer-style streaming: install the per-node weight-stream hook on the
-    // CPU backend for the duration of this graph. Mutually exclusive with window.
+    // Per-node weight-stream hook on the CPU backend for the duration of this
+    // graph. Used by FlexInfer-style dense streaming (flex) or MoE expert
+    // streaming (moe-buffer); the two are mutually exclusive.
     auto * flex = model.get_flex_context();
+    auto * moe  = model.get_moe_buffer_context();
     const bool flex_active = backend_cpu != nullptr && llama_flex_enabled(flex);
+    const bool moe_active  = backend_cpu != nullptr && !flex_active && llama_moe_buffer_enabled(moe);
     if (flex_active) {
         llama_flex_graph_begin(*flex);
         ggml_cpu_set_weight_stream_callback(llama_flex_stream_callback, flex);
+        ggml_cpu_set_op_override_callback(nullptr, nullptr);
+    } else if (moe_active) {
+        ggml_cpu_set_weight_stream_callback(llama_moe_buffer_stream_callback, moe);
+        ggml_cpu_set_op_override_callback(llama_moe_buffer_mul_mat_id_callback, moe);
     }
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
@@ -2369,9 +2377,10 @@ ggml_status llama_context::graph_compute(
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
 
-    if (flex_active) {
+    if (flex_active || moe_active) {
         ggml_backend_sched_synchronize(sched.get());
         ggml_cpu_set_weight_stream_callback(nullptr, nullptr);
+        ggml_cpu_set_op_override_callback(nullptr, nullptr);
     }
 
     if (set_node_callback_fn != nullptr) {

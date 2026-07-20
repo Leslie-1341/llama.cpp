@@ -1708,10 +1708,17 @@ static void ggml_compute_forward_mul_mat_id(
 
 static ggml_cpu_weight_stream_callback g_weight_stream_cb = NULL;
 static void *                           g_weight_stream_ud = NULL;
+static ggml_cpu_op_override_callback    g_op_override_cb   = NULL;
+static void *                           g_op_override_ud   = NULL;
 
 void ggml_cpu_set_weight_stream_callback(ggml_cpu_weight_stream_callback cb, void * user_data) {
     g_weight_stream_cb  = cb;
     g_weight_stream_ud  = user_data;
+}
+
+void ggml_cpu_set_op_override_callback(ggml_cpu_op_override_callback cb, void * user_data) {
+    g_op_override_cb = cb;
+    g_op_override_ud = user_data;
 }
 
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
@@ -1726,6 +1733,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     // before the kernel reads it. Cheap no-op when no streaming is configured.
     if (g_weight_stream_cb != NULL && g_weight_stream_cb(tensor, params->ith, g_weight_stream_ud)) {
         ggml_barrier(params->threadpool);
+    }
+
+    if (g_op_override_cb != NULL && g_op_override_cb(tensor, params->ith, params->nth, g_op_override_ud)) {
+        return;
     }
 
     // extra_buffer op?
