@@ -172,3 +172,6 @@ trace_prompts/
 *.trace
 /*.gguf
 /models/*.gguf
+
+# CTest runtime artifacts
+/Testing/
