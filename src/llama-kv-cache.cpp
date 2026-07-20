@@ -6270,6 +6270,177 @@ void llama_kv_cache::paged_release_blocks(uint32_t n_kv) {
 #endif
 }
 
+llama_kv_cache::llama_kv_bounded_release_result llama_kv_cache::paged_release_blocks_bounded(
+        uint64_t target_bytes,
+        uint32_t max_scan_blocks) {
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+    llama_kv_bounded_release_result result;
+
+    if (!kv_paged_enabled || !paged_block_release_enabled) {
+        return result;
+    }
+    if (v_trans || n_stream != 1 || paged_block_size == 0 || paged_n_blocks == 0 ||
+            paged_block_states.size() != paged_n_blocks) {
+        return result;
+    }
+
+    // target=0: return immediately — no ownership collection or scan.
+    // Reset test-only seams so fault injections are strictly single-shot.
+    if (target_bytes == 0) {
+        paged_release_bounded_test_force_ownership_abort     = false;
+        paged_release_bounded_test_madvise_fail_block        = -1;
+        paged_release_bounded_test_block_state_override.block = UINT32_MAX;
+        return result;
+    }
+
+    // scan budget of zero: return immediately without scanning or ownership check.
+    // Reset test-only seams so fault injections are strictly single-shot.
+    if (max_scan_blocks == 0) {
+        result.block_scan_exhausted = true;
+        result.shortfall_bytes      = target_bytes;
+        paged_release_bounded_test_force_ownership_abort     = false;
+        paged_release_bounded_test_madvise_fail_block        = -1;
+        paged_release_bounded_test_block_state_override.block = UINT32_MAX;
+        return result;
+    }
+
+    // Ownership collection — reuse the same intent as paged_release_blocks
+    const auto ownership = llama_kv_release_collect_ownership(
+            v_cells, paged_n_blocks, paged_block_size, PAGED_BLOCK_INVALID, LLAMA_MAX_SEQ,
+            [&](uint32_t logical_cell) { return paged_resolve(logical_cell); });
+    if (!ownership.valid || paged_release_bounded_test_force_ownership_abort) {
+        result.ownership_aborted = true;
+        if (!ownership.valid) {
+            paged_block_release_ownership_invalid += ownership.invalid_mappings;
+            LLAMA_LOG_ERROR(
+                    "KV_PAGED_RELEASE_BOUNDED_ABORT reason=INVALID_LIVE_MAPPING invalid_mappings=%llu\n",
+                    (unsigned long long) ownership.invalid_mappings);
+        }
+        // Reset ALL test-only flags immediately (single-shot — no residual across exit paths).
+        paged_release_bounded_test_force_ownership_abort     = false;
+        paged_release_bounded_test_madvise_fail_block        = -1;
+        paged_release_bounded_test_block_state_override.block = UINT32_MAX;
+        return result;
+    }
+    const auto & owned = ownership.owned;
+
+    uint32_t scanned = 0;
+    const uint32_t scan_limit = std::min(max_scan_blocks, paged_n_blocks);
+
+    for (uint32_t physical_block = 0; physical_block < scan_limit; ++physical_block) {
+        scanned = physical_block + 1;
+
+        // Skip owned blocks (contains live cells)
+        if (owned[physical_block]) {
+            result.blocks_skipped_owned += 1;
+            continue;
+        }
+
+        const paged_block_state state =
+            (paged_release_bounded_test_block_state_override.block == physical_block)
+            ? static_cast<paged_block_state>(
+                    paged_release_bounded_test_block_state_override.state)
+            : paged_block_states[physical_block];
+        // Explicitly skip PENDING_WRITE, SWAPPED, RELEASED
+        if (state == paged_block_state::PENDING_WRITE ||
+                state == paged_block_state::SWAPPED ||
+                state == paged_block_state::RELEASED) {
+            result.blocks_skipped_state += 1;
+            continue;
+        }
+
+        // Candidate block: try madvise (skip actual call when test injects failure
+        // on this block — avoids DONTNEED without state-change inconsistency)
+        uint64_t advised_bytes = 0;
+        uint64_t local_failures = 0;
+        uint64_t local_skipped = 0;
+        uint64_t local_skip_live = 0;
+        if ((int32_t)physical_block != paged_release_bounded_test_madvise_fail_block) {
+            advised_bytes = paged_madvise_block(
+                    physical_block, &owned,
+                    local_failures, local_skipped, local_skip_live,
+                    nullptr);
+        } else {
+            // Test-injected failure: simulate a madvise failure.
+            paged_release_bounded_test_madvise_fail_block = -1;
+            local_failures = 1;
+        }
+
+        if (advised_bytes == 0) {
+            // madvise failed: do not change block state, do not consume release
+            // budget, continue scanning.
+            result.madvise_failures += local_failures;
+            continue;
+        }
+
+        // madvise succeeded: release the block
+        // Clear backing metadata
+        const uint32_t begin = physical_block * paged_block_size;
+        const uint32_t end = std::min<uint32_t>(begin + paged_block_size, paged_kv_size);
+        for (uint32_t cell = begin; cell < end; ++cell) {
+            if (cell < paged_swap_offsets.size()) {
+                paged_swap_offsets[cell] = 0;
+            }
+            if (cell < paged_swap_sizes.size()) {
+                paged_swap_sizes[cell] = 0;
+            }
+        }
+
+        paged_block_states[physical_block] = paged_block_state::RELEASED;
+        result.released_blocks += 1;
+        result.released_bytes += advised_bytes;
+
+        // Update usage tracking and free list
+        if (physical_block < paged_block_used.size() && paged_block_used[physical_block]) {
+            paged_block_used[physical_block] = 0;
+            if (paged_blocks_in_use > 0) {
+                paged_blocks_in_use -= 1;
+            }
+            if (std::find(paged_free_list.begin(), paged_free_list.end(), physical_block) ==
+                    paged_free_list.end()) {
+                paged_free_list.push_back(physical_block);
+            }
+        }
+
+        // Update global counters (not the per-call block last fields — those belong to
+        // the unbounded paged_release_blocks)
+        paged_block_release_bytes += advised_bytes;
+        paged_blocks_released += 1;
+        if (state == paged_block_state::UNUSED) {
+            paged_blocks_released_unused += 1;
+        } else {
+            paged_blocks_released_dead += 1;
+        }
+
+        // Budget check: stop once target is met (allow one-block overshoot)
+        if (result.released_bytes >= target_bytes) {
+            break;
+        }
+    }
+
+    result.blocks_scanned = scanned;
+    result.block_scan_exhausted = (scanned >= scan_limit);
+
+    // Reset ALL test-only seams — single-shot across every exit path.
+    paged_release_bounded_test_force_ownership_abort     = false;
+    paged_release_bounded_test_madvise_fail_block        = -1;
+    paged_release_bounded_test_block_state_override.block = UINT32_MAX;
+
+    if (result.released_bytes < target_bytes) {
+        result.shortfall_bytes = target_bytes - result.released_bytes;
+    }
+    if (result.released_bytes > target_bytes) {
+        result.overshoot_bytes = result.released_bytes - target_bytes;
+    }
+
+    return result;
+#else
+    (void) target_bytes;
+    (void) max_scan_blocks;
+    return {};
+#endif
+}
+
 void llama_kv_cache::clear_frontier_advance(uint32_t n_kv) {
     if (!kv_lazy_clear) {
         return;

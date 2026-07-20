@@ -448,11 +448,57 @@ public:
     void swap_out_window(uint32_t n_kv);
     void sample_swap_rss();
 
+    // Bounded release result — returned by paged_release_blocks_bounded().
+    // released_bytes may overshoot target_bytes by at most one block.
+    struct llama_kv_bounded_release_result {
+        uint64_t released_bytes = 0;
+        uint64_t shortfall_bytes = 0;
+        uint64_t overshoot_bytes = 0;
+        uint32_t released_blocks = 0;
+        uint32_t blocks_scanned = 0;
+        uint32_t blocks_skipped_owned = 0;
+        uint32_t blocks_skipped_state = 0;
+        uint32_t madvise_failures = 0;
+        bool block_scan_exhausted = false;
+        bool ownership_aborted = false;
+    };
+
     // stage F1 / P1: advise the unused tail capacity [GGML_PAD(n_kv, 256), kv_size) away via
     // MADV_DONTNEED to lower current RSS. No-op unless LLAMA_KV_LAZY_TAIL=1 (and !v_trans &&
     // n_stream==1). See docs/kv_lazy_block_stage_f1_design.md.
     void madvise_tail(uint32_t n_kv);
     void paged_release_blocks(uint32_t n_kv);
+    llama_kv_bounded_release_result paged_release_blocks_bounded(
+            uint64_t target_bytes,
+            uint32_t max_scan_blocks);
+
+    // Test-only seams for paged_release_blocks_bounded().
+    // All default to no-injection; no production behaviour changes unless a test sets them.
+    // - test_force_ownership_abort: when true, the next bounded release call executes the full
+    //   ownership-ABORT path (ownership_aborted=true, zero released, zero state changes).
+    // - test_madvise_fail_block: when >= 0, the actual paged_madvise_block() call is skipped for
+    //   that physical block so the "madvise failed" path is exercised without changing block state
+    //   or issuing a real MADV_DONTNEED.
+    // - test_block_state_override: override the seen state for a single physical block.
+    //   Uses uint8_t to avoid private-enum access issues; cast to paged_block_state at use site.
+    mutable bool    paged_release_bounded_test_force_ownership_abort = false;
+    mutable int32_t paged_release_bounded_test_madvise_fail_block = -1;
+    struct {
+        uint32_t block = UINT32_MAX;
+        uint8_t  state = 0;  // cast to paged_block_state (UNUSED=0)
+    } mutable paged_release_bounded_test_block_state_override;
+
+    // Test-only read accessors for post-ABORT state invariance verification.
+    // Returns paged_block_state cast to uint8_t, or UINT8_MAX if block is out of range.
+    uint8_t paged_release_bounded_test_read_block_state(uint32_t block) const {
+        if (block >= paged_block_states.size()) return UINT8_MAX;
+        return static_cast<uint8_t>(paged_block_states[block]);
+    }
+    bool paged_release_bounded_test_block_in_free_list(uint32_t block) const {
+        return std::find(paged_free_list.begin(), paged_free_list.end(), block)
+            != paged_free_list.end();
+    }
+
     void paged_swap_out_window(uint32_t n_kv);
 
     // stage P2: clear-frontier. When LLAMA_KV_LAZY_CLEAR=1 (and !v_trans && n_stream==1),
