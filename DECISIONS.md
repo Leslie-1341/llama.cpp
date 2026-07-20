@@ -338,3 +338,47 @@ Stage 3A-0 已验证 destructive release 的 ownership、事务和 fail-closed �
 - `scripts/run-server-kv-pressure-stage3a-1c.py`、`scripts/parse-server-kv-pressure-stage3a-1c.py`、`tests/test-server-kv-pressure-stage3a-1c-parser.py`：9 合成负例通过、py_compile 通过。
 - **Stage 3A-1C VALID artifact**: `/root/oscomp/kv_logs/server_kv_pressure_stage3a_1c_20260719T134156Z_726d977b26bb` — parser exit 0、artifact status VALID、10/10 cases PASS。Strace ON 归因 6 条 sampler procfs/cgroup 路径、OFF 零路径；lifecycle post-resume sample_count 独立重置；idle 1.5s 窗口零 periodic marker。
 - 此前失败 artifacts 保留为 INVALID 诊断证据：`…073412Z_4ac1919ec2ed`（strace ON 无法观测 procfs 路径）、`…082058Z_31e81656d1e6`（pre-request marker 缺失）、`…125819Z_ad92e603f7b8`（ON strace lacks required sampler procfs reads；strace 在首次采样后 attach，60000ms 采样周期导致 completion 结束前无后续采样，trace 文件全空；与 lifecycle post-resume marker 无关）；均 runner 10/10 cases 完成但 parser 拒绝。
+
+## D-0010 — Bounded release 作为 per-call budget 控制原语，先入 core 再连 pressure policy
+
+- Date: 2026-07-20
+- Status: accepted
+- Evidence commit/worktree: `949fbd0c850b7413302907df20cc4022f623d8db`（clean）；CTest #29 `test-kv-paged-release-bounded` 注册并 build 通过
+- Supersedes: D-0009 中"bounded reclaim 尚未实现"的阶段描述——本决策提交 core 原语，server 接入留待下道门禁
+- Superseded by: none
+
+**Context**
+
+Stage 3A-0 的 `paged_release_blocks()` 是全量扫描、无 budget 控制——每次调用遍历全部 physical block 并释放所有符合条件的 dead/unused block。真实 server scheduler 需要以有限频率、有限量调用 release，避免单次调用阻塞 scheduler loop 太久或过量释放导致后续 request 无可用 block。此外，原 unbounded release 的 state gate 未检查 PENDING_WRITE——事务中间态 block 存在被误 madvise 的风险。
+
+**Decision**
+
+1. **新增 `paged_release_blocks_bounded(target_bytes, max_scan_blocks)` 核心原语**，提供 per-call budget（释放字节上限 + 扫描 block 上限）控制。target_bytes=0 立即返回零副作用；max_scan_blocks=0 返回 exhausted + 完整 shortfall。
+2. **复用 `llama_kv_release_collect_ownership` 门禁**：ownership ABORT 路径与 unbounded release 一致——invalid mapping 立即返回、零 state change。
+3. **显式 PENDING_WRITE gate**：在 state check 中显式跳过 PENDING_WRITE（以及 SWAPPED、RELEASED），修复原 unbounded release 的防御缺口。B6 test 验证 PENDING_WRITE gate 在 ownership gate 之后独立触发。
+4. **Test-only seam 机制**：三个 mutable 字段（force_ownership_abort、madvise_fail_block、block_state_override）直接嵌入 `llama_kv_cache` 对象，默认值保证生产路径零行为差异。所有 seam 在每次调用退出时自动复位（四条退出路径全覆盖），严格 single-shot。两个只读 accessor 用于 post-condition 验证。
+5. **Result struct 语义**：`llama_kv_bounded_release_result` 提供 released_bytes、shortfall_bytes、overshoot_bytes（单 block 粒度）、blocks_scanned、skipped_owned、skipped_state、madvise_failures、block_scan_exhausted、ownership_aborted——caller 可据此判断是否需要再次调用（shortfall > 0 且 scan 未穷尽）。
+6. **先入 core，不连 pressure**：bounded release 当前无 server scheduler 调用点，无 pressure-driven 触发，无 dry-run 模式。server pressure policy 接入作为独立下道门禁。
+
+**Alternatives rejected**
+
+- 直接修改 `paged_release_blocks()` 签名增加 budget 参数：破坏已有 R0–R5/N0–N2 correctness 验证的调用接口和 artifact 格式。保留原版、新增 bounded variant 降低回退风险。
+- 在 server 层封装 budget 逻辑：需要访问 `paged_block_states`、`paged_madvise_block`、ownership bitmap 等 core-private 状态，会破坏 D-0003 的 core/策略分离边界。
+- 将 test seam 放在独立 test helper 中：需要 friend class 或 `#ifdef TEST` 条件编译，增加构建复杂度且难以覆盖 ABORT/state-override/madvise-failure 的真实调用路径。
+- 让 bounded release 跳过 PENDING_WRITE 检查（与原版一致）：PENDING_WRITE 是事务中间态，madvise 会留下不可恢复的中间 block；防御性检查代价极低（一次枚举比较），收益明确。
+
+**Consequences and limits**
+
+- 收益：per-call budget 控制使上层 scheduler 可以限制单次 release 时延和回收量；PENDING_WRITE gate 修复原版防御缺口；test seam 提供可审计的故障注入路径；result struct 支持 caller 决策循环。
+- 代价：`llama_kv_cache` 对象增加三个 mutable 字段和两个 accessor——对象布局/size 改变；test seam 是公开 mutable 字段，虽然命名约定为 `test_*`，但无编译期访问控制。原 unbounded release 的 PENDING_WRITE 缺陷未在本提交修复（只在新原语中防御）。
+- 当前验证范围：build 通过、CTest 注册、`git diff --check` 通过、Part A ownership fault fixture（4 组）无需模型即可运行。Part B（B1–B11）需模型文件，当前环境因缺少 `LLAMACPP_TEST_MODELFILE` 而 CTest SKIP。
+- 失效边界：与 unbounded release 共享 `paged_madvise_block`、ownership collection、RELEASED state transition 和 swap 互斥 gate——这些公共路径的变更会同时影响两个 release 原语。Test seam 为 mutable public 字段，未来字段语义变更可能与测试预期不一致。
+
+**Evidence**
+
+- `src/llama-kv-cache.h:450-497`：`llama_kv_bounded_release_result` struct、`paged_release_blocks_bounded()` 声明、六个 test-only 成员。
+- `src/llama-kv-cache.cpp:6273-6440`：`paged_release_blocks_bounded()` 实现（~170 行），含四条退出路径的 seam 自动复位。
+- `tests/test-kv-paged-release-bounded.cpp`：533 行，Part A 4 组 ownership fault fixture + Part B B1–B11（含 B5 ABORT snapshot invariance、B6 PENDING_WRITE gate、B7 madvise failure、B8 dual-context logits match）。
+- `tests/CMakeLists.txt`：注册 test #29 `test-kv-paged-release-bounded`。
+- Build artifact: `build/bin/test-kv-paged-release-bounded` 存在，CTest 可在有模型时运行 Part B。
+- `git diff --check`：通过（无 whitespace 错误）。

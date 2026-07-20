@@ -234,3 +234,63 @@ R1 mincore: `mincore_before_last=243,793,920` bytes (~232 MiB) 在 madvise 前 r
 - **性能结论为 EXPLORATORY_ONLY**（n=3，单模型、单提示、无并发请求、ctx 1024、32 token 输出）。不构成正式 TTFT/TPOT/吞吐收益或退化声明。
 - Pressure thresholds 1/2/3 KiB 为 forced lifecycle validation，非部署推荐值。
 - 不覆盖：并发请求、长上下文、真实内存压力下的 CRITICAL 状态转换、不同模型/quantization、GPU/device memory。
+
+## E-0010 — Stage 3A-2A bounded release 原语正确性测试
+
+- Status: **registered**（test binary build 通过、CTest 注册、Part A 无需模型可运行；Part B 因环境缺少 `LLAMACPP_TEST_MODELFILE` 而 SKIP）
+- Date: 2026-07-20
+- Commit/worktree: `949fbd0c850b7413302907df20cc4022f623d8db`；clean（untracked `Testing/` 不与测试重叠）
+- Target/source: `test-kv-paged-release-bounded`（CTest #29）；`src/llama-kv-cache.{h,cpp}`、`tests/test-kv-paged-release-bounded.cpp`
+- Build artifact: `build/bin/test-kv-paged-release-bounded` 存在
+- CTest: 注册为 test #29（label: `main`），无模型时返回 SKIP_EXIT_CODE (77)
+- Registered result: build 通过、`git diff --check` 通过、CTest 注册通过；Part A ownership fault fixture（4 组）在 build 中 verified-compiles；Part B 正式 run 日志未产生
+
+**Question and scope**
+
+验证 `paged_release_blocks_bounded()` 的 per-call budget 控制、状态门禁（ownership ABORT、owned skip、PENDING_WRITE/SWAPPED/RELEASED state skip）、madvise failure 恢复、test seam single-shot 自复位、active-owned block 保护（logits consistency）、shortfall/overshoot/idempotent 语义，以及 ownership ABORT 的零 state change 不变性。
+
+**Test structure**
+
+| Part | 名称 | 模型需求 | 验证目标 |
+|------|------|----------|----------|
+| A | FAULT_1–4 | 无 | 合成 ownership fault fixture：identity valid、invalid mapping detected、all invalid、OOB block |
+| B1 | target=0 | 是 | 零 budget 立即返回，零副作用 |
+| B2 | max_scan=0 | 是 | 零 scan budget → exhausted + full shortfall |
+| B3 | overshoot | 是 | target=1 → 至少 1 block released，overshoot == released - target |
+| B4 | scan budget | 是 | max_scan_blocks=2 → blocks_scanned==2, exhausted==true |
+| B5 | ownership ABORT | 是（fresh ctx） | force_ownership_abort seam → ABORT，zero released，pre/post state+free-list snapshot 不变，seam auto-reset |
+| B6 | PENDING_WRITE gate | 是（fresh ctx） | block_state_override=4 on dead block → skipped by state gate（非 owned gate），real state+free-list 不变 |
+| B7 | madvise failure | 是（fresh ctx） | madvise_fail_block injection → block state unchanged，scan continued，subsequent blocks released，seam auto-reset |
+| B8 | active-owned | 是（dual ctx） | bounded release between prompt and continuation → zero blocks released，blocks_skipped_owned>0，dual-context logits byte-exact match |
+| B9 | shortfall | 是 | all blocks RELEASED → exhausted==true，shortfall==target-released |
+| B10 | idempotent | 是 | repeat call on all-RELEASED → released_blocks==0，same skipped_state count both calls |
+| B11 | scan precision | 是 | max_scan=3 → blocks_scanned==3；target=0,max_scan=0 corner |
+
+**Correctness gate (Part B)**
+
+- B1–B4、B8–B11 各 CHECK 不触发 `failures++`。
+- B5：ownership_aborted=true、released_blocks==0、released_bytes==0、blocks_scanned==0、pre/post state snapshot（4 blocks）+ free list snapshot 全等、全部三个 seam 自动复位。
+- B6：ownership_aborted=false、blocks_skipped_owned==0（证明 block 不受 ownership gate 保护）、blocks_skipped_state>=1、real state+free list 不变、override 自动复位。
+- B7：madvise_fail_block==-1 post-call、blocks_scanned>1（扫描继续）、released_blocks>0（后续 block 释放）、madvise_failures==1、failed block state+free list 不变。
+- B8：released_blocks==0、released_bytes==0、blocks_skipped_owned>0、ctx1 vs ctx2 logits 全词汇表精确一致。
+- B9–B10：exhausted shortfall 正确计算、repeat release 幂等。
+- 全部 B 组：无 fake pass（`failures` 计数器全局递增，最终非零则 exit 1）。
+
+**Environment**
+
+Binary: Release build, GCC 11.4, GGML CPU/OpenMP/native, 12 logical CPU (Xeon Platinum 8358), Ubuntu 22.04/Linux 5.15, ~24 GB RAM.
+Model requirement: GGUF 格式（推荐 Meta-Llama-3-8B-Instruct Q4_K_M），由 `LLAMACPP_TEST_MODELFILE` 环境变量或 argv[1] 指定。
+Test config: `LLAMA_KV_PAGED=1 LLAMA_KV_PAGED_RELEASE=1 LLAMA_KV_PAGED_BLOCK_SIZE=16`；ctx 256、K/V F32。
+
+**Known test limitations**
+
+- `decode_prompt()` 硬编码 BOS token `128000`（Llama-3 tokenizer）；非 Llama-3 模型运行时 BOS token 无效，decode 失败。
+- B5–B7 需要 fresh context（避免 all-RELEASED block reuse edge case），函数内创建独立 `ContextGuard`。
+- B8 创建 dual context（baseline + variant），各 prompt→release→continuation 管线隔离。
+- Part B 全部 11 组均需模型；无模型时 test 返回 SKIP_EXIT_CODE (77)，CTest 标记为 `Skipped`（非 FAIL）。
+
+**Supported conclusion and limits**
+
+- 可支持：Stage 3A-2A bounded release 原语已提交并通过 build/CTest 注册/`git diff --check`；Part A ownership fault fixture 在 build 中 verified-compiles；4 条退出路径的 seam 自动复位有源码级覆盖。
+- 证据限制：Part B 正式 run 因缺少模型而 SKIP——本条目为 `registered` 状态，不得升级为 `valid` 直至提供模型运行并通过全部 B1–B11 assertions。
+- **不覆盖**：并发 request、server scheduler 集成、pressure-driven 触发、RSS 降幅、TTFT/TPOT/吞吐影响、长上下文、不同模型/quantization/block_size。

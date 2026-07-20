@@ -2,9 +2,9 @@
 
 > 记录当前源码可验证的稳定结构。讨论方案必须标记为 proposed，不得混入已实现架构。
 
-- Last verified: 2026-07-19
-- Evidence commit: `726d977b26bba375edd8e79c1c04a46cece942e4`
-- Verification scope: 当前源码、Git history、server pressure telemetry 集成 diff、测试注册，以及真实 server + Meta-Llama-3-8B Q4_K_M 的 Stage 3A-1C VALID artifact（10/10 cases PASS）
+- Last verified: 2026-07-20
+- Evidence commit: `949fbd0c850b7413302907df20cc4022f623d8db`
+- Verification scope: 当前源码、Git history、server pressure telemetry 集成 diff、bounded release 原语 diff、CTest 注册、build 产物，以及真实 server + Meta-Llama-3-8B Q4_K_M 的 Stage 3A-1C VALID artifact（10/10 cases PASS）
 
 ## System Boundary
 
@@ -77,6 +77,43 @@ PENDING_WRITE transaction (reuse allocation 写入新 K/V):
     -> PENDING_WRITE → RELEASED (rollback)
     -> push to free list
 ```
+
+### Bounded release 路径（`paged_release_blocks_bounded`）
+
+```text
+paged_release_blocks_bounded(target_bytes, max_scan_blocks)
+  target=0 → return empty result (zero side effects, seam reset)
+  max_scan=0 → return exhausted + full shortfall (zero scan)
+  → llama_kv_release_collect_ownership: per-block owned/shared bitmap
+    invalid mapping → ABORT, ownership_aborted=true, zero state changes
+    test_force_ownership_abort seam → ABORT (single-shot, auto-reset)
+  → for physical_block in [0, min(max_scan_blocks, paged_n_blocks)):
+    if owned[block] → blocks_skipped_owned++, continue
+    resolve state via test_block_state_override seam (if set) else real state
+    if PENDING_WRITE | SWAPPED | RELEASED → blocks_skipped_state++, continue
+    (RESIDENT or UNUSED):
+      test_madvise_fail_block seam → inject failure, no DONTNEED
+      → paged_madvise_block(MADV_DONTNEED) on K/V pages
+      madvise fails → madvise_failures++, continue (state unchanged, scan continues)
+      madvise succeeds:
+        → clear backing metadata (swap offsets/sizes)
+        → state → RELEASED, push to free list
+        → released_bytes += advised_bytes, released_blocks++
+        → update global counters (released_unused / released_dead)
+    if released_bytes >= target_bytes → stop (one-block overshoot allowed)
+  → result: released_bytes, shortfall_bytes, overshoot_bytes, blocks_scanned,
+    blocks_skipped_owned, blocks_skipped_state, madvise_failures,
+    block_scan_exhausted, ownership_aborted
+  → ALL test-only seams auto-reset (single-shot guarantee)
+```
+
+- `target_bytes` 控制单次调用可释放的字节预算；`released_bytes` 可能因单 block 粒度 overshoot。
+- `max_scan_blocks` 控制最大扫描 block 数，在 remaining 全为 owned/RELEASED/SWAPPED/PENDING_WRITE 时产生 shortfall。
+- **PENDING_WRITE gate 是相对于原 `paged_release_blocks()` 的防御增强**：原 unbounded release 在 state check 中仅跳过 RELEASED 和 SWAPPED，不检查 PENDING_WRITE——处于事务中间态的 block 可能被误 madvise。bounded release 在处理循环中显式检查 `state == PENDING_WRITE` 并跳过。
+- ownership ABORT 路径严格零 state change：test seam `force_ownership_abort` 验证了 pre/post state snapshot 和 free list snapshot 不变。
+- madvise 失败时 block state 不变、free list 不变，扫描继续到后续候选 block；madvise_failures 计数递增。
+- Test-only seams（`paged_release_bounded_test_*`）均为 `mutable` 成员字段直接嵌入 `llama_kv_cache` 对象——其存在改变对象布局/size，但默认值保证生产路径零行为差异。所有 seam 在每次 `paged_release_blocks_bounded()` 退出时自动复位（target=0、max_scan=0、ABORT、正常结束四条路径全覆盖），严格 single-shot。
+- Bounded release 当前 **未接入 server scheduler、pressure sampler 或任何 reclaim policy**。调用点仅存在于 test 和 future example driver 层。
 
 ### Pressure sampler → server telemetry 路径
 
@@ -254,6 +291,7 @@ graph cache reuse
 - `examples/kv-*`：构造 idle/resume/trace workload 和上层策略信号；不拥有 core swap/release 状态机。
 - `scripts/run-kv-p0-*.sh`、`scripts/run-kv-paged-release-correctness.sh` 及 parser：P0 回归、稳定性、release correctness 协议和 fail-closed artifact 门禁。
 - `tests/test-kv-paged-release-ownership.cpp`、`tests/test-kv-paged-release-correctness-parser.py`：ownership 逻辑单元测试与 parser 合成负例回归。
+- `tests/test-kv-paged-release-bounded.cpp`：**bounded release 正确性测试**（533 行，test #29）——Part A 无模型 ownership fault fixture（4 组合成 invalid/OOB mapping）；Part B 需模型文件的 11 组正确性门禁（B1–B11：target=0、max_scan=0、overshoot、scan budget、ownership ABORT、PENDING_WRITE state gate、madvise failure injection、active-owned skip + logits consistency、shortfall、idempotent、scan precision corners）。所有 seam 验证 single-shot 自复位；B5 post-ABORT state/free-list snapshot invariance；B6 验证 PENDING_WRITE gate 在 ownership gate 之后独立触发；B8 dual-context logits match 验证 K/V 不被误伤。无模型时返回 SKIP_EXIT_CODE (77)。
 
 ## Integration Points
 
@@ -308,5 +346,9 @@ graph cache reuse
 - Stage 3A-1C validation protocol 的 10-case 矩阵使用 1/2/3 KiB RSS 阈值，仅为 state lifecycle forced validation，不代表部署推荐值或经验性压力限制。
 - 尚未验证真实模型/server 请求下的四态转换、source 动态切换与 stale 恢复；当前状态机证据来自 synthetic/fixture 单测。3A-1C artifact 的 CRITICAL 状态由 3 KiB forced threshold 触发，不代表真实内存压力场景。
 - bounded reclaim 尚未实现，无法确认 PRESSURE/CRITICAL 下的回收预算、RSS 降幅、live/shared 安全性或并发干扰。
+- **Bounded release 原语已实现但未接入任何调度层**：`paged_release_blocks_bounded()` 无 server scheduler 调用点，无 pressure-driven 触发，无 dry-run 模式。并发 request 下的 ownership 不变性、RSS 降幅、TTFT/TPOT/吞吐影响均未验证。
+- **内部对象布局变化**：`llama_kv_cache` 新增三个 `mutable` test-only seam 字段和两个 test-only accessor 方法。默认值保证生产路径零行为差异，但对象 size 和 cache line 布局改变是静默的——当前没有 CI 门禁或 sizeof assertion 检测未来字段增删对布局的累积影响。
+- **原 unbounded `paged_release_blocks()` 缺少 PENDING_WRITE gate**：只检查 RELEASED 和 SWAPPED，不检查 PENDING_WRITE。PENDING_WRITE block 当前可被 madvise 误伤。该缺陷被 bounded release 的显式 PENDING_WRITE skip 间接记录为已知差距，但原路径尚未修复。
+- **`test-kv-paged-release-bounded` 的 `decode_prompt()` 硬编码 BOS token 128000**（Llama-3 tokenizer）。非 Llama-3 模型（如 Qwen、DeepSeek）的 BOS 不同，测试将因 token 无效而失败。测试不声明通用模型兼容性。
 - 当前 release 证据覆盖单机 CPU、Llama-3-8B Q4_K_M、ctx 1024、parallel 4、固定 idle/resume workload。不覆盖多模型、长上下文、server/continuous batching 或不同 backend/layout。
 - 历史 README 中的性能数字缺少仓库内原始 artifacts 与 commit/worktree 绑定，目前无法确认其对当前 HEAD 的适用性。
