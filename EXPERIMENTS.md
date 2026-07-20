@@ -294,3 +294,73 @@ Test config: `LLAMA_KV_PAGED=1 LLAMA_KV_PAGED_RELEASE=1 LLAMA_KV_PAGED_BLOCK_SIZ
 - 可支持：Stage 3A-2A bounded release 原语已提交并通过 build/CTest 注册/`git diff --check`；Part A ownership fault fixture 在 build 中 verified-compiles；4 条退出路径的 seam 自动复位有源码级覆盖。
 - 证据限制：Part B 正式 run 因缺少模型而 SKIP——本条目为 `registered` 状态，不得升级为 `valid` 直至提供模型运行并通过全部 B1–B11 assertions。
 - **不覆盖**：并发 request、server scheduler 集成、pressure-driven 触发、RSS 降幅、TTFT/TPOT/吞吐影响、长上下文、不同模型/quantization/block_size。
+
+## E-0011 — Stage 3A-2B pressure-driven KV reclaim dry-run OFF/ON controlled A/B
+
+- Status: **valid**（真实 server + Meta-Llama-3-8B Q4_K_M，OFF/ON controlled A/B，parser exit 0、verdict PASS）
+- Date: 2026-07-20
+- Commit/worktree: `02f8cd5ed33a13ffac3cce444d6d3ea7eb987650`；clean
+- Runner: `scripts/run-kv-dry-run-stage3a-2b.py`（OFF/ON paired A/B）
+- Parser: `scripts/parse-kv-dry-run-stage3a-2b.py`（fail-closed）
+- Parser synthetic negatives: `tests/test-kv-dry-run-stage3a-2b-parser.py`
+- Static checks: `tests/test-server-kv-pressure-static.py`（含 dry-run decoupling、marker field schema、config isolation 检查）
+- C++ integration: `tests/test-server-kv-pressure.cpp`（含 dry-run config 解析、cooldown/backoff、state-entry、skip-reason 路径）
+- Raw artifact: `/root/oscomp/kv_logs/kv_dry_run_stage3a_2b_20260720T161209Z_02f8cd5ed3`
+- Evidence hashes: manifest `manifest.json` 覆盖 OFF/ON case 的 binary/model/parser SHA256；summary `summary.json` verdict PASS
+
+**Question and protocol**
+
+验证 pressure-driven dry-run 控制链路：在 forced CRITICAL 状态下，dry-run scanner 是否能正确执行只读候选 block 评估、产出 would-release 预测，同时保持零 KV state mutation、零 MADV_DONTNEED、零 destructive release，且不伤害推理正确性。
+
+Fixed OFF/ON paired protocol: OFF variant（`LLAMA_KV_PRESSURE_DRY_RUN=0`）vs ON variant（`LLAMA_KV_PRESSURE_DRY_RUN=1`、`TARGET_BYTES=33554432`（32 MiB）、`MAX_SCAN_BLOCKS=64`、`COOLDOWN_MS=500`、`BACKOFF_MS=5000`）。两者共享 `LLAMA_KV_PRESSURE_SAMPLER=1` + forced thresholds（1/2/3 KiB RSS）触发 CRITICAL 状态。ON strace 捕获确认 zero MADV_DONTNEED。
+
+**Environment and workload**
+
+Binary: Release build, GCC 11.4, GGML CPU/OpenMP/native, 12 logical CPU (Xeon Platinum 8358), Ubuntu 22.04/Linux 5.15, ~24 GB RAM.
+Model: Meta-Llama-3-8B-Instruct Q4_K_M, ctx 1024, n-predict 32, seed 1, K/V F32.
+Prompt: "In one short sentence, explain why deterministic tests are useful."
+Timeout: 60s, non-dry-run（runner 参数命名；server 行为是 dry-run）。
+
+**Correctness gate**
+
+- Parser exit 0、verdict PASS。
+- OFF case: zero `kv_pressure_dry_run` markers、telemetry markers present（dry-run 独立于 telemetry）。
+- ON case: ≥1 `kv_pressure_dry_run` marker with `release_enabled=0`（`LLAMA_KV_PAGED_RELEASE` 未设置）、`skipped_reason=none`、`would_release_bytes>0`、`ownership_aborted=0`。
+- OFF 与 ON 的 response 必须 byte-identical。
+- ON strace: zero MADV_DONTNEED calls。
+- 两者: zero destructive release markers（`paged_release_blocks`/`paged_block_release_bytes=[1-9]`/`paged_blocks_released=[1-9]`）。
+- Zero residual processes。
+- OFF/ON 环境差异仅限于 `LLAMA_KV_PRESSURE_DRY_RUN*` 系列变量。
+
+**Key results**
+
+| Metric | OFF | ON |
+|--------|-----|----|
+| dry_run markers | 0 | 7 |
+| response length | 183 | 183 |
+| response text | byte-identical | byte-identical |
+| destructive release | NONE | NONE |
+| MADV_DONTNEED (strace) | 0 | 0 |
+| residual processes | 0 | 0 |
+
+- OFF/ON response 完全一致——dry-run scanner 不影响推理输出。
+- ON 产出的 7 个 dry_run marker 均由 forced CRITICAL 状态触发：`state=CRITICAL source=RSS_ABSOLUTE stale=0 release_enabled=0 would_release_bytes>0 ownership_aborted=0 skipped_reason=none`。
+- `release_enabled=0` 符合预期：`LLAMA_KV_PAGED_RELEASE` 未设置，dry-run scanner 以 `disabled` 观测性状态运行（非 skip reason）。
+- strace 归因零 MADV_DONTNEED——dry-run 的 `const` 只读性在 syscall 层面得到确认。
+
+**Supported conclusion and limits**
+
+- Stage 3A-2B pressure-driven dry-run 控制链路门禁已通过：forced CRITICAL 状态下的 would-release 预测正确产出、响应 byte-identical、零 KV state mutation（strace 确认）、零 destructive release。
+- **该证据仅验证 dry-run 控制链路、只读性和协议。** 不声明真实阈值下的回收效果或性能收益。
+- **不代表真实 pressure 行为**：CRITICAL 状态由 1/2/3 KiB RSS forced threshold 触发（`FORCED_LIFECYCLE_STATE_VALIDATION_ONLY_NOT_REAL_DEPLOYMENT_THRESHOLDS`），不代表真实内存压力场景下的 dry-run 触发模式或 would-release 候选分布。
+- **不覆盖**：并发请求、长上下文、真实内存压力、NORMAL/RECOVERY 状态下的 dry-run 零触发（parser 验证 OFF marker=0，但未验证 NORMAL 状态下的 marker suppression）、cooldown/backoff 动态行为（forced CRITICAL 下 state 持续，cooldown 影响 marker 间隔但非本实验验证目标）、不同模型/quantization/block_size、dry-run scanner 的 CPU 开销 profiling。
+- Dry-run 的 `const` 零 mutation 属性在 C++ 类型系统和源码审计层面成立；strace 的零 MADV_DONTNEED 确认了 syscall 层面的零 destructive 行为。但尚未验证 `const_cast` 绕过或其他 indirect mutation 路径是否存在。
+- 本实验固定使用 32 MiB target_bytes 和 64 max_scan_blocks——这些值与 dry-run 的 would-release 预测相关，但当前 artifact 的 would-release 字节/block 计数的绝对值不构成正式容量或回收率结论。
+
+**Relation to next gate**
+
+本实验完成 dry-run 控制链路验证后，下道门禁 Stage 3A-2C 将 dry-run scanner 替换为真实 destructive `paged_release_blocks_bounded()`，在相同 OFF/ON controlled A/B 协议下验证：
+- ON strace 确认 MADV_DONTNEED 发生且计数与 release marker 一致；
+- 响应仍 byte-identical（release 不误伤 active-owned block）；
+- ownership ABORT 零发生；
+- 使用固定 target_bytes（非动态阈值）以便与 dry-run 的 would-release 预测对比。

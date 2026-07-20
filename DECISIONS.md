@@ -382,3 +382,78 @@ Stage 3A-0 的 `paged_release_blocks()` 是全量扫描、无 budget 控制—�
 - `tests/CMakeLists.txt`：注册 test #29 `test-kv-paged-release-bounded`。
 - Build artifact: `build/bin/test-kv-paged-release-bounded` 存在，CTest 可在有模型时运行 Part B。
 - `git diff --check`：通过（无 whitespace 错误）。
+
+## D-0011 — Dry-run bounded release 先于 destructive release 接入 server scheduler，通过只读控制链路验证调度时序与压力状态一致性
+
+- Date: 2026-07-20
+- Status: accepted
+- Evidence commit/worktree: `02f8cd5ed33a13ffac3cce444d6d3ea7eb987650`（clean）；VALID artifact `/root/oscomp/kv_logs/kv_dry_run_stage3a_2b_20260720T161209Z_02f8cd5ed3`
+- Supersedes: D-0010 中"bounded release 先入 core，不连 pressure"的阶段描述——本决策提交 server scheduler 的 dry-run 连接，destructive 接入留待 Stage 3A-2C
+- Superseded by: none
+
+**Context**
+
+D-0010 提交的 `paged_release_blocks_bounded()` 是 per-call budget 控制的 destructive 原语，但无 server scheduler 调用点。若在首次接入 server 时直接执行 destructive `MADV_DONTNEED`，调度时序错误、ownership ABORT、cooldown 不足导致的过度回收、或 NORMAL 状态下误触发释放等问题将无法与 dry-run 的只读预测解耦归因。此外，dry-run 与 destructive release 的解耦本身就是一个需要独立验证的设计假设。
+
+**Decision**
+
+1. **先接入 dry-run，不接入 destructive release。** 在 `maybe_sample_kv_pressure()` 的 telemetry 采样后新增 Phase B：调用 `paged_release_blocks_bounded_dry_run()`——与 destructive `paged_release_blocks_bounded()` 共享 ownership collection + state gate 逻辑，但**零 KV state mutation、零 MADV_DONTNEED、零 backing metadata 清除**。
+2. **Dry-run 与 destructive release 完全解耦**：
+   - Dry-run scanner 为 `const` 方法，编译器强制零 mutation。
+   - Dry-run 不检查 `LLAMA_KV_PAGED_RELEASE`——仅需 paged KV + valid layout + !swap。即使 destructive release 因 `LLAMA_KV_PAGED_RELEASE != 1` 而 disabled，dry-run 仍可独立评估。
+   - Dry-run 不接入 test-only seam（`force_ownership_abort`、`madvise_fail_block`、`block_state_override`）——这些 seam 仅服务于 destructive 路径的正确性测试。
+3. **显式 `should_evaluate` 六道门控**（无隐式 fallthrough、无 sentinel 字符串）：
+   - Gate 1: master switch enabled + target_bytes > 0
+   - Gate 2: `llama_memory_i` 存在
+   - Gate 3: `paged_release_status()` 精确区分 hard skip（swap_enabled/not_paged/layout_unsupported）与 observational disabled
+   - Gate 4: `telemetry.stale` 拒绝
+   - Gate 5: pressure state ∈ {PRESSURE, CRITICAL}——NORMAL/RECOVERY 不触发评估、不输出 marker
+   - Gate 6: `dry_run_due()` cooldown/backoff 时间门控
+   - 任意条件不满足即不调用 scanner、不输出 marker。
+4. **Cooldown/backoff 策略**：
+   - State-entry 语义：进入 PRESSURE/CRITICAL 时立即评估一次（重置 cooldown timer）。
+   - CRITICAL entry：绕过 cooldown 进行首次评估；后续 sustained CRITICAL 评估仍受 cooldown 限制。
+   - 同一 state episode 内：`elapsed >= cooldown_ms` 才允许再次评估。
+   - 评估后 shortfall + scan exhausted → 延长到 backoff_ms（避免在无法满足 target 时频繁无效扫描）；否则回 base cooldown。
+5. **`llama_kv_release_status` 枚举**：替代旧版单一 boolean `can_enable` 过载，精确区分 release 可用性原因（`available` / `not_paged` / `layout_unsupported` / `swap_enabled` / `disabled`）。server policy 据此区分 hard skip reason 与 observational disabled。
+6. **`llama_kv_bounded_release_result` 提升为全局类型**：从 `llama_kv_cache` 内部 struct 移至 `llama-kv-cache-release.h`，供 `llama-memory.h` virtual 接口引用（避免 core/server header 循环依赖）。
+7. **验收仅验证 forced-pressure 控制链路、只读性和协议，不代表真实阈值或性能收益。**
+
+**Alternatives rejected**
+
+- 首次接入即同时执行 dry-run + destructive release：无法独立归因调度时序问题、ownership 问题和 madvise syscall 副作用。dry-run 只读路径是自然的中间门禁。
+- 在 sampler 初始化成功前允许 dry-run 触发：dry-run 需要 sampler 提供的 pressure state 进行触发判定。允许独立运行需额外 state source abstraction——当前阶段不需要此复杂度。
+- 使用单个 boolean `can_enable` 表达所有 release 状态：无法区分"swap 互斥"（hard skip）与"release 未启用"（observational），导致 server policy 过度跳过或错误触发。
+- 让 dry-run scanner 也访问 test-only seam：dry-run 是生产路径——test seam 的语义（ABORT 注入、madvise failure 模拟）与只读语义冲突。保持两套代码路径（destructive + seam vs dry-run + no seam）降低了 seam 泄漏到生产 dry-run 的风险。
+- 不做 cooldown/backoff，每次 telemetry sample 都评估 dry-run：ownership collection + page-aligned byte counting 是 O(n_blocks × n_layers) 操作，在 250ms 采样间隔下可能造成不必要的 CPU 开销。cooldown/backoff 将评估频率限制在 seconds 量级。
+
+**Consequences and limits**
+
+- 收益：控制链路只读验证独立于 destructive release 的正确性/性能风险；dry-run marker 提供可审计的 would-release 预测（候选 block 数、字节数、skip reason、cooldown 状态），可在 destructive 接入前确认 policy 决策一致性；`should_evaluate` 门控零隐式行为——所有 skip 原因通过 `skipped_reason` 字段可见。
+- 代价：server scheduler 每次 telemetry sample 后额外执行门控检查（即使不评估也需通过 Gates 1–5）；ownership collection 在每次 dry-run 评估时执行（与 destructive release 对等的 O(n_blocks × n_seqs × cells_per_seq) 开销）；`llama_kv_cache` 对象进一步扩大（新增 4 个 global counter accessor）；`llama_kv_bounded_release_result` 提升为全局类型增加了 header 依赖面。
+- 当前验证范围：单请求、单模型（Llama-3-8B Q4_K_M）、forced thresholds（1/2/3 KiB RSS）、ctx 1024、32 token 输出。不覆盖并发请求、长上下文、真实内存压力、不同模型/quantization。
+- 失效边界：若后续 sampler 被移除或替换，dry-run 的 pressure state 输入随之消失。若 cooldown/backoff 参数与实际 workload 的 pressure 变化速率不匹配，可能导致过度评估（CPU 浪费）或响应滞后（CRITICAL 持续但 dry-run 被 cooldown 阻塞）。Cooldown 默认值（2s base / 10s backoff / 500ms min）为初始值，未经过真实 workload 调优。
+- Dry-run 的 `const` 零 mutation 属性仅由 C++ 类型系统和源码审计保证——编译器阻止对 `this` 的非 mutable 成员写入，但 `paged_block_states` 等核心数组在 `const` 方法内仍可被误用（通过 `const_cast` 或其他路径）。当前实现未使用此类绕过。
+
+**Evidence**
+
+- `src/llama-kv-cache-release.h:6-59`：`llama_kv_release_status` 枚举、`llama_kv_bounded_release_result` struct（全局类型）。
+- `src/llama-kv-cache.h:381-383`：`bounded_release_dry_run()` 声明。
+- `src/llama-kv-cache.h:470-484`：`paged_release_blocks_bounded_dry_run() const` 声明与零副作用契约注释。
+- `src/llama-kv-cache.h:507-519`：4 个 global counter test-only accessor。
+- `src/llama-kv-cache.cpp:6444-6620`：`paged_release_blocks_bounded_dry_run()` ~177 行实现——ownership collection、state gate、page-aligned byte counting、budget check、zero mutation。
+- `src/llama-kv-cache.cpp:6622-6648`：`paged_release_status()` 实现——快速路径 `available` 与慢速路径逐项检查。
+- `src/llama-memory.h:162-176`：`bounded_release_dry_run()` 与 `paged_release_status()` virtual 接口。
+- `tools/server/server-kv-pressure.h:44-134`：`server_kv_pressure_dry_run_config`、`server_kv_pressure_dry_run_event` structs 与 env 解析声明。
+- `tools/server/server-kv-pressure.h:148-178`：`dry_run_enable()` / `dry_run_disable()` / `dry_run_due()` / `dry_run_record()` / `dry_run_config()` 接口。
+- `tools/server/server-kv-pressure.cpp:193-254`：dry-run config env 解析（parse_bool_env、parse_uint64_env、parse_uint32_env 及 cooldown/backoff minimum clamping）。
+- `tools/server/server-kv-pressure.cpp:256-296`：`dry_run_due()` 与 `dry_run_record()` 实现——state-entry 语义、cooldown elapsed 比较、backoff 扩展。
+- `tools/server/server-kv-pressure.cpp:298-324`：`server_kv_pressure_dry_run_format_marker()`——16 字段结构化 marker。
+- `tools/server/server-context.cpp:1098-1129`：`init_kv_pressure_sampler()` 内 dry-run config 解析与 `dry_run_enable()`。
+- `tools/server/server-context.cpp:1153-1198`：`maybe_sample_kv_pressure()` 内 Phase B `should_evaluate` 六道门控 + `bounded_release_dry_run()` 调用 + marker 输出。
+- `scripts/run-kv-dry-run-stage3a-2b.py`：546 行 OFF/ON controlled A/B runner。
+- `scripts/parse-kv-dry-run-stage3a-2b.py`：314 行 fail-closed parser。
+- `tests/test-kv-dry-run-stage3a-2b-parser.py`：dry-run parser 合成负例。
+- `tests/test-server-kv-pressure.cpp`：dry-run config 解析、cooldown/backoff、state-entry、skip-reason 路径。
+- `tests/test-server-kv-pressure-static.py`：dry-run decoupling、marker field schema、config isolation 静态检查。
+- **Stage 3A-2B VALID artifact**：`/root/oscomp/kv_logs/kv_dry_run_stage3a_2b_20260720T161209Z_02f8cd5ed3`——parser exit 0、verdict PASS、OFF=0 ON=7 dry_run markers、response byte-identical、zero destructive release、zero MADV_DONTNEED (strace)。
