@@ -3,6 +3,33 @@
 #include <cstdint>
 #include <vector>
 
+// Precise release capability — why paged destructive release can or cannot run.
+// Used by server pressure policy to differentiate skip reasons instead of
+// overloading a single boolean.
+enum class llama_kv_release_status {
+    available,           // Release can run: paged + ingraph + layers + row_idx + !swap
+    not_paged,           // KV paging not enabled
+    layout_unsupported,  // v_trans or n_stream != 1 or block_size == 0
+    swap_enabled,        // Swap is active; release + swap are mutually exclusive
+    disabled,            // paged_block_release_enabled is false
+};
+
+// Bounded release result — reported by both destructive and dry-run release paths.
+// released_bytes may overshoot target_bytes by at most one block.
+// In dry-run mode, these fields carry would-release semantics (no actual release occurred).
+struct llama_kv_bounded_release_result {
+    uint64_t released_bytes     = 0;
+    uint64_t shortfall_bytes    = 0;
+    uint64_t overshoot_bytes    = 0;
+    uint32_t released_blocks    = 0;
+    uint32_t blocks_scanned     = 0;
+    uint32_t blocks_skipped_owned = 0;
+    uint32_t blocks_skipped_state = 0;
+    uint32_t madvise_failures   = 0;
+    bool     block_scan_exhausted = false;
+    bool     ownership_aborted    = false;
+};
+
 inline bool llama_kv_destructive_release_can_enable(
         bool paged_enabled,
         bool ingraph_enabled,

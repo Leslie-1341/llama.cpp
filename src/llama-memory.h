@@ -2,6 +2,7 @@
 
 #include "llama.h"
 #include "llama-graph.h"
+#include "llama-kv-cache-release.h"
 
 #include <cstdint>
 #include <map>
@@ -156,6 +157,23 @@ struct llama_memory_i {
     virtual void set_seq_prefetch_protected(llama_seq_id seq_id, bool enabled) {
         GGML_UNUSED(seq_id);
         GGML_UNUSED(enabled);
+    }
+
+    // Dry-run bounded release: read-only evaluation of would-be release candidates
+    // under given budget constraints.  Default no-op returns empty result — only
+    // paged-KV memory implementations provide a real scanner.
+    virtual llama_kv_bounded_release_result bounded_release_dry_run(
+            uint64_t target_bytes, uint32_t max_scan_blocks) {
+        GGML_UNUSED(target_bytes);
+        GGML_UNUSED(max_scan_blocks);
+        return {};
+    }
+
+    // Whether paged destructive release is currently active, and if not,
+    // the precise reason.  Used by server pressure policy to differentiate
+    // skip reasons (swap vs non-paged vs layout vs disabled).
+    virtual llama_kv_release_status paged_release_status() const {
+        return llama_kv_release_status::not_paged;
     }
 
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;

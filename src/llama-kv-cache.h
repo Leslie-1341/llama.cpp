@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama-kv-cache-identity.h"
+#include "llama-kv-cache-release.h"
 
 #include "llama-batch.h"
 #include "llama-graph.h"
@@ -377,6 +378,9 @@ public:
     int32_t prefetch_seq(llama_seq_id seq_id) override;
     int32_t prefetch_seq_step(llama_seq_id seq_id, uint32_t max_blocks) override;
     void set_seq_prefetch_protected(llama_seq_id seq_id, bool enabled) override;
+    llama_kv_bounded_release_result bounded_release_dry_run(
+            uint64_t target_bytes, uint32_t max_scan_blocks) override;
+    llama_kv_release_status paged_release_status() const override;
     void defer_idle_swapout(int32_t n_steps);
     void prefetch_seq_last_stats(
             uint64_t & owned_blocks,
@@ -448,20 +452,11 @@ public:
     void swap_out_window(uint32_t n_kv);
     void sample_swap_rss();
 
-    // Bounded release result — returned by paged_release_blocks_bounded().
+    // Bounded release result — defined in llama-kv-cache-release.h for shared access
+    // between core (llama_kv_cache) and server (llama_memory_i).
     // released_bytes may overshoot target_bytes by at most one block.
-    struct llama_kv_bounded_release_result {
-        uint64_t released_bytes = 0;
-        uint64_t shortfall_bytes = 0;
-        uint64_t overshoot_bytes = 0;
-        uint32_t released_blocks = 0;
-        uint32_t blocks_scanned = 0;
-        uint32_t blocks_skipped_owned = 0;
-        uint32_t blocks_skipped_state = 0;
-        uint32_t madvise_failures = 0;
-        bool block_scan_exhausted = false;
-        bool ownership_aborted = false;
-    };
+    // (No using-declaration needed — the global ::llama_kv_bounded_release_result is
+    //  visible through the included llama-kv-cache-release.h.)
 
     // stage F1 / P1: advise the unused tail capacity [GGML_PAD(n_kv, 256), kv_size) away via
     // MADV_DONTNEED to lower current RSS. No-op unless LLAMA_KV_LAZY_TAIL=1 (and !v_trans &&
@@ -471,6 +466,17 @@ public:
     llama_kv_bounded_release_result paged_release_blocks_bounded(
             uint64_t target_bytes,
             uint32_t max_scan_blocks);
+
+    // Dry-run bounded release: same ownership + state-gate scan as the destructive
+    // variant, but NEVER calls paged_madvise_block(MADV_DONTNEED) or modifies KV state.
+    // Returns would-release counts — candidate blocks, their byte totals,
+    // skipped blocks, and scan-exhaustion status.  Zero side effects on:
+    //   paged_block_states, paged_free_list, paged_swap_offsets/sizes,
+    //   paged_block_used, paged_blocks_in_use, or any release counters.
+    // Does NOT access test-only seams — those belong to the destructive path only.
+    llama_kv_bounded_release_result paged_release_blocks_bounded_dry_run(
+            uint64_t target_bytes,
+            uint32_t max_scan_blocks) const;
 
     // Test-only seams for paged_release_blocks_bounded().
     // All default to no-injection; no production behaviour changes unless a test sets them.
@@ -497,6 +503,19 @@ public:
     bool paged_release_bounded_test_block_in_free_list(uint32_t block) const {
         return std::find(paged_free_list.begin(), paged_free_list.end(), block)
             != paged_free_list.end();
+    }
+    // Test-only accessors for dry-run zero-change verification.
+    uint64_t paged_release_bounded_test_read_release_bytes() const {
+        return paged_block_release_bytes;
+    }
+    uint64_t paged_release_bounded_test_read_released_blocks() const {
+        return paged_blocks_released;
+    }
+    uint64_t paged_release_bounded_test_read_released_unused() const {
+        return paged_blocks_released_unused;
+    }
+    uint64_t paged_release_bounded_test_read_released_dead() const {
+        return paged_blocks_released_dead;
     }
 
     void paged_swap_out_window(uint32_t n_kv);

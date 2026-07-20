@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <cstring>
 #include <sstream>
 
 namespace {
@@ -185,5 +186,173 @@ std::string server_kv_pressure_format_marker(const server_kv_pressure_event & ev
         << " skip_count=" << event.skip_count
         << " idle=" << (event.idle ? 1 : 0)
         << " trigger=" << event_trigger(event);
+    return out.str();
+}
+
+// --- Dry-run policy implementation ---
+
+namespace {
+
+constexpr uint32_t MIN_COOLDOWN_MS = 500;
+
+bool parse_bool_env(const char * name) {
+    const char * val = std::getenv(name);
+    return val && std::strcmp(val, "1") == 0;
+}
+
+bool parse_uint64_env(const char * name, uint64_t & out, std::string & error) {
+    const char * val = std::getenv(name);
+    if (!val) return true;
+    while (std::isspace((unsigned char) *val)) ++val;
+    if (*val == '\0') { error = std::string(name) + " is empty"; return false; }
+    const char * end = val;
+    while (*end != '\0') ++end;
+    while (end > val && std::isspace((unsigned char) end[-1])) --end;
+
+    uint64_t parsed = 0;
+    for (const char * c = val; c != end; ++c) {
+        if (!std::isdigit((unsigned char) *c)) {
+            error = std::string(name) + " must be a non-negative integer";
+            return false;
+        }
+        const uint64_t digit = *c - '0';
+        if (parsed > (UINT64_MAX - digit) / 10) {
+            error = std::string(name) + " is out of range";
+            return false;
+        }
+        parsed = parsed * 10 + digit;
+    }
+    out = parsed;
+    return true;
+}
+
+bool parse_uint32_env(const char * name, uint32_t minimum, uint32_t & out,
+                      std::string & error) {
+    uint64_t val = 0;
+    if (!parse_uint64_env(name, val, error)) return false;
+    if (val > UINT32_MAX) { error = std::string(name) + " is out of range"; return false; }
+    out = std::max<uint32_t>((uint32_t) val, minimum);
+    return true;
+}
+
+} // namespace
+
+bool server_kv_pressure_dry_run_config_from_env(
+        server_kv_pressure_dry_run_config & config, std::string & error) {
+    server_kv_pressure_dry_run_config parsed;
+    error.clear();
+
+    parsed.enabled = parse_bool_env("LLAMA_KV_PRESSURE_DRY_RUN");
+
+    if (!parse_uint64_env("LLAMA_KV_PRESSURE_DRY_RUN_TARGET_BYTES",
+                          parsed.target_bytes, error)) {
+        return false;
+    }
+
+    if (!parse_uint32_env("LLAMA_KV_PRESSURE_DRY_RUN_MAX_SCAN_BLOCKS",
+                          1, parsed.max_scan_blocks, error)) {
+        return false;
+    }
+
+    if (!parse_uint32_env("LLAMA_KV_PRESSURE_DRY_RUN_COOLDOWN_MS",
+                          server_kv_pressure_dry_run_config::MIN_COOLDOWN_MS,
+                          parsed.cooldown_ms, error)) {
+        return false;
+    }
+
+    if (!parse_uint32_env("LLAMA_KV_PRESSURE_DRY_RUN_BACKOFF_MS",
+                          server_kv_pressure_dry_run_config::MIN_COOLDOWN_MS,
+                          parsed.backoff_ms, error)) {
+        return false;
+    }
+
+    // If target_bytes is 0, treat as effectively disabled regardless of the
+    // master switch — there is nothing to evaluate.
+    if (parsed.enabled && parsed.target_bytes == 0) {
+        parsed.enabled = false;
+    }
+
+    config = parsed;
+    return true;
+}
+
+bool server_kv_pressure_runtime::dry_run_due(
+        time_point now, kv_pressure_state state,
+        bool stale) const {
+    if (!dry_run_config_.enabled || dry_run_config_.target_bytes == 0) {
+        return false;
+    }
+    if (stale) {
+        return false;
+    }
+    if (state != kv_pressure_state::PRESSURE &&
+            state != kv_pressure_state::CRITICAL) {
+        return false;
+    }
+
+    // State-entry semantics: when the pressure state transitions INTO
+    // PRESSURE or CRITICAL from a different state, we are entering a new
+    // episode.  Reset the cooldown timer so the first evaluation fires
+    // without waiting.
+    //
+    // CRITICAL entry: bypass cooldown entirely for the first evaluation
+    // within the new episode.  Sustained CRITICAL calls are still rate-limited.
+    //
+    // PRESSURE entry: first evaluation fires immediately (cooldown was
+    // reset).  Subsequent calls are rate-limited by the base cooldown.
+    const bool state_entered = (state != last_dry_run_state_);
+    if (state_entered) {
+        last_dry_run_state_ = state;
+        last_dry_run_ = time_point {};
+        return true;  // Evaluate immediately on state entry.
+    }
+
+    // Within the same state episode: apply cooldown.
+    if (last_dry_run_ == time_point {}) {
+        return true;
+    }
+
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - last_dry_run_);
+    return elapsed.count() >= (int64_t) current_cooldown_ms_;
+}
+
+void server_kv_pressure_runtime::dry_run_record(bool had_shortfall, time_point now) {
+    last_dry_run_ = now;
+    if (had_shortfall) {
+        current_cooldown_ms_ = dry_run_config_.backoff_ms;
+    } else {
+        current_cooldown_ms_ = dry_run_config_.cooldown_ms;
+    }
+}
+
+std::string server_kv_pressure_dry_run_format_marker(
+        const server_kv_pressure_dry_run_event & event) {
+    const auto & r = event.result;
+
+    const char * reason = event.skipped_reason;
+    if (!reason) reason = "none";
+
+    std::ostringstream out;
+    out << "kv_pressure_dry_run"
+        << " state=" << kv_pressure_state_name(event.pressure_state)
+        << " source=" << kv_pressure_source_name(event.pressure_source)
+        << " stale=" << (event.stale ? 1 : 0)
+        << " release_enabled=" << (event.release_enabled ? 1 : 0)
+        << " would_release_bytes=" << r.released_bytes
+        << " would_release_blocks=" << r.released_blocks
+        << " blocks_scanned=" << r.blocks_scanned
+        << " blocks_skipped_owned=" << r.blocks_skipped_owned
+        << " blocks_skipped_state=" << r.blocks_skipped_state
+        << " shortfall_bytes=" << r.shortfall_bytes
+        << " overshoot_bytes=" << r.overshoot_bytes
+        << " block_scan_exhausted=" << (r.block_scan_exhausted ? 1 : 0)
+        << " ownership_aborted=" << (r.ownership_aborted ? 1 : 0)
+        << " target_bytes=" << event.target_bytes
+        << " max_scan_blocks=" << event.max_scan_blocks
+        << " skipped_reason=" << reason
+        << " cooldown_ms=" << event.cooldown_ms
+        << " sample_count=" << event.sample_count
+        << " idle=" << (event.idle ? 1 : 0);
     return out.str();
 }

@@ -697,6 +697,10 @@ private:
     // Pressure state is telemetry-only here and never drives KV mutations.
     std::unique_ptr<kv_pressure_sampler> kv_pressure_sampler_owner;
     server_kv_pressure_runtime kv_pressure_runtime;
+
+    // Dry-run bounded release evaluation: enabled only when LLAMA_KV_PRESSURE_DRY_RUN=1.
+    // Shared config lives on the runtime; the copy here is the authoritative parsed source.
+    server_kv_pressure_dry_run_config kv_pressure_dry_run_config;
 #endif
 
     server_metrics metrics;
@@ -747,6 +751,8 @@ private:
 #if defined(__linux__)
             kv_pressure_sampler_owner.reset();
             kv_pressure_runtime.disable();
+            kv_pressure_runtime.dry_run_disable();
+            kv_pressure_dry_run_config = server_kv_pressure_dry_run_config{};
 #endif
             destroy();
         } else {
@@ -1073,6 +1079,8 @@ private:
     void init_kv_pressure_sampler() {
         kv_pressure_sampler_owner.reset();
         kv_pressure_runtime.disable();
+        kv_pressure_runtime.dry_run_disable();
+        kv_pressure_dry_run_config = server_kv_pressure_dry_run_config{};
 
         const kv_pressure_enablement enablement = kv_pressure_sampler_environment_enablement();
         if (enablement == kv_pressure_enablement::KV_PRESSURE_ENABLEMENT_DISABLED) {
@@ -1088,6 +1096,29 @@ private:
         if (!server_kv_pressure_config_from_env(config, error)) {
             SRV_WRN("KV pressure telemetry disabled: %s\n", error.c_str());
             return;
+        }
+
+        // Parse dry-run config independently — it is not gated on sampler init
+        // success because the dry-run could conceptually run with a different
+        // pressure input source in the future.  For now it shares the sampler
+        // lifecycle but fails independently.
+        {
+            server_kv_pressure_dry_run_config dry_cfg;
+            std::string dry_error;
+            if (!server_kv_pressure_dry_run_config_from_env(dry_cfg, dry_error)) {
+                SRV_WRN("KV pressure dry-run disabled: %s\n", dry_error.c_str());
+            } else if (dry_cfg.enabled) {
+                kv_pressure_dry_run_config = dry_cfg;
+                // Dry-run piggybacks on the pressure sampler lifecycle but does
+                // not require it — the sampler must also be initialized for the
+                // dry-run to fire because it reads pressure state.
+                kv_pressure_runtime.dry_run_enable(dry_cfg);
+                SRV_INF("KV pressure dry-run enabled: target_bytes=%" PRIu64
+                        " max_scan_blocks=%" PRIu32 " cooldown_ms=%" PRIu32
+                        " backoff_ms=%" PRIu32 "\n",
+                        dry_cfg.target_bytes, dry_cfg.max_scan_blocks,
+                        dry_cfg.cooldown_ms, dry_cfg.backoff_ms);
+            }
         }
 
         try {
@@ -1121,6 +1152,96 @@ private:
         if (event.should_log()) {
             const std::string marker = server_kv_pressure_format_marker(event);
             SRV_INF("%s\n", marker.c_str());
+        }
+
+        // --- Dry-run bounded release evaluation (read-only, never mutates KV) ---
+        {
+            const auto & telemetry = kv_pressure_sampler_owner->telemetry();
+
+            server_kv_pressure_dry_run_event dry_event;
+            dry_event.pressure_state   = telemetry.state;
+            dry_event.pressure_source  = telemetry.source;
+            dry_event.stale            = telemetry.stale;
+            dry_event.idle             = idle;
+            dry_event.release_enabled  = false;  // set below after status check
+            dry_event.sample_count     = kv_pressure_runtime.sample_count();
+            dry_event.target_bytes     = kv_pressure_dry_run_config.target_bytes;
+            dry_event.max_scan_blocks  = kv_pressure_dry_run_config.max_scan_blocks;
+
+            const auto now = server_kv_pressure_runtime::clock::now();
+
+            // Explicit evaluation gate — no empty branches, no sentinel strings.
+            // Only when should_evaluate==true is the dry-run scanner called.
+            bool should_evaluate = false;
+            const char * skip_reason = nullptr;
+
+            // Master switch: enabled + non-zero target.
+            if (!kv_pressure_dry_run_config.enabled ||
+                    kv_pressure_dry_run_config.target_bytes == 0) {
+                // Dry-run is disabled — zero markers, zero scanner calls.
+            } else if (!ctx_tgt || !llama_get_memory(ctx_tgt)) {
+                skip_reason = "no_memory";
+            } else {
+                // Release capability check: only hard blockers set skip_reason.
+                const auto release_status =
+                    llama_get_memory(ctx_tgt)->paged_release_status();
+                switch (release_status) {
+                case llama_kv_release_status::available:
+                    dry_event.release_enabled = true;
+                    break;
+                case llama_kv_release_status::disabled:
+                    break;  // observational, not a skip
+                case llama_kv_release_status::swap_enabled:
+                    skip_reason = "swap_enabled";        break;
+                case llama_kv_release_status::not_paged:
+                    skip_reason = "not_paged";           break;
+                case llama_kv_release_status::layout_unsupported:
+                    skip_reason = "layout_unsupported";  break;
+                }
+
+                if (!skip_reason && telemetry.stale) {
+                    skip_reason = "stale";
+                }
+
+                // Trigger-state gate: only PRESSURE / CRITICAL are eligible.
+                if (!skip_reason &&
+                        telemetry.state != kv_pressure_state::PRESSURE &&
+                        telemetry.state != kv_pressure_state::CRITICAL) {
+                    // NORMAL or RECOVERY — no evaluation, no marker.
+                } else if (!skip_reason) {
+                    // Cooldown / state-entry check.  dry_run_due() returns true
+                    // on state entry (immediate evaluation) or when the cooldown
+                    // has elapsed.  Returns false when still within the cooldown
+                    // window — skip this sample, no marker.
+                    should_evaluate = kv_pressure_runtime.dry_run_due(
+                            now, telemetry.state, telemetry.stale);
+                }
+            }
+
+            if (should_evaluate) {
+                // Evaluate dry-run scan
+                auto * mem = llama_get_memory(ctx_tgt);
+                dry_event.result = mem->bounded_release_dry_run(
+                        kv_pressure_dry_run_config.target_bytes,
+                        kv_pressure_dry_run_config.max_scan_blocks);
+                const bool had_shortfall = dry_event.result.shortfall_bytes > 0 &&
+                    dry_event.result.block_scan_exhausted;
+                kv_pressure_runtime.dry_run_record(had_shortfall, now);
+                dry_event.cooldown_ms = kv_pressure_dry_run_config.cooldown_ms;
+                skip_reason = "none";
+            }
+
+            if (skip_reason) {
+                dry_event.skipped_reason = skip_reason;
+                const std::string marker =
+                    server_kv_pressure_dry_run_format_marker(dry_event);
+                // Ownership ABORT is a correctness anomaly — escalate to WARNING.
+                if (dry_event.result.ownership_aborted) {
+                    SRV_WRN("%s\n", marker.c_str());
+                } else {
+                    SRV_INF("%s\n", marker.c_str());
+                }
+            }
         }
     }
 #endif

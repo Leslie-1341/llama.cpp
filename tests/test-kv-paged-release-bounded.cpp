@@ -521,6 +521,322 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "B11 scan precision + corner: OK\n");
     }
 
+    // =========================================================================
+    // Part C: Dry-run scanner — zero-change proof and semantic consistency.
+    // =========================================================================
+
+    // --- snapshot helpers for dry-run verification ---
+    auto snap_block_states = [](llama_kv_cache * kv, uint32_t n, std::vector<uint8_t> & out) {
+        out.resize(n);
+        for (uint32_t b = 0; b < n; ++b)
+            out[b] = kv->paged_release_bounded_test_read_block_state(b);
+    };
+    auto snap_free_list = [](llama_kv_cache * kv, uint32_t n, std::vector<bool> & out) {
+        out.resize(n);
+        for (uint32_t b = 0; b < n; ++b)
+            out[b] = kv->paged_release_bounded_test_block_in_free_list(b);
+    };
+
+    const uint32_t n_blocks = 256 / 16;  // ctx 256 / block_size 16
+
+    // DR1+DR2 use a fresh context so destructive release history from B1-B11
+    // doesn't pollute the dry-run state invariants.
+    {
+        ContextGuard g;
+        if (!g.init(model, cparams)) {
+            std::fprintf(stderr, "DR1: context init failed — skipped\n");
+        } else {
+            // =================================================================
+            // DR1: dry-run zero-change — block states, free list, and release
+            //   counters are identical before and after.
+            // =================================================================
+
+            // Decode a prompt so blocks are in RESIDENT state, then drop all
+            // sequences to make blocks unowned (dead).
+            std::vector<llama_token> prompt(20, 1);
+            int rc = decode_prompt(g.ctx, prompt);
+            CHECK(rc == 0, "DR1a: decode must succeed");
+            if (rc == 0) {
+                llama_memory_seq_rm(g.mem, 0, -1, -1);
+
+                // Pre-snapshot
+                std::vector<uint8_t> pre_states;
+                std::vector<bool>    pre_free;
+                snap_block_states(g.kv, n_blocks, pre_states);
+                snap_free_list(g.kv, n_blocks, pre_free);
+                const uint64_t pre_rel_bytes  = g.kv->paged_release_bounded_test_read_release_bytes();
+                const uint64_t pre_rel_blocks = g.kv->paged_release_bounded_test_read_released_blocks();
+                const uint64_t pre_rel_unused = g.kv->paged_release_bounded_test_read_released_unused();
+                const uint64_t pre_rel_dead   = g.kv->paged_release_bounded_test_read_released_dead();
+
+                // Run dry-run — must NOT change any KV state.
+                const auto dr = g.kv->paged_release_blocks_bounded_dry_run(
+                        UINT64_MAX, UINT32_MAX);
+
+                // Post-snapshot
+                std::vector<uint8_t> post_states;
+                std::vector<bool>    post_free;
+                snap_block_states(g.kv, n_blocks, post_states);
+                snap_free_list(g.kv, n_blocks, post_free);
+                const uint64_t post_rel_bytes  = g.kv->paged_release_bounded_test_read_release_bytes();
+                const uint64_t post_rel_blocks = g.kv->paged_release_bounded_test_read_released_blocks();
+                const uint64_t post_rel_unused = g.kv->paged_release_bounded_test_read_released_unused();
+                const uint64_t post_rel_dead   = g.kv->paged_release_bounded_test_read_released_dead();
+
+                // Assert: zero state change
+                CHECK(pre_states == post_states,
+                        "DR1b: block states unchanged by dry-run");
+                CHECK(pre_free == post_free,
+                        "DR1c: free list unchanged by dry-run");
+                CHECK(pre_rel_bytes == post_rel_bytes,
+                        "DR1d: release bytes counter unchanged by dry-run");
+                CHECK(pre_rel_blocks == post_rel_blocks,
+                        "DR1e: released blocks counter unchanged by dry-run");
+                CHECK(pre_rel_unused == post_rel_unused,
+                        "DR1f: released-unused counter unchanged by dry-run");
+                CHECK(pre_rel_dead == post_rel_dead,
+                        "DR1g: released-dead counter unchanged by dry-run");
+
+                // Dry-run should find candidates (blocks are unowned + RESIDENT)
+                CHECK(dr.released_blocks > 0,
+                        "DR1h: dry-run found would-release candidates");
+                CHECK(dr.released_bytes > 0,
+                        "DR1i: dry-run counted would-release bytes");
+                CHECK(!dr.ownership_aborted,
+                        "DR1j: ownership_aborted == false");
+                CHECK(dr.madvise_failures == 0,
+                        "DR1k: madvise_failures == 0 (dry-run never calls madvise)");
+
+                std::fprintf(stderr, "DR1 dry-run zero-change: would_release=%" PRIu32
+                        "/%" PRIu64 "B scanned=%" PRIu32 " state+free+counter delta=0 OK\n",
+                        dr.released_blocks, dr.released_bytes, dr.blocks_scanned);
+
+                // =================================================================
+                // DR2: dry-run vs destructive — candidate/byte semantics match.
+                //   Run dry-run again (still same state), then run destructive
+                //   and verify the same blocks/bytes were selected.
+                // =================================================================
+
+                const auto dr2 = g.kv->paged_release_blocks_bounded_dry_run(
+                        UINT64_MAX, UINT32_MAX);
+                const uint32_t would_blocks = dr2.released_blocks;
+                const uint64_t would_bytes  = dr2.released_bytes;
+                CHECK(would_blocks > 0,
+                        "DR2a: dry-run found candidates before destructive release");
+                CHECK(!dr2.ownership_aborted,
+                        "DR2b: ownership valid");
+
+                // Run destructive bounded release — same budget, same scan limit.
+                const auto rr = g.kv->paged_release_blocks_bounded(
+                        UINT64_MAX, UINT32_MAX);
+
+                // Released counts must match.
+                CHECK(rr.released_blocks == would_blocks,
+                        "DR2c: released_blocks == would_release_blocks");
+                CHECK(rr.released_bytes == would_bytes,
+                        "DR2d: released_bytes == would_release_bytes");
+                CHECK(rr.blocks_scanned == dr2.blocks_scanned,
+                        "DR2e: blocks_scanned matches");
+                CHECK(rr.blocks_skipped_owned == dr2.blocks_skipped_owned,
+                        "DR2f: skipped_owned matches");
+                CHECK(rr.blocks_skipped_state == dr2.blocks_skipped_state,
+                        "DR2g: skipped_state matches");
+                CHECK(!rr.ownership_aborted,
+                        "DR2h: destructive ownership valid");
+                CHECK(rr.shortfall_bytes == dr2.shortfall_bytes,
+                        "DR2i: shortfall matches");
+                CHECK(rr.overshoot_bytes == dr2.overshoot_bytes,
+                        "DR2j: overshoot matches");
+                CHECK(rr.block_scan_exhausted == dr2.block_scan_exhausted,
+                        "DR2k: exhausted matches");
+
+                std::fprintf(stderr, "DR2 semantic match: would=%" PRIu32 "/%" PRIu64
+                        "B actual=%" PRIu32 "/%" PRIu64 "B OK\n",
+                        would_blocks, would_bytes, rr.released_blocks, rr.released_bytes);
+            }
+        }
+    }
+
+    // =========================================================================
+    // DR3: dry-run with active sequences — all blocks owned, zero candidates,
+    //   zero state change.
+    // =========================================================================
+    {
+        ContextGuard g;
+        if (!g.init(model, cparams)) {
+            std::fprintf(stderr, "DR3: context init failed — skipped\n");
+        } else {
+            // Decode a prompt WITHOUT removing sequences → all blocks owned.
+            std::vector<llama_token> prompt = { 100, 200, 300, 400, 500 };
+            int rc = decode_prompt(g.ctx, prompt);
+            CHECK(rc == 0, "DR3a: decode must succeed");
+            if (rc == 0) {
+                std::vector<uint8_t> pre_states;
+                std::vector<bool>    pre_free;
+                snap_block_states(g.kv, n_blocks, pre_states);
+                snap_free_list(g.kv, n_blocks, pre_free);
+                const uint64_t pre_rel_bytes = g.kv->paged_release_bounded_test_read_release_bytes();
+
+                const auto dr = g.kv->paged_release_blocks_bounded_dry_run(
+                        UINT64_MAX, UINT32_MAX);
+
+                std::vector<uint8_t> post_states;
+                std::vector<bool>    post_free;
+                snap_block_states(g.kv, n_blocks, post_states);
+                snap_free_list(g.kv, n_blocks, post_free);
+                const uint64_t post_rel_bytes = g.kv->paged_release_bounded_test_read_release_bytes();
+
+                // All blocks are owned → zero candidates
+                CHECK(dr.released_blocks == 0,
+                        "DR3b: released_blocks == 0 (all blocks owned)");
+                CHECK(dr.released_bytes == 0,
+                        "DR3c: released_bytes == 0 (all blocks owned)");
+                CHECK(dr.blocks_skipped_owned > 0,
+                        "DR3d: blocks_skipped_owned > 0");
+                CHECK(!dr.ownership_aborted,
+                        "DR3e: ownership valid");
+                CHECK(dr.madvise_failures == 0,
+                        "DR3f: madvise_failures == 0 (dry-run never calls madvise)");
+
+                // Zero state change
+                CHECK(pre_states == post_states,
+                        "DR3g: block states unchanged");
+                CHECK(pre_free == post_free,
+                        "DR3h: free list unchanged");
+                CHECK(pre_rel_bytes == post_rel_bytes,
+                        "DR3i: release counters unchanged");
+
+                std::fprintf(stderr, "DR3 active-owned: skipped_owned=%" PRIu32
+                        " scanned=%" PRIu32 " state-delta=0 OK\n",
+                        dr.blocks_skipped_owned, dr.blocks_scanned);
+            }
+        }
+    }
+
+    // =========================================================================
+    // DR4: dry-run edge cases — target=0 and max_scan=0 fast paths.
+    // =========================================================================
+    {
+        // target=0: immediate return, zero side effects
+        const auto dr1 = main_ctx.kv->paged_release_blocks_bounded_dry_run(0, 100);
+        CHECK(dr1.released_bytes == 0, "DR4a: target=0 → released_bytes=0");
+        CHECK(dr1.released_blocks == 0, "DR4b: target=0 → released_blocks=0");
+        CHECK(dr1.blocks_scanned == 0, "DR4c: target=0 → blocks_scanned=0");
+        CHECK(!dr1.block_scan_exhausted, "DR4d: target=0 → exhausted=false");
+        CHECK(!dr1.ownership_aborted, "DR4e: target=0 → no ownership check");
+        CHECK(dr1.madvise_failures == 0, "DR4f: target=0 → madvise_failures=0");
+
+        // max_scan=0: exhausted + full shortfall, zero scan
+        const uint64_t t = 65536;
+        const auto dr2 = main_ctx.kv->paged_release_blocks_bounded_dry_run(t, 0);
+        CHECK(dr2.block_scan_exhausted, "DR4g: max_scan=0 → exhausted");
+        CHECK(dr2.shortfall_bytes == t, "DR4h: max_scan=0 → full shortfall");
+        CHECK(dr2.released_bytes == 0, "DR4i: max_scan=0 → released_bytes=0");
+        CHECK(dr2.blocks_scanned == 0, "DR4j: max_scan=0 → blocks_scanned=0");
+        CHECK(!dr2.ownership_aborted, "DR4k: max_scan=0 → no ownership check");
+
+        // All blocks are now RELEASED from the DR2 destructive call.
+        // Dry-run should return zero candidates (all skipped via state gate).
+        const auto dr3 = main_ctx.kv->paged_release_blocks_bounded_dry_run(
+                UINT64_MAX, UINT32_MAX);
+        CHECK(dr3.released_blocks == 0,
+                "DR4l: all RELEASED → zero candidates");
+        CHECK(dr3.blocks_skipped_state > 0,
+                "DR4m: RELEASED blocks counted as skipped_state");
+        CHECK(dr3.madvise_failures == 0,
+                "DR4n: madvise_failures == 0 (dry-run never calls madvise)");
+        CHECK(!dr3.ownership_aborted,
+                "DR4o: ownership_aborted == false");
+
+        std::fprintf(stderr, "DR4 edge cases: skipped_state=%" PRIu32
+                " scanned=%" PRIu32 " OK\n",
+                dr3.blocks_skipped_state, dr3.blocks_scanned);
+    }
+
+    // =========================================================================
+    // DR5: dry-run with LLAMA_KV_PAGED_RELEASE=0 — scanner works even when
+    //   destructive release is disabled.  Verifies release_enabled=0 is purely
+    //   observational, not a skip reason.
+    // =========================================================================
+    {
+        // Clear the release env var so the fresh context has release disabled.
+        unsetenv("LLAMA_KV_PAGED_RELEASE");
+
+        ContextGuard g;
+        if (!g.init(model, cparams)) {
+            std::fprintf(stderr, "DR5: context init failed — skipped\n");
+            setenv("LLAMA_KV_PAGED_RELEASE", "1", 1);
+        } else {
+            // Confirm release is disabled
+            const auto status = g.kv->paged_release_status();
+            CHECK(status == llama_kv_release_status::disabled,
+                    "DR5a: paged_release_status == disabled (env var not set)");
+
+            // Destructive bounded release must return empty (release not active)
+            const auto rr = g.kv->paged_release_blocks_bounded(UINT64_MAX, UINT32_MAX);
+            CHECK(rr.released_bytes == 0,
+                    "DR5b: destructive release returns 0 bytes (release disabled)");
+            CHECK(rr.released_blocks == 0,
+                    "DR5c: destructive release returns 0 blocks (release disabled)");
+
+            // Decode a prompt so blocks are in RESIDENT state, then drop all
+            // sequences to make blocks unowned (dead).
+            std::vector<llama_token> prompt(20, 1);
+            int rc = decode_prompt(g.ctx, prompt);
+            CHECK(rc == 0, "DR5d: decode must succeed");
+            if (rc == 0) {
+                llama_memory_seq_rm(g.mem, 0, -1, -1);
+
+                // Pre-snapshot for zero-change verification
+                std::vector<uint8_t> pre_states;
+                std::vector<bool>    pre_free;
+                pre_states.resize(n_blocks);
+                pre_free.resize(n_blocks);
+                for (uint32_t b = 0; b < n_blocks; ++b) {
+                    pre_states[b] = g.kv->paged_release_bounded_test_read_block_state(b);
+                    pre_free[b]  = g.kv->paged_release_bounded_test_block_in_free_list(b);
+                }
+
+                // Dry-run MUST work even with release disabled
+                const auto dr = g.kv->paged_release_blocks_bounded_dry_run(
+                        UINT64_MAX, UINT32_MAX);
+
+                // Post-snapshot
+                std::vector<uint8_t> post_states;
+                std::vector<bool>    post_free;
+                post_states.resize(n_blocks);
+                post_free.resize(n_blocks);
+                for (uint32_t b = 0; b < n_blocks; ++b) {
+                    post_states[b] = g.kv->paged_release_bounded_test_read_block_state(b);
+                    post_free[b]  = g.kv->paged_release_bounded_test_block_in_free_list(b);
+                }
+
+                // Dry-run found candidates despite release being disabled
+                CHECK(dr.released_blocks > 0,
+                        "DR5e: dry-run found would-release candidates (release disabled)");
+                CHECK(dr.released_bytes > 0,
+                        "DR5f: dry-run counted would-release bytes (release disabled)");
+                CHECK(!dr.ownership_aborted,
+                        "DR5g: ownership_aborted == false");
+                CHECK(dr.madvise_failures == 0,
+                        "DR5h: madvise_failures == 0 (dry-run never calls madvise)");
+
+                // Zero state change
+                CHECK(pre_states == post_states,
+                        "DR5i: block states unchanged by dry-run (release disabled)");
+                CHECK(pre_free == post_free,
+                        "DR5j: free list unchanged by dry-run (release disabled)");
+
+                std::fprintf(stderr, "DR5 release-disabled dry-run: would_release=%" PRIu32
+                        "/%" PRIu64 "B scanned=%" PRIu32 " status=disabled OK\n",
+                        dr.released_blocks, dr.released_bytes, dr.blocks_scanned);
+            }
+
+            // Restore env for subsequent tests (none follow, but be defensive)
+            setenv("LLAMA_KV_PAGED_RELEASE", "1", 1);
+        }
+    }
+
     llama_model_free(model);
     llama_backend_free();
 

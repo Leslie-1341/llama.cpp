@@ -272,6 +272,192 @@ static void test_init_failure_stays_disabled() {
     clear_env();
 }
 
+// --- dry-run policy tests -----------------------------------------------------
+
+static void test_dry_run_normal_recovery_not_due() {
+    server_kv_pressure_runtime runtime;
+    server_kv_pressure_dry_run_config cfg;
+    cfg.enabled = true;
+    cfg.target_bytes = 4194304;
+    cfg.cooldown_ms = 2000;
+    cfg.backoff_ms = 10000;
+    runtime.dry_run_enable(cfg);
+
+    auto t0 = server_kv_pressure_runtime::clock::now();
+
+    // NORMAL: dry_run_due must return false
+    CHECK(!runtime.dry_run_due(t0, kv_pressure_state::NORMAL, false));
+
+    // RECOVERY: dry_run_due must return false
+    CHECK(!runtime.dry_run_due(t0, kv_pressure_state::RECOVERY, false));
+
+    // stale: false regardless of state
+    CHECK(!runtime.dry_run_due(t0, kv_pressure_state::CRITICAL, true));
+    CHECK(!runtime.dry_run_due(t0, kv_pressure_state::PRESSURE, true));
+}
+
+static void test_dry_run_pressure_critical_entry() {
+    server_kv_pressure_runtime runtime;
+    server_kv_pressure_dry_run_config cfg;
+    cfg.enabled = true;
+    cfg.target_bytes = 4194304;
+    cfg.cooldown_ms = 2000;
+    cfg.backoff_ms = 10000;
+    runtime.dry_run_enable(cfg);
+
+    auto t0 = server_kv_pressure_runtime::clock::now();
+
+    // State entry to PRESSURE: immediate evaluation
+    CHECK(runtime.dry_run_due(t0, kv_pressure_state::PRESSURE, false));
+
+    // Record at evaluation time t0
+    runtime.dry_run_record(false, t0);
+
+    // 500 ms after: cooldown not elapsed → false
+    auto t1 = t0 + std::chrono::milliseconds(500);
+    CHECK(!runtime.dry_run_due(t1, kv_pressure_state::PRESSURE, false));
+
+    // After cooldown: true again
+    auto t2 = t0 + std::chrono::milliseconds(2500);
+    CHECK(runtime.dry_run_due(t2, kv_pressure_state::PRESSURE, false));
+}
+
+static void test_dry_run_critical_entry_immediate() {
+    server_kv_pressure_runtime runtime;
+    server_kv_pressure_dry_run_config cfg;
+    cfg.enabled = true;
+    cfg.target_bytes = 4194304;
+    cfg.cooldown_ms = 2000;
+    cfg.backoff_ms = 10000;
+    runtime.dry_run_enable(cfg);
+
+    auto t0 = server_kv_pressure_runtime::clock::now();
+
+    // State entry to CRITICAL: bypass cooldown → immediate
+    CHECK(runtime.dry_run_due(t0, kv_pressure_state::CRITICAL, false));
+
+    runtime.dry_run_record(false, t0);
+
+    // Within cooldown → false
+    auto t1 = t0 + std::chrono::milliseconds(500);
+    CHECK(!runtime.dry_run_due(t1, kv_pressure_state::CRITICAL, false));
+}
+
+static void test_dry_run_cooldown_blocking() {
+    server_kv_pressure_runtime runtime;
+    server_kv_pressure_dry_run_config cfg;
+    cfg.enabled = true;
+    cfg.target_bytes = 4194304;
+    cfg.cooldown_ms = 2000;
+    cfg.backoff_ms = 10000;
+    runtime.dry_run_enable(cfg);
+
+    auto t0 = server_kv_pressure_runtime::clock::now();
+
+    // Entry evaluation
+    CHECK(runtime.dry_run_due(t0, kv_pressure_state::PRESSURE, false));
+    runtime.dry_run_record(false, t0);
+
+    // 500 ms: still within 2000ms cooldown → blocked
+    auto t1 = t0 + std::chrono::milliseconds(500);
+    CHECK(!runtime.dry_run_due(t1, kv_pressure_state::PRESSURE, false));
+
+    // 2001 ms: cooldown elapsed → allowed
+    auto t2 = t0 + std::chrono::milliseconds(2001);
+    CHECK(runtime.dry_run_due(t2, kv_pressure_state::PRESSURE, false));
+
+    runtime.dry_run_record(false, t2);
+
+    // 500 ms after second eval: cooldown not elapsed → blocked
+    auto t3 = t2 + std::chrono::milliseconds(500);
+    CHECK(!runtime.dry_run_due(t3, kv_pressure_state::PRESSURE, false));
+}
+
+static void test_dry_run_shortfall_backoff() {
+    server_kv_pressure_runtime runtime;
+    server_kv_pressure_dry_run_config cfg;
+    cfg.enabled = true;
+    cfg.target_bytes = 4194304;
+    cfg.cooldown_ms = 2000;
+    cfg.backoff_ms = 10000;
+    runtime.dry_run_enable(cfg);
+
+    auto t0 = server_kv_pressure_runtime::clock::now();
+
+    // Entry evaluation
+    CHECK(runtime.dry_run_due(t0, kv_pressure_state::CRITICAL, false));
+    runtime.dry_run_record(true, t0);  // shortfall → backoff
+
+    // 2001 ms: still within 10s backoff → blocked
+    auto t1 = t0 + std::chrono::milliseconds(2001);
+    CHECK(!runtime.dry_run_due(t1, kv_pressure_state::CRITICAL, false));
+
+    // 5000 ms: still within 10s backoff → blocked
+    auto t2 = t0 + std::chrono::milliseconds(5000);
+    CHECK(!runtime.dry_run_due(t2, kv_pressure_state::CRITICAL, false));
+
+    // 10001 ms: backoff elapsed → allowed
+    auto t3 = t0 + std::chrono::milliseconds(10001);
+    CHECK(runtime.dry_run_due(t3, kv_pressure_state::CRITICAL, false));
+}
+
+static void test_dry_run_state_transition_resets_cooldown() {
+    server_kv_pressure_runtime runtime;
+    server_kv_pressure_dry_run_config cfg;
+    cfg.enabled = true;
+    cfg.target_bytes = 4194304;
+    cfg.cooldown_ms = 2000;
+    cfg.backoff_ms = 10000;
+    runtime.dry_run_enable(cfg);
+
+    auto t0 = server_kv_pressure_runtime::clock::now();
+
+    // Enter PRESSURE → immediate
+    CHECK(runtime.dry_run_due(t0, kv_pressure_state::PRESSURE, false));
+    runtime.dry_run_record(false, t0);
+
+    // 500ms: within cooldown → blocked
+    auto t1 = t0 + std::chrono::milliseconds(500);
+    CHECK(!runtime.dry_run_due(t1, kv_pressure_state::PRESSURE, false));
+
+    // Transition to CRITICAL (new episode) → immediate (bypass cooldown)
+    auto t2 = t0 + std::chrono::milliseconds(1000);
+    CHECK(runtime.dry_run_due(t2, kv_pressure_state::CRITICAL, false));
+    runtime.dry_run_record(false, t2);
+
+    // 500ms after CRITICAL entry → within cooldown → blocked
+    auto t3 = t2 + std::chrono::milliseconds(500);
+    CHECK(!runtime.dry_run_due(t3, kv_pressure_state::CRITICAL, false));
+
+    // Drop back to RECOVERY → not a trigger state → false
+    CHECK(!runtime.dry_run_due(t3, kv_pressure_state::RECOVERY, false));
+
+    // Back to PRESSURE (new PRESSURE episode) → immediate
+    auto t4 = t3 + std::chrono::milliseconds(1000);
+    CHECK(runtime.dry_run_due(t4, kv_pressure_state::PRESSURE, false));
+}
+
+static void test_dry_run_config_disabled() {
+    server_kv_pressure_runtime runtime;
+    server_kv_pressure_dry_run_config cfg;
+    cfg.enabled = false;
+    cfg.target_bytes = 0;
+    runtime.dry_run_enable(cfg);
+
+    auto t0 = server_kv_pressure_runtime::clock::now();
+
+    // Disabled: dry_run_due always false
+    CHECK(!runtime.dry_run_due(t0, kv_pressure_state::PRESSURE, false));
+    CHECK(!runtime.dry_run_due(t0, kv_pressure_state::CRITICAL, false));
+    CHECK(!runtime.dry_run_due(t0, kv_pressure_state::NORMAL, false));
+
+    // Enable with target_bytes=0 → effectively disabled
+    cfg.enabled = true;
+    cfg.target_bytes = 0;
+    runtime.dry_run_enable(cfg);
+    CHECK(!runtime.dry_run_due(t0, kv_pressure_state::CRITICAL, false));
+}
+
 int main() {
     test_default_off();
     test_interval_config();
@@ -282,6 +468,13 @@ int main() {
     test_lifecycle_reset();
     test_marker_fields();
     test_init_failure_stays_disabled();
+    test_dry_run_normal_recovery_not_due();
+    test_dry_run_pressure_critical_entry();
+    test_dry_run_critical_entry_immediate();
+    test_dry_run_cooldown_blocking();
+    test_dry_run_shortfall_backoff();
+    test_dry_run_state_transition_resets_cooldown();
+    test_dry_run_config_disabled();
 
     std::printf("server KV pressure tests: %d/%d passed\n", tests_total - tests_failed, tests_total);
     return tests_failed == 0 ? 0 : 1;

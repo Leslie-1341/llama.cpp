@@ -6270,7 +6270,7 @@ void llama_kv_cache::paged_release_blocks(uint32_t n_kv) {
 #endif
 }
 
-llama_kv_cache::llama_kv_bounded_release_result llama_kv_cache::paged_release_blocks_bounded(
+llama_kv_bounded_release_result llama_kv_cache::paged_release_blocks_bounded(
         uint64_t target_bytes,
         uint32_t max_scan_blocks) {
 #if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
@@ -6439,6 +6439,178 @@ llama_kv_cache::llama_kv_bounded_release_result llama_kv_cache::paged_release_bl
     (void) max_scan_blocks;
     return {};
 #endif
+}
+
+llama_kv_bounded_release_result llama_kv_cache::paged_release_blocks_bounded_dry_run(
+        uint64_t target_bytes,
+        uint32_t max_scan_blocks) const {
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+    llama_kv_bounded_release_result result;
+
+    // Dry-run is decoupled from LLAMA_KV_PAGED_RELEASE: it only requires
+    // paged KV to be enabled so it can walk the K/V tensor layout.  The
+    // destructive release flag is irrelevant — dry-run never calls madvise.
+    if (!kv_paged_enabled) {
+        return result;
+    }
+    if (v_trans || n_stream != 1 || paged_block_size == 0 || paged_n_blocks == 0 ||
+            paged_block_states.size() != paged_n_blocks) {
+        return result;
+    }
+
+    // target=0: return immediately — zero side effects.
+    if (target_bytes == 0) {
+        return result;
+    }
+
+    // scan budget of zero: return immediately without scanning or ownership check.
+    if (max_scan_blocks == 0) {
+        result.block_scan_exhausted = true;
+        result.shortfall_bytes      = target_bytes;
+        return result;
+    }
+
+    // Ownership collection — same intent as the destructive variant.
+    const auto ownership = llama_kv_release_collect_ownership(
+            v_cells, paged_n_blocks, paged_block_size, PAGED_BLOCK_INVALID, LLAMA_MAX_SEQ,
+            [&](uint32_t logical_cell) { return paged_resolve(logical_cell); });
+    if (!ownership.valid) {
+        result.ownership_aborted = true;
+        return result;
+    }
+    const auto & owned = ownership.owned;
+
+    const long page = sysconf(_SC_PAGESIZE);
+    const uint64_t pg = (page > 0) ? (uint64_t) page : 4096;
+
+    uint32_t scanned = 0;
+    const uint32_t scan_limit = std::min(max_scan_blocks, paged_n_blocks);
+
+    for (uint32_t physical_block = 0; physical_block < scan_limit; ++physical_block) {
+        scanned = physical_block + 1;
+
+        // Skip owned blocks (contains live cells)
+        if (physical_block < owned.size() && owned[physical_block]) {
+            result.blocks_skipped_owned += 1;
+            continue;
+        }
+
+        // State gate: skip PENDING_WRITE, SWAPPED, RELEASED.
+        // Does NOT access test-only seams — dry-run is a production path.
+        const paged_block_state state = paged_block_states[physical_block];
+        if (state == paged_block_state::PENDING_WRITE ||
+                state == paged_block_state::SWAPPED ||
+                state == paged_block_state::RELEASED) {
+            result.blocks_skipped_state += 1;
+            continue;
+        }
+
+        // Candidate block: compute would-release byte count by walking each
+        // layer's K/V tensors with the same page-alignment + neighbor-protection
+        // logic as the destructive release path, but without calling madvise().
+        uint64_t block_bytes = 0;
+
+        for (const auto & layer : layers) {
+            auto count_tensor = [&](ggml_tensor * t, uint64_t row) {
+                if (!t || row == 0 || !t->data) {
+                    return;
+                }
+
+                char * base = (char *) t->data;
+                const uint64_t lo_cell = (uint64_t) physical_block * paged_block_size;
+                const uint64_t hi_cell = std::min<uint64_t>(
+                        lo_cell + paged_block_size, paged_kv_size);
+                const uintptr_t lo_a = (uintptr_t) base + (uintptr_t) lo_cell * row;
+                const uintptr_t hi_a = (uintptr_t) base + (uintptr_t) hi_cell * row;
+                if (hi_a <= lo_a) {
+                    return;
+                }
+
+                const uintptr_t a_start = (lo_a + pg - 1) & ~(uintptr_t) (pg - 1);
+                const uintptr_t a_end   = hi_a & ~(uintptr_t) (pg - 1);
+                if (a_end <= a_start) {
+                    return;
+                }
+
+                // Page-alignment math already excludes partial pages at block
+                // boundaries (which would be shared with neighbors).  The
+                // aligned interior [a_start, a_end) is entirely within this
+                // candidate block's address range, matching what the
+                // destructive path would actually advise.
+                block_bytes += (uint64_t) (a_end - a_start);
+            };
+
+            ggml_tensor * k = layer.k_stream.empty() ? nullptr : layer.k_stream[0];
+            ggml_tensor * v = layer.v_stream.empty() ? nullptr : layer.v_stream[0];
+            count_tensor(k, k ? ggml_row_size(k->type, hparams.n_embd_k_gqa(layer.il)) : 0);
+            count_tensor(v, v ? ggml_row_size(v->type, hparams.n_embd_v_gqa(layer.il)) : 0);
+        }
+
+        if (block_bytes == 0) {
+            // Page-sharing prevented all pages from being counted.
+            // Not a failure — just an uncountable candidate.
+            continue;
+        }
+
+        // This block WOULD be released by the destructive path.
+        result.released_blocks += 1;
+        result.released_bytes += block_bytes;
+
+        // Budget check: stop once target is met (allow one-block overshoot)
+        if (result.released_bytes >= target_bytes) {
+            break;
+        }
+    }
+
+    result.blocks_scanned = scanned;
+    result.block_scan_exhausted = (scanned >= scan_limit);
+
+    // NO test-seam access, NO state mutation, NO free-list change,
+    // NO backing-metadata clear, NO global-counter increment.
+
+    if (result.released_bytes < target_bytes) {
+        result.shortfall_bytes = target_bytes - result.released_bytes;
+    }
+    if (result.released_bytes > target_bytes) {
+        result.overshoot_bytes = result.released_bytes - target_bytes;
+    }
+
+    return result;
+#else
+    (void) target_bytes;
+    (void) max_scan_blocks;
+    return {};
+#endif
+}
+
+llama_kv_bounded_release_result llama_kv_cache::bounded_release_dry_run(
+        uint64_t target_bytes, uint32_t max_scan_blocks) {
+    return paged_release_blocks_bounded_dry_run(target_bytes, max_scan_blocks);
+}
+
+llama_kv_release_status llama_kv_cache::paged_release_status() const {
+    // Fast path: the stored enabled flag already encodes the full can_enable check.
+    if (paged_block_release_enabled) {
+        return llama_kv_release_status::available;
+    }
+
+    // Dry-run scanner preconditions (also required by destructive release).
+    // The scanner walks K/V tensor data using the same address math, so it
+    // needs paged KV enabled, a valid layout, and swap disabled.
+    // It does NOT need paged_row_idx_enabled or layers_supported — those are
+    // specific to the ingraph gather path and destructive release.
+    if (!kv_paged_enabled) {
+        return llama_kv_release_status::not_paged;
+    }
+    if (v_trans || n_stream != 1 || paged_block_size == 0 || paged_n_blocks == 0) {
+        return llama_kv_release_status::layout_unsupported;
+    }
+    if (paged_swap_enabled) {
+        return llama_kv_release_status::swap_enabled;
+    }
+    // All preconditions met but LLAMA_KV_PAGED_RELEASE != 1.
+    // Dry-run can still proceed — disabled is observational, not a skip reason.
+    return llama_kv_release_status::disabled;
 }
 
 void llama_kv_cache::clear_frontier_advance(uint32_t n_kv) {
