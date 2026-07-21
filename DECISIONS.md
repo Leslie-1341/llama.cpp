@@ -457,3 +457,52 @@ D-0010 提交的 `paged_release_blocks_bounded()` 是 per-call budget 控制的 
 - `tests/test-server-kv-pressure.cpp`：dry-run config 解析、cooldown/backoff、state-entry、skip-reason 路径。
 - `tests/test-server-kv-pressure-static.py`：dry-run decoupling、marker field schema、config isolation 静态检查。
 - **Stage 3A-2B VALID artifact**：`/root/oscomp/kv_logs/kv_dry_run_stage3a_2b_20260720T161209Z_02f8cd5ed3`——parser exit 0、verdict PASS、OFF=0 ON=7 dry_run markers、response byte-identical、zero destructive release、zero MADV_DONTNEED (strace)。
+
+## D-0012 — Diff-aware validation harness 作为 implement/review/review-fix/audit 的强制门禁
+
+- Date: 2026-07-21
+- Status: accepted
+- Evidence commit/worktree: `fd51455b79af08f629810621578965e772ce0685`（clean）；harness self-test 15/15 E2E PASS；audit gate verdict PASS
+- Supersedes: none
+- Superseded by: none
+
+**Context**
+
+此前 implement/review/review-fix/audit 任务的"完成"判定依赖人工检查 agent 输出，存在三大问题：(1) 无法机器化判定变更是否引入语法错误、whitespace 问题或构建失败；(2) C/C++ 源文件与 CMake build target 的映射依赖人工知识（例如 `tools/server/server-context.cpp`→`llama-server`），容易遗漏增量构建；(3) parser test、skill validation 和 memory check 的遗漏仅能在后续 code review 中发现，反馈周期长。
+
+**Decision**
+
+1. **新增 `scripts/os-agent/gate-runner`** 作为 implement/review/review-fix/audit 四种模式的统一门禁入口。每个模式定义不同的 check 组合——implement 最全（git-diff-check、build、clang-tidy、shell/python 语法、parser test、skill、memory），audit 仅做只读分类+mapping。
+2. **Diff 分析自动驱动 check dispatch**：`diff-analyzer.sh` 自动检测变更文件并按扩展名分类（cpp/c/h/py/sh/cmake/skill/ledger），设置 HAS_* flags——无 C/C++ 变更时自动 SKIP build/clang-tidy。
+3. **真实 CMake target mapping**：`target-mapper.sh` 从 `compile_commands.json` 的 `-o CMakeFiles/<target>.dir/` 提取源文件→target，header 通过 UMBRELLA_MAP 解析到 umbrella target，所有 target 经 `cmake --target help` 验证。Mapping 失败 → UNRESOLVED (code=2)，不强阻塞但需人工确认。
+4. **唯一结构化 marker**：`OS_AGENT_GATE_RESULT mode=<mode> verdict=<v> code=<c> checks=<n> pass=<p> fail=<f> skip=<s> unresolved=<u> artifact=<path>`。全局唯一输出点——无重复、无歧义。Exit codes: 0=PASS 1=FAIL 2=UNRESOLVED 3=INCOMPLETE 4=NO_CHANGES。
+5. **Artifact 写入 repo 外**：`/tmp/os-agent-gate/gate-<mode>-<timestamp>/`，防自污染，包含 `full.log` 与 `summary.txt`。
+6. **Harness self-test 回归**：`test-harness.sh` 15 个合成 E2E 测试覆盖全部四种模式、target mapping、marker 唯一性、artifact 防自污染、grammar FAIL 检测——15/15 PASS。
+7. **不作为 implicit hook**：gate 仅在显式调用 `bash scripts/os-agent/gate-runner <mode>` 时运行，不自动 hook 到 git commit/push/PR workflow。
+
+**Alternatives rejected**
+
+- 将 gate 逻辑嵌入 `os-agent-task` SKILL.md 的 prose 指令：prose 无法 machine-verify——语法错误、构建失败和 mapping 缺失仍需人工发现。
+- 使用 CI workflow（GitHub Actions/Jenkins）：当前竞赛私有仓库缺少 CI infrastructure；本地 gate 提供即时反馈且不依赖外部服务。
+- 让 gate 自动 commit/push：违反 CLAUDE.md 规定（git commit/push 由用户完成）；gate 只做验证不做变更。
+- 仅提供 check 脚本、不提供统一 gate-runner：分散的 check 脚本难以确保每次使用相同顺序和完整组合；gate-runner 的 `OS_AGENT_GATE_RESULT` marker 提供机器可解析的统一 verdict。
+- 让 gate 在缺少 compile_commands.json 时 FAIL：该文件由 CMake `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON` 生成，非项目强制依赖；UNRESOLVED 比 FAIL 更合适——标记了需要人工清理，但不阻塞非 C/C++ 任务的 audit。
+
+**Consequences and limits**
+
+- 收益：implement/review/review-fix/audit 任务获得机器可验证的完成标准；`OS_AGENT_GATE_RESULT` marker 提供可审计的通过/失败证据；自动 diff 分类避免遗漏跨语言变更的语法检查；target mapping 消除"该编译哪个 target"的不确定性。
+- 代价：每次 implement/review/review-fix/audit 任务需额外运行 gate-runner（通常 <10s 不含 build）；需维护 compile_commands.json（已有构建流程）；harness 自身代码 ~1900 行需作为 infra 维护。
+- 当前验证范围：自测 15/15 PASS 使用 synthetic fixture repos；audit gate 在 repo 根实际运行通过（verdict=PASS）；真实 incremental build（E2E-10）使用 synthetic fixture，未验证完整 `llama.cpp` build。
+- 失效边界：若 compile_commands.json 缺失或过期，target mapping → UNRESOLVED；若 CMake 构建系统变更 target 命名，UMBRELLA_MAP 需同步更新；clang-tidy 在缺少工具时自动 SKIP（非 FAIL）。Gate 不替代完整 CTest suite 或长时间稳定性测试——它仅验证 diff 范围内的语法、构建和基本正确性。
+
+**Evidence**
+
+- `scripts/os-agent/gate-runner`：107 行主入口，arg 解析、diff 分析、check dispatch、verdict + marker 输出。
+- `scripts/os-agent/lib/common.sh`：119 行，exit codes（0–4）、gate_log、gate_record_check、gate_final_verdict（优先级 FAIL>UNRESOLVED>INCOMPLETE>PASS>NO_CHANGES）、gate_emit_summary（唯一 marker 输出点）。
+- `scripts/os-agent/lib/diff-analyzer.sh`：187 行，ext-based 分类 + HAS_* flags + deleted 文件追踪。
+- `scripts/os-agent/lib/target-mapper.sh`：200 行，compile_commands.json -o flag 提取 + UMBRELLA_MAP + cmake --target help 验证。
+- `scripts/os-agent/lib/artifact.sh`：60 行，/tmp/os-agent-gate/ 目录创建与防自污染。
+- `scripts/os-agent/gates/define-gates.sh`：126 行，四模式 check 组合。
+- `scripts/os-agent/checks/run-checks.sh`：534 行，10 个 check 函数。
+- `scripts/os-agent/tests/test-harness.sh`：526 行，15 E2E 合成测试——**15/15 PASS**。
+- Audit gate 实际运行：`bash scripts/os-agent/gate-runner audit` → `OS_AGENT_GATE_RESULT mode=audit verdict=PASS code=0 checks=8 pass=5 fail=0 skip=3 unresolved=0`。

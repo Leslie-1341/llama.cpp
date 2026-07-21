@@ -2,11 +2,11 @@
 
 > 当前项目快照。仅记录可验证事实；历史决策和实验结果分别进入 `DECISIONS.md` 与 `EXPERIMENTS.md`。
 
-- Last updated: 2026-07-20
-- Evidence commit: `02f8cd5ed33a13ffac3cce444d6d3ea7eb987650`
+- Last updated: 2026-07-21
+- Evidence commit: `fd51455b79af08f629810621578965e772ce0685`
 - Branch: `fix/kv-p0-b1-bounded-store`
-- Worktree: clean（untracked `Testing/` 不与源码重叠）
-- Upstream relation: 相对 `origin/fix/kv-p0-b1-bounded-store` ahead 10
+- Worktree: **dirty**（10 tracked modified + 3 untracked = Stage 3A-2C 未提交改动；详见"In Progress"）
+- Upstream relation: 相对 `origin/fix/kv-p0-b1-bounded-store` ahead 11
 
 ## Goal
 
@@ -14,9 +14,19 @@
 
 ## Current Stage
 
-**Stage 3A-2B pressure-driven KV reclaim dry-run 稳定节点已提交并 VALID。** HEAD `02f8cd5ed` 将 Stage 3A-1C 已验证的 server pressure telemetry 与 Stage 3A-2A 的 bounded release 原语通过 `paged_release_blocks_bounded_dry_run()` 只读扫描连接：在 PRESSURE/CRITICAL 状态下对符合 budget 约束的候选 block 计算 would-release 决策，但**零 KV state mutation、零 MADV_DONTNEED、零 backing metadata 清除**。dry-run 与 destructive release 完全解耦：dry-run 不接入 test-only seam、不检查 `LLAMA_KV_PAGED_RELEASE`（仅需 paged KV + valid layout + !swap）、通过 `should_evaluate` 显式门控（master switch、release_status gate、stale 拒绝、状态触发 gate、cooldown/backoff）控制评估频率。OFF/ON controlled A/B artifact parser exit 0、verdict PASS、response byte-identical、strace 确认零 MADV_DONTNEED、零 destructive release。**该证据仅验证 forced-pressure dry-run 控制链路、只读性和协议，不代表真实阈值或性能收益。**
+**Stage 3A-2B pressure-driven KV reclaim dry-run 稳定节点 + Harness v1 已提交并 VALID。** HEAD `fd51455b7` 在 Stage 3A-2B dry-run 之上新增 diff-aware validation harness（`scripts/os-agent/`）——gate-runner 支持 implement/review/review-fix/audit 四种模式，通过 diff 分析自动分类变更文件、mapping C/C++ 源文件到已验证 CMake targets，并以唯一结构化 marker `OS_AGENT_GATE_RESULT` 输出 verdict。自测 15/15 E2E PASS，四模式均产出有效 marker。
+
+**工作树当前有 10 tracked modified + 3 untracked = Stage 3A-2C 未提交改动**：将 destructive `paged_release_blocks_bounded()` 接入 server scheduler 的 PRESSURE/CRITICAL 分支（替换 dry-run scanner），执行真实 MADV_DONTNEED。该改动尚未提交、构建或验证，不得描述为已实现。
 
 ## Implemented and Verified
+
+- **Harness v1 — diff-aware validation harness**（`fd51455b7`）：
+  - `scripts/os-agent/gate-runner`：单入口，支持 `implement` | `review` | `review-fix` | `audit` 四种模式。自动 diff 分析（`diff-analyzer.sh`）→ target mapping（`target-mapper.sh`，compile_commands.json -o flag 提取 + cmake --target help 验证）→ 模式特定检查（git-diff-check、shell/python 语法、cmake-configure、clang-tidy、incremental-build、parser-test、skill-validation、memory-check）→ 唯一结构化 marker `OS_AGENT_GATE_RESULT mode=<mode> verdict=<v> code=<c> checks=<n> pass=<p> fail=<f> skip=<s> unresolved=<u> artifact=<path>`。Exit codes: 0=PASS 1=FAIL 2=UNRESOLVED 3=INCOMPLETE 4=NO_CHANGES。Artifact 写入 `/tmp/os-agent-gate/`（仓库外，防自污染）。
+  - `scripts/os-agent/lib/target-mapper.sh`：从 compile_commands.json 的 `-o CMakeFiles/<target>.dir/` 提取源文件→target；header 通过 UMBRELLA_MAP（`src→llama`、`tools/server→llama-server` 等）解析；所有 target 经 `cmake --build <dir> --target help` 验证。
+  - `scripts/os-agent/lib/diff-analyzer.sh`：分类 changed/deleted/untracked 文件到 ext-based 类别（cpp/c/h/py/sh/cmake/skill/ledger），设置 HAS_* 标志驱动后续 check dispatch。
+  - `scripts/os-agent/tests/test-harness.sh`：**15/15 E2E PASS**——覆盖 NO_CHANGES、audit readonly、Python/shell 语法 FAIL 检测、untracked 检测、deleted 追踪、C++ target mapping、multi-target mapping、UNRESOLVED cpp、incremental build PASS、artifact 防自污染、单一 summary marker、parser UNRESOLVED、implement/review/review-fix/audit 四模式 dispatch、--build-dir flag。
+  - Audit gate 在 repo 根实际运行：verdict=PASS，checks=8，pass=5，skip=3，unresolved=0。
+  - 已知限制：clang-tidy 在无 clang-tidy 环境会 SKIP（非 FAIL）；E2E-10 incremental build 使用 fixture repo（非真实编译）；target mapping 依赖 compile_commands.json 存在；gate 仅验证 diff 范围内的文件，不执行完整 CTest suite。
 
 - **Stage 3A-2B pressure dry-run 控制链路**（`02f8cd5ed`）：
   - `paged_release_blocks_bounded_dry_run(target_bytes, max_scan_blocks) const`：只读扫描——与 destructive `paged_release_blocks_bounded()` 共享 ownership collection + state gate 逻辑，但不调用 `paged_madvise_block()`、不修改 `paged_block_states`、不操作 `paged_free_list`、不清除 backing metadata、不递增 global release counters。结果通过 `llama_kv_bounded_release_result` 返回 would-release 语义。
@@ -66,19 +76,20 @@
 
 ## In Progress
 
-- 无源码、脚本或测试改动正在进行；本轮仅同步四个工程账本。
+- **Stage 3A-2C destructive bounded release server 接入**：源码改动已存在于 10 tracked modified + 3 untracked 文件中（`src/llama-kv-cache-release.h`、`src/llama-kv-cache.cpp`、`src/llama-kv-cache.h`、`src/llama-memory.h`、`tests/CMakeLists.txt`、`tests/test-server-kv-pressure-static.py`、`tests/test-server-kv-pressure.cpp`、`tools/server/server-context.cpp`、`tools/server/server-kv-pressure.cpp`、`tools/server/server-kv-pressure.h` 以及 3 个 untracked runner/parser/test 文件），**尚未提交、构建或验证**。不得描述为已实现或已验证。
 
 ## Blocked
 
-- 无已知功能门禁阻塞。dry-run 控制链路已验证通过；下一门禁为 destructive reclaim 受控验证（Stage 3A-2C）。
+- 无已知功能门禁阻塞。dry-run 控制链路已验证通过；destructive reclaim（Stage 3A-2C）源码改动已在工作树中，待构建和受控验证。
 
 ## Next Gate
 
-**唯一下一门禁：Stage 3A-2C — 固定 target 的真实 bounded destructive reclaim 受控验证。** 在 dry-run 已验证的控制链路基础上，将 `paged_release_blocks_bounded()` 接入 PRESSURE/CRITICAL 分支（替换 dry-run scanner），执行真实 `MADV_DONTNEED`。验收要求：
+**唯一下一门禁：Stage 3A-2C — 固定 target 的真实 bounded destructive reclaim 受控验证。** 将 `paged_release_blocks_bounded()` 接入 PRESSURE/CRITICAL 分支（替换 dry-run scanner），执行真实 `MADV_DONTNEED`。验收要求：
 1. OFF/ON controlled A/B：OFF 零 release marker + 零 MADV_DONTNEED；ON 产生真实 release marker（`paged_block_release_bytes > 0`、`paged_blocks_released > 0`）。
 2. 响应 byte-identical（release 不误伤 active-owned block）。
 3. strace 确认 MADV_DONTNEED 仅发生于 ON variant 且数量与 release marker 一致。
 4. ownership ABORT 零发生（排除 invalid mapping）。
 5. 不引入 swap、prefetch、dry-run 或 backing store 变更。
 6. 使用固定 target_bytes 和 max_scan_blocks（非 forced-pressure 动态阈值），以便与 dry-run 的 would-release 预测对比验证。
-7. 通过后进入 Stage 3B：压力阈值调优、动态 target 策略、与 swap/prefetch 的互斥调度融合。
+7. 实现完成后须通过 `gate-runner implement` 门禁再声明完成。
+8. 通过后进入 Stage 3B：压力阈值调优、动态 target 策略、与 swap/prefetch 的互斥调度融合。

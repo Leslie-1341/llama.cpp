@@ -2,9 +2,9 @@
 
 > 记录当前源码可验证的稳定结构。讨论方案必须标记为 proposed，不得混入已实现架构。
 
-- Last verified: 2026-07-20
-- Evidence commit: `02f8cd5ed33a13ffac3cce444d6d3ea7eb987650`
-- Verification scope: 当前源码、Git history（`949fbd0c8`→`02f8cd5ed` diff）、dry-run 实现（`paged_release_blocks_bounded_dry_run`、`llama_kv_release_status`、server dry-run policy）、Stage 3A-2B VALID artifact、static check 扩展、parser 合成负例扩展、CTest 注册
+- Last verified: 2026-07-21
+- Evidence commit: `fd51455b79af08f629810621578965e772ce0685`
+- Verification scope: 当前源码、Git history（`02f8cd5ed`→`fd51455b7` diff）、Harness v1 实现（`scripts/os-agent/` 全部文件）、test-harness.sh 15/15 E2E PASS、audit gate verdict PASS、四模式 marker 验证
 
 ## System Boundary
 
@@ -12,6 +12,7 @@
 - 当前已核对路径主要面向 Linux CPU/host memory。KV paged 路径要求 `n_stream == 1 && !v_trans`；`madvise`/`mincore` 不适用于 GPU device memory。
 - Dense Flex、MoE-Buffer/CLG、lazy KV、paged KV、destructive release、pressure sampler 和 **pressure-driven dry-run** 均由环境变量显式启用；普通未配置路径不主动进入这些实验机制。
 - Pressure sampler 已编入 `llama` 库，并在 server scheduler 的 `update_slots()` 中以单 owner、限频方式接入。**Stage 3A-2B 新增 pressure-driven dry-run scanner 在同一 scheduler 上下文中以只读方式运行**；destructive reclaim 尚未接入 server。
+- **Harness v1**（`scripts/os-agent/gate-runner`）是 diff-aware agent gate 框架——仅在显式调用时运行，不 hook 到 git、build 或 editor；artifact 写入 `/tmp/os-agent-gate/`（repo 外）。
 
 ## Runtime Data Flow
 
@@ -361,6 +362,93 @@ graph cache reuse
 - Shared block 的 shared 状态单独计数（`paged_block_release_skip_shared`），但同样受 owned gate 保护——shared 不等于 unowned，release 不回收仍被任何 seq 引用的 block。
 - **Dry-run scanner 复用同一 ownership collection 逻辑**：与 destructive 路径完全一致的 bitmap 计算和 ABORT 语义。
 
+## Agent Infrastructure（Harness v1）
+
+Harness v1 是一个 diff-aware 的 agent gate 框架，位于 `scripts/os-agent/`，为 implement/review/review-fix/audit 四种工程模式提供自动化的变更验证门禁。它在 repo 根通过 `gate-runner <mode>` 调用，输出唯一结构化 marker `OS_AGENT_GATE_RESULT`。
+
+### Harness 架构
+
+```text
+gate-runner <mode>
+  -> diff_analyze()              [diff-analyzer.sh]
+     -> git diff --name-only HEAD  (tracked: MADRC)
+     -> git diff --name-only --diff-filter=D HEAD  (deleted)
+     -> git ls-files --others     (untracked, excluding artifacts+fixtures)
+     -> _classify_files(): ext-based 分类 → DIFF_CLASSES[HAS_*]
+     -> diff_report(): 结构化 DIFF_* 输出到 artifact
+  -> run_checks_for_mode <mode>   [checks/run-checks.sh]
+     -> gate_implement | gate_review | gate_review_fix | gate_audit  [gates/define-gates.sh]
+        -> check_git_diff_check()    (trailing whitespace, conflict markers)
+        -> check_shell_syntax()      (bash -n 对所有变更 .sh)
+        -> check_python_syntax()     (python3 -m py_compile)
+        -> target_mapper_init()      (compile_commands.json → verified targets)
+        -> check_cmake_configure()   (cmake --build --target help)
+        -> check_compile_commands()  (compile_commands.json 存在且覆盖变更 .cpp)
+        -> check_clang_tidy()        (clang-tidy --warnings-as-errors，无工具时 SKIP)
+        -> check_incremental_build() (cmake --build，仅编译变更 target)
+        -> check_parser_test()       (Python parser 合成负例)
+        -> check_skill_validation()  (.claude/skills + .agents/skills 一致性)
+        -> check_memory_check()      (工程账本验证)
+  -> gate_final_verdict()         [common.sh]
+     -> 优先级: FAIL > UNRESOLVED > INCOMPLETE > PASS > NO_CHANGES
+  -> gate_emit_summary <code>     [common.sh]
+     -> 唯一 OS_AGENT_GATE_RESULT marker + summary.txt
+```
+
+### 四种模式
+
+| 模式 | 用途 | C/C++ build | clang-tidy | parser test |
+|------|------|-------------|------------|-------------|
+| `implement` | 实现完成后的完整门禁 | incremental build | ✓ | ✓ |
+| `review` | diff 审查 | incremental build | ✓ | ✓ |
+| `review-fix` | 按审查结论修复后 | incremental build | ✗ | ✓ |
+| `audit` | 只读分析（分类、语法、mapping） | target resolution only | ✗ | ✓ |
+
+### Target Mapping
+
+- `.cpp/.c/.cc` 源文件：从 `compile_commands.json` 的 `-o CMakeFiles/<target>.dir/` 提取 target。
+- `.h/.hpp` 头文件：按目录 umbrealla mapping——`src/`→`llama`、`tools/server/`→`llama-server`、`common/`→`llama-common`、`ggml/src/`→`ggml`、`examples/kv-*`→对应 example target。
+- 所有 resolved target 必须通过 `cmake --build <dir> --target help` 验证存在。
+- Mapping 失败 → UNRESOLVED (code=2)，不阻塞但需人工确认。
+
+### Unique Marker
+
+```
+OS_AGENT_GATE_RESULT mode=<mode> verdict=PASS|FAIL|UNRESOLVED|INCOMPLETE|NO_CHANGES code=<0-4> checks=<n> pass=<p> fail=<f> skip=<s> unresolved=<u> artifact=<path>
+```
+
+- 全局唯一输出点：`gate_emit_summary()`（`common.sh:80-115`）。
+- Artifacts 写入 `/tmp/os-agent-gate/gate-<mode>-<timestamp>/`（仓库外，防自污染），包含 `full.log` 与 `summary.txt`。
+- Exit codes: 0=PASS 1=FAIL 2=UNRESOLVED 3=INCOMPLETE 4=NO_CHANGES。
+
+### Harness Self-tests
+
+- `scripts/os-agent/tests/test-harness.sh`：15 个合成 E2E 测试，覆盖：
+  - E2E-1: NO_CHANGES（clean repo → code 4）
+  - E2E-2: audit PASS（只读分析通过）
+  - E2E-3: Python 语法 FAIL 检测
+  - E2E-4: Shell 语法 FAIL 检测
+  - E2E-5: Untracked 文件检测
+  - E2E-6: Deleted 文件追踪
+  - E2E-7: C++ target mapping（compile_commands.json -o flag）
+  - E2E-8: Multi-target mapping（同一源文件多 target）
+  - E2E-9: UNRESOLVED cpp（未知文件无 target）
+  - E2E-10: 真实 incremental build（fixture repo + cmake）
+  - E2E-11: Artifact 目录在 repo 外（防自污染）
+  - E2E-12: 单一 summary marker（无重复）
+  - E2E-13: Parser test UNRESOLVED
+  - E2E-14: implement/review/review-fix/audit 四模式 dispatch
+  - E2E-15: --build-dir flag 正确转发
+- 已确认：**15/15 E2E PASS**（运行于 HEAD `fd51455b7`）。
+
+### Harness Invariants
+
+- **默认不运行**：只有显式调用 `gate-runner` 时才执行；不 hook 到 git、build 或 editor。
+- **Fail-closed marker**：唯一 marker 由 `gate_emit_summary()` 生成；不会在 stdout 出现第二个 `OS_AGENT_GATE_RESULT` 行。
+- **Artifact 防自污染**：artifact 目录 `/tmp/os-agent-gate/` 在 repo 外，diff-analyzer 自动排除该前缀路径。
+- **Synthetic fixture 隔离**：harness self-test 在 `/tmp/os-agent-gate-test-*/` 临时目录创建 fixture repos，exit 时 trap cleanup。
+- **模式不自行扩大范围**：audit 不执行 build，review 不执行 clang-tidy（仅 implement）。
+
 ## Module Responsibilities
 
 - `src/llama-model.cpp`、`src/llama-flex.*`：Dense layer 注册、ring sizing、stream/prefetch 与 compute callback 接入。
@@ -385,6 +473,14 @@ graph cache reuse
 - `scripts/run-kv-p0-*.sh`、`scripts/run-kv-paged-release-correctness.sh` 及 parser：P0 回归、稳定性、release correctness 协议和 fail-closed artifact 门禁。
 - `tests/test-kv-paged-release-ownership.cpp`、`tests/test-kv-paged-release-correctness-parser.py`：ownership 逻辑单元测试与 parser 合成负例回归。
 - `tests/test-kv-paged-release-bounded.cpp`：**bounded release 正确性测试**（CTest #29）——Part A 无模型 ownership fault fixture（4 组）；Part B 需模型（B1–B11）。
+- `scripts/os-agent/gate-runner`：**gate harness 单入口**——diff 分析 → target mapping → mode-specific checks → unique marker。
+- `scripts/os-agent/lib/common.sh`：**shared constants**——exit codes（0–4）、gate_log、gate_record_check、gate_final_verdict、gate_emit_summary。
+- `scripts/os-agent/lib/diff-analyzer.sh`：**变更检测**——ext-based 分类（cpp/c/h/py/sh/cmake/skill/ledger + deleted variants），设置 HAS_* flags 驱动 check dispatch。
+- `scripts/os-agent/lib/target-mapper.sh`：**C/C++ target mapping**——compile_commands.json -o flag 提取 + UMBRELLA_MAP header 解析 + cmake --target help 验证。
+- `scripts/os-agent/lib/artifact.sh`：**artifact 管理**——/tmp/os-agent-gate/ 目录创建、full.log/summary.txt、防自污染。
+- `scripts/os-agent/gates/define-gates.sh`：**四模式 gate 定义**——implement/review/review-fix/audit 的 check 组合与 dispatch 逻辑。
+- `scripts/os-agent/checks/run-checks.sh`：**check 函数库**——git-diff-check、shell/python 语法、cmake-configure、compile-commands、clang-tidy、incremental-build、parser-test、skill-validation、memory-check。
+- `scripts/os-agent/tests/test-harness.sh`：**15 E2E 自测**——合成 fixture repos、四模式 dispatch、target mapping、marker 唯一性、artifact 防自污染。
 
 ## Integration Points
 
@@ -423,6 +519,13 @@ graph cache reuse
 - **Stage 3A-2B dry-run parser** 对 dry-run marker field schema、OFF/ON isolation、response divergence、destructive release contamination、MADV_DONTNEED leakage、config isolation 均 fail-closed。
 - Identity fast-path eligibility is immutable for a constructed context；graph reuse 必须 preserve topology。
 - **Release 是 correctness 机制，不是压力调度策略**。当前证据验证的是选择性（不误伤）、事务原子性和互斥门禁。Dry-run 扩展验证的是控制链路、只读性和协议——不代表真实阈值下的回收效果或性能收益。
+- **Harness v1 不变量**：
+  - 默认不运行：只有显式 `gate-runner <mode>` 才执行，不 hook 到 git/build/editor。
+  - Fail-closed marker：`OS_AGENT_GATE_RESULT` 全局唯一输出点——无重复、无歧义、无隐式 fallback。
+  - Artifact 防自污染：`/tmp/os-agent-gate/` 在 repo 外，diff-analyzer 排除此前缀。
+  - Synthetic fixture 隔离：harness self-test 在 `/tmp/os-agent-gate-test-*/` 创建临时目录，exit 时 trap cleanup。
+  - 模式不扩大范围：audit 不执行 build/review/clang-tidy；review-fix 不执行 clang-tidy。
+  - Mapping 失败不阻塞：target mapping UNRESOLVED 返回 code 2（不是 FAIL/1）——标记需要人工确认但不阻止 audit/review 完成。
 
 ## Modification Boundaries
 
@@ -435,6 +538,8 @@ graph cache reuse
 - 修改 `paged_block_state` 枚举或状态转换时必须同步核对：ownership collection、dummy redirect、事务提交/回滚、swap gate、release gate **和 dry-run scanner 的 state gate**。
 - 任何可能改变 post-construction mapping/residency 的新机制必须与 release 的 ownership gate 互斥或提供经证明的失效契约。
 - 不应把 release correctness 协议结果或 dry-run would-release 计数描述为压力调度性能结论。
+- 修改 `scripts/os-agent/` 文件时必须同步更新 `test-harness.sh` 中的对应 E2E 测试、确保 15/15 继续 PASS；`target-mapper.sh` 的 UMBRELLA_MAP 必须在 CMake target 名称变化时同步更新。
+- `DIFF_CLASSES`、`HAS_*` flags 或 check dispatch 逻辑的修改会影响所有四种 gate 模式的行为——必须通过 audit gate 回归后再推进其他模式。**修改 `gate_emit_summary()` 的 marker 格式时，必须同步更新所有 parser 和 test-harness.sh 的 marker 断言。**
 
 ## Known Limitations
 
@@ -456,3 +561,10 @@ graph cache reuse
 - **`llama_kv_bounded_release_result` 提升至 `llama-kv-cache-release.h`**：将该 struct 从 `llama_kv_cache` 内部类型提升为全局类型，使得 `llama-memory.h` 可引用而无需 include `llama-kv-cache.h`。未来若 `llama_kv_bounded_release_result` 字段变化，server marker 格式化和 parser 均需同步更新。
 - 当前 release 证据覆盖单机 CPU、Llama-3-8B Q4_K_M、ctx 1024、parallel 4、固定 idle/resume workload。不覆盖多模型、长上下文、server/continuous batching 或不同 backend/layout。
 - 历史 README 中的性能数字缺少仓库内原始 artifacts 与 commit/worktree 绑定，目前无法确认其对当前 HEAD 的适用性。
+- **Harness v1 限制**：
+  - Harness 仅验证 diff 范围内的文件与合成 fixture——不执行完整 CTest suite 或长时间稳定性测试。`incremental-build` 只编译受影响 targets，不等同于全量构建。
+  - `clang-tidy` 在缺少 clang-tidy 二进制或 `CMAKE_EXPORT_COMPILE_COMMANDS` 时自动 SKIP（非 FAIL），当前环境无 clang-tidy。
+  - `target-mapper` 依赖 `compile_commands.json`；该文件由 CMake `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON` 生成，非项目强制依赖。缺失时 target resolution → UNRESOLVED。
+  - Harness self-test 的 E2E-10（incremental build）使用 synthetic fixture repo（最小 CMakeLists.txt），非对真实 `llama.cpp` build 的验证。
+  - `check_memory_check()` 验证工程账本文件存在但不验证内容正确性——内容一致性由人工 `memory update` 和 `os-agent-task` 流程保证。
+  - Gate 仅覆盖四种显式 mode 调用；不会自动 hook 到 git commit、push 或 PR workflow。
