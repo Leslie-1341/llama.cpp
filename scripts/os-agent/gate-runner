@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# gate-runner — repo-level diff-aware agent-gate Harness
+# Main entry point for os-agent gate execution.
+#
+# Usage: gate-runner <mode> [--build-dir <dir>] [--quiet] [--verbose]
+#   mode: implement | review | review-fix | audit
+#
+# Exit codes: 0=PASS 1=FAIL 2=UNRESOLVED 3=INCOMPLETE 4=NO_CHANGES
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+
+source "$SCRIPT_DIR/lib/common.sh"
+source "$SCRIPT_DIR/lib/artifact.sh"
+source "$SCRIPT_DIR/lib/diff-analyzer.sh"
+source "$SCRIPT_DIR/lib/target-mapper.sh"
+
+# --- arg parsing ---
+GATE_MODE=""
+GATE_BUILD_DIR="${GATE_BUILD_DIR:-build}"
+
+while (( $# > 0 )); do
+    case "$1" in
+        implement|review|review-fix|audit)
+            GATE_MODE="$1" ;;
+        --build-dir)
+            shift; GATE_BUILD_DIR="$1" ;;
+        --build-dir=*)
+            GATE_BUILD_DIR="${1#*=}" ;;
+        -q|--quiet)
+            GATE_LOG_LEVEL=0 ;;
+        -v|--verbose)
+            GATE_LOG_LEVEL=2 ;;
+        -h|--help)
+            cat <<'HELP'
+Usage: gate-runner <mode> [options]
+
+Modes:
+  implement    Full gate: all checks including build, clang-tidy, parser tests
+  review       Review gate: diff-focused checks, build, parser tests
+  review-fix   Fix verification: build + parser tests
+  audit        Read-only: classification, syntax, mapping (no build)
+
+Options:
+  --build-dir DIR    CMake build directory (default: build)
+  -q, --quiet        Minimal output
+  -v, --verbose      Verbose output
+  -h, --help         This help
+
+Exit codes:
+  0 PASS             All checks passed
+  1 FAIL             One or more checks failed
+  2 UNRESOLVED       C/C++ target mapping failed
+  3 INCOMPLETE       Required checks were skipped
+  4 NO_CHANGES       No changes detected
+HELP
+            exit 0 ;;
+        *)
+            printf 'Unknown argument: %s\n' "$1" >&2
+            exit 3 ;;
+    esac
+    shift
+done
+
+if [[ -z "$GATE_MODE" ]]; then
+    printf 'ERROR: mode required (implement|review|review-fix|audit)\n' >&2
+    exit 3
+fi
+
+# --- artifact initialization ---
+artifact_init
+
+gate_log 1 "gate-runner mode=$GATE_MODE build_dir=$GATE_BUILD_DIR"
+gate_log 1 "repo=$REPO_ROOT head=$(git rev-parse HEAD 2>/dev/null)"
+
+# --- diff analysis ---
+diff_analyze
+
+diff_report > "$GATE_ARTIFACT_DIR/diff-report.txt"
+diff_report >> "$GATE_FULL_LOG"
+
+gate_log 1 "Diff: $DIFF_TOTAL files changed (tracked=$HAS_TRACKED untracked=$HAS_UNTRACKED deleted=${DIFF_CLASSES[deleted_cpp]:-0} cpp deleted)"
+
+# If no changes at all, report NO_CHANGES
+if (( DIFF_TOTAL == 0 )); then
+    gate_log 1 "NO_CHANGES: no changes relative to HEAD"
+    gate_emit_summary 4
+    exit 4
+fi
+
+# --- run checks ---
+source "$SCRIPT_DIR/checks/run-checks.sh"
+run_checks_for_mode "$GATE_MODE"
+
+# --- final verdict (single summary marker via gate_emit_summary) ---
+# gate_final_verdict returns non-zero for FAIL/UNRESOLVED/INCOMPLETE.
+# With set -e, we must capture the exit code in a conditional context
+# so the script doesn't terminate before gate_emit_summary runs.
+set +e
+gate_final_verdict
+final_code=$?
+set -e
+gate_emit_summary "$final_code"
+
+exit $final_code

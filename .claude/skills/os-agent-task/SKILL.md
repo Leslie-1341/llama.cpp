@@ -30,6 +30,27 @@ disable-model-invocation: true
 
 只有权限边界确实无法判断时才询问一次。不要为了补齐固定背景而追问。
 
+## Gate 门禁（必执行）
+
+`implement`、`review`、`review-fix`、`audit` 四种模式在完成主要工作后、声明"已完成"前，**必须**执行 diff-aware agent-gate：
+
+```bash
+bash scripts/os-agent/gate-runner <mode>
+```
+
+- `implement` → `bash scripts/os-agent/gate-runner implement`
+- `review` → `bash scripts/os-agent/gate-runner review`
+- `review-fix` → `bash scripts/os-agent/gate-runner review-fix`
+- `audit` → `bash scripts/os-agent/gate-runner audit`（只读，不构建）
+
+Gate 输出格式：`OS_AGENT_GATE_RESULT mode=<mode> verdict=PASS|FAIL|UNRESOLVED|NO_CHANGES|INCOMPLETE code=<n> ...`
+
+- **verdict=PASS (code=0)**：允许声明完成。
+- **verdict=FAIL (code=1) / UNRESOLVED (code=2) / INCOMPLETE (code=3)**：**禁止**声明完成。必须检查 artifact 目录中的 `full.log` 和 `summary.txt`，修复 FAIL/UNRESOLVED 项后重新运行 gate，直到 PASS。
+- **verdict=NO_CHANGES (code=4)**：无改动可检查，可声明完成但需在报告中注明。
+
+`contract`、`script`、`memory` 模式不强制运行 gate，但若涉及源码修改仍需运行对应模式的 gate。
+
 ## 2. 开始前
 
 1. 阅读仓库根目录的 `AGENTS.md` 和 `CLAUDE.md`。
