@@ -7,7 +7,7 @@ disable-model-invocation: true
 
 # OS Agent Task
 
-把用户的简短目标转换为一次边界明确、证据驱动、可验收的工程任务。结果优先，不把提示词写成冗长施工步骤。
+把用户的简短目标转换为一次边界明确、证据驱动、可验收的工程任务。结果优先，但不得把局部报错直接当作根因；先确认当前阶段、系统不变量和完整生命周期，再决定是否修改。
 
 ## 1. 输入
 
@@ -30,9 +30,40 @@ disable-model-invocation: true
 
 只有权限边界确实无法判断时才询问一次。不要为了补齐固定背景而追问。
 
-## Gate 门禁（必执行）
+## 2. 系统级视角门禁
 
-`implement`、`review`、`review-fix`、`audit` 四种模式在完成主要工作后、声明"已完成"前，**必须**执行 diff-aware agent-gate：
+除纯 `memory` 外，开始任务前必须执行一次内部“全局检查点”，但不必把内部过程逐条输出：
+
+1. 当前任务位于哪个阶段、阻塞哪一道门禁；
+2. 当前看到的是表面症状、首个真实错误，还是已经有证据的根因；
+3. 是否存在更上游的构建身份、argv/env、默认参数、模型/数据类型、拓扑或 capability 前置条件；
+4. 涉及哪些跨模块状态、不变量、资源所有权、可见性和完整生命周期；
+5. 当前结论由哪一层证据支持，哪一层仍未验证；
+6. 是否至少存在一个尚未排除的替代解释；
+7. 最小下一动作能否证伪当前判断，而不只是继续修补最后一条报错。
+
+高风险或连续失败任务读取 [references/systemic-workflow.md](references/systemic-workflow.md)；`contract` 或需要推荐模型时读取 [references/model-selection.md](references/model-selection.md)。
+
+以下任一情况视为**高风险系统任务**，必须使用完整状态/生命周期契约：
+
+- destructive release/reclaim/swap、持久化或 backing store；
+- block/cell/page、pending、commit/rollback、ownership、active visibility；
+- 并发、异步、跨线程、共享资源仲裁；
+- server slot、请求生命周期、错误闩锁和跨模块错误传播；
+- parser/runner/Harness 等最终证据链；
+- 同时修改三个以上模块，或真实路径与单元测试结论冲突；
+- 同一问题已经连续两轮以上未关闭。
+
+高风险任务在根因、不变量、合法/非法状态转移和失败回滚尚未明确时：
+
+- `audit` 继续审计，不得猜测性给出实现结论；
+- `implement` 停止修改，报告缺失契约；
+- `review-fix` 退回只读审计，不得边猜边修；
+- `review` 必须尝试推翻实现者的核心假设，而不是只确认局部代码。
+
+## 3. Gate 门禁（必执行）
+
+`implement`、`review`、`review-fix`、`audit` 四种模式在完成主要工作后、声明任务状态前，**必须**执行 diff-aware agent-gate：
 
 ```bash
 bash scripts/os-agent/gate-runner <mode>
@@ -43,18 +74,23 @@ bash scripts/os-agent/gate-runner <mode>
 - `review-fix` → `bash scripts/os-agent/gate-runner review-fix`
 - `audit` → `bash scripts/os-agent/gate-runner audit`（只读，不构建）
 
-Gate 输出格式：`OS_AGENT_GATE_RESULT mode=<mode> verdict=PASS|FAIL|UNRESOLVED|NO_CHANGES|INCOMPLETE code=<n> ...`
+Gate 输出格式：`OS_AGENT_GATE_RESULT mode=<mode> verdict=PASS|FAIL|UNRESOLVED|UNVERIFIED|NO_CHANGES|INCOMPLETE code=<n> ...`
 
-- **verdict=PASS (code=0)**：允许声明完成。
-- **verdict=FAIL (code=1) / UNRESOLVED (code=2) / INCOMPLETE (code=3)**：**禁止**声明完成。必须检查 artifact 目录中的 `full.log` 和 `summary.txt`，修复 FAIL/UNRESOLVED 项后重新运行 gate，直到 PASS。
-- **verdict=NO_CHANGES (code=4)**：无改动可检查，可声明完成但需在报告中注明。
+- **PASS (code=0)**：仅表示该 gate 中必要的短检查通过；不能替代真实 server、模型、长周期或 clean-HEAD 证据。
+- **FAIL (code=1)**：存在已执行并失败的检查，禁止声明完成。
+- **UNRESOLVED (code=2)**：存在相关 knownfail、未注册测试或未关闭歧义，禁止声明完成。
+- **INCOMPLETE (code=3)**：检查链未完整执行，禁止声明完成。
+- **NO_CHANGES (code=4)**：无改动可检查，可报告无改动，但不能据此证明行为正确。
+- **UNVERIFIED (code=5)**：必要检查被跳过或证据层不足，禁止声明完全完成。
 
-`contract`、`script`、`memory` 模式不强制运行 gate，但若涉及源码修改仍需运行对应模式的 gate。
+非 PASS 时必须检查 artifact 中的 `full.log` 和 `summary.txt`。不得通过删除测试、放宽 parser、修改 baseline 或把相关 knownfail 标成 unrelated 来获得绿色结果。
 
-## 2. 开始前
+`contract`、`script`、`memory` 模式不强制运行 gate；若实际修改源码或 Harness，仍需运行对应模式 gate。
 
-1. 阅读仓库根目录的 `AGENTS.md` 和 `CLAUDE.md`。
-2. 阅读 [references/project-contract.md](references/project-contract.md) 与 [references/ledger-policy.md](references/ledger-policy.md)。
+## 4. 开始前
+
+1. 阅读仓库根目录的 `AGENTS.md` 和 `CLAUDE.md`，但不要重复其中固定规则。
+2. 始终阅读 [references/project-contract.md](references/project-contract.md) 与 [references/ledger-policy.md](references/ledger-policy.md)。高风险/连续失败任务再读 [references/systemic-workflow.md](references/systemic-workflow.md)；`contract` 或模型选择任务再读 [references/model-selection.md](references/model-selection.md)。
 3. 读取仓库根目录中已存在的工程账本：
    - `PROJECT_STATE.md`
    - `ARCHITECTURE.md`
@@ -71,62 +107,74 @@ Gate 输出格式：`OS_AGENT_GATE_RESULT mode=<mode> verdict=PASS|FAIL|UNRESOLV
    ```
 
    若当前工具不提供 `SKILL_DIR`，直接从仓库根目录执行对应脚本路径。
-6. 以事实来源优先级工作：当前源码、当前 diff、实际测试输出 > 工程账本 > README/docs > 历史总结或聊天记录。
-7. 工程账本是快速恢复上下文的索引，不得覆盖当前代码事实。账本与源码冲突时，以源码和直接证据为准，并报告账本陈旧。
-8. 只读取与当前目标直接相关的代码、测试和文档。陌生跨文件调用链、公共接口或核心状态修改前可使用 CodeGraph；最终结论仍需直接核对源码。
+6. 事实来源优先级：当前源码、当前 diff、实际测试/实验原始输出 > 当前构建身份和机器可读元数据 > 工程账本 > README/docs > 历史总结或聊天记录。
+7. 工程账本是快速恢复上下文的索引，不得覆盖当前代码事实。冲突时指出账本陈旧，不自动调和。
+8. 只读取与当前目标相关的代码、测试和文档，但跨文件状态机、公共接口或核心生命周期修改不得只读单个函数；必要时使用 CodeGraph 定位，最终结论直接核对源码。
 
-## 3. 通用任务契约
+## 5. 通用任务契约
 
-内部先形成以下五项，不必机械复述给用户：
+内部先形成以下七项，不必机械复述给用户：
 
-1. **目标结果**：最终要实现或证明什么；
-2. **必要上下文**：哪些当前事实会改变实现判断；
-3. **关键边界**：不得破坏什么、允许改什么；
-4. **验收标准**：怎样机器可判定地通过；
-5. **最终输出**：需要报告哪些证据。
+1. **全局位置**：当前阶段、上一门禁、下一门禁；
+2. **目标结果**：最终要实现或证明什么；
+3. **症状与根因状态**：已知症状、首个错误、根因置信度；
+4. **必要上下文**：会改变判断的配置、默认值、拓扑和当前事实；
+5. **关键边界与不变量**：不得破坏什么、允许改什么；
+6. **验收标准与证据层**：怎样通过、由哪一层证据证明；
+7. **最终输出**：需要报告哪些证据、未确认事项和唯一下一动作。
 
 若一个请求包含多个独立目标，优先完成最高优先级且可独立验收的一项，不自行扩大范围。
 
-## 4. 选择模式并执行
+## 6. 选择模式并执行
 
-读取 [references/modes.md](references/modes.md) 中对应模式。严格遵守该模式的允许动作、停止条件和交付物。
+读取 [references/modes.md](references/modes.md) 中对应模式，严格遵守允许动作、系统级检查、停止条件和交付物。
 
 验证要求读取 [references/validation-policy.md](references/validation-policy.md)。
 
-最终输出使用 [references/output-templates.md](references/output-templates.md) 中对应模板，但删去不适用栏目，避免空泛填充。
+最终输出使用 [references/output-templates.md](references/output-templates.md) 中对应模板，删去不适用栏目。低风险任务保持简洁；高风险任务只输出必要的全局结论，不倾倒内部推理过程。
 
-## 5. 工程账本更新边界
+## 7. 工程账本更新边界
 
 - 普通 `audit`、`implement`、`review`、`review-fix`、`script` 不自动修改四个账本。
-- 任务结束时，仅在确有影响时输出一行 `工程账本影响`，指出建议更新的文件和事实；无影响则省略。
-- 只有用户显式调用 `memory update`，或明确要求“同步工程账本”，才允许修改账本。
-- `PROJECT_STATE.md` 可更新当前快照；`ARCHITECTURE.md` 只记录已验证结构；`DECISIONS.md` 与 `EXPERIMENTS.md` 采用追加或显式 supersede，不重写历史。
-- 不把计划写成已完成，不把单次或未验证结果写成正式实验结论。
+- 任务结束时，仅在确有影响时输出一行 `工程账本影响`；无影响则省略。
+- 只有用户显式调用 `memory update`，或明确要求同步工程账本，才允许修改账本。
+- `PROJECT_STATE.md` 可更新当前快照；`ARCHITECTURE.md` 只记录已验证结构；`DECISIONS.md` 与 `EXPERIMENTS.md` 追加或显式 supersede，不重写历史。
+- 高风险状态机契约只有在源码、review 和对应证据通过后，才可进入 `ARCHITECTURE.md` 或 `DECISIONS.md`。
+- 不把计划写成已完成，不把 dirty-tree 单次结果写成正式实验结论。
 
-## 6. 全局边界
+## 8. 全局边界
 
 - 不自动执行 `git commit`、`git push`、merge、rebase、tag、release、`git reset --hard` 或 `git clean -fd`。
 - 默认不生成 patch。只有用户明确要求，或需要跨环境交付增量差异、严格审查或回滚时才生成。
 - 不覆盖与当前任务无关的已有改动。若工作区已有修改与目标文件重叠且无法安全区分，停止并报告。
-- 可执行与修改范围匹配的构建、静态检查、单元测试和短 smoke；长时间模型回归、稳定性测试和正式性能实验只编写脚本与执行命令，由用户运行。
-- 不修改测试标准、baseline 参数或解析规则来掩盖失败。
-- 不把理论收益、单次结果、probe 或历史数据写成当前实测结论。
-- 发现 P0 问题时停止低优先级优化，先报告 P0。
-- 不顺手重构、不增加无关功能、不生成提交信息或 PR 文案，除非用户明确要求且用于本私有竞赛仓库。
+- 代理执行与修改强相关的定向构建、单元测试、fixture 和短 smoke；全量构建、真实模型 server、strace/mincore/cgroup、长稳定性和正式实验由用户执行。
+- 不修改测试标准、baseline 参数、parser 或 gate 规则来掩盖 core 正确性失败。
+- 不把构建成功、Gate PASS、理论收益、单次结果、probe 或历史数据写成更高证据层的结论。
+- 发现 P0 问题时停止低优先级优化，先关闭正确性和证据门禁。
+- 同一问题连续两轮未关闭时，必须停止局部修补，重新执行系统级 audit。
+- 不顺手重构、不增加无关功能、不生成提交信息或 PR 文案，除非用户明确要求。
 - 回复使用中文，直接给结论；不输出内部推理过程，不逐条叙述常规工具调用。
 
-## 7. 完成判定
+## 9. 完成判定
 
-只有同时满足以下条件才可写“已完成”：
+只有同时满足以下条件，才可使用与证据层相匹配的完成措辞：
 
 - 目标行为已实现或目标结论已有直接证据；
-- 必要的短验证已通过，或明确说明由用户执行的长验证尚未完成；
-- 没有隐藏的失败项；
+- 必要短验证通过；
+- 高风险任务的完整生命周期、失败回滚和默认关闭路径已覆盖；
+- 没有隐藏失败、相关 skip、未解释的配置差异或验证工具矛盾；
 - 修改范围与任务目标一致；
-- 已列出未确认事项和剩余风险。
+- 已列出未确认事项和剩余风险；
+- 需要真实 server/模型或 clean-HEAD 的结论，已经获得对应层证据。
 
-否则使用“实现完成但证据不足”“审计完成，尚未实现”或“目前无法确认”等准确表述。
+措辞规则：
 
-## 8. 示例
+- 只有静态/单元层通过：`代码已实现并通过短验证，真实路径尚未验证`；
+- dirty-tree 真实短实验通过：`已诊断验证，尚不可归档`；
+- clean-HEAD 正式协议通过：`已实现并验证`；
+- 根因或证据不足：`目前无法确认`；
+- 不得只因 Gate PASS 写“阻塞项已关闭”或“阶段已完成”。
+
+## 10. 示例
 
 需要调用示例时阅读 [references/examples.md](references/examples.md)。
