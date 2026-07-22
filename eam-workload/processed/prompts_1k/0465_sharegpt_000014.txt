@@ -1,0 +1,5 @@
+trying to connect grapgql-engine with dogital ocean database i linux server,
+but I am gettin this error. In my local machine it is working
+
+{"detail":{"info":{"database_url":"postgresql://doadmin:...@ips-backend-db-do-user-13678898-0.b.db.ondigitalocean.com:25060/Verlagg?sslmode=require","retries":1},"kind":"postgres_connection"},"level":"info","timestamp":"2023-03-27T10:40:29.956+0000","type":"startup"}
+backend-graphql-engine-1 | {"timestamp":"2023-03-27T10:41:29.000+0000","level":"info","type":"startup","detail":{"kind":"migrations-startup","info":"failed waiting for 9691, try increasing HASURA_GRAPHQL_MIGRATIONS_SERVER_TIMEOUT (default: 30)"}

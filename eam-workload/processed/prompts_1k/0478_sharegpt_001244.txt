@@ -1,0 +1,2 @@
+Napisati C program koji unosi rečenicu i na osnovu nje formira niz cijelih brojeva tako da
+članovi niza predstavljaju ASCII kodove znakova unesene rečenice i nakon što odtipkate program detaljno objasnite po redu kako ide program.

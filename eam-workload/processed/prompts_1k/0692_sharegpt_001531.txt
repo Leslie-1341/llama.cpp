@@ -1,0 +1,1 @@
+write php program to compute every combination for ANY length binary string

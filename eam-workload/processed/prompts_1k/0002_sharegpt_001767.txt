@@ -1,0 +1,36 @@
+3 / 3extract all of the route map names and permit/deny statements from this nxos config
+
+route-map RMAP-TNT{{ tenant_id }}-TUC-IN deny 10
+ match ip address prefix-list PLIST-DEFAULT
+route-map RMAP-TNT{{ tenant_id }}-TUC-IN permit 20
+ match ip address prefix-list PLIST-TNT{{ tenant_id }}-MGMT
+ set community {{ tenant_id }}:65021 additive
+route-map RMAP-TNT{{ tenant_id }}-TUC-IN permit 30
+ match ip address prefix-list PLIST-TNT{{ tenant_id }}-TUC-SVCS
+ set community {{ tenant_id }}:65022 additive
+route-map RMAP-TNT{{ tenant_id }}-TUC-IN permit 40
+ match ip address prefix-list PLIST-ALLOW-ALL
+ set community {{ tenant_id }}:65021 {{ tenant_id }}:65032 {{ tenant_id }}:65034 additive
+route-map RMAP-TNT{{ tenant_id }}-TUC-IN deny 10000
+
+route-map RMAP-TNT{{ tenant_id }}-TUC-OUT deny 10
+ match community CLIST-TNT{{ tenant_id }}-CUST-ER-DEFAULT
+route-map RMAP-TNT{{ tenant_id }}-TUC-OUT permit 20
+ match community CLIST-TNT{{ tenant_id }}-MGMT-ER-DEFAULT
+route-map RMAP-TNT{{ tenant_id }}-TUC-OUT permit 30
+ match community CLIST-TNT{{ tenant_id }}-VRTR-DEFAULT
+route-map RMAP-TNT{{ tenant_id }}-TUC-OUT permit 40
+ match community CLIST-TNT{{ tenant_id }}-MGMT-ER
+route-map RMAP-TNT{{ tenant_id }}-TUC-OUT permit 50
+ match community CLIST-TNT{{ tenant_id }}-ESX-MGMT
+route-map RMAP-TNT{{ tenant_id }}-TUC-OUT permit 60
+ match community CLIST-TNT{{ tenant_id }}-ESX-VMOT
+route-map RMAP-TNT{{ tenant_id }}-TUC-OUT permit 70
+ match community CLIST-TNT{{ tenant_id }}-ESX-REPL
+route-map RMAP-TNT{{ tenant_id }}-TUC-OUT permit 80
+ match community CLIST-TNT{{ tenant_id }}-HCX-MGMT
+route-map RMAP-TNT{{ tenant_id }}-TUC-OUT permit 90
+ match community CLIST-TNT{{ tenant_id }}-CUST-ER
+route-map RMAP-TNT{{ tenant_id }}-TUC-OUT permit 100
+ match community CLIST-TNT{{ tenant_id }}-TOC
+route-map RMAP-TNT{{ tenant_id }}-TUC-OUT deny 10000

@@ -1,0 +1,13 @@
+Qué pasos debería seguir para desarrollar una app con la siguiente descripción? 
+Aplicación realizada con React Native mediante Expo en la que el usuario se puede dar de alta para introducir eventos mediante un formulario.
+Cada evento tendrá los siguientes campos:
+1) Fecha dd/mm/aaaa hh:mm
+2) Nombre del evento
+3) Categoria del evento
+4) Ubicación del evento
+5) Precio
+6) Descripción
+
+Cada vez que se envíe un evento se implementará un sistema de aviso para que un moderador lo valide.
+Una vez validado aparecerá en una lista de eventos "minimal" donde los eventos estarán organizados por dias y cada evento será una fila, si se pasa el dedo encima se ampliará para ver el resto de info (Descripción y cartel? Link a ubicación Google Maps?).
+La pantalla principal dispondrá de un sistema de filtrado por determinar para filtrar los eventos.

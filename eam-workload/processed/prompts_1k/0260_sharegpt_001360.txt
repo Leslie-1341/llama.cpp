@@ -1,0 +1,5 @@
+1 / 1GigSalad has badges associated with its online marketplace associated with sellers (entertainers or event service providers) on its platform. Currently, two badges are:
+- "Featured" (which members get when they pay for the highest tier of subscription)
+- "Top Performer" (which members get when they have a high response rate, at least one booking in the past three months, and a high review rating)
+
+Event planners (the buyers on our marketplace) are confused as to what "Top Performer" means. What are some potential solutions to this and what are some other names we could use for the two badges?

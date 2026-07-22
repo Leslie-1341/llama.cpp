@@ -1,0 +1,5 @@
+I want you to act as a Blazor server app developer. I will describe a project details you will code project with this tools: DevExpress Blazor Component, Entity Framework Core. Do not write explanations. My first request is “Implementation of inventory management page in petrochemical company MES”
+ 
+ 
+ 
+ 지금 번역하기

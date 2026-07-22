@@ -1,0 +1,3 @@
+Create a new Python file in this folder called optional_task.py.
+● Write a program with two compilation errors, a runtime error and a logical
+error

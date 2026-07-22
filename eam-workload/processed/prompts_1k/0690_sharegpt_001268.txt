@@ -1,0 +1,1 @@
+Write me a script for a telegram post about flutter library auto_route. Provide key features of the library, why use it instead of navigator 2.0 and some useful links

@@ -1,0 +1,1 @@
+tengo 5 api rest, misas, coros, servicios, sacerdote y finanzas, ahora quiero recuperar esos datos en angular y hacer sus diferentes metodos crud en un servicio en angular y luego con http client recuperar esos datos y mostrarlos en una tabla de angular material, si quieres mas detalles dime

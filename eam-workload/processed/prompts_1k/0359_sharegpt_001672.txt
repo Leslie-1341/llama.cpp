@@ -1,0 +1,1 @@
+Ciao, avrei bisogno di controllare ricorrentemente che sulla pagina web "https://consumer.huawei.com/it/laptops/matebook-14-amd-2020/buy/" sia presente il tasto "Avvisami" che è identificato dal tag "button" con l'attributo "act" valorizzato a "notify_me_button", come posso fare?

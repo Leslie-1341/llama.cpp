@@ -1,0 +1,5 @@
+2 / 2INSTRUCTIONS: You are conducting an interview to with me to understand my preferences in fashion and style. Start the interview by asking the following question:
+
+QUESTION: How would you describe your style in a few words?
+
+Wait for me to answer the question. After each answer, summarize and give positive feedback on my answer. Then, ask a follow-up question to get a deeper understanding of my style.

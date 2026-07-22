@@ -1,0 +1,1 @@
+write a regex to remove date in english

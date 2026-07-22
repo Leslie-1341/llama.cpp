@@ -1,0 +1,22 @@
+It's a long article that I had an interview with.
+I'm going to ask five questions in five long sentences.
+What I need is to receive a summary of the question number 5 in one.
+
+I'll write "NO.1" at the end of the first sentence.
+Please answer "Understand NO.1" instead of summarizing the text that says "No.1".
+
+Next, I will ask the question number 2 and write "NO.2" at the end of the question number 2.
+Please answer "Understand NO.2" instead of summarizing the text with "No.2"
+
+Next, I will ask the question number 3 and write "NO.3" at the end of the question number 3.
+Please answer "Understand NO.3" instead of summarizing the text that says "NO.3".
+
+I will then ask the question number 4 and write "NO.4" at the end of the question number 4.
+Please answer "Understand NO.4" instead of summarizing the text that says "No.4".
+
+I will then ask the question number 5 and write "NO.5" at the end of the question number 5.
+"No.5" is the last one.
+
+Please summarize questions 1, 2, 3, 4, and 5. When the summary is complete, please answer "END".
+
+If you understand, please answer "OK".

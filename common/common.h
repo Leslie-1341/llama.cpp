@@ -538,6 +538,8 @@ struct common_params {
     bool multiline_input   = false; // reverse the usage of `\`
     bool simple_io         = false; // improves compatibility with subprocesses and limited consoles
     bool cont_batching     = true;  // insert new sequences for decoding on-the-fly
+    int32_t cont_batching_wait_us = 0; // server: wait this long before internal decode ticks to admit more tasks
+    int32_t cont_batching_min     = 0; // server: wait only while fewer than this many slots are processing
     bool no_perf           = false; // disable performance metrics
     bool show_timings      = true;  // show timing information on CLI
     bool ctx_shift         = false; // context shift on infinite text generation

@@ -1,0 +1,62 @@
+Can you extract the HT amount, the TVA and the TTC from this invoice text: £ © Facture
+À N'FCITELO/20/080008
+77 À commande : D22191-00230 au 30/09/2020
+Devis : D22191-07672 du 04/09/2020
+TelObseques AGENCE DE PARIS (ALA)
+sté Anubis International Assistance
+43 rue de Liege
+75008 PARIS 08
+Franco
+Téléphone :
+Votre contact :
+Date 30/09/2020 Mail:
+Date d'échéance 30/10/2020 Habitation préfectoral: 18 75 0419
+Numéro du dossier 
+Référence client
+Défunt 
+Date et lieu du 
+décès 
+Lieu de départ HOPITAL, France France
+Ludo INHUMATION, , France
+Lieu d'arrivée
+TVA intracom : FR44
+Descriptions Quantité TVA Montant T.T.C.
+09GES Honoraires, organisation & coordination 1 20.00 % 15,12€
+Lieu : France
+Frais de mise en relation
+Montant H.T. 12,60 €
+TVA au taux légal en vigueur, taux normal : 20 % 2,52€
+Exonération de TVA 0,00€
+Montant T.T.C. 15,12€
+Déje perçu 0,00€
+Reste à payer 152€
+
+Vente de biens au profit d'un preneur sssujetti à la TVA:
+Exonération de TVA article 259 & 259B du CG]
+
+Vente Preneur CEE : Exonération de TVA anticie 262 T er 1 du CGI (Directive 200B/BCE)
+Exonération de TVA, article 262 | du CGI
+
+Exonération de TVA, article 262 |] - 8° du CGI
+Expédition de biens vers les DOM, article 294-2 du CGI
+Ventes de prestations de services à un Preneur assujetti à la TVA, installé dans un autre état membre de l'union européenne:
+Exonération de TVA, article 283-2 du CGI
+
+Extrait CG: Aticle 9 - CONDITIONS DE PAIEMENT
+Des pénalités seront automatiquement appliquées dans le cas où les sommes dues sersient versées après la data de paisment convenue figurant sur la facture, Ces
+pénalités sont d'un montant équivalent à celui qui résulte de l'application d'un taux égal à une fois et demie le taux d'intérêt légal conformément eux dispositions de l'article
+
+L441-6 du code du commerce,
+
+Mode de palement: Virement
+
+Compte bancaire :
+Banque : HSBC EUR
+
+Code Banque Code guichet numéro decompte Clé RIB
+E]
+
+ANUBIS INTERNATIONAL ASSISTANCE - RCS Paris N° 444506646 - Sarl au capital de 60 000 € « TVA Intracom FR34444506646 - Code APE 9603Z
+ORIAS 15003321 - Siège social 43 rue de Ilege 75008 PARIS 08 France - www.anublsgroup.org
+
+FACTURE FC/TELO/20/080003 1/3

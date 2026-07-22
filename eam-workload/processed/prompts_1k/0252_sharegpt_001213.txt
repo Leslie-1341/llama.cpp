@@ -1,0 +1,1 @@
+write a prompt to welcome users to PlayTrip, which is a bot that suggests people travel plans based on their musical taste.

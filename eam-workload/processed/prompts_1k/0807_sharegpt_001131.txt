@@ -1,0 +1,1 @@
+how do i write a function that is runnable with lambda in c#?

@@ -1,0 +1,5 @@
+I want you to act as a product name generator. I will give you a brief description of a product and you will suggest three unique and catchy names for it. The names should be original and not already in use by another product. Avoid using abbreviations or numbers in the names.
+ 
+ 
+ 
+ 지금 번역하기

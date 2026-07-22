@@ -1,0 +1,45 @@
+Write a C++ program that accesses a GPIB using NI IVIHere is an example C++ program that accesses a GPIB using NI IVI (National Instruments Interchangeable Virtual Instrument):Copy code#include 
+#include 
+
+int main() {
+ ViSession vi;
+ ViStatus status;
+ ViChar resource[] = "GPIB0::1::INSTR"; // GPIB address of the instrument
+
+ // Open the instrument
+ status = viOpen(VI_NULL, resource, VI_NULL, VI_NULL, &amp;vi);
+ if (status != VI_SUCCESS) {
+ std::cerr &lt;&lt; "Unable to open instrument" &lt;&lt; std::endl;
+ return 1;
+ }
+
+ // Send a command to the instrument
+ ViChar command[] = "*IDN?"; // Query identification string
+ ViChar response[1024];
+ ViUInt32 retCount;
+ status = viWrite(vi, (ViBuf)command, sizeof(command)-1, &amp;retCount);
+ if (status != VI_SUCCESS) {
+ std::cerr &lt;&lt; "Unable to send command" &lt;&lt; std::endl;
+ return 1;
+ }
+
+ // Read the response from the instrument
+ status = viRead(vi, (ViBuf)response, sizeof(response)-1, &amp;retCount);
+ if (status != VI_SUCCESS) {
+ std::cerr &lt;&lt; "Unable to read response" &lt;&lt; std::endl;
+ return 1;
+ }
+
+ // Print the response
+ std::cout &lt;&lt; "Response: " &lt;&lt; response &lt;&lt; std::endl;
+
+ // Close the instrument
+ status = viClose(vi);
+ if (status != VI_SUCCESS) {
+ std::cerr &lt;&lt; "Unable to close instrument" &lt;&lt; std::endl;
+ return 1;
+ }
+
+ return 0;
+}
+This program does the following:Opens a connection to the GPIB instrument at the specified address (GPIB0::1::INSTR) using viOpen().Sends a command to the instrument (*IDN?) using viWrite().Reads the response from the instrument using viRead().Prints the response.Closes the connection to the instrument using viClose().You will need to include the ivi.h header file and link to the IVI libraries in order to build this program.

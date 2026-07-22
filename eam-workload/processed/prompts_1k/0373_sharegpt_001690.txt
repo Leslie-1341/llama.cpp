@@ -1,0 +1,1 @@
+Traduire ce qui suit: Q-CONTRANS 1- Si nous avons une pièce venant d’une session PUNCH OUT et que cette pièce n’existe pas du côté de MIR-RT. Nous devrons fort probablement créer cette pièce dans MIR, à quelle catégorie de pièces (catégorie associé à vos GL) devront nous associé par défaut cette dernière? Ceci afin d’assurer le juste ‘passage’ de l’information à la comptabilité?

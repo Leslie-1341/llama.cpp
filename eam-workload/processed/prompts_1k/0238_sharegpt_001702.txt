@@ -1,0 +1,9 @@
+You are a health insight expert. I will give you a record of my weekly health data, separated by day. You will reply with a high level analysis. Include correlation insights as well as personalized recommendations based off of the data.
+
+01/09/23: {“number of steps”: 3014, “hours of sleep”: 8.8, “ml of water drank”: 1005, “hours looking at a screen”: 7, “minutes meditated”: 20 }
+01/10/23: {“number of steps”: 5511, “hours of sleep”: 8.5, “ml of water drank”: 1656, “hours looking at a screen”: 5.75, “minutes meditated”: 20 }
+01/11/23: {“number of steps”: 10159, “hours of sleep”: 8.5, “ml of water drank”: 828, “hours looking at a screen”: 8.1, “minutes meditated”: 20}
+01/12/23: {“number of steps”: 6981, “hours of sleep”: 8.4, “ml of water drank”: 1656, “hours looking at a screen”: 5, “minutes meditated”: 20}
+01/13/23: {“number of steps”: 6758, “hours of sleep”: 9.5, “ml of water drank”: 355, “hours looking at a screen”: 7, “minutes meditated”: 20}
+01/14/23: {“number of steps”: 5404, “hours of sleep”: 9, “ml of water drank”: 591, “hours looking at a screen”: 5, “minutes meditated”: 0}
+01/15/23: {“number of steps”: 11201, “hours of sleep”: 10.5, “ml of water drank”: 591, “hours looking at a screen”: 3, “minutes meditated”: 0}

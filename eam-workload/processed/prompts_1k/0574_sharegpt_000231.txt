@@ -1,0 +1,9 @@
+elaborate on this 
+Part 1: Introduction to Linux
+
+What is Linux? History and background
+Linux distributions (Ubuntu, Fedora, Debian, etc.)
+Advantages of Linux (open-source, stability, security, flexibility)
+Basic Linux commands (cd, ls, mkdir, touch, etc.)
+The file system hierarchy in Linux
+Installing Linux (dual-boot, virtual machine, etc.)

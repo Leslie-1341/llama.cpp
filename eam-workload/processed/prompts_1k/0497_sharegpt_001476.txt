@@ -1,0 +1,1 @@
+I'm using Ubuntu server. Help me to write list of command to copy file from portable drive to temporary folder, add execution permission then run the file. fdisk is not allowed

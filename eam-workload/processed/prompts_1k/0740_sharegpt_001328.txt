@@ -1,0 +1,9 @@
+Let me introduce The Korean Institute of Information Scientists and Engineers as following:
+
+The Korean Institute of Information Scientists and Engineers(KIISE) was founded in 1973 to propagate the technology of information science and to promote the amity among members of KIISE. KIISE was incorporated as a nonprofit organization under jurisdiction of the Ministry of Science and Technology (No. 46). and moved to the Ministry of Science, ICT and Future Planning(currently the Ministry of Science and ICT) in 2013.
+
+KIISE became the regular member of IFIP in 1977 and established the cooperative association with ACM, IEEE, IEEE Computer Society, IPSJ, and IEICE-ISS etc. to promote the international academic interchange and collaboration so far.
+
+On the present day of 2022, KIISE has more than 35,000 individual members, 156 special members, and 279 institutional members. KIISE publishes its periodicals about 50 times in a year including ‘Journal of KIISE’ that was registered and appraised as the best journal by the Korea Research Foundation(KRF) (currently, the National Research Foundation of Korea(NRF)) in 2002. KIISE also holds the regular and irregular conferences for over 60 times a year.
+
+Vision of KIISE : To lead the Knowledge Information Society by promoting the ICT Innovation and the Convergence with other disciplines based on the Computing Technology.

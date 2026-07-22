@@ -1,0 +1,16 @@
+Please answer the following questions:
+
+Question title:
+
+"if" statement syntax differences between C and C++
+
+Question body:
+
+if (1) int a = 2;
+This line of code is valid C++ code (it compiles at the very least) yet invalid C code (doesn't compile). I know there are differences between the languages but this one was unexpected.
+I always thought the grammar was
+if (expr) statement
+but this would make it valid in both.
+My questions are:
+1. Why doesn't this compile in C?
+2. Why does this difference exist?

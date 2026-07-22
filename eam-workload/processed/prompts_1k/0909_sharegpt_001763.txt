@@ -1,0 +1,1 @@
+오늘 사내에서 접수되는 여러 작업내용을 기준으로 고객에게 공지하는 내용을 HTML 코드로 샘플제공할꺼야번역결과Based on the various work contents received in the company today, we will provide a sample of the contents to be notified to the customer in HTML code.

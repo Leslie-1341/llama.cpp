@@ -1,0 +1,17 @@
+Web search results:
+
+[1] "나는 인터뷰할 때 연예인이 아닌 사람을 바라보는 따뜻한 시각으로 임하려고 한다. 그래서 인생 가치관이나 고민에 대해 질문하곤 하는데 류준열 배우는 인터뷰에서 항상 명언을 남겨서 나도 배운다. (웃음) 영화 담당 기자로서 취재나 기사 작성 노하우가 있나? 처음엔 영화에 대해 깊게 알지 못했다. 그래서 어두운 영화관에서 영화를 보며 무작정 노트에..."
+URL: https://www.hani.co.kr/arti/society/schooling/986567.html
+
+[2] "한 달에 1~2회 주말 당직, 3~4회 야간 당직을 소화해야 한다. 주말이나 야간에 쏟아져 나오는 기사는 당직 기자들이 쓴 것이라고 보면 된다. 당직 후엔 대체 휴무를 쓰거나, 지연 출근하는 것이 가능하다고. 채용 절차는 이래요 보통은 서류-면접의 단계를 거치지만 ..."
+URL: https://univ20.com/87010
+
+[3] "따라서 면접을 앞두고 있다면 정답을 찾기보다는 합격자들의 면접 모습을 관찰하고 왜 이런 모습들이 최종 합격에 긍정적으로 작용했는지를 찾기 위해 노력해야 한다. 최종 (임원) 면접에서 떨어지고 좌절하는 사람이 많은데 최종 (임원) 면접은 못해서 떨어지는 ..."
+URL: https://blog.naver.com/solkiloveme/221176950430
+
+
+Current date: 2023. 2. 27.
+
+Instructions: Using the provided web search results, write a comprehensive reply to the given query. Make sure to cite results using [[number](URL)] notation after the reference. If the provided search results refer to multiple subjects with the same name, write separate answers for each subject.
+Query: 연예부 기자의 최종면접을 앞두고 있어. 면접관이 되어서 질문들을 만들어줘.
+Reply in 한국어

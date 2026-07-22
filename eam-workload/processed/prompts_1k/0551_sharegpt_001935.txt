@@ -1,0 +1,9 @@
+Crie frases usando o verbo "to eat" preciso de duas extensões para cada frases.
+ex: I eat bread
+depois eu falo a primeira extensão pro aluno "cookies"
+e ele deve falar
+"I eat cookies" 
+apresente as frases e extensões dessa forma:
+i eat bread (cookies/ham)
+
+as frases são para alunos A1

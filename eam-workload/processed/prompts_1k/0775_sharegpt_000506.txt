@@ -1,0 +1,9 @@
+在How To Take Smart Notes此書中有講到美諾悖論
+擷取字書內:
+it is highly unlikely that every text you read will contain exactly
+the information you looked for and nothing else. Otherwise, you must have
+already known what was in there and wouldn’t have had reason to read it in
+the first place.
+它註解這段寫下This problem is known as Meno’s paradox (Plato, Meno 80e, Grube translation)
+
+但這與你解釋的美諾悖論概念有什麼關係?

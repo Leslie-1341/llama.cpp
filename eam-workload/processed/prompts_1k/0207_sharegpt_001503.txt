@@ -1,0 +1,6 @@
+What architectural concept would you recommend for a PHP project. The main task of the backend in this case:
+1. Receiving data from several ba
+2. Data preparation.
+3. Passing to the front as json
+
+There are also some logical tasks with calculations and aggregation

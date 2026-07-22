@@ -1,0 +1,1 @@
+generate python code to fetch total non-farm employment data (all employees, not seasonally adjusted) between 2019 and 2022 from the us dept of labor statistics v2 public API, using my registration key : c37af3befcc64e5e8fde53f245800c7e and a post request.

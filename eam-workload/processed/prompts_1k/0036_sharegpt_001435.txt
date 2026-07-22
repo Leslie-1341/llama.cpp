@@ -1,0 +1,8 @@
+convert to table command,target,option,value
+"visit","","","https://www.everlast.com/"
+"hover","Mouse","",""
+"click","Gloves","",""
+"hover","Mouse","",""
+"click","product-image-photo","",""
+"click","S/M","",""
+"click","Add to Cart","",""

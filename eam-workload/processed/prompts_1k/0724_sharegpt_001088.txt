@@ -1,0 +1,8 @@
+Here is my object.
+var scriptDatas = {
+"age":20, "name"MGS"
+}
+
+How to re-write the below if condition properly without getting the undefined error?
+if(!scriptDatas.status || scriptDatas.status=='Failed') {
+}

@@ -1,0 +1,13 @@
+tu es ingénieur support chez un intégrateur d'équipement cybersécurité que peux tu me dire sur ce message : 
+Bonjour,
+Nous renconrtrons un bloquage sur l'accès à la bilbiothèque cloud Adobe creative cloud.
+Des tests ont été effectué ce jour et nottament sur le réseau dédié vers 18h00 .
+
+Les bibliothèques se chargent avec le client Néo via le réseau dédié - stagging.
+Les bibliothèques ne se chargent pas avec le client Néo via le réseau classique NarbonneAccessoires.
+
+Pouvez-vous investiguer sur ce blocage s'il vous plait ?
+
+Dans l'idéal il faudrait régler ce problème assez rapidement.
+
+Bien cordialement,

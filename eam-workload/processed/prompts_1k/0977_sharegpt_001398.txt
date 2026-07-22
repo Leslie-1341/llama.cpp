@@ -1,0 +1,24 @@
+in resume writing, for the accomplishments section follow the following format/guidelines:
+
+Accomplishment Statements
+• Something you did to help the employer and has measurable 
+results
+• Not just a list of tasks, duties or skills. Not a job description
+• Use a variety of action words to describe experiences
+• Action Verb + (What/How) + Results
+• Start with a good action verb
+• State specifically what you did and how you did it, including 
+industry relevant skills or tools
+• State the benefits of your actions. If possible, quantify the 
+results
+
+based on this, can you suggest improvements to the following accomplishments:
+
+• Developed and updated Restful APIs and Spring boot services for various features such as clinical data transfer to client
+specified cloud storage and instance scaling services to save uptime costs by 20%
+• Involved in setting up environment for big data processing – deployment of apps in edge node and configuration of HDFS,
+Hive, YARN, Spark and other BDP components using Ambari
+• Designed CI/CD pipelines using Azure DevOps to automate deployment flows of the application, BDP cluster configuration
+in EMR etc. which reduced manual workloads by 30%
+• Implemented new features in the application such as Custom charts and Email Reporting using NodeJS and Iron.IO that
+enabled hospitals expand their data utilization to their R&D and clinical consulting

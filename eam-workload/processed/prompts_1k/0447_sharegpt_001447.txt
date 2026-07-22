@@ -1,0 +1,4 @@
+I want to make a cell of excel
+Calculate the number of Link words in column H, and at the same time, the text in column C must be the same as K6
+
+Please give me the formula for the cell

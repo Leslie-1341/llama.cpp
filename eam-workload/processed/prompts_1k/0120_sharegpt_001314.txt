@@ -1,0 +1,9 @@
+Mini-batch SGD performs optimization by taking the average gradient over a mini-batch, denoted $\mathcal{B} \in \mathbb{R}^{b\times d}$, where $1 < b \ll n$. Each training example in the mini-batch, denoted $\mathbf{x}_j \in \mathcal{B}$, is randomly sampled without replacement from the data matrix $X$. Assume that $X$ is full rank. Where $\mathcal{L}$ denotes the loss on $\mathbf{x}_j$, the update for a single step of mini-batch SGD at time $t$ with scalar learning rate $\eta$ is:
+\begin{equation}
+ \mathbf{w}_{t+1} \leftarrow \mathbf{w}_t - \frac{\eta}{b} \sum_{\mathbf{x}_j \in \mathcal{B}} \nabla_{\mathbf{w}_t} \mathcal{L}(\mathbf{x}_j, \mathbf{w}_t)
+\end{equation}
+Mini-batch SGD iterates by randomly drawing mini-batches and updating model weights using the above equation until convergence is reached.
+
+For an overparameterized linear model, gradient descent starting from zero initialization finds the unique minimum norm solution $\mathbf{w}^*$ such that $X\mathbf{w}^* = \mathbf{t}$. Let $\mathbf{w}_0 = \mathbf{0}$, $d>n$. Assume mini-batch SGD also converges to a solution $\hat{\mathbf{w}}$ such that $X \hat{\mathbf{w}} = \mathbf{t}$. 
+
+Prove that $w$ stays in the span of $X$, so that we can always write $w = X^T a$ for some $a \in \mathbb{R}^n$.

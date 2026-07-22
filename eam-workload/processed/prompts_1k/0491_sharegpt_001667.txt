@@ -1,0 +1,1 @@
+2 / 2I have a python repo that has a script that parses my s3 data but its a lot of data to download and run the package locally. How can I create a lambda that can run the script from the repo on my s3 data?

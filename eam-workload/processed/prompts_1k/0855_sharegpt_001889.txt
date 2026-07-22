@@ -1,0 +1,23 @@
+1.computer networks
+2.routing, different routing algorithms(list)
+3.adaptive and non- adaptive routing alg.
+4.Flooding,
+5.tunneling.
+6.subnet mask
+7.subnet mask and elements of sockets
+8.out of band data
+9.blocking and non -blocking I/O
+10.Differentiate between TCP and UDP
+11.Trasport entity
+12.TCP and UDP header
+13.Services of transport layer
+14.IP address classes
+15.Example IP address class
+16.Name server
+17.Resource record
+18.HTTP
+19.WWW
+20.E-mail
+21.User agent
+22.Mobile IP
+explain all the topics briefly

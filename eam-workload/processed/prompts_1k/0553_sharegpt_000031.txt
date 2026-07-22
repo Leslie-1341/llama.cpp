@@ -1,0 +1,3 @@
+Giờ tôi sẽ đưa ra một bài tập của môn lập trình Python. Bạn hãy giúp tôi phân tích, và liệt kê các tính năng.
+
+Bài tập là: Thiết kế một chương trình quản lý bán hàng trực tuyến đơn giản. Sử dụng được lập trình hướng đối tượng để phát triển giải pháp. Phải thể hiện rõ 4 đặc tính chính của OOP trong giải pháp.

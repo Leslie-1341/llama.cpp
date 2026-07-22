@@ -1,0 +1,28 @@
+check code: import pandas as pd
+import xlsxwriter
+import sys
+import os
+
+# Write the merged DataFrame to an Excel file
+output_filename = "rank.xlsx"
+
+# Check if merge.xlsx is open in another application
+if os.path.exists(output_filename):
+ # File exists
+ try:
+ # Try opening the file in write mode
+ with open(output_filename, "w") as f:
+ pass
+ except IOError:
+ # File is open in another application
+ print(f"Please close {output_filename} in other applications and try again.")
+ exit()
+
+# Check that the correct number of arguments was provided
+if len(sys.argv) != 2:
+ print(f"Usage: python {sys.argv[0]} input_excel")
+ exit()
+
+# Read in the whole Excel file and store it in a dictionary of DataFrames
+df = pd.read_excel(sys.argv[1])
+print(f"Sheet names in {sys.argv[1]}: {df.keys()}")

@@ -1,0 +1,25 @@
+I have google sheet, in this google sheet I have collums divided into 15minutes and each 15 minutes are given different statuses: email status, chat status. phone status. This sheets purpose is to write down what "status" should agents work on. This means either they should be on email given the status, or on chat given the status, or on phone. However agents operate from software called cases and this google sheet is in a different window, therefore they have to check them selves manually what status they currently have assigned. I want you to write code which will connet the google sheet to the cases software and automatically switch those statuses, so agents do not need to look into the google sheet, but stay in the cases software.To accomplish this, you will need to use the Google Sheets API to access the data in your Google Sheet from the Cases software. Here are the steps you can follow:First, you will need to create a Google API project and obtain the necessary credentials to access the Google Sheets API. You can find more information on how to do this here: https://developers.google.com/sheets/api/quickstart/python#step_1_turn_on_theNext, you will need to install the Google Sheets API Python client library in your Cases software. You can do this by running the following command:Copy codepip install google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client
+Once the client library is installed, you can use the following Python code to authenticate and access the data in your Google Sheet:Copy code# Import the necessary libraries
+from google.oauth2.credentials import Credentials
+
+# Replace the values of these variables with your own
+client_id = "YOUR_CLIENT_ID"
+client_secret = "YOUR_CLIENT_SECRET"
+refresh_token = "YOUR_REFRESH_TOKEN"
+
+# Use the refresh token to obtain an access token
+creds = Credentials.from_authorized_user_info(client_id=client_id, client_secret=client_secret, refresh_token=refresh_token)
+
+# Access the Google Sheets API
+service = build('sheets', 'v4', credentials=creds)
+
+# Set the spreadsheet ID and range of the data you want to access
+spreadsheet_id = "YOUR_SPREADSHEET_ID"
+range_name = "Sheet1!A1:C"
+
+# Call the Sheets API to get the data
+result = service.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=range_name).execute()
+
+# Print the data
+print(result)
+The code above will retrieve the data in your Google Sheet and print it to the console. You can then use this data to automatically switch the statuses in your Cases software.I hope this helps! Let me know if you have any questions or need further assistance.

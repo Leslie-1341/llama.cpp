@@ -1,0 +1,1 @@
+python 出現invalid syntax，檢查後也沒發現問題，該怎麼處裡

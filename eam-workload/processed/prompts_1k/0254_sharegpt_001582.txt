@@ -1,0 +1,19 @@
+2 / 2The provided MATLAB script (diceSimulation.m) runs a simulation of rolling six, 6-sided dice and calculating the sum. The simulation is repeated 1,000,000 times to create a histogram of the probability distribution as shown below.
+ 
+The code produces the correct result, but can be improved to run faster. Rewrite the script such that the simulation produces the same results with 1,000,000 trials, a histogram of the results is created, and a faster execution time.
+
+Here is the script "diceSimulation.m":
+
+%% Simulate the sum of rolling 6 dice 1e6 times.
+
+numSims = 1e6;
+for i = 1:numSims
+ 
+ % Create 6 random integers in the range [1, 6]
+ dice = randi([1, 6], 1, 6);
+ 
+ % Sum the six integers and store the result
+ diceSum(i) = sum(dice);
+end
+
+histogram(diceSum);

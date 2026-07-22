@@ -1,0 +1,6 @@
+Transform with regular expressions those lines:
+0003 AB
+0568 FD
+into:
+AB
+FD

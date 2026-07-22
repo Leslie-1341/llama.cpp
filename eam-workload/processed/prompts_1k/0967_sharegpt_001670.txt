@@ -1,0 +1,20 @@
+Is there any resource leak bug in the following C code?
+
+int snapshot_sys_lpi_us(void)
+{
+ FILE *fp;
+ int retval;
+
+ fp = fopen_or_die("/sys/devices/system/cpu/cpuidle/low_power_idle_system_residency_us", "r");
+
+ retval = fscanf(fp, "%lld", &amp;cpuidle_cur_sys_lpi_us);
+ if (retval != 1) {
+ fprintf(stderr, "Disabling Low Power Idle System output\n");
+ BIC_NOT_PRESENT(BIC_SYS_LPI);
+ fclose(fp);
+ return -1;
+ }
+ fclose(fp);
+
+ return 0;
+}

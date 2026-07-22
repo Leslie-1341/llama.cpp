@@ -1,0 +1,45 @@
+AIPRM - ChatGPT Prompts for SEOsExamples"Explain quantum computing in simple terms" →"Got any creative ideas for a 10 year old’s birthday?" →"How do I make an HTTP request in Javascript?" →CapabilitiesRemembers what user said earlier in the conversationAllows user to provide follow-up correctionsTrained to decline inappropriate requestsLimitationsMay occasionally generate incorrect informationMay occasionally produce harmful instructions or biased contentLimited knowledge of world and events after 2021
+ 
+ 
+ AIPRM - ChatGPT Prompts for SEOs
+ 
+ 
+ 
+ Add Link to Article
+ Find the best place and anchor text to add a link to [YOUR TARGET URL] in an existing THEIR ARTICLE.
+ Use prompt →
+ 
+ 
+ 
+ Outrank Article
+ Outrank the competition with an in-depth, SEO-optimized article based on [YOUR COMPETITOR URL]. Be like your competition, just a little better ;-)
+ Use prompt →
+ 
+ 
+ 
+ Keyword Strategy
+ Create a keyword stategy and SEO content plan from 1 [KEYWORD]
+ Use prompt →
+ 
+ 
+ 
+ Keyword Intent
+ Classify a list of keywords based on their search intent
+ Use prompt →
+ 
+ 
+ 
+ Keyword Cluster
+ Cluster a list of keywords based on their semantic relevance
+ Use prompt →
+ 
+ 
+ 
+
+ 
+ 
+ Showing 1 to 5 of 10 Entries
+ 
+ 
+ Prev
+ Next

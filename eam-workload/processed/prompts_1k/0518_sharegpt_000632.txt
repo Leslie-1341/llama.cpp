@@ -1,0 +1,22 @@
+1 / 1Relaciones:
+- ALUMNOS (nro_alumno, nom_alumno, nro_doc_alumno)
+- CARRERAS (cod_carrera, nom_carrera, nota_aprob_examen_final)
+- MATERIAS (cod_carrera, cod_materia, nom_materia, cuat_materia, optativa)
+- MATRICULAS (nro_alumno, cod_carrera, ano_ingreso)
+- EXAMENES (nro_alumno, cod_carrera, cod_materia, fecha_examen, nro_libro,
+nro_acta, nota_examen)
+Consideraciones:
+- Cada alumno se identifica con un nro. único
+- Cada carrera se identifica con un código único
+- En cada carrera las materias se identifican con un código único por carrera
+- Un alumno puede estar matriculado en más de una carrera (cursa más de una
+carrera)
+- Las actas de exámenes finales se identifican con un nro.libro y un nro. acta y en cada
+acta no se repite el alumno.
+- La nota de examen puede ser nula lo que implica un ausente
+Responde lo siguiente:
+1. Identificar claves primarias, claves alternativas y claves foráneas.
+2. Programar con MYSQL la siguiente consultas:
+a. SELECT nro_alumno, nom_alumno, cod_carrera, nom_carrera y promedio de los
+alumnos que ingresaron en 1995 y tienen promedio &gt;= 7 y han rendido más de
+20 exámenes finales (no considerar los ausentes).

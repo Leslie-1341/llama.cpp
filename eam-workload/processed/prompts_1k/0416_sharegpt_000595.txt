@@ -1,0 +1,3 @@
+create me a bash one liner that looks for all pods over all namespaces that match the label foo=bar, show me all pod names and their namespaces one on each line, ask me at the end for confirmation, then if confirmation is given delete all the matching pods
+
+only respond with a single code box, no explanations

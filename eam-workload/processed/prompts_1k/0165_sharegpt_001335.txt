@@ -1,0 +1,7 @@
+Réecris ce texte de facon plus académique et détaillé : 
+
+L’utilisateur rentre du code dans l’environnement de développement Monaco. Au moment où il submit. Le code est envoyé sur le serveur distant sur la route correspondant au langage. 
+
+Dans le cas d’un code en Python grâce à child_process on peut passer en paramètre de la fonction spawn le binaire d’exécution de python, ce qui permet ensuite d’exécuter le code python envoyé en tant que string par le front. 
+
+Dans le cas d’un code en Java c’est plus complexe. Le processus d’écriture de code dans le front reste le même mais une fois arrivé dans sur le serveur distant pour faire le traitement du code on doit récupérer le mot qui vient après “public class”. De cette facon on créer un fichier temporaire en concaténant le mot + “.java”. On place ensuite le code envoyé par le front dans ce fichier temporaire, on le compile en utilisant javac. Et dans la même logique qu’avec le code Python on renvoie ce qui a été exécuté pour s’en servir dans le front. On supprime ensuite les fichiers temporaire.

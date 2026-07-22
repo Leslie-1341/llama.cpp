@@ -1,0 +1,21 @@
+<table>
+ <thaed>
+ <tr>
+ <th>출장비 내역</th>
+ <th>금액</th>
+ </tr>
+ </thead>
+ <tbody>
+ <tr>
+ <td>교통비</td>
+ <td>45000</td>
+ </tr>
+ <tbody>
+ <tfoot>
+ <tr>
+ <td>총 합계</td>
+ <td>103000</td>
+ </tr>
+ </tfoot>
+
+이 코드에서 잘못 된 부분을 찾아줘

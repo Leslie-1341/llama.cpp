@@ -1,0 +1,3 @@
+Write a python script to compare two dataframes df1 and df2. 
+
+Script should compare column A of df2 against column X of df1 and if no match is found then it should compare column A of df2 against column Y of df1 and then declare whether a match is found or not.

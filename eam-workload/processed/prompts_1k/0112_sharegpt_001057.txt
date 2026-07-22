@@ -1,0 +1,1 @@
+Can I use a transformer or attention model with time series of different timeframes? For example, I have 4 time series with daily data and also monthly forecasts of 5 other variables for each one of the dates in daily data.

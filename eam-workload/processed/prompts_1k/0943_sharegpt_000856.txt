@@ -1,0 +1,1 @@
+I want a function in C# to tell me whether a date is legal. The signature of function is IsLegalDate(int year, int month, int day). IsLegalDate(2022, 2, 30) should return false, and IsLegalDate(2000, 3, 31) should return true.

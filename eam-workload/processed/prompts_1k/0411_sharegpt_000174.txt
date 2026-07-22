@@ -1,0 +1,1 @@
+Hello, could you tell me how I can automate the deploy of a gitlab hosted repository of a project to a bare metal machine (which has a docker-compose.yml for quick start), that based on config name, it would fetch a config.json and other custom assets and replace them on that deployed project? What would be the best way to go about this?

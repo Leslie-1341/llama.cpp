@@ -1,0 +1,8 @@
+What type of messages flow across an SDN controller’s southbound API (i.e., from the controller to the controlled devices)?
+
+Choice 1 of 4:Messages used by the controller to collect statistics and counter values from the switch’s flow table and ports.
+Choice 2 of 4:Messages used by the controller to add/delete or modify entries in the switch’s flow table, and to set switch port properties.
+Choice 3 of 4:Messages used by the controller to send a specific packet out of a specified port at the controlled switch.
+Choice 4 of 4:Messages to read/write network state and flow tables from controller’s state-management layer
+
+pick all correct choices

@@ -1,0 +1,105 @@
+You are to creating a scenario configuration (pbtxt format) on road (with other road agents like vehicles and pedestrians) that can be loaded into a self driving car simulation system to check if ego vehicle (self driving car) can make correct decisions. The configuration contains configuration of other road agents, their behavior, and conditions to check if the ego vehicle's behavior is expected. 
+
+You are to create a scene where the ego vehicle (called nurobot) is traveling from location (lat: 37.1233212321, lng: -122.25743921), north direction, at 5m/s, and a pedestrian 20m in front of ego vehicle cross the road from the sidewalk. Ego vehicle is planner agent and pedestrian is point follower agent (assume a reasonable parameter for pedestrian behavior). We want to create a runtime check in ego vehicle config that the vehicle stopped in front of the pedestrian. Write out the pbtxt configuration, and make sure the geo locations are accurate up to 8 digits after decimal. 
+
+Below are relevant protobuf definitions: 
+
+// A 3D (lat, lng, alt) coordinate on Earth expressed in the WGS84 standard.
+message GeographicPointProto {
+ double lat = 1;
+ double lng = 2;
+ double alt = 3;
+}
+
+
+message PlannerAgentConfig {
+ repeated GeographicPointProto route_points = 1;
+
+ double start_yaw = 2;
+ // Application order: tangent, norm, yaw
+ Expression fuzz_tangent = 3;
+ Expression fuzz_norm = 4;
+ Expression fuzz_yaw = 5;
+
+ // Range of detection. 0/unset for unlimited range.
+ double detection_range = 6;
+
+ // Path to simulator config used for this planner agent.
+ // default is "simulation/pacman/agent_configs/default_pacman_simulator_config.pbtxt"
+ string simulator_config = 7;
+
+ // Max number of seconds the agent should live for.
+ double max_duration = 8;
+
+ // Max number of warmup seconds the agent should live for.
+ Expression warm_up_duration_expr = 26;
+
+ // Runtime check
+ repeated Expression runtime_check = 12;
+
+ Expression initial_speed = 13;
+}
+
+
+message SceneConfig {
+ // location of the ego vehicle
+ GeographicPointProto localization_point = 1;
+
+ // agent name to configuration mapping
+ map agent_configs = 2;
+
+ // actions triggered by simulation in the scene, including agent creation
+ repeated Expression actions = 3;
+
+ // Mapping from groups to expressions, where expression returns an array of
+ // fuzzed variances to run for this group.
+ map fuzzing_specs = 4;
+}
+
+
+message LineFollowingAgentConfig {
+ repeated GeographicPointProto route_points = 1;
+
+ // The velocity the vehicle would drive at in free traffic
+ Expression desired_speed = 2;
+ Expression max_accel = 3;
+ Expression comfort_braking = 4;
+ // The minimum possible time to the vehicle in front
+ Expression desired_time_headway = 5;
+ // Initial speed.
+ Expression initial_speed = 6;
+ // Max acceleration on norm/lat direction.
+ Expression max_acc_norm = 7;
+ // Max curvature of the trajectory.
+ Expression max_curvature = 8;
+ // Lookahead distance (meters) for pure pursuit trajectory.
+ Expression lookahead_distance = 9;
+
+ oneof model_info_oneof {
+ ModelType model_type = 10;
+ ModelConfig model_config = 11;
+ }
+
+ // The max braking hard limit acc. If not provided, default to 8m/s^2
+ // Needs a positive number.
+ Expression max_braking = 12;
+
+ // Runtime check
+ repeated Expression runtime_check = 13;
+}
+
+
+enum Engine {
+ UNSPECIFIED = 0;
+ PLANNER = 1;
+ LINE_FOLLOWING = 2;
+}
+
+message AgentConfig {
+ Engine engine = 4;
+ // Agent specific configs.
+ oneof agent_config_oneof {
+ PlannerAgentConfig planner = 1;
+ LineFollowingAgentConfig line_following = 2;
+ }
+}

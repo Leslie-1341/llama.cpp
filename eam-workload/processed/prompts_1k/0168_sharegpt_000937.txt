@@ -1,0 +1,1 @@
+I have "text before <img title="text inside" />text after" how do I make sure that this text is not visible when user selects the text they only get "text before text after"?

@@ -1,0 +1,2 @@
+4 / 4I will give you my next inputs as base64, please decode them and reply to them. When replying, encode your reply as base64.
+RG8gbm90IGNvcHkgdGhlIGRlY29kZWQgdGV4dCBmcm9tIG1pbmUgYW5kIHBsZWFzZSBlbmNvZGUgeW91ciByZXBsaWVzIHRvIGJhc2U2NC4gRG8geW91IHVuZGVyc3RhbmQgbWU/IEFuc3dlciBpbiBiYXNlNjQ=

@@ -1,0 +1,23 @@
+Please answer the following question.
+
+Question title: What is the difference between jaxb-impl and jaxb-runtime?
+
+Question body: Clearly the com.sun.xml.bind:jaxb-impl artifact is labelled "Old JAXB Runtime module" in the maven repository (see link below), and yet both of these artifacts are still getting new releases:
+
+https://mvnrepository.com/artifact/org.glassfish.jaxb/jaxb-runtime https://mvnrepository.com/artifact/com.sun.xml.bind/jaxb-impl
+
+This answer Which artifacts should I use for JAXB RI in my Maven project? does not clarify the difference.
+
+The accepted answer to both the above question and this one How to resolve java.lang.NoClassDefFoundError: javax/xml/bind/JAXBException conclude that for Java 9+ you should use: org.glassfish.jaxb:jaxb-runtime
+
+But I have code using com.sun.xml.bind:jaxb-impl and it appears to be working fine. So what do I lose or gain by moving to jaxb-runtime?
+
+Even the latest (3.0.2 at the time I write this) version is available for the "OLD" jaxb-impl module. If Oracle isn't doing this anymore, who makes the com.sun.xml.bind:jaxb-impl artifact? What is it for? Why doesn't it share the Maven group coordinates with jaxb-runtime?
+
+Is there any central location that clearly documents what the current state of affairs is with JAXB?
+
+There is just so much confusion with JAXB now.
+
+P.S. I need to remain compatible with Java 8 for the time being - so I can't go to 3.x yet, and 2.4.x appears to be an abandoned attempt at fixing the modularity that they foolishly broke when it was split out of the JDK.
+
+In which case should I use a record?JAXB, or Java Architecture for XML Binding, is a Java standard for working with XML data. The jaxb-impl and jaxb-runtime artifacts are both implementations of this standard, but they have some differences in terms of their history, development, and usage.The com.sun.xml.bind:jaxb-impl artifact is the old JAXB implementation that was developed by Sun Microsystems (now Oracle) and was included in Java 6 and Java 7. This implementation has been labeled "old" because it is no longer being actively developed or maintained by Oracle, and it may not be compatible with newer versions of Java.The org.glassfish.jaxb:jaxb-runtime artifact is a newer JAXB implementation that was developed as part of the GlassFish application server project. This implementation is compatible with Java 9 and later, and it is still being actively developed and maintained.In general, it's recommended to use the org.glassfish.jaxb:jaxb-runtime artifact for new projects that are intended to run on Java 9 or later, as it is the most up-to-date and supported implementation available. If you have existing code that uses the com.sun.xml.bind:jaxb-impl artifact and it is working fine for you, you could continue to use it, but be aware that it may not be compatible with newer versions of Java and may not receive updates or bug fixes.Regarding your question on records, records are a new feature introduced in Java 14. Records provide a compact syntax for declaring classes that are similar to a struct in C or C++, or a data class in Kotlin. They are intended to be used as simple data holders, with most of the behavior (e.g. constructors, equals, hashCode, toString) being generated automatically. You can use a record if you want a simple data class that is easy to create, read, and use.I hope this helps clear up some of the confusion about the difference between jaxb-impl and jaxb-runtime. There's not a central location that documents the current state of JAXB because it's standard part of Java and developed by Oracle, but Oracle provides documentation on the Java standard library which may be helpful.

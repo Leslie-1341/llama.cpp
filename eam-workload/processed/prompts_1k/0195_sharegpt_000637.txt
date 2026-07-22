@@ -1,0 +1,79 @@
+write a game design doc for these features..
+
+Feature Requirements
+
+Game
+
+• Update score metrics at set intervals based on City tiles current stats.
+• Update ‘player score’ based on score metrics.
+• Track score metrics and trigger game over if any reach 0
+• Ability to choose personality type based on TBD conditions.
+
+Viewport
+
+• zoom in/out.
+• drag based on zoom level.
+City Grid
+
+• Start with a varied grid size (min 3x3, max 4x4)
+• Expand infinitely in any direction (gameplay logic will restrict this by default)
+• Select empty grid cells.
+• Add city tiles to grid cells.
+• Select city tiles in grid cells.
+• Change city tiles in grid cells.
+• Unlock extra grid cells via user ‘purchase’ (expand).
+• Unlock new grid cells via reward? (expand).
+• Ability for ‘off grid’ slots that can be flagged as ‘offshore’, ‘outskirts.
+City tiles
+
+• Level up tiles at a cost to money metric.
+• Change tile visually based on current tile level.
+• Adjust tile base stats based on current tile level.
+• Adjust tile base stats based on active tile enhancements.
+City Timeline
+
+• Ability to configure how often a ‘score metrics update’ will trigger (default 1 day/week/month?)
+• Ability to configure how often a ‘decide stage’ will trigger (default 1 year)
+• Ability to configure how often a ‘develop stage’ will trigger (default 5 years)
+• Ability to configure number of years in timeline (default 30)
+• Ability to configure duration of timeline in minutes (default 15)
+• Ability to progress time on a scaled level based on desired duration.
+• Ability to calculate and trigger a ‘develop state’ event at correct intervals.
+• Ability to calculate and trigger a ‘decide stage’ event at correct intervals.
+• Ability to calculate and trigger a ‘score metrics update’ event at correct intervals.
+• Ability to Detect and trigger the end of the timeline.
+Decision Cards
+
+• Activate/de-active tile enhancements based on user choice.
+• Adjust current score metrics based on user choice.
+• Serve up a selection of random decision cards.
+o Weight selection by card rarity
+o Weight selection by active tiles in the city
+Develop Stage
+
+• Pause timeline and enable cell interactivity.
+• Ensure all grid cells are filled before allowing progression
+Purchase
+
+• Ability to add a cost to actions / items.
+• Ability to test if user can afford action / item based on their ‘money metric’. 
+• Ability to update users ‘money score metric’ on purchase of action / item. 
+Weather/climate?
+
+• Trigger weather events at certain intervals
+• Adjust score metrics based on active weather effects. 
+Development / QA shortcuts
+
+• Manually adjust any score metric
+• Infinite money.
+• Unlock all tiles.
+• Activate/Deactivate any tile enhancements.
+• Ability to control the speed of the timeline at runtime 😉 
+• Ability to enable ‘lazy auto decision.’
+o Game will just randomly choose yes/no for you and screw the consequences.
+• Is there a way we can code in an ‘autoplay’ for testing.
+o We could make choices based on pure randomness.
+ Decide Stage: random accept/reject choice.
+ Develop Stage: have empty cell. pick random affordable tile to add.
+ We could maybe weight these choices by a selected metric.
+o I think getting the computer to probably play this for us would probably eat budget, a quick lazy thing that just allows it to go through the steps (like above) maybe plausible.

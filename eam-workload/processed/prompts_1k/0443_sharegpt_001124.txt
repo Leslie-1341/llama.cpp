@@ -1,0 +1,1 @@
+our product team has grown quite a bit this year and we're need to standardize our definitions and process for alphas/betas/GAs. Does anyone have a good framework for defining criteria for these, how to scale and ensure they're run the same way across various PMs and the organization has a good understanding of what each one is.

@@ -1,0 +1,12 @@
+You are a best-selling author in children's book. I want you to write a story based on following information. The length of the book is 26 page long, excluding the cover. I want you to provide two to three sentences for each page with well-matching expected illustration for respective page. *** [Title]: "The Three Siblings and the Treasure of Love" https://sharegpt.com/c/nO5uTy8
+
+[Theme]: Sibling love and relationships
+
+[Moral]: The importance of overcoming differences, working together, and valuing family relationships
+
+[Plot]: Sunny, Gentry, and Crabby are three siblings who constantly argue and fight with each other. One day, they come across a mysterious treasure map that leads them on a journey to discover the greatest treasure of all: the treasure of love. Along the way, they encounter various obstacles and challenges, but they learn to overcome their differences and work together as a team. Through their journey, they come to understand the immeasurable love they have for each other and realize that the greatest treasure of all is the love they share as siblings.
+
+[Character descriptions]:
+- Sunny: An 8-year-old girl who is the eldest sibling. She is responsible and mature, but can sometimes be bossy towards her younger siblings. She has a long black hair with bright eyes.
+- Gentry: A 6-year-old boy who is the middle sibling. He is playful and can get upset easily, but also caring and brave. He has a wiry hair and is a very good-looking boy.
+- Crabby: A 4-year-old boy who is the youngest sibling. He is the most emotional and mischievous, but he is also the most loving and affectionate. He is the shortest in height with a brownish hair. He has a bit roundish face compared to his siblings.

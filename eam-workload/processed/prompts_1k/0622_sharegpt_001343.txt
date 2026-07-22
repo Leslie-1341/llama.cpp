@@ -1,0 +1,2 @@
+Please feedback follow paragraph:
+Principal component analysis, PCA is a technique that high-dimension datasets compress to small-dimension datasets for analysis easily. Finding a linear combination of the original variables and using eigenvalues, PCA finds orthogonal principal components of each other. The compressed datasets by PCA express well the characteristic of the original datasets. Then, it is an efficient method to analyze and visualize the datasets with plotting and clustering.

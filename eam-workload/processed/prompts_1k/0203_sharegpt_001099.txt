@@ -1,0 +1,1 @@
+laravel6系のValidator内のfunctionはどのように呼び出されてるのかがわかりません

@@ -1,0 +1,41 @@
+Hello! Here is some code you wrote for me:
+
+<!DOCTYPE html>
+<html>
+<body>
+
+<video id="myVideo" width="320" height="176" controls>
+ <source src="video.mp4" type="video/mp4">
+ Your browser does not support HTML5 video.
+</video>
+
+<script>
+var vid = document.getElementById("myVideo");
+var pauseTimes = [5, 10, 15]; // array of times to pause in seconds
+var currentTime = 0;
+
+vid.ontimeupdate = function() {
+ currentTime = vid.currentTime;
+ if (pauseTimes.includes(Math.floor(currentTime))) {
+ vid.pause();
+ // Wait for a call to continue playing
+ waitForContinue();
+ }
+};
+
+function waitForContinue() {
+ // Do something, like displaying a message or button to continue
+ // Add an event listener to continue the video
+ document.getElementById("continue-btn").addEventListener("click", function() {
+ vid.play();
+ });
+}
+</script>
+
+<button id="continue-btn">Continue</button>
+
+</body>
+</html>
+
+
+This code works well but because the times are rounded to whole seconds, sometimes pressing the continue button doesn't move the video to the next time that is listed in the array, are you able to help me fix this?

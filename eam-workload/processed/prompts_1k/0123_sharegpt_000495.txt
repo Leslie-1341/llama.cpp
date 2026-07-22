@@ -1,0 +1,33 @@
+The following is a list of scores from the Wechsler Intelligence Scale for Children, 5th edition. Please interpret these scores and tell me what it means for a middle school student in a classroom:
+ Verbal Comprehension Index
+84
+Similarities
+8
+Vocabulary
+6
+Visual Spatial Index
+114
+Block Design
+12
+Visual Puzzles
+13
+Fluid Reasoning Index
+94
+Matrix Reasoning
+9
+Figure Weights
+9
+Working Memory Index
+91
+Digit Span
+7
+Picture Span
+10
+Processing Speed Index
+95
+Coding
+8
+Symbol Search
+10
+Full Scale 
+88

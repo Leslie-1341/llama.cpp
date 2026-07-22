@@ -1,0 +1,32 @@
+Take a list of YouTube URLs. Start with this list.
+
+Step I: Write a python client that downloads the videos. Implement it as follows: 
+Use the PyTube Library.
+
+Class SiteCrawler(urls: [string], decover_id: string)
+
+Public API: crawl() → [success_urls: [string], failed_urls: [string]]
+
+Private: __crawl() 
+
+Step II: Use OpenAI’s Whisper API to transcript.
+Key: <REDACTED_OPENAI_API_KEY>
+
+
+Step III: Index these in ElasticSearch (Ravi will provide the API).
+Assume the API contract:
+
+Endpoint: /staging-api.decoverapp.com/api/v1/index_data
+Method: POST
+Header: X-DECOVER-ID: dec-XXXXX
+Body: 
+{
+ 'Url': ..,
+ 'Text': ...
+}
+
+
+Note: 
+Create this as a Github Repo &amp; check it in.
+Do not check in the Key. 
+Use base64 encoder to encode and decode the key or read from the environment variables.

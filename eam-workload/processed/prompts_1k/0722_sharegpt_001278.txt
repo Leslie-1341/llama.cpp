@@ -1,0 +1,16 @@
+I have created an API. I will explain my business case and the endpoints I have already developed. You can suggest possible improvements and additional endpoints, but please do not provide implementation details. 
+
+My business case involves a service called Reference Data, which enables users to upload an Excel spreadsheet product through an API and then use such information, also from the API. The endpoints I have currently developed are:
+
+Validate: This endpoint validates one or more products uploaded to the system and returns validation information.
+
+Upload: This endpoint enables users to upload products from an Excel spreadsheet to the system.
+
+Get product: get latest version of a product by name or specific version by name and version number.
+
+Get keys: This endpoint uses DynamoDB to store all products with a partition key of "name" and a sort key of "version".
+
+Delete: This endpoint allows users to delete the latest version of a product by name. If a specific version is specified, it will delete that version instead of the latest one.
+
+
+Some of my ideas to add are allowing users to search for products not only by name and version, but also by internal information such as currency. However, your suggestions need not be limited to this feature.

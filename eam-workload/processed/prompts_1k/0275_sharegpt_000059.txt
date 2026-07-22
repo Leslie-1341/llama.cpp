@@ -1,0 +1,21 @@
+I have the following code:
+
+```
+useEffect(() =&gt; {
+ const handleKeyDown = (event) =&gt; {
+ // Check if the CMD + F key combination was pressed
+ if (event.key === "f" &amp;&amp; event.metaKey) {
+ event.preventDefault();
+
+ setIsShown(true);
+ }
+
+ window.addEventListener("keydown", handleKeyDown);
+
+ return () =&gt; {
+ window.removeEventListener("keydown", handleKeyDown);
+ };
+ }, [setExclusionFilter]);
+```
+
+It shows the new state on Mac but on Windows it doesn't trigger. How can I support windows?

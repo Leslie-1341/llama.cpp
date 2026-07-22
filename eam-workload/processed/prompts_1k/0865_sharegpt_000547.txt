@@ -1,0 +1,73 @@
+Write a unit test for this python method using pytest:
+
+```
+def calculate_viability_measurements(
+ assay_measurements: FrozenSet[StudyAssayMeasurement]
+):
+ """
+ Calculate viability using the formula (observed_value - low control) / (high control - low control)
+ if high and low controls are available, or (observed_value / high control) if only high control
+ is available.
+ """
+ viability_measurements = set()
+
+ measurements_grouped = defaultdict(lambda: defaultdict(list))
+ high_controls_grouped = defaultdict(list)
+ low_controls_grouped = defaultdict(list)
+
+ sample_plate_tuples = {(am.sample_id, am.plate_id) for am in assay_measurements}
+
+ for am in assay_measurements:
+ if am.drug_treatment_id is not None and am.control_type is None and len(am.drug_doses) &gt; 0:
+ measurements_grouped[(am.sample_id, am.plate_id)][(am.drug_treatment_id, am.drug_doses)].append(am)
+ elif am.control_type == ControlType.HIGH:
+ high_controls_grouped[(am.sample_id, am.plate_id)].append(am)
+ elif am.control_type == ControlType.LOW:
+ low_controls_grouped[(am.sample_id, am.plate_id)].append(am)
+
+ replicate_count = defaultdict(lambda: 0)
+
+ for sample_id, plate_id in sample_plate_tuples:
+ sample_plate_tuple = (sample_id, plate_id)
+ measurements = measurements_grouped[sample_plate_tuple]
+ high_controls = high_controls_grouped[sample_plate_tuple]
+ low_controls = low_controls_grouped[sample_plate_tuple]
+
+ avg_high_control_value = np.array([x.float_value for x in high_controls]).mean()
+ avg_low_control_value = np.array([x.float_value for x in low_controls]).mean()
+
+ if np.isnan(avg_high_control_value):
+ raise RuntimeError("No high control available, need at least a high control to calculate viability.")
+
+ if np.isnan(avg_low_control_value):
+ avg_low_control_value = 0
+
+ for drug_treatment_id, drug_doses in measurements:
+ treatment_tuple = (drug_treatment_id, drug_doses)
+ study_id = next(iter(measurements[treatment_tuple])).study_id
+ source_file_id = next(iter(measurements[treatment_tuple])).source_file_id
+
+ avg_drug_measurement = np.array([x.float_value for x in measurements[treatment_tuple]]).mean()
+
+ viability = (avg_drug_measurement - avg_low_control_value) / (
+ avg_high_control_value - avg_low_control_value)
+
+ viability_measurements.add(StudyViabilityMeasurement(
+ study_id=study_id,
+ sample_id=sample_id,
+ float_value=viability,
+ drug_treatment_id=drug_treatment_id,
+ source_file_id=source_file_id,
+ replicate_number=replicate_count[
+ (study_id, sample_id, drug_treatment_id, frozenset(drug_doses))
+ ],
+ drug_doses=drug_doses,
+ assay_measurement_ids=frozenset(
+ ([x.id for x in measurements[treatment_tuple]] +
+ [x.id for x in high_controls] +
+ [x.id for x in low_controls])
+ )
+ ))
+
+ return viability_measurements
+```

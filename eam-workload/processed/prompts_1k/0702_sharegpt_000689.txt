@@ -1,0 +1,1 @@
+Write me an example Android app which uses a single activity to demonstrate the use of RecyclerView. Use Java. Do not use fragments.

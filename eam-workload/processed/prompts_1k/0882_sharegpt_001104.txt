@@ -1,0 +1,1 @@
+Create an OpenEHR record for the free text: "The patient is feeling blue"

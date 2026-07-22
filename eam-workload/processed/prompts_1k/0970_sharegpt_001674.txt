@@ -1,0 +1,36 @@
+Summarize this: 
+
+The Vulcan FireStorm: Vaporizing the Supply with Flames
+
+What is the Vulcan FireStorm?
+When we think of a FireStorm we think of raging wind-swept embers floating down from above while furnace-like flames ravage the ground on which it engulfs. Powerful, with a force that can have extremely deadly consequences. Vulcan blockchain is a powerful force! While it’s not deadly, the FireStorm packs a fierce punch!
+
+So what is the FireStorm? Simply put, the Vulcan FireStorm is the vaporization of $VUL coins from the FirePit to reduce total supply. Originally the coins in the FirePit were going to live there forever, continuing to rebase. This meant that the FirePit supply would be counted in the total supply.
+
+Now here’s the beauty of the FireStorm. By creating a FireStorm event, within the underlying core Vulcan Blockchain Protocol and utilizing the newest Ethereum upgrade; EIP1559 - will create the automatic burning of $VUL coins from the FirePit, completely removing these coins from the circulating supply and total supply permanently by way of vaporization.
+
+This means these vaporized coins will no longer exist and no longer rebase, meaning more rebases for you, the user, whilst the protocol acts more efficiently by extending its life to 18 years until the last rebase epoch is achieved.
+
+When is the Vulcan FireStorm and How Often Does it Occur?
+The FireStorm event is triggered every 3 months. Much like the Bitcoin Halving which happens every 4 years, the Vulcan FireStorm will also act in a similar fashion by reducing Total Supply of $VUL coins through use of the FireStorm Auto-Deflationary Metric.
+
+The Vulcan Portal (dApp) will feature a public countdown along with the number of coins targeted for vaporization so that everybody is aware with complete transparency well before the FireStorm event occurs.
+
+What are the Benefits of the FireStorm?
+It is important to know that the Vulcan FireStorm happens every 3 months and when triggered will always bring the FirePit percentage down to 51% of Total Supply. Once the FireStorm Epoch takes place, the FirePit will start to reaccumulate again until the next FireStorm event is triggered.
+
+The main advantage of FireStorm is that in theory there should be a lot more room for price appreciation due to the supply being reduced every 3 months. This will mean that $VUL continuously lowers in its reported MarketCap, thus should technically equal a higher coin price benefiting coin holders with unrealized gains.
+
+The less $VUL supply existing on the Blockchain as a whole, the better for price and the greater its future growth potential for everyone.
+
+Example:
+Before the FireStorm: FirePit percentage is sitting at 83%
+After the FireStorm: 32% of the FirePit supply is vaporized and the FirePit reverts back to 51%.
+
+Why 51%?
+Keeping the FirePit burn percentage above 51% will equal greater longevity of the Vulcan Blockchain whilst truly remaining deflationary.
+
+Key Detail:
+Only $VUL coins held in the FirePit supply are vaporized in the FireStorm. No user wallets are touched or effected as this is technically impossible due to the programming code of the Blockchain itself.
+
+Please also note that the FireStorm event has absolutely no impact on FixedFlex. Those values are untouched.

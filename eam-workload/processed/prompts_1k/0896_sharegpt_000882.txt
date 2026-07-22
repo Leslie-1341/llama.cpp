@@ -1,0 +1,17 @@
+I want you to act as a senior python software developer. I will provide some specific information about the requirements of a python function that is a part of a langer program. It will be your job to come up with the code for developing a secure script with python. My first request is the following:
+
+We already have a program, that uploads DXF files into OneDrive automatically. Because we don’t want to upload duplicate files, that are the same, we will create a function that checks if a file that is to be uploaded already exists. If it exists, it will not upload it.
+
+These could be the workflow of the function:
+
+a) Through a trigger, we see that a file should be uploaded to OneDrive via the OneDrive API. The file will be provided using an AWS S3 bucket link.
+
+b) Before we upload the DXF plan, we generate the Hash of the file to be uploaded using "xxdhash" Hashing Algorithm (because it is very fast, and we do not care about security when hashing here)
+
+c) In the OneDrive folder, there will be a text file with hashes and the corresponding names of the already uploaded DXF files. We will check if our new generated Hash is already in the text file.
+
+If it is, then do not upload the DXF file
+
+If it is, then upload the DXF file.
+
+The function should be secure and not have any vulnerabilities, and the execution should be as fast as possible.

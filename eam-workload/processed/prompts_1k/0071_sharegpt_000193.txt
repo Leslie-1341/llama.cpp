@@ -1,0 +1,3 @@
+I need to make a simple 2d virtual world marketplace which supports user sign up, login, buying items, seeing their profile, and seeing their bought items
+
+Please design a custom solution for me. I usually use JavaScript

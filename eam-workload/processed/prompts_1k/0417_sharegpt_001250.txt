@@ -1,0 +1,18 @@
+Using the following info about a project I have to do, come up with possible ideas for a girl in STEM and premed to do a the project over.
+```
+This is a project for SDS 320E Elements of Statistics at UT Austin. The student must choose a topic that interests them, and propose a research project where they will analyze a real dataset. The project must have one numeric response variable, one numeric and one binary explanatory variable, a sample size of at least 100 independent observations, and proposed numeric variables must have at least 10 unique values. They cannot use data from the class, must not include certain restricted variables, and if collecting data from human subjects, the participants must be at least 18 and consent to being in the study. They must complete the Collaborative Institutional Training Initiative (CITI) Program before collecting data from human subjects. They must also create a pilot dataset to reflect the structure of what the final dataset will look like.
+```
+
+```
+Possible vars:
+Number of pets owned
+Number of books read in a month
+Number of cups of coffee/tea consumed in a day
+Binary variable indicating if the person has traveled abroad
+Number of languages spoken fluently
+Number of concerts attended in a year
+Binary variable indicating if the person enjoys horror movies
+Number of times the person has gone bungee jumping/skydiving
+Binary variable indicating if the person has ever tried a new cuisine
+Number of times the person has volunteered in a year
+```

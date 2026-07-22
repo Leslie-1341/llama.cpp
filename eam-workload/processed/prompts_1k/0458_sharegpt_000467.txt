@@ -1,0 +1,30 @@
+Can you explain the secret santa functionality of the RSVP web app based on this Flask view function code:
+
+```python
+@app.route("/secret-santa/<event_id>", methods=["GET", "POST"])
+@login_required
+@role_required("secret-santa-admin")
+def secret_santa(event_id):
+ from rsvp.rudolph import get_people, main
+
+ people = get_people(event_id)
+ if request.method == "GET":
+ return render_template("secret-santa.html", people=people, event_id=event_id)
+
+ test_run = not request.form.get("live-run") == "on"
+ pairs = main(people=people, test=test_run)
+ pairs = [
+ (User.objects.get(email=santa), User.objects.get(email=kiddo))
+ for (santa, kiddo) in pairs
+ ]
+ if test_run:
+ return render_template(
+ "secret-santa.html",
+ event_id=event_id,
+ pairs=pairs,
+ people=people,
+ test_run=test_run,
+ )
+ else:
+ return "Santas notified"
+```

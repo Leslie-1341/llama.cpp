@@ -1,0 +1,10 @@
+Define three functions 
+
+
+α1(x)={0, x≤0, 1, x>0, 
+α2(x)={0, x<0, 1, x≥0,
+α3(x)={0, x<0, ½, x=0, 1, x>0
+
+Let f be a bounded function on [-1,1].
+Prove that 
+f∈R(α1) iff f(0+)=f(0) and that then ∫f dα1=f(0).

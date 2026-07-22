@@ -1,0 +1,1 @@
+I am using heap to track events that happen on my website. I'd like to hook up Active Campaign to also track events and use them to send emails. How can I hook up Active Campaign to heap.

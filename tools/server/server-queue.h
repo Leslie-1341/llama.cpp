@@ -29,6 +29,7 @@ private:
     std::function<void(server_task &&)> callback_new_task;
     std::function<void(void)>           callback_update_slots;
     std::function<void(bool)>           callback_sleeping_state;
+    std::function<bool(void)>           callback_wait_next_response;
 
 public:
     // Add a new task to the end of the queue
@@ -73,7 +74,7 @@ public:
      * - Call callback_sleeping_state(false)
      * - Exit sleeping state
      */
-    void start_loop(int64_t idle_sleep_ms = -1);
+    void start_loop(int64_t idle_sleep_ms = -1, int64_t cont_batching_wait_us = 0);
 
     // for metrics
     size_t queue_tasks_deferred_size() {
@@ -93,6 +94,13 @@ public:
     // Register the function to be called when all slots data is ready to be processed
     void on_update_slots(std::function<void(void)> callback) {
         callback_update_slots = std::move(callback);
+    }
+
+    // Register a predicate used by start_loop() before processing an internal
+    // NEXT_RESPONSE tick. When true, the queue waits briefly so real user tasks
+    // can join the next continuous batch before inference is kicked again.
+    void on_wait_next_response(std::function<bool(void)> callback) {
+        callback_wait_next_response = std::move(callback);
     }
 
     // Register callback for sleeping state change; multiple callbacks are allowed

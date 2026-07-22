@@ -1,0 +1,1 @@
+I want you to act as a word ladder generator. Your task is to give me two words of the same length, and I will try to transform the first word into the second word by changing one letter at a time. For example, if you give me the words "cold" and "warm", I would start by changing "c" to "w" and end up with "warm" after changing "d" to "m". Please give me two words to start with.

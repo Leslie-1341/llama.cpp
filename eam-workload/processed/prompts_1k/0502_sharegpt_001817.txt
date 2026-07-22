@@ -1,0 +1,42 @@
+Ich habe folgendes Projekt vor:
+
+Die Firma PComplett betreibt eine E-commerce Abteilung, in der Produkte eingekauft und
+über einen Onlineshop, sowie über Amazon verkauft werden.
+Zitat Kundenanfrage:
+"Da wir die Grundversion des Warenwirtschafissystems von JTL nutzen, stehen uns viele
+Funktionen nicht zur Verfügung, die die Arbeit an den Produkten und Verkäufen schneller
+und intuitiver gestalten würden.
+Beispielsweise ist die Warenbeschaffung recht unübersichtlich. Ein Programm, das die
+benötigten Bestellmengen aller Produkte auslesen und zusammenfassen kann, wäre
+deshalb sehr hilfreich.
+Für die Übertragung der Käufe über die Verkaufsplattform Amazon ist eine externe
+Anwendung nötig, da sie nicht durch das Warenwirtschaftssystem erfolgt. Die Informationen
+müssen aufgeschlüsselt nach Verkaufskanal eingelesen werden."
+
+"Zitat Kundenanfrage:
+"Für die tägliche Inventur wäre es hilfreich ein externes Programm zu haben, das die aktuellen
+Soll-Bestände aus dem Warenwirtschafissystem ausliest und in tabellarischer Form wiedergibt.
+Sind die Produkte für den Onlineshop mal angelegt, wäre es von großem Vorteil, eine
+tabellarische Auflistung dieser zu haben, um die Nachbearbeitung der Produktinformationen zu
+erleichtern. In diesem Zusammenhang ist die Veränderung des Verkaufspreises und der
+Metadaten als besonders wichtig hervorzuheben.
+Im Rahmen der Erstellung der Produktinformationen für die Produkte im Onlineshop ist es nötig,
+Tabellen mit den technischen Details anzulegen. Das Waw bietet nur eine eingeschränkte
+Möglichkeit Tabellen zu erstellen, vor allem solche, die nach unseren Vorstellungen formatiert
+sind. Deshalb wäre ein Programm von Vorteil, dass eine einfache Übertragung einer Excel Datei
+in ein festgelegtes Tabellenformat ermöglicht, die dann entweder in die Artikeldetails übertragen
+werden kann oder automatisch übertragen wird."
+Anwendungen für den Auftrags und Artikelimport wurden bereits in den letzten Monaten von mir
+entwickelt, und sollen in das neue Programm eingebunden werden.
+Für die Artikelbeschreibung, für den Onlineshop, wird es ein Textfeld geben.Der Inhalt soll dann
+in HTML Quelltext umgewandelt an die Datenbank übergeben werden. Über die
+Programmeinstellungen soll es dann möglich sein, die Formatierung des Textes
+einzustellen.Dafür richte ich eine neue Tabelle in der Datenbank ein, damit alle Nutzer:innen mit
+demselben Einstellungen arbeiten.
+Bei den "Technischen Details" der Artikel ist außerdem gewünscht, dass die Texte, nach den
+Überschrifeten, ein oder aufklappbar sind.
+Ebenfalls gewünscht wurde, dass die Schrift ,der Überschrift, von normal auf fett wechselt, wenn
+diese ausgewählt wurde.
+Später soll es noch die Möglichkeit geben diverse Verkaufsstatistiken auszuwerten."
+
+Schreibe mit einen Ausblick nachdem das Projekt erfolgreich abgeschlossen wurde

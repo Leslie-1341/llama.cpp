@@ -1,0 +1,64 @@
+I want the following program to draw the printed output to the GUI window, could you do this for me? Here is the program: #include <iostream>
+#include <string>
+
+#include <gtk/gtk.h>
+
+static void on_name_entry_activate(GtkEntry *entry, gpointer user_data)
+{
+ // Get the text that the user entered in the name entry field
+ const gchar *name = gtk_entry_get_text(entry);
+
+ // Convert the name to a std::string
+ std::string name_str(name);
+
+ // Print out "Sneed's Feed and Seed" followed by "Formerly [name of user]"
+ std::cout << "Sneed's Feed and Seed" << std::endl;
+ std::cout << "Formerly " << name_str << std::endl;
+}
+
+int main(int argc, char *argv[])
+{
+ // Initialize GTK+
+ gtk_init(&argc, &argv);
+
+ // Create a new window
+ GtkWidget *window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+
+ // Set the window title
+ gtk_window_set_title(GTK_WINDOW(window), "Sneed's Feed and Seed");
+
+ // Set the window's default size
+ gtk_window_set_default_size(GTK_WINDOW(window), 640, 480);
+
+ // Set the window's minimum size
+ gtk_widget_set_size_request(window, 640, 480);
+
+ // Create a new vertical box
+ GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+
+ // Add the vertical box to the window
+ gtk_container_add(GTK_CONTAINER(window), vbox);
+
+ // Create a new label
+ GtkWidget *label = gtk_label_new("Enter your name:");
+
+ // Add the label to the vertical box
+ gtk_box_pack_start(GTK_BOX(vbox), label, FALSE, FALSE, 0);
+
+ // Create a new entry field for the user's name
+ GtkWidget *name_entry = gtk_entry_new();
+
+ // Add the name entry field to the vertical box
+ gtk_box_pack_start(GTK_BOX(vbox), name_entry, FALSE, FALSE, 0);
+
+ // Connect the "activate" signal for the name entry field to a callback function
+ g_signal_connect(name_entry, "activate", G_CALLBACK(on_name_entry_activate), NULL);
+
+ // Show the window and all of its child widgets
+ gtk_widget_show_all(window);
+
+ // Run the GTK+ main event loop
+ gtk_main();
+
+ return 0;
+}

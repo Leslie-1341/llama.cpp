@@ -1,0 +1,3 @@
+id: document.forms['reszletezo_post'].elements['arveres_id'].value =747051; document.forms['reszletezo_post'].elements['arverestetel_id'].value =497965; document.forms['reszletezo_post'].submit();
+
+write me a java code that extract 747051 this arveresi_id integer

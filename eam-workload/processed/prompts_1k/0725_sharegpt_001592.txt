@@ -1,0 +1,1 @@
+Como criar uma API na AWS, que roda um lambda escrito em Python, que me permite atráves de um nome de arquivo recebido pela URL, buscar esse arquivo dentro de um bucket S3, e retornar como resposta da API, uma URL de acesso temporário com permissão de leitura para este arquivo dentro do bucket?

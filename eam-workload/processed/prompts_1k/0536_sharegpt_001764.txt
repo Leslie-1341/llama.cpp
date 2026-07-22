@@ -1,0 +1,1 @@
+write 3 UI short dialog subtitle of "restaurant table fully booked" and suggest user to put themselves into waiting list

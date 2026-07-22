@@ -1,0 +1,21 @@
+How would you write this java code? public void fightMenu() {
+ switch (Abilities.count) {
+ case 1:
+ System.out.println(String.format("[%s]", Ability1));
+ break;
+ case 2:
+ System.out.println(String.format("[%s] [%s]", Ability1, Ability2));
+ break;
+ case 3:
+ System.out.println(String.format("[%s] [%s]", Ability1, Ability2));
+ System.out.println(String.format("[%s]", Ability3));
+ break;
+ case 4:
+ System.out.println(String.format("[%s] [%s]", Ability1, Ability2));
+ System.out.println(String.format("[%s] [%s]", Ability1, Ability2));
+ break;
+ default:
+ //can't be reached
+ break;
+ }
+ }

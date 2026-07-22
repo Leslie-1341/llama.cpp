@@ -1,0 +1,20 @@
+At Activision Blizzard we are dedicated to creating the most epic entertainment experiences, driven by our company values and passion, Activision Blizzard creates worlds with the focus to entertain the universe. We are looking for talented and innovative students to join our team for the 2023 summer. All interns will receive a meaningful project and an unparalleled experience. We’ll provide the tools and resources you need to learn. The challenging and creative work you do throughout your internship will directly impact the team you are contributing on.
+
+All interns will be given the choice to work remotely or relocate to the internship location. The company will cover relocation services and will provide a living student to supplement housing, utility, and office supply costs.
+
+Internship Opportunities
+Data Analytics (Mobile): Be a core component of the most successful Mobile gaming business by working closely with internal teams across Product, Production, User Acquisition, Development, Design, Leadership, and other decision-makers on our games to deliver critical insights to support strategic business and marketing decisions.
+• Expertise in querying with SQL.
+• Expertise in quantitative methods – finding the truth and narrative in the data.
+• Knowledge of data visualization techniques and standard processes.
+• Programming expertise in Python and/or R is preferable.
+• Bonus: comfortable working in a Notebook environment (Jupyter, Zeppelin, etc.).
+
+Your Mission
+• Explore game or player data in various contexts.
+• Use modern data science methods to analyze data.
+• Visualize and interpret analytical results.
+• Spend a summer focusing on a meaningful project that directly impacts game development while having an unparalleled experience.
+• Participate in learning and development tech talks to understand how our employees come together to launch AAA games
+
+What are possible problems to solve and projects to make for the job position above?

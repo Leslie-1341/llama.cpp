@@ -1,0 +1,1 @@
+I want you to build a wordpress plugin for SEO. On Articles and Pages within the wordpress backend, there will be a section where you can click on buttons to rewrite the title of the article, the content. The plugin will connect to openai to proceed to rewrites

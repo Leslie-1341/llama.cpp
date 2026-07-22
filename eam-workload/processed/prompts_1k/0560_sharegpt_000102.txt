@@ -1,0 +1,37 @@
+based on the following job description, can you write me an upbeat message that I can use to prospect them about recruiting for the role for them:
+
+Hey there, good to have you here 👋
+Synthesia is the global leader in synthetic media. Our vision is to build the first fully programmable video generation platform and help everyone transform non-video content into video.
+Synthesia is already working with some of the world’s biggest companies and celebrities such as David Beckham and Lionel Messi, BBC, EY, Facebook, McDonalds, Amazon and WPP.
+Our Messi campaign collaboration received a Cannes Lion Award in 2021 and we’ve raised more than $66M so far from names like Marc Cuban, First Mark Capital, Seedcamp, Google Ventures, Kleiner Perkins and more.
+
+About the position
+If you are looking to join a collaborative, open, high impact team of researchers - this one's for you. 🚀
+We're looking for a Research Engineer with a passion for working on cutting edge problems in computer vision that can help us create highly realistic, emotional and life-like synthetic humans through text-to-video.
+In this position, you'll be working on our core visual synthesis technologies in a small dynamic team working to solve extremely challenging problems. You will take a concept from idea to final execution and deliver completely new capabilities to market. You will be at the heart of how the team operates, from building the data-sets we require, the models we implement, the evaluation protocols we adopt, through to the production ready code we deliver.
+We are very proud of our research culture and the impact we have achieved in visual synthesis of digital humans with our AI Avatars. You'll have the opportunity to work with multiple R&D teams across diverse areas in direct collaboration with internationally leading academics. As we scale (and we are growing quickly) you'll become a fundamental part of how we shape the future of synthetic media.
+Requirements
+ An MSc or PhD in Computer Vision
+ A proven track record of impact through publication, technology innovation or software development
+ A keen interest in audio/visual analysis and synthesis, specifically for video synthesis of digital humans
+ Deep knowledge of the latest models, techniques and innovations in machine learning
+ Strong expertise in modern machine learning frameworks (TensorFlow, PyTorch)
+ Strong expertise in software development (Python)
+ Excellent verbal and written communication skills
+ 
+In short: You have a passion for computer vision and visual media, you love to build new technologies and you want to have an impact. This is an exciting opportunity to join a world-class research team building a completely new category of technology.
+The good stuff...
+In addition to being a part of a great team, working in a fun and innovative environment, we offer...
+
+📌Offices in Amsterdam
+📈Generous stock option plan
+💰Performance based bonus
+👴Pension
+🌴25 days of annual leave + Bank holidays
+👶Excellent Maternity/Paternity leave
+🎊Fun culture with regular socials and company retreats twice a year
+📨Generous referral scheme
+💻Brand new MacBook
+ 
+
+🚀Join the rocketship while is taking off

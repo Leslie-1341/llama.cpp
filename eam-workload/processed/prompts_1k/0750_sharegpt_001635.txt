@@ -1,0 +1,5 @@
+which one of these is true in Java,
+1. Vector can be resized while ArrayList cannot be
+2. Vector is synchronized but ArrayList is not
+3. ArrayLists can grow but cannot shrink in size while Vector can both grow and shrink
+4. Vectors allow duplicate values while ArrayList does not

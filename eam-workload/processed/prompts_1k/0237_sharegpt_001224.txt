@@ -1,0 +1,60 @@
+幫我生成一份可以在 mac 運行的 .sh 檔案內容，一開始用 npx create-react-app@latest my-app --template typescript，執行後要自動生成一份可在執行的前端網頁，生成內容要包括 react Component 的完整內容且使用只 hook component 不使用 class component，除了沒有需要更改的檔案，其他的程式碼請全部產生並將資料結構如下方給的資料結構內容，把所有『程式碼』都寫完，如果太長的話當我喊繼續就從中斷處接著寫完即可（不要跟我說篇幅限制所以省略）
+
+
+1. 功能說明：
+畫面中上方區塊要有四張卡片包含在 Hero List 的 Component 內，卡片的 Component 為 Hero Card，每張卡片上半部是圖片，下半部是文字
+
+點擊卡片要切換 router 到 /heroes/:heroId 
+
+
+2. 頁面需求
+
+&gt; 整個專案會需要兩個頁面
+&gt; Hero List Page (網址: /heroes)
+&gt; Hero Profile Page (網址: /heroes/:heroId)
+&gt; "Hero List Page"、"Hero Profile Page" 都有一個 "Hero List" 在頁面上水平置中 (API: GET https://hahow-recruit.herokuapp.com/heroes)
+&gt; "Hero List" 上的元素我們稱為 "Hero Card"，在 "Hero List" 中由左到右排列，如果在小尺寸螢幕上列表中的元素超出畫面就自動往下排列
+&gt; "Hero Card" 必須包含圖片和名字，且是可以點擊的連結
+&gt; "Hero Card" 連結會連到單一 Hero 的 "Hero Profile Page"，"Hero List" 依然在相同位置，並且不因切換連結重新 render
+&gt; 當在 "Hero Profile Page" 時要將現在所選中的 "Hero Card" 用不同的顏色或圖案標示出來
+&gt; "Hero Profile Page" 中，在 "Hero List" 底下會有一個 "Hero Profile"
+&gt; "Hero Profile" 會顯示 Hero 的能力值 (API: GET https://hahow-recruit.herokuapp.com/heroes/:heroId/profile)，並且在數值左右各有一個按鈕，負責做增減功能，另外有一個顯示剩餘的能力點數的地方，一開始預設值是 0
+&gt; "Hero Profile" 最下方有一個儲存按鈕，按下按鈕後，會將現在設定的能力值提交更新 server 上的資料 (API: PATCH https://hahow-recruit.herokuapp.com/heroes/1/profile)，送出的能力值總和必須與拿到的時候相同
+&gt; Hero 能力值不能小於零
+
+3. 資料夾結構為：
+
+├── src/
+│ ├── conmponents/
+│ │ └── HeroCard/
+│ │ └── index.ts
+│ │ └── style.css
+│ ├── pages/
+│ │ └── HeroList/ #網址: /heroes
+│ │ └── index.ts
+│ │ └── style.css
+│ │ └── HeroProfile/ #網址: /heroes/:heroId
+│ │ └── index.ts
+│ │ └── style.css
+│ ├── const/ #enum
+│ │ └── index.ts
+│ ├── contexs/ #放全域變數
+│ │ └── index.tsx
+│ ├── helper/ #放 function
+│ │ └── index.tsx
+│ ├── hooks/ #放 function
+│ │ └── index.tsx
+│ ├── App.css
+│ ├── App.test.tsx
+│ ├── App.tsx
+│ ├── index.css
+│ ├── index.tsx
+│ ├── logo.svg
+│ ├── react-app-env.d.ts
+│ ├── setupTest.ts
+├── .eslintcache
+├── .gitignore
+├── README.md
+├── package-lock.json
+├── package.json
+└── tsconfig.json

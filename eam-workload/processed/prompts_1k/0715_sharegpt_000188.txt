@@ -1,0 +1,24 @@
+What is this code doing?
+
+-- CLIENT TODO: specify the proper account_number field for web authentication here
+
+drop view if exists customer_account_number;
+create sql security invoker view customer_account_number as
+select c.id as customer_id,
+ c.utility_id as utility_id,
+ c.util_internal_id as account_number,
+ cs.search_util_internal_id as search_account_number
+-- c.util_internal_id_2 as account_number
+ from customer c inner join customer_search cs on cs.customer_id=c.id;
+ 
+-- If utility_acct.util_account_id is needed, use the following SQL
+-- NOTE that this only works on single fuel utilities
+/*
+create sql security invoker view customer_account_number as
+select c.id as customer_id,
+ c.utility_id as utility_id,
+ ua.util_account_id as account_number,
+ uas.search_util_account_id as search_account_number
+ from customer c inner join utility_acct ua on ua.customer_id=c.id inner join utility_account_search uas on uas.utility_account_id = ua.id;
+ where ua.inactive_date is null;
+*/

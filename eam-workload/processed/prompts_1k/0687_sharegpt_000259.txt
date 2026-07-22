@@ -1,0 +1,24 @@
+This query returns the list of ArtisanIDs, Quarter and Onboarding Type:
+
+select sod."ArtisanId", case 
+ when sod."date" &lt; '2022-03-31' then 'Q1-22'
+ when sod."date" &gt;= '2022-03-31' and sod."date" &lt;= '2022-06-30' then 'Q2-22'
+ when sod."date" &gt;= '2022-07-01' and sod."date" &lt;= '2022-09-30' then 'Q3-22'
+ when sod."date" &gt;= '2022-10-01' and sod."date" &lt;= '2022-12-31' then 'Q4-22'
+ when sod."date" &gt;= '2023-01-01' then 'Q1-23'
+end as "Quarter",
+sod."onboardingType"
+from "SAAS_OnboardingDates" sod
+where sod."ArtisanId" in 
+(select as2."ArtisanId" from "ArtisanSubscriptions" as2 where as2."SubscriptionTierId" = 2)
+union
+select as2."ArtisanId", 'Q1-22' as "Quarter", 'High-Touch-In-Person' as "onboardingType" from "ArtisanSubscriptions" as2 where as2."SubscriptionTierId" = 2
+and as2."ArtisanId" not in (
+select sod."ArtisanId" from "SAAS_OnboardingDates" sod
+)
+
+This query, returns a list of payments, including ArtisanId as a field
+
+select * from "ArtisanPayouts" ap 
+
+Write a query that returns the list of pros who are present in the list of payments, their total payment value (a field called amount in ArtisanPayouts), and the quarter and onboarding type

@@ -1,0 +1,1 @@
+2 / 2how to configure python script to run in the background in redhat linux using service

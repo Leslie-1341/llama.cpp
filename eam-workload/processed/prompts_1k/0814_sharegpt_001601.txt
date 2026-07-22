@@ -1,0 +1,1 @@
+how to clone a branch from gitlab into EC2

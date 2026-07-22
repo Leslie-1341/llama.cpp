@@ -1,0 +1,1 @@
+I want you to write code as an ImageJ plugin. I have monochrome .bmp files means that there are only black and white color. There is a black background, an irregular shaped white object that has one or multiple irregular shaped black holes inside. I want to measure the longest diameter and shortest diameter of those black holes.

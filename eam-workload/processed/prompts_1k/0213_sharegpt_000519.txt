@@ -1,0 +1,1 @@
+Given a game where a number 0-9 is randomly, if 4 of the last 6 draws, the number 8 has been drawn, what number should I choose?

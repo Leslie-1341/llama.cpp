@@ -1,0 +1,1 @@
+provide me the arduino code to generate audio morse code on a speaker, given the sentence sent from the IDE serial monitor

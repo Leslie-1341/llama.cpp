@@ -1,0 +1,18 @@
+Listed below is a list of startup ideas from the publishing industry. First, please suggest a reliable framework for evaluating startup ideas by converting them into numbers, and evaluate each idea according to that framework. Then, give your answers in tabular form, sorted in descending order of the total score.
+
+- Founded an internet publishing site
+- Opened online book purchase service
+- Creation of a book review site
+- Delivery service provided
+- Data room update and operation
+- Creation of corporate customer service
+- Development of e-book management system
+- Production of book introduction video
+- Traditional publishing business
+- Development of products for small publishers
+- Establishment of book marketing strategy
+- Book information statistical analysis work
+- Development of communication channels with users
+- Management of book advertising and promotional activities
+- Conduct user interviews and surveys
+- Real-time analysis of book sales

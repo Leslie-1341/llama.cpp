@@ -1,0 +1,6 @@
+1 / 1Let $D$ be a positive definite diagonal matrix.
+Let $C$ be a positive definite matrix, and is given.
+Let $W$ be an arbitrary matrix such that $W*W^T$ is the same shape as $D$.
+
+
+How do I optimize $D$ and $W$ jointly such that $C^{-1} \approx (D - W*W^T)$ under the constraint that $(D - W*W^T)$ is positive definite.

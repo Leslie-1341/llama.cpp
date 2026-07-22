@@ -1,0 +1,17 @@
+the following is a table from microsoft excel 
+Activity Name Impact of AI The reason for your classification
+Coordinating the Work and Activities of Others  Augmented by AI humans can tell the AI about dependencies and timelines and then the AI can handle the collaboration
+Communicating with Supervisors, Peers, or Subordinates  Augmented by AI 
+Getting Information  Fully automatable by AI 
+Organizing, Planning, and Prioritizing Work  Only human performed 
+Working with Computers  Fully automatable by AI 
+Developing and Building Teams  Only human performed 
+Scheduling Work and Activities  Fully automatable by AI 
+Making Decisions and Solving Problems  Augmented by AI 
+Monitoring and Controlling Resources  Fully automatable by AI 
+Updating and Using Relevant Knowledge  Fully automatable by AI 
+Developing Objectives and Strategies  Only human performed 
+Establishing and Maintaining Interpersonal Relationships  Only human performed 
+Interpreting the Meaning of Information for Others  Fully automatable by AI 
+
+DEscribe the table to me

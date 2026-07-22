@@ -1,0 +1,6 @@
+PS C:\Users\student\WebstormProjects\notes> node .
+node:events:491
+ throw er; // Unhandled 'error' event
+ ^
+
+Error: listen EADDRINUSE: address already in use :::3000

@@ -1,0 +1,19 @@
+1 / 1以下java日志报错，可能是什么原因
+ExecuteThread: '34' for queue: 'weblogic.kernel.Default (self-tuning)' [ERROR]:Tried all: 1 addresses, but could not connect over HTTPS to server: soatest.joyoung.com port: 443
+java.net.ConnectException: Tried all: 1 addresses, but could not connect over HTTPS to server: soatest.joyoung.com port: 443
+ at weblogic.net.http.HttpsClient.openServer(HttpsClient.java:284)
+ at weblogic.net.http.HttpsClient.openServer(HttpsClient.java:502)
+ at weblogic.net.http.HttpsClient.New(HttpsClient.java:566)
+ at weblogic.net.http.HttpsURLConnection.connect(HttpsURLConnection.java:242)
+ at weblogic.net.http.HttpURLConnection.getInputStream(HttpURLConnection.java:361)
+ at weblogic.net.http.SOAPHttpsURLConnection.getInputStream(SOAPHttpsURLConnection.java:37)
+ at org.jasig.cas.client.util.CommonUtils.getResponseFromServer(CommonUtils.java:281)
+ at org.jasig.cas.client.validation.AbstractCasProtocolUrlBasedTicketValidator.retrieveResponseFromServer(AbstractCasProtocolUrlBasedTicketValidator.java:33)
+ at org.jasig.cas.client.validation.AbstractUrlBasedTicketValidator.validate(AbstractUrlBasedTicketValidator.java:178)
+ at org.springframework.security.cas.authentication.CasAuthenticationProvider.authenticateNow(CasAuthenticationProvider.java:131)
+ at org.springframework.security.cas.authentication.CasAuthenticationProvider.authenticate(CasAuthenticationProvider.java:117)
+ at org.springframework.security.authentication.ProviderManager.doAuthentication(ProviderManager.java:120)
+ at org.springframework.security.authentication.AbstractAuthenticationManager.authenticate(AbstractAuthenticationManager.java:48)
+ at org.springframework.security.cas.web.CasAuthenticationFilter.attemptAuthentication(CasAuthenticationFilter.java:104)
+ at org.springframework.security.web.authentication.AbstractAuthenticationProcessingFilter.doFilter(AbstractAuthenticationProcessingFilter.java:199)
+ at org.sp

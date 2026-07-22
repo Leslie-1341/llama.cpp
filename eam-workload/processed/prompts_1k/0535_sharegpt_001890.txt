@@ -1,0 +1,5 @@
+I am using shell to execute following command
+
+/opt/CA/WorkloadAutomationAE/autosys/bin/autouxlog -j adf_pipeline_parameters_v2 -t S -saml 'UserSession;Version-1.0;9cb628d78fdc6f9c05b0b2082f1219-632ba5b3-102a8240-beeab'
+
+Shell is picking the command only till first semicolon

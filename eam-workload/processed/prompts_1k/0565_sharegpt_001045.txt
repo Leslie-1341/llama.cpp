@@ -1,0 +1,1 @@
+for the decimal integers 0 to 90000, in each case count total number of 0's and 1's and give it in table

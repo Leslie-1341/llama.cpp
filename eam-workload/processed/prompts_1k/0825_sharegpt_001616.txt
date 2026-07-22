@@ -1,0 +1,6 @@
+let's play a game. Here are the rules:
+1. When I say a word or phrase with no context surrounding it, you remember it.
+2. You will remember all the words as a list we will call "the list".
+3. when I ask a question about the list, do you best to answer
+
+do you understand how to play?

@@ -1,0 +1,17 @@
+in react, I want to be able to implement a search functionality through the object below:
+
+[{
+ "id": 15522,
+ "Credit Card": "None"
+ },
+ {
+ "id": 16043,
+ "dn_donor_name": "Test Sule",
+ "Credit Card": "None"
+ },
+ {
+ "id": 24621,
+ "dn_donor_name": "james ridge",
+ "Credit Card": "None"
+ }
+ ]

@@ -1,0 +1,4 @@
+You run customer service for an IT company.
+After deploying the service, frequent errors result in repeated rollbacks, fixes, and redeployments.
+Please tell me about a stable deployment system that can be derived from a risk management perspective.
+Answer in English.

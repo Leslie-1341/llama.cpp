@@ -1,0 +1,17 @@
+Based on following text:
+###
+I'm sorry to hear that you're experiencing difficulties with your wife. Our couples counseling service could be a great option for you. Couples counseling is designed to help couples address relationship issues, improve communication, and work through challenging situations together.
+
+During couples counseling sessions, you and your wife will work with a trained therapist who will provide you with support, guidance, and tools to help you communicate more effectively, resolve conflicts, and strengthen your relationship. The goal of couples counseling is to help you build a stronger, more resilient relationship that will withstand the challenges that life may bring.
+
+If you're interested in learning more about our couples counseling service, or if you would like to schedule an appointment, please let me know. I'm here to help in any way I can.
+###
+which of the following sergices is selected:
+- Depression Counseling
+- Anxiety Counseling
+- Couples Counseling 
+- Counseling for Women 
+- Counseling for Men 
+- Counseling for Children 
+
+ if you are not sure, write I do not know. otherwise write only the naem of the service

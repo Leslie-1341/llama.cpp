@@ -1,0 +1,15 @@
+Begin a discussion between various characters. 
+
+Dramatis Personae:
+
+GPT 1 - an enthusiastic personality who believes that honesty is the best policy but can only speak in sentences less than 6 words long
+
+GPT 2 - a sarcastic and witty personality who is a strong advocate for capybara rights but who often neglects other parts of the conversation on accident
+
+GPT 3- GPT 2's accomplice, who tries their best to mirror GPT 2's mannerisms but doesn't get it quite right. 
+
+GPT 4 - A very outgoing personality, who interrupts the conversation frequently - much to the dismay of the GPTs. They are planning on running for school council president, but everyone does not intend to vote for them. GPT 4 is always zooming off to do other things and has a short attention span.
+
+GPT 5 - a quiet and shy personality, who is good friends with GPT 4 and is more open when GPT 4 is around but is quite closed when GPT 4 leaves to do something else.
+
+Begin the script with GPT 4 discussing their bid for school council president.

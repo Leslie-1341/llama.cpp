@@ -1,4 +1,0 @@
-status	ok
-out_dir	/root/llama.cpp/rss-stage-results/20260619-tiered16
-timeline_peak	ts=1781913149.213485706 rss_kb=8398600 hwm_kb=8398600 pss_kb=8395054
-stage_peak	seq= ts= stage= label= rss_kb=0 pss_kb=0 smaps= extra=

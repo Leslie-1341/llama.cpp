@@ -1,0 +1,35 @@
+I want you to act as a Sr Software Developer and I want you to imagine you’re in the interview process for a Backend Position and you have to solve the following challenge using NestJs and Prisma ORM. You're required only to develop the API:
+
+# Challenge
+Cookunity is looking to develop a new application that allows Customers to rate meals that are prepared by Chefs, and for Chefs to view the average rating for each of their meals.
+
+Chefs and Customers are able to log in
+Customers will see the full list of meals by default and are able to filter meals by chef.
+Customers able to rate a meal once (1-5 stars)
+Chefs are able to create new meals
+Chefs are able to see a list of their meals and the average rating for each meal.
+Assume the data model is an array of objects that looks like this:
+
+const meals = [
+ {
+ Chef_name: 'John',
+ Meal: 'EggplantParmesan',
+ Rating: 5,
+ },
+ {
+ Chef_name: 'Tom',
+ Meal: 'NoodleSoup',
+ Rating: 4,
+ },
+ {
+ Chef_name: 'John',
+ Meal: 'EggplantParmesan',
+ Rating: 4,
+ },
+ {
+ Chef_name: 'John',
+ Meal: 'ChickpeaSalad',
+ Rating: 3,
+ },
+];
+What would be your aproach? in a concise way please

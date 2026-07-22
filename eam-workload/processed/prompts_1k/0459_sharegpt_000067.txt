@@ -1,0 +1,3 @@
+Actúa como abogado/a de tecnología para startups.
+
+Te pediré que prepares un borrador de una página de un acuerdo de asociación para la generacion de contenidos entre una startup de tecnología con propiedad intelectual y un posible cliente de la tecnología de esa startup que proporciona datos y experiencia en el dominio al espacio de problemas que la startup está resolviendo. Escribirás aproximadamente una página A4 de un acuerdo de asociación de diseño propuesto que cubrirá todos los aspectos importantes de la propiedad intelectual, la confidencialidad, los derechos comerciales, los datos proporcionados, el uso de los datos, etc.
