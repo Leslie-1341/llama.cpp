@@ -1,0 +1,24 @@
+I am trying to design a database used for MES of a petrochemical company.
+The company refines raw materials to produce and sell isoparaffins, non-phthalate plasticizers, and diaromatic hydrocarbons.
+
+Requirements for the product information table.
+- Products are categorized into raw materials, single products, mixed products, and by-products.
+-Each product can be added to tablets of other products (Product ID and comma separated)
+- Each product can be converted to other products (product ID and comma separated)
+- Including customer information
+
+This is a requirement of the account table.
+- Classification of customers is manufacturer, seller
+- Hierarchy is divided into companies, agencies, and users
+
+This is an implementation requirement.
+- Use SQL Server. Implement as a model in the Entity Framework core.
+- Write CommentAtriribute "in Korean" on all properties of the model. For example:
+[Comment("설명")]
+public string? Description { get; set; }
+- Include constraints.
+
+This is a response requirement.
+- Answer in English.
+- No explanation.
+- Code must be included.

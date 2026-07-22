@@ -1,0 +1,12 @@
+我有一個如下的內容：
+
+ 1. 玩家提交「問題(Question)」
+ 2. 問題被「IGS智能客服(LangChain)」轉交給「語意向量引擎(Embedding Model)」
+ 3. 語音向量引擎處理完後，將「問題向量(Question Vector)」回傳給IGS智能客服
+ 4. IGS智能客服將問題向量傳給「向量資料庫(Qdrant)」做特徵比對
+ 5. 向量資料庫比對向量，將「前K名的相關內容(Top K facts)」傳回給IGS智能客服
+ 6. IGS智能客服將前K名的相關內容做為提詞，將原來的問題含入後，一併詢問「聊天機器人(LLM)」
+ 7. 聊天機器人嘗試參考前K名相關內容回答，將答案回覆給IGS智能客服
+ 8. IGS智能客服最終將聊天機器人的答案回給玩家
+
+請參考 https://mermaid.js.org/syntax/sequenceDiagram.html 的內容，給我一個sequenceDiagram

@@ -1,0 +1,3 @@
+Decorte is a company that is building a machine learning-based platform that will allow devices with a microphone to detect heart beats. This novel technology can be used to identify heart conditions non-invasively and at scale, for very low cost. Alongside that, they can also perform cough detection.
+
+Using this information, write a short article about Decorte, and its founder from Cambridge, Roeland.

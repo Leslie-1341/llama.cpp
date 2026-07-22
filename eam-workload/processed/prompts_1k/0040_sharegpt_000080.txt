@@ -1,0 +1,15 @@
+2 / 2Here is my Python code:
+api_url = 'https://api.yelp.com/v3/businesses/search'
+params = {'term':'tacos','location':'90045'}
+api_key = 'Ee7vYfTT9GpATMDYqODar7mbdyz_8EJ668FCbiqCv81Y3j98WaCsiAleAyI_LFn5p_JVHehSQnxffx-tDdQLekCpMhFJPxz8SVMp34Beawxkint62oDnJ_I0PiXMY3Yx'
+headers = {'Authorization':'Bearer %s' % api_key}
+api_request = requests.get(api._url, params=params, headers=headers)
+
+Why am I receiving the error below and how do I fix it?
+NameError Traceback (most recent call last)
+<ipython-input-7-c77b945f2073> in <module>
+ 3 api_key = 'Ee7vYfTT9GpATMDYqODar7mbdyz_8EJ668FCbiqCv81Y3j98WaCsiAleAyI_LFn5p_JVHehSQnxffx-tDdQLekCpMhFJPxz8SVMp34Beawxkint62oDnJ_I0PiXMY3Yx'
+ 4 headers = {'Authorization':'Bearer %s' % api_key}
+----> 5 api_request = requests.get(api._url, params=params, headers=headers)
+
+NameError: name 'api' is not defined

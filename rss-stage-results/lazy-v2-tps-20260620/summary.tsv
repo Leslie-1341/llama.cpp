@@ -1,4 +1,0 @@
-status	ok
-out_dir	/root/llama.cpp/rss-stage-results/lazy-v2-tps-20260620
-timeline_peak	ts=1781928303.200351143 rss_kb=5624908 hwm_kb=5624908 pss_kb=5639859
-stage_peak	seq= ts= stage= label= rss_kb=0 pss_kb=0 smaps= extra=

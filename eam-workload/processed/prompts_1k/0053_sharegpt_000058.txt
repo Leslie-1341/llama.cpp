@@ -1,0 +1,1 @@
+I want you to act as an expert web developer. I want to create a translation tool for churches that could take the live audio of the Spanish sermon and transcribe it to English on the big screen. Has this been done yet and by who?

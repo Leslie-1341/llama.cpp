@@ -1,0 +1,1 @@
+Project A requires 2 full time magento backend developers with a deadline of 10th April. Project B requires 1 full time and 1 part time magento backend developer with a deadline of 11th May. Both projects require 1 month of 2 fulltime dedicated magento backend developers. How shall this be resourced in order to achieve deadlines of both?

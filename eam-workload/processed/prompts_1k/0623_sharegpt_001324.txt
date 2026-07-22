@@ -1,0 +1,31 @@
+Overview: This assignment requires you to write code for a cooling simulation involving rooms and
+devices. Three types of devices can be used to cool a room: air conditioners, ceiling fans, and
+standing fans. Air conditioners and ceiling fans cannot be removed from a room once they are added.
+Standing fans however are portable devices that can be swapped between rooms only if they are not
+in use. The table below shows the different properties of each device: portability, breeziness,
+noisiness, and cooling power.
+Table 1
+You are required to create 4 rooms with the following properties such that the breeziness, noisiness,
+and ending temperature of the rooms can be quantified and assessed for correctness.
+Table 2
+
+Device Interface
+The Device interface specifies the following behaviour for a device:
+PortableDevice Interface
+The PortableDevice interface does not specify any behaviour. It allows a standing fan to be subtyped
+as a PortableDevice.
+Method Signature Return Type Purpose
+ getID( ) String Returns the ID of a device
+isBreezy( ) boolean Returns true if the device has a breeziness greater
+than zero, false otherwise
+isNoisy( ) boolean Returns true if the device has a noisiness greater
+than zero, false otherwise
+isOn( ) boolean Returns true if the device is turned on, false
+otherwise
+turnOn( ) void Turns a device on
+turnOff( ) void Turns a device off
+coolsBy( ) int Returns the temperature drop produced by a device
+getBreeziness( ) int Returns the breeziness of a device
+getNoisiness( ) int Returns the noisiness of a device
+
+write java code for the device interface

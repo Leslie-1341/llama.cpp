@@ -1,0 +1,29 @@
+Can you improve this code? Ensure that the improvements don't change the look or behaviour of the application. There should be no errors when implementing the improvements!
+
+code:
+import { MdOutlineLibraryBooks } from "react-icons/md";
+
+import { api } from "~/utils/api";
+
+const [selectedTargetPrompt, setSelectedTargetPrompt] = useState("");
+
+export default function Library({
+ setInputMessage,
+}: {
+ setInputMessage: Dispatch&gt;;
+}) {
+ const utils = api.useContext();
+
+ const [editedName, setEditedName] = useState("");
+ const [editedPrompt, setEditedPrompt] = useState("");
+
+ const prompts = api.prompt.all.useQuery();
+ const { isOpen, onOpen, onClose } = useDisclosure();
+
+ const upsertPrompt = api.prompt.upsert.useMutation({
+ onSuccess: async () =&gt; utils.prompt.invalidate(),
+ });
+
+ const deletePrompt = api.prompt.delete.useMutation({
+ onSuccess: async () =&gt; utils.prompt.invalidate(),
+ });

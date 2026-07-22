@@ -1,4 +1,0 @@
-status	ok
-out_dir	/root/llama.cpp/rss-stage-results/20260619-native-minimal
-timeline_peak	ts=1781905211.855804607 rss_kb=8894844 hwm_kb=8894844 pss_kb=8890229
-stage_peak	seq= ts= stage= label= rss_kb=0 pss_kb=0 smaps= extra=

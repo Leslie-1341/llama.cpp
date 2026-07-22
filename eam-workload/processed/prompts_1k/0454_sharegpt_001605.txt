@@ -1,0 +1,5 @@
+take the following data and make a function to parse it
+01_site.png,0,30,45,60
+02_bg linedraw.png,0,60
+03_hideman.png,0,60
+04_glow.png,0,60

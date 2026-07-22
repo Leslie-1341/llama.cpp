@@ -1,0 +1,3 @@
+I want to python code about 'concentration' in chemistry. I want to use this code to make mock exam in Korean SAT. The variables for concentration code are 'Solution', 'Molar mass of solute', 'Water(H2O)', 'Volume of Solution or Water', 'Mass of solute', 'Mol of solute', 'Mass of Solution', 'Density of Solution.' In Korean SAT, there are some sequences to make 'concentration' quiz. First, mix some solutions to make new solution. The volume of new solution is sum of the volume of mixed solutions. Second, take a solution in previous step's solution. For example, 1) I prepare 0.2M NaOH(aq) 40mL. 2) I take NaOH(aq) 20mL in step 1). 
+
+Can you suggest how to implement this learning contents and questioning techniques in python code? Please give me some answers.

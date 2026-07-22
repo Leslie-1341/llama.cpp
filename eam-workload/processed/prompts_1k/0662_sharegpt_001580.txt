@@ -1,0 +1,29 @@
+translate this code's comment to english:
+
+def get_substitues(substitutes, tokenizer, mlm_model, use_bpe, substitutes_score=None, threshold=3.0):
+ '''
+ 将生成的substitued subwords转化为words
+ '''
+ # substitues L,k
+ # from this matrix to recover a word
+ words = []
+ sub_len, k = substitutes.size() # sub-len, k
+
+ if sub_len == 0:
+ # 比如空格对应的subwords就是[a,a]，长度为0
+ return words
+
+ elif sub_len == 1:
+ # subwords就是本身
+ for (i, j) in zip(substitutes[0], substitutes_score[0]):
+ if threshold != 0 and j &lt; threshold:
+ break
+ words.append(tokenizer._decode([int(i)]))
+ # 将id转为token.
+ else:
+ # word被分解成了多个subwords
+ if use_bpe == 1:
+ words = get_bpe_substitues(substitutes, tokenizer, mlm_model)
+ else:
+ return words
+ return words

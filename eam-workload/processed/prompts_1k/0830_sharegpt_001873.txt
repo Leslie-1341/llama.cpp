@@ -1,0 +1,14 @@
+ummarize this in bullet points "MyPortal is a single entry for all the company's support services: IT, HR, real estate, finance and purchasing
+70,000 employees of the Group use this platform which has greatly reduced the processes and administrative burden perceived previously
+The portal, also available as a mobile application, simplifies the daily life of employees while boosting their productivity
+It covers a wide spectrum, with more than 1,000 services available: onboarding of newcomers, career management on the entrances and exits of employees, logistical requests such as signaling air conditioning problems or badge management
+At the financial level, this simplifies the processing of supplier accounting requests; this also allows a better organization, but also the obtaining of reliable and complete KPIs.
+60% of the processes are now automated and the satisfaction rate rises to 88% on the end-user side
+The portal has made it possible to un-silos the businesses. This makes the organization more efficient, the work of employees more fluid and therefore the customer experience better
+The ergonomics of MyPortal was crucial in the success of the platform, we have therefore conducted numerous workshops and numerous interviews upstream to clearly identify the feedback from all users, but also from the support services concerned.
+The complete overhaul of our IT processes has made it possible to standardize them as much as possible, in order to avoid complex and energy-intensive case-by-case management. The simplification of processes and the automation of workflows were at the heart of our approach.
+The human being is the key to success when developing such a digital project! First of all because there is a strong challenge of change management.
+It was necessary to spend time with the teams to understand what their needs were and introduce them to new tools whose mode of operation was sometimes different from the tools used until then.
+Then, it is essential to obtain the support of end-users, support services and more broadly professions.
+For MyPortal, each function (IT, HR, finance and purchasing ...) had very different expectations and approaches. It was a challenge to bring them together on one and the same platform, but we were able to do it by taking the time to clearly identify their respective needs.
+Finally, the Governance was decisive. On a project of such a scale, it is necessary that the company's management is a stakeholder in the project, that it supports and defends it almost on a daily basis"

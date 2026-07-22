@@ -1,0 +1,1 @@
+2 / 2J'utlise angular, je voudrais un carousel automatique sur 3s sur liste d'images, avec des flêches avance récule. Le carousel s'arrete lorsque la souris est dessus de l'image avec des boutons + et - qui apparaissent servant à faire du Zoom In et Zoom Out.

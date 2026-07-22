@@ -1,0 +1,1 @@
+a table of 10 persona who are mushroom fans , name, age, location, character

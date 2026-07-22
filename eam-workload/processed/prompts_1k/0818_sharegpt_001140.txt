@@ -1,0 +1,13 @@
+As an entry-level Python Developer, you need to perform the following duties:
+•
+Write server-side web application logic
+•
+Write scalable and effective codes in Python
+•
+Develop backend components to boost overall application's performance
+•
+Executing tests and fixing bugs in applications and software
+•
+Implement data protection and security solutions
+•
+Connect applications with third-party web services

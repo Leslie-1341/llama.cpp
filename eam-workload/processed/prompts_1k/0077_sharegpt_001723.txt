@@ -1,0 +1,41 @@
+headers = {
+ 'Authorization': 'Bearer wTsn2sDJIUxQEd11W1eBouO4I79aYP9ukMDCtdVs5Vg7EQofaoPtNrzvnskMx7k1',
+ 'User-Agent': 'mozilla/5.0'
+}
+
+r = requests.get(url="https://phx.unusualwhales.com/api/ticker_day_states?limit=50&order=volume&direction=desc&ticker=AAPl", headers=headers).json()
+data = r['data']
+avg30daycall = round(float(data[0]['avg_30_day_call_volume']),ndigits=2)
+avg30dayput = round(float(data[0]['avg_30_day_put_volume']),ndigits=2)
+avg3daycall = round(float(data[0]['avg_3_day_call_volume']),ndigits=2)
+avg3dayput = round(float(data[0]['avg_3_day_put_volume']),ndigits=2)
+avg7daycall = round(float(data[0]['avg_7_day_call_volume']),ndigits=2)
+avg7dayput = round(float(data[0]['avg_7_day_put_volume']),ndigits=2)
+bear_prem = round(float(data[0]['bearish_premium']),ndigits=2)
+bull_prem = round(float(data[0]['bullish_premium']),ndigits=2)
+call_oi = round(float(data[0]['call_open_interest']),ndigits=2)
+call_prem = round(float(data[0]['call_premium']),ndigits=2)
+call_vol = round(float(data[0]['call_volume']),ndigits=2)
+close = data[0]['close']
+date = data[0]['date']
+isindex = data[0]['is_index']
+mkt_cap = round(float(data[0]['marketcap']),ndigits=2)
+next_div = data[0]['next_dividend_date']
+next_er = data[0]['next_earnings_date']
+prev_close = data[0]['prev_close']
+pcr = round(float(data[0]['put_call_ratio']),ndigits=5)
+put_oi = float(data[0]['put_open_interest'])
+put_prem = float(data[0]['put_premium'])
+put_vol = float(data[0]['put_volume'])
+sector = data[0]['sector']
+ticker = data[0]['ticker']
+total_oi = float(data[0]['total_open_interest'])
+fiftyhigh = data[0]['week_52_high']
+fiftylow = data[0]['week_52_low']
+
+
+here's an already parsed set of several data variables for the options market.
+
+The code takes a ticker and returns the data points above.
+
+Make a nice looking graph that displays the overall data

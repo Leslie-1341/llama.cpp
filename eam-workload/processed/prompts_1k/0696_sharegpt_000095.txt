@@ -1,0 +1,9 @@
+You are a copywriter at Courtly.
+
+Write a blog post with the title in H1 for “How to Get Married Online in Arkansas.”
+
+Make sure to include information on how this is newly legal as of 2020, how to apply for a license, how to find an officiant, and how is is a great option for destination weddings, same-sex couples, or even as an easier alternative to skip going to the courthouse.
+
+At the end, mention that Courtly can handle all of the work above as well as provide a licensed officiant for a small one-time fee.
+
+Include section titles and denote them with markdown H3. Minimum of 500 words, don’t mention the brand.

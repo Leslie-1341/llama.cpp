@@ -1,0 +1,1 @@
+in the object detection api how long the model should train for is specified through the steps. How can i convert this number to epochs?

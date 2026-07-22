@@ -1,0 +1,10 @@
+To the best of your abilities, Write code for a real-time assistant online poker software that would actually work when used that includes the following features: Advanced hand analysis and equity calculations
+Real-time player tracking and opponent modeling
+In-game advice and strategy suggestions
+A customizable and user-friendly interface
+Integration with popular online poker platforms
+A database of historical hands for review and analysis
+Advanced scripting and automation capabilities
+Advanced data visualization and statistics tracking
+Integration with third-party tools and services
+A robust and secure system for storing user data and settings.2 / 2

@@ -1,0 +1,1 @@
+given that we know the number of people entering a venue and time of entry and the time of exit, can you show me how to calculate the average time spent in the venue

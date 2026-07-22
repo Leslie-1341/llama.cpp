@@ -1,0 +1,15 @@
+I want to write 5-6 more poems in this genre -- structured nix package list, where packages belong together but also work as a poem hinting at some abstract context unknown.
+
+We have shell.nix:
+{ pkgs ? import <nixpkgs> {} }:
+
+pkgs.mkShell {
+
+ buildInputs = with pkgs; [
+ just
+ tree
+ poetry
+ cocoapods
+ cargo
+ ];
+}

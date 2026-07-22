@@ -1,0 +1,63 @@
+Can you optimize this function?
+
+const groupLogsByType = (
+ rawLogs: T.BuildLog[],
+ filterType: FilterState,
+): FilteredLog[] => {
+ const logs = rawLogs.map((l, index) => ({ ...l, index }));
+ if (filterType === 'all' || logs.length === 0) {
+ return [{ hidden: false, logs }];
+ }
+
+ const groups: FilteredLog[] = [];
+
+ let currentGroup: BuildLogWithIndex[] = [];
+ let currentGroupType: FilterState = 'all';
+ const firstLog = logs[0];
+ if (firstLog.error) {
+ currentGroupType = 'errors';
+ } else if (firstLog.warning) {
+ currentGroupType = 'warnings';
+ }
+
+ // Create groups of the same log type.
+ for (const log of logs) {
+ let logType: FilterState = 'all';
+ if (log.error) {
+ logType = 'errors';
+ } else if (log.warning) {
+ logType = 'warnings';
+ }
+
+ if (logType !== currentGroupType) {
+ groups.push({
+ hidden: currentGroupType !== filterType,
+ logs: currentGroup,
+ });
+ currentGroup = [log];
+ currentGroupType = logType;
+ } else {
+ currentGroup.push(log);
+ }
+ }
+
+ // Group together neighboring groups that are either both hidden or visible.
+ const compactedGroups = groups.reduce<FilteredLog[]>((prev, cur) => {
+ const isCurrentGroupHidden = cur.hidden;
+ const previousGroup = prev.at(-1);
+ const isPreviousGroupHidden =
+ previousGroup === undefined ? isCurrentGroupHidden : previousGroup.hidden;
+
+ if (isCurrentGroupHidden === isPreviousGroupHidden) {
+ const newGroups = prev;
+ if (newGroups.length === 0) {
+ return [cur];
+ }
+ newGroups.at(-1)?.logs.push(...cur.logs);
+ return newGroups;
+ }
+ return prev.concat(cur);
+ }, []);
+
+ return compactedGroups;
+};

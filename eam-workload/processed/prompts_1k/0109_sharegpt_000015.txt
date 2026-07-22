@@ -1,0 +1,1 @@
+Cual consideras que es mejor lenguaje de programación para una persona con poca experiencia que quiera desarrollar proyectos personales y conseguir trabajo formal en una empresa tradicional, Javascript con Nextjs y typescript o php con laravel?

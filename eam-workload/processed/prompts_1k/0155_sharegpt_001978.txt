@@ -1,0 +1,1 @@
+2 / 2My goal is to write C code for training and testing an MLP (Mult-Layer Perceptron) with the MNIST dataset. I would like first to declare names of C functions needed to accomplish my goal. If this list of function names looks good then we can move with implementing them one at a time.

@@ -1,0 +1,34 @@
+Objective
+The objective of this assignment is for students to conduct probabilistic design calculations of an air
+conditioning system covering the relevant topics in thermal engineering.
+
+Problem Statement
+The air-conditioning system of a building, shown in Figure 1, is designed based on the district cooling
+approach. A central chiller system using a single compressor generates chilled water to be circulated
+throughout the building. The chilled water is supplied to Air Handling Units (AHU) that is located at
+every level of the building. A heat exchanger in each AHU facilitates the cooling of air that is
+discharged back to individual rooms or spaces. Due to the large thermal load from the building, the
+chiller operation is assisted by a cooling tower that uses water to remove the heat rapidly from the
+chiller condenser. 
+
+Question:
+
+A. Thermal Load Analysis
+Consider an academic building with three lecture halls. The maximum capacity of each hall is 200
+occupants. In each hall, there are 40 units of 10W lamps being used continuously due to poor natural
+lighting. There is also an LCD projector in each hall that is normally used for lecture. Each hall has 10 glass windows with an area of 0.5 m2 per window. The reflectivity of the tinted windows are 20% and the absorptivity is negligible. The solar irradiation on the building walls are assumed constant at 700 W/m2 in the morning and 1200 W/m2 at noon. Other external thermal loads are assumed negligible.
+1. Provide an in-depth explanation of internal and external thermal loads for buildings (CO1).
+2. Compute and graphically compare the combined thermal load variations for these cases
+(CO3):
+CASE I: 50% and 100% attendance for morning classes with 100% lighting used,
+CASE II: 50% and 100% attendance for noon classes with 100% lighting used,
+CASE III: 100% attendance at noon with 50% and 0% lighting used.
+2
+Analyze and discuss the contribution (in %) of each heat sources, with respect to the period
+the classes are being held. In the studied cases, what is the major contributor for the thermal
+loads?
+3. List THREE practical engineering measures that can be applied to reduce the thermal load
+of the lecture halls? (CO1)
+4. For the highest case of thermal load in Section A, plot the air temperature profile exiting the
+lecture halls if the initial room air temperature is 24oC and the total air flow rates from all the
+halls varies at 5,000 to 20,000 liters per minute. (CO2)

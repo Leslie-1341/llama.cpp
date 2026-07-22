@@ -1,0 +1,51 @@
+I have a vacation rental website and I am looking for alliterative and descriptive headlines that are at least 4 words in length and a maximum of 5 words. Examples: "Get Away to Galveston", "Sleep Soundly in Seattle". Each headline should have alliteration of at least 50% of the words and be colourful in language. Make each headline unique from the others by not repeating words. Be persuasive in convincing a person to visit. Each headline should include a verb. Put into an table with the city in column one and the results in column two for the following cities:
+Galveston
+Sedona
+Honolulu
+Palm Springs
+Tybee Island
+Hilton Head
+Big Bear
+Gatlinburg
+Destin
+Whistler
+Buenos Aires
+Cartagena
+Lima
+Montevideo
+Quito
+Rio de Janeiro
+Santiago
+Sao Paulo
+Amsterdam
+Barcelona
+Berlin
+Dublin
+Edinburgh 
+London
+Paris
+Rome
+Bali
+Bangkok
+Tokyo
+Kathmandu
+Kuala Lumpur
+Manila
+Mumbai
+Singapore
+Auckland
+Gold Coast
+Hobart
+Melbourne
+Queenstown
+Rotorua
+Sydney
+Wellington
+Accra
+Amman
+Cairo
+Doha
+Durban
+Lagos
+Marrakesh
+Dubai

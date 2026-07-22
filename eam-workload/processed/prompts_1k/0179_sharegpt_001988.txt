@@ -1,0 +1,1 @@
+can you read in datadog max cpu last 2 weeks for a service via api then take the value and update resources.yaml into github

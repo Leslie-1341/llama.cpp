@@ -1,0 +1,1 @@
+using nx and fastify on an ibm iseries to generate node worker threads, trying to solve this problem: worker threads require a javascript file to start and spawn their own JS parser and node instance on a new thread.  I can't get nx to output that js file on it's own along with the typescript bundle.

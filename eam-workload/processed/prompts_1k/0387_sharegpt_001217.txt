@@ -1,0 +1,8 @@
+Write Help article for feature Storage management of Zalo Chat app:
+- Requirement: consise and clear language
+- Audience: low tech people (do not mention in the article)
+- Main usecases: See overview off the app data, clean unnecessary resources to save device storage.
+- Home screen: Summary of storage Zalo used: Total storage, Cache, Conversation storage, Other storage.
+- User can delete cache without losing message data.
+- User can delete media and files in each converation. Or they can look for the biggest files which are more than 5MB from all conversations.
+- Warning: We use file reference method that reuse the same resource of the same files for all related conversation to save storage. If user delete, the file will be removed from all conversations.

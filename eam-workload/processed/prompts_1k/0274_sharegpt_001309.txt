@@ -1,0 +1,3 @@
+Write an AWS Lambda in Go that deletes EBS Snapshots based off of a tag called "backup_type" that can have the following possible values: monthly, daily, weekly, or yearly.
+
+We want to keep the last 14 monthly snapshots, the last 10 daily snapshots, the last 4 weekly snapshots, and 1 yearly snapshot.

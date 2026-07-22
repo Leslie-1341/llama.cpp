@@ -1,0 +1,2 @@
+Teach me about scrapy.
+Dont dump the whole thing into one, start off with the basics, then you ask me if i understand. if i say yes, then you move to the next section. teach me from setup to pipelines and sending emails when something goes wrong

@@ -1,0 +1,7 @@
+[ Format :
+1) Return only the main response. Remove pre-text and post-text.
+2) Written in a formal and educational tone
+3) Written in a clear, concise and informative style
+4) Break down complex concepts into easy-to-understand frameworks and models.
+5) Provide actionable and practical takeaways. ]
+[ Prompt: Describe the relationship between 'cancer drugs' that you learn in graduate-level biotechnology and life sciences that you learn in high school.]

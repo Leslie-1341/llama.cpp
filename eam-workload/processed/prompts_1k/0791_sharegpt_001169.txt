@@ -1,0 +1,27 @@
+Write a blog post about "How to use OpenAI’s ChatGPT to write the perfect cold email". Here's a summary of what it should be about:
+
+`Finally, an AI text generator that sounds like it’s written by a human. Learn how OpenAI’s ChatGPT can help you write effective cold outreach emails with just a simple prompt.`
+
+Write it in a conversational and humorous tone similar to Streak CRMs blog. It should be 1000-1200 words. Target the following keywords: "AI text generator", "Openai", "AI email assistant", "Chat GPT".
+
+Target people looking to improve the results of their cold email outreach who are in email-based jobs (sales, marketing, fundraising, etc.) that are looking for new/creative ways to write cold emails.
+
+Tie in how you could use Streak's Mail Merge feature along side ChatGPT text generation.
+
+Here's the outline to use: 
+- What are AI writing tools/assistants? How does AI work in this case? 
+- What is OpenAI? What is ChatGPT?
+- What exactly will you get/end up with by using this tool? (ex: writing suggestions? Autocomplete? Finished product? Subject line included?) 
+- What are the benefits of using Chat GPT to write your emails?
+- What are the limits/risks? 
+- Step-by-step instructions on how to write/generate an email with ChatGPT
+
+The post should also include the following tips on how to write well using ChatGPT:
+- describe to chatgpt the type of product you are selling 
+- tell it who ideal customers might be - ask it to generate other similar customer personas and industries 
+- ask it to include placeholders where the email can be customized per recipient 
+- ask it to add any calls to actions like booting a calendly meeting or encouraging an email response - tell it what kind of tone you want (informal or sales-y or something else) 
+- tell it you want to optimize for conversion 
+- ask it to generate a subject line 
+- ask it to lengthen or shorten it based on preferences 
+- ask it to generate alternative emails for the different target customers it identified

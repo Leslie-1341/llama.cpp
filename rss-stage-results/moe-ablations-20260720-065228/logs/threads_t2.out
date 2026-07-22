@@ -1,6 +1,0 @@
-| model                          |       size |     params | backend    | threads |            test |                  t/s |
-| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
-| qwen2moe A2.7B Q4_K - Medium   |   3.67 GiB |     6.01 B | CPU        |       2 |             pp1 |          4.19 ± 0.00 |
-| qwen2moe A2.7B Q4_K - Medium   |   3.67 GiB |     6.01 B | CPU        |       2 |            tg24 |          4.50 ± 0.00 |
-
-build: 1feb34372 (9299)

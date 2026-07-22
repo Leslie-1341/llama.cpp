@@ -1,0 +1,1 @@
+Android SDK introduce BroadcastReceiver.onReceive method. Is it called only from the main thread?

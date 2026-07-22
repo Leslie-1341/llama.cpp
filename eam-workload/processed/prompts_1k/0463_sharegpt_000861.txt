@@ -1,0 +1,3 @@
+I need to compress a LiFePo4 battery cell, to meet manyufacture specifications. the cell is in the shape of a rectangular cube. the cells dimensions are 205mm height , 174mm width and 72mm thick. I want to compress the cell on both sides of its largest face. 
+
+please help me with the math

@@ -1,0 +1,32 @@
+Hi, i am working on a arduino neopixel project right now. This is the code:
+#include <Adafruit_NeoPixel.h>
+
+const int buttonPin = 2;
+const int numPixels = 27;
+const int blueSide = 13; // Index of first blue pixel
+
+Adafruit_NeoPixel pixels = Adafruit_NeoPixel(numPixels, 6, NEO_GRB + NEO_KHZ800);
+
+int redSide = 0;
+int blueInvader = blueSide;
+int previousButtonState = HIGH;
+
+void setup() {
+ pixels.begin();
+ pinMode(buttonPin, INPUT);
+}
+
+void loop() {
+ int buttonState = digitalRead(buttonPin);
+
+ if (buttonState == LOW && previousButtonState == HIGH) {
+ if(blueInvader < numPixels) {
+ blueInvader++;
+ pixels.setPixelColor(blueInvader-1, pixels.Color(0,0,255));
+ pixels.setPixelColor(blueInvader, pixels.Color(255,0,0));
+ pixels.show();
+ }
+ delay(0.1);
+ }
+ previousButtonState = buttonState;
+}

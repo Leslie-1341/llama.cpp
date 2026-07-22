@@ -1,0 +1,21 @@
+7 / 7I have a list of tasks that I would like to accomplish today, can you help me prioritise and time block them so I can be the most productive?
+
+The tasks that have already a time defined can't be changed, others can have an estimate of time. Events can't overlap with each other. My work schedule starts at 9 am and ends at 6 pm, I don't want to work after that hour. I also have a one-hour lunch break from 1 pm to 2 pm, which should be assumed as a task. Prioritise the tasks so that at least the critical ones are handled.
+
+The output should only be a list, ordered by time, with the following format:
+- NAME (START_TIME - END_TIME)
+
+The list of tasks is the following: 
+- 1-1 session with the intern - 30 min
+- Update website headings: 15 min
+- Fix the issue with account creation on the app
+- Status call with Rui: 12 pm - 12.15 pm
+- Review activity data and follow up with leads: 30 min
+- Ask for feedback from the last growth session: 15 min
+- Debug client problem receiving emails
+- Review and clean backlog
+- Generate new app builds (30 min)
+- Deploy new version live: 30 min
+- Demo call with Eutelsat: 3 pm - 4.30 pm
+- Prepare next week's workshop with the team
+- Schedule a call with the development partner

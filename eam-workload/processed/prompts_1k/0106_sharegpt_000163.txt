@@ -1,0 +1,1 @@
+The code above creates a search box on website hosted on Squarespace. After the search button, it calls a search api and gets the results to display. It takes too long to render the results. But I refresh the page after clicking the search button, it shows the results immediately. Any suggestions to improve this situation?

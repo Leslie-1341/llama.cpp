@@ -1,0 +1,1 @@
+could you explain the bootstrap process of Angular?

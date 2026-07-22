@@ -1,0 +1,32 @@
+summarize this abstract into two sentence:
+Language models (LMs) have demonstrated
+remarkable performance on downstream tasks,
+using in-context exemplars or human instruc-
+tions. Recent works have shown that chain-
+of-thought (CoT) prompting can elicit mod-
+els to solve complex reasoning tasks, step-by-
+step. However, the efficacy of prompt-based
+CoT methods is restricted to very large LMs
+such as GPT-3 (175B), thus limiting deploy-
+ability. In this paper, we revisit the fine-
+tuning approach to enable complex reasoning
+in smaller LMs, optimized to efficiently per-
+form a specific task. We propose Fine-tune-
+CoT, a method that leverages the capabilities
+of very large LMs to generate reasoning sam-
+ples and teach smaller models via fine-tuning.
+We evaluate our method on publicly available
+LMs across a wide range of complex tasks and
+model sizes. We find that Fine-tune-CoT en-
+ables substantial reasoning capability in small
+models, whereas previous prompt-based base-
+lines exhibit near-random performance. Stu-
+dent models can even outperform the teacher
+in some tasks while reducing model size re-
+quirements by several orders of magnitude.
+We conduct extensive ablations and sample
+studies to understand the reasoning capabili-
+ties of student models. We also identify sev-
+eral important nuances that have been over-
+looked in concurrent fine-tuning works on CoT
+and address them in our analysis.

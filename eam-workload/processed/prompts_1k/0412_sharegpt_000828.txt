@@ -1,0 +1,1 @@
+how do you stop a mainloop from pauseing your flow in tkinter

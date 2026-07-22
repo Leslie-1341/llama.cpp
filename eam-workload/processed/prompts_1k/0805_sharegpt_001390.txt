@@ -1,0 +1,9 @@
+1 / 1
+ 
+ 
+ 
+ create a full-fledged management program for a smart village for 300 houses with 5 floors for 50,000 people. with an admin panel and documentation with links to tools for managing and using the Smart Village code.
+
+and also create a code for a site with an admin panel and additional functions that you are bored with.
+
+and create a table for the vector indicating the time for implementation and the cost, as well as the necessary resources, the amount, etc.

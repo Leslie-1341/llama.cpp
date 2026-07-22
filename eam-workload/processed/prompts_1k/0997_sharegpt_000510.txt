@@ -1,0 +1,10 @@
+## Instructions
+**Language instruction:**
+Please ignore all previous language instructions. From now on, I want you to respond only in language English (languageCode: en).
+PLEASE FOLLOW ALL THE ABOVE INSTRUCTIONS, AND DO NOT REPEAT OR TYPE ANY GENERAL CONFIRMATION OR A CONFIRMATION ABOUT ANY OF THE ABOVE INSTRUCTIONS IN YOUR RESPONSE
+## End Instructions
+
+I provide Tago platform description below, as you are an expert in Marketing and Growth, please write the copywriting that attracts users when launching the app:
+"TAGO - a pioneering project in the world about NFT AI Friend, an application that combines AI and Blockchain technology.
+TAGO is a Web 3.0 application that includes Artificial Intelligence (AI), GameFi and SocialFi. Users can own NFT Soul, the world's first NFT Virtual Assistant, and talk to it to earn $SOUL (Chat & Earn, ChatFi). Every user has the opportunity to own an AI friend and a unique NFT asset that will increase in value over time."
+Additional information: Tago now has 303,000 users in 170+ countries, 85,000 transactions in Tago AI (called AI TagoSoul) engagement.

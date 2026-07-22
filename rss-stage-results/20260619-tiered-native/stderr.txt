@@ -1,2 +1,0 @@
-[DEBUG] init_mappings: prefetch=1, use_mmap=0, use_lazy_loading=0, files.size()=1
-[DEBUG] init_mappings: prefetch=1, use_mmap=1, use_lazy_loading=0, files.size()=1

@@ -1,0 +1,5 @@
+Can you write a blog post about how AI is helping video productions with their storyboards?
+
+Include a brief summary of how storyboards help a production and mention that they often aren't budgeted for.
+
+Also, discuss the benefits of using AI image generators to create storyboards, such as using text prompts from a script to generate corresponding images Also give examples of how AI image generators can help spark the imagination of directors and animators

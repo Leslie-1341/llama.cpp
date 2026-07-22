@@ -1,0 +1,39 @@
+What could go wrong with this code? It will run in AWS lambda: import { request } from 'https';
+import type { Handler } from 'aws-lambda';
+import type { CronJobDefinition } from 'utils/projects-utils/src/types';
+
+export interface CronTriggerInvokeEvent {
+ ownerId: string;
+ deploymentId: string;
+ projectId: string;
+ cron: CronJobDefinition;
+ url: string;
+}
+
+export const handler: Handler =
+ async function triggerCronsLambda(event, context) {
+ const timestampInMs = Date.now();
+
+ const client = request(event.url, {
+ headers: {
+ 'user-agent': 'vercel-cron/1.0',
+ },
+ });
+
+ // we close the connection as soon as it was received, to avoid waiting for the response
+ await new Promise((res) =&gt; {
+ client.end(() =&gt; res());
+ });
+
+ // the following invocation response payload will be forwarded to Tinybird for usage tracking
+ return {
+ ownerId: event.ownerId,
+ deploymentId: event.deploymentId,
+ projectId: event.projectId,
+ path: event.cron.path,
+ schedule: event.cron.schedule,
+ host: event.cron.host,
+ timestampInMs,
+ awsRequestId: context.awsRequestId,
+ };
+ };

@@ -1,0 +1,140 @@
+creat all the folwling 25 tabesl in PostgreSQL database ....Users
+user_id (primary key)
+name
+email
+phone
+date_registered
+Merchants
+merchant_id (primary key)
+name
+email
+phone
+address
+Date_registered
+Transaction_provider_id
+Has_credit_terms
+credit_term_days
+
+
+Players
+player_id (primary key)
+name
+email
+phone
+date_registered
+Merchant-payments
+PaymentID INT PRIMARY KEY,
+ MerchantID INT NOT NULL,
+ PlayerID INT NOT NULL,
+ PaymentAmount DECIMAL(10, 2) NOT NULL,
+ PaymentDate DATETIME NOT NULL,
+ PaymentStatus VARCHAR(20) NOT NULL,
+ FOREIGN KEY (MerchantID) REFERENCES Merchants (MerchantID),
+ FOREIGN KEY (PlayerID) REFERENCES Players (PlayerID)
+Has_credit_terms
+credit_term_days
+);
+Opted-in Offers
+offer_id (primary key)
+merchant_id (foreign key to Merchants table)
+offer_name
+offer_description
+Cash Reward Offers
+offer_id (primary key, foreign key to Opted-in Offers table)
+transaction_id (foreign key to Transactions table)
+reward_amount
+Credit Reward Offers
+offer_id (primary key, foreign key to Opted-in Offers table)
+transaction_id (foreign key to Transactions table)
+reward_amount
+odds
+time_updated
+Points
+user_id (primary key and foreign key to Users table)
+points_balance
+Bonus Retries
+user_id (primary key and foreign key to Users table)
+bonus_retries_earned
+bonus_retries_used
+Merchant Credit
+user_id (primary key and foreign key to Users table)
+Merchant_credit_balance
+Geolocation
+merchant_id (primary key and foreign key to Merchants table)
+location
+Referral Program
+user_id (primary key and foreign key to Users table)
+referral_code
+invitee
+reward_earned
+Player Wallet
+user_id (primary key and foreign key to Users table)
+points_balance
+bonus_retries_balance
+merchant_credit_balance
+Purchased Offers
+offer_id (primary key, foreign key to Opted-in Offers table)
+user_id (foreign key to Users table)
+Date_purchased
+Points Earned
+user_id (primary key and foreign key to Users table)
+source
+points_earned
+date_time
+Points Redeemed
+user_id (primary key and foreign key to Users table)
+source
+points_redeemed
+date_time
+Dynamic Odds
+offer_id (primary key, foreign key to Opted-in Offers table)
+odds
+time_updated
+Communication
+user_id (primary key and foreign key to Users table)
+offer_id (foreign key to Opted-in Offers table)
+message
+time_sent
+Levels
+user_id (primary key and foreign key to Users table)
+level
+Transactions Providers
+transaction_provider_id (primary key)
+name
+website
+support_email
+support_phone
+Bank Linked
+user_id (primary key and foreign key to Users table)
+bank_name
+account_number
+sort_code
+Games
+game_id (primary key)
+user_id (foreign key to Users table)
+merchant_id (foreign key to Merchants table)
+game_name
+Game_description
+points_won
+credits_won
+banked_points
+banked_cridits
+Spending Merchant Credit
+transaction_id (primary key, foreign key to Transactions table)
+user_id (foreign key to Users table)
+merchant_id (foreign key to Merchants table)
+amount_spent
+amount_credited
+24. Merchant Credit Redemptions
+redemption_id (PK)
+user_id (FK)
+merchant_id (FK)
+redemption_amount
+redemption_date
+Game Statistics
+game_id (PK, FK)
+user_id (PK, FK)
+points_banked
+credit_banked
+points_won
+credit_won

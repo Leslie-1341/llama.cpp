@@ -1,0 +1,15 @@
+Web search results:
+
+[1] "Tell us more: Provide the URL of the page pertaining to your question or problem: Which operating system do you use (e.g., Windows 10, macOS Mojave)? Which browser do you use (e.g., Chrome ..."
+Source: https://www.mmafighting.com/contact
+
+[2] "Within 24 hours: Interview, business meeting, deal, conference, interview, or special event. Within 48 hours: Submission of application or another type of form. Within 1-2 weeks: Follow-up after no response regarding a meeting request or the status of a job opportunity. Every 3 months: Catch up with a member of your network to maintain your ..."
+Source: https://blog.hubspot.com/sales/follow-up-email-after-meeting-networking
+
+[3] "The ultimate training bundle. Take your training to the next level with our range of MMA gear. Shop now. Hayabusa. Hayabusa PTS 3 Micro Focus Mitts $139.95. Hayabusa. Hayabusa Boxing Target Paddles $99.95. Hayabusa. Hayabusa Boxing Training Sticks $69.95."
+Source: https://mmafightstore.com.au/
+
+
+Current date: 11/01/2023
+Instructions: Using the provided web search results, write a comprehensive reply to the given prompt. Make sure to cite results using [[number](URL)] notation after the reference. If the provided search results refer to multiple subjects with the same name, write separate answers for each subject.
+Prompt: Write me an email to MMA Fight Store, following on from a meeting I had with them recently where we discussed a potential collaboration using their bad boy fight gear and adding my logo to it and buying in wholesale. Ask them about their wholesale rates and logistics to set it upDear MMA Fight Store,I hope this email finds you well. I wanted to follow up on the meeting we had recently, where we discussed the potential for a collaboration between our companies. Specifically, I was interested in using your Bad Boy Fight Gear, and adding my logo to it for our own use. Additionally, I was wondering if it would be possible to purchase these products in wholesale.As per our conversation, the idea is to use your fight gear for the training and events for my company, and we thought it would be great to have a collaboration between us by adding our logo on the gear.Can you please provide me with more information on your wholesale rates and logistics for setting up a partnership like this? I would greatly appreciate it if you could also include any minimum order requirements, shipping and handling costs, and lead times for delivery.Please let me know if there is any additional information that I need to provide in order to move forward with this project, and thank you for your time and consideration.Best Regards[Your name]PS: I found your website and it's very informative, specially the 3 page where I saw the MMA gear products for training, looks like good quality products!

@@ -1,0 +1,38 @@
+Web search results:
+
+[1] "Know what's coming with AccuWeather's extended daily forecasts for 曼谷, 曼谷, 泰國. Up to 90 days of daily highs, lows, and precipitation chances. 返回"
+URL: https://www.accuweather.com/zh/th/bangkok/318849/daily-weather-forecast/318849
+
+[2] "Get the monthly weather forecast for 曼谷, 曼谷, 泰國, including daily high/low, historical averages, to help you plan ahead."
+URL: https://www.accuweather.com/zh/th/bangkok/318849/april-weather/318849
+
+[3] "曼谷雨季闷热难受和阴天，旱季闷热和部分多云，全年热。 在一年中，气温通常在22°c到35°c之间变化，极少低于18°c或高于37 ..."
+URL: https://zh.weatherspark.com/y/113416/%E6%B3%B0%E5%9B%BD%E3%80%81%E6%9B%BC%E8%B0%B7%E7%9A%84%E5%85%A8%E5%B9%B4%E5%B9%B3%E5%9D%87%E5%A4%A9%E6%B0%94
+
+[4] "泰國曼谷天氣天氣如何呢? 妳知道嗎？ 曼谷屬於熱帶莽原氣候， 位於赤道多雨氣候的高緯兩側，所以在雨季的時候常常會遇到洪水的災害，雨季時的曼谷街道，常常出現積水的狀況喔! ... 曼谷天氣 3 月、 4 月、 5 月 ... 16 8 月, 2019 at 10:29 下午 4 年 ago Reply."
+URL: https://girl-travel.com/bangkok-weather/
+
+[5] "泰國是港人熱愛旅遊地點之一，訂購曼谷特價機票，都要理解曼谷天氣。因為泰國屬於熱帶氣候，與香港四季不同，泰國一年只分為三季。即使都分別是3至5月的夏季，6至10月的雨季和11月至2月的乾季。 曼谷全年氣溫沒有很大改變，平均為28度，最低也有20度。"
+URL: https://blog.airbare.com.hk/8135/%E3%80%90%E6%B3%B0%E5%9C%8B-%E6%97%85%E9%81%8Atips%E3%80%91%E6%9B%BC%E8%B0%B7%E5%A4%A9%E6%B0%A3%E6%87%B6%E4%BA%BA%E5%8C%85-%E5%9B%9B%E5%AD%A3%E5%A4%A9%E6%B0%A3%E5%88%86%E6%9E%90%E5%BB%BA%E8%AD%B0/
+
+[6] "泰國自由行省錢票券＆一日遊行程推薦. 在泰國自由行、曼谷自由行過程中，想要規劃1~2天特色行程，直接參加當地旅行社一日遊很不錯，算下來其實和自己去花費差不多，還有專人服務。. 另外重要景點門票也可以事先上網購買，會比現場買更划算，也別忘記 ..."
+URL: https://mimihan.tw/bangkok-travel/
+
+[7] "泰國的天氣就開始回升。泰國熱季，白天平均氣溫可以高達35度c以上。 3、4月時，天氣非常熱，南方海島因有海洋調節，相較內陸的天氣型態，天氣較為穩定，所以除了參加潑水節，選擇到泰國南邊的海灣與島嶼度假，是非常受歡迎的! 3月：可以明顯感受，自 ..."
+URL: https://jotdownvoyage.com/best-time-to-visit-thailand/
+
+[8] "【泰國潑水節】泰國潑水節穿搭、必備用品、注意事項統整 【泰國∥必買】還在買日韓美彩妝？告訴你泰國彩妝有多狂－2019泰國必買彩妝. 其實泰國是所有東南亞國家中，最受台灣人歡迎的地區，除了機票時常促銷外，飛行時間約 3-4 小時就到了!"
+URL: https://angeltraveling.tw/2019-08-15-90/
+
+[9] "提供您臺北市最準確的 10 天天氣預報，以便預先準備，還包括最高溫、最低溫、降水機率，盡在 The Weather Channel 和 Weather.com"
+URL: https://weather.com/zh-TW/weather/tenday/l/fe7393b7f2c8eed2cf692bd079361df362d9f0c1c0f896e6e46a649295e15c7d
+
+[10] "疫情期間請遵照防疫相關規定，並留意自身防疫措施及交通安全，詳細資料請參考：中央氣象局官網首頁資料／天文資料下載之「懸日預報」。. 2023/03/01 本局花蓮氣象雷達站至112年4月底進行雷達儀更新作業，更新期間該站暫時停止觀測，. 2023/01/09 「112年氣象 ..."
+URL: https://www.cwb.gov.tw/
+
+
+Current date: 2023/3/28
+
+Instructions: Using the provided web search results, write a comprehensive reply to the given query. Make sure to cite results using [[number](URL)] notation after the reference. If the provided search results refer to multiple subjects with the same name, write separate answers for each subject.
+Query: 2023/3/29~4/5泰國天氣
+Reply in 中文

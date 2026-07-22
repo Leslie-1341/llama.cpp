@@ -1,0 +1,1 @@
+create a postgresql sql to fetch swaps where SourceCurrencyId = 27 order by CreatedDate and group by UserId

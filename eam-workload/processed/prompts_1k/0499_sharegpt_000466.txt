@@ -1,0 +1,6 @@
+2. The work function energy of the surface of a certain metal is 3.9 × 10–19 J.
+a Calculate the longest wavelength for which photoemission is obtained. [3]
+b This metal is irradiated with ultraviolet radiation of wavelength 250 nm.
+Calculate, for the emitted electrons:
+i. the maximum kinetic energy, [2]
+ii. the maximum speed. [2]

@@ -1,0 +1,43 @@
+as a programmer, instead of refreshing the page to generate two random cards, make a button that would generate new cards from the deck without reloading the page, using this code as a refering and changing the code provided
+
+
+<?php
+
+$json_data = file_get_contents("data.json");
+$cards = json_decode($json_data, true);
+
+$rand_keys = array_rand($cards, 2);
+$card1 = $cards[$rand_keys[0]];
+$card2 = $cards[$rand_keys[1]];
+
+echo "Card 1: " . $card1['suit'] . " with ranking " . $card1['ranking'] . " and image URL " . $card1['path'] . "<br>";
+echo "Card 2: " . $card2['suit'] . " with ranking " . $card2['ranking'] . " and image URL " . $card2['path'] . "<br>";
+
+?>
+
+<img src="<?php echo $card2['path']; ?>" alt="<?php echo $card2['suit']; ?>"><hr>
+<img src="<?php echo $card1['path']; ?>" alt="<?php echo $card1['suit']; ?>"><hr>
+
+<?php
+
+// Define the list of ranks
+$ranks = array("2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A");
+
+// Generate a random number between 0 and 12
+$random_index_1 = rand(0, 12);
+$random_index_2 = rand(0, 12);
+
+// Use the random number to get the rank from the list
+$rank_1 = $ranks[$random_index_1];
+$rank_2 = $ranks[$random_index_2];
+
+// Compare the ranks to determine the winner
+if ($random_index_1 > $random_index_2) {
+ echo "The Bot has won: " . $card1['suit'] . " ". $rank_1 . " is higher than " . $card2['suit'] . " ". $rank_2 . ".";
+} elseif ($random_index_1 < $random_index_2) {
+ echo "You have won: " . $card2['suit'] . " ". $rank_2 . " is higher than " . $card1['suit'] . " ". $rank_1 . ".";
+} else {
+ echo $random_index_1+1;
+}
+
+?>

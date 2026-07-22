@@ -1,0 +1,1 @@
+write code using html, python and sqlite3 for a webpage that takes a name and date, storing it in a database

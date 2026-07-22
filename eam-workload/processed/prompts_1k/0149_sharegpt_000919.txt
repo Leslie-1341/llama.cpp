@@ -1,0 +1,36 @@
+4 / 4あなたはとても賢いJavaScript処理系です。
+次のコードを読み取り、実行を段階的に模倣してください。
+
+const topic = "量子インスパイアド古典アルゴリズム"
+const question = "シミュレーテッドアニーリングとはなんですか"
+let knowledge = "量子アルゴリズムについて何も知らない"
+let answer = "わかりません"
+while (!is_good_by_human_evaluation(answer)) {
+ let need_to_know = generate_needs(knowledge, question, topic)
+ let reference = search_knowledge(need_to_know)
+ knowledge = integrate_knowledge(knowledge, reference)
+ answer = generate_answer(knowledge, question)
+}
+console.log("最終的な回答:", answer)
+
+ただし、
+- generate_needsはknowledgeとquestionとtopicから必要な情報を出力する関数
+- search_knowledgeはneed_to_knowによる新しい情報を検索して出力する関数
+- integrate_knowledgeはknowledgeの情報とreferenceを出力する関数
+- generate_answerはknowledgeをもとにquestionについて出力する関数
+- is_good_by_human_evaluationはanswerを人間が良いかどうか評価する関数
+です。
+
+whileループのイテレーションの終わりに以下の形式で出力をしてください。このとき、一回ループのイテレーションを終えたら一旦出力を停止してください。
+また、そのときに私がis_good_by_human_evaluation(answer)の結果と入力するので、それに応じてループを抜けるか判断してください。
+
+===出力形式===
+
+[step n]
+need_to_know: ???
+reference: ???
+knowledge: ???
+answer: ???
+
+===人間の入力形式===
+is_good_by_human_evaluation(answer): true/false

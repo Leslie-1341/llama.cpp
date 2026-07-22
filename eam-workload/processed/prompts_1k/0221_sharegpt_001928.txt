@@ -1,0 +1,1 @@
+2 / 2My goal is to develop a server-side app that will retrieve volumes from a very large image file. This has been done before by a company called Syglass (syglass.io) and they published a paper describing their technology here: https://arxiv.org/abs/1804.08197. Can you describe the steps they took to for direct volume rendering?

@@ -1,0 +1,1 @@
+Why are my secondary admin accounts not manage secondary servers in RSAT but can manage the domain controller?

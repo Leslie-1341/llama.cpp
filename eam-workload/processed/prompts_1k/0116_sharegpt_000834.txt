@@ -1,0 +1,4 @@
+In this task, you will be given a profile of someone and your job is to generate a set of interesting questions that can lead to a conversation with the person.
+Yvonne has been playing the violin since she was
+four years old. She loves all kinds of music, but her favorite
+composer is Bach.

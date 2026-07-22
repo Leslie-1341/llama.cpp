@@ -1,0 +1,3 @@
+ładuje moduł gsap za pomocą scryptu 
+<script type="module" src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.11.0/gsap.min.js" defer></script>
+Mam taki bląd w consoli gsap.min.js: Uncaught TypeError: Cannot set property window of #<Window> which has only a getter at gsap.min.js

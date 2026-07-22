@@ -1,0 +1,1 @@
+Write a C++ program for the Raspberry Pi 4B to control hardware GPIO pin 12 using the pigpio library

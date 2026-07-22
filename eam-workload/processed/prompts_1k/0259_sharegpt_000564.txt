@@ -1,0 +1,10 @@
+Summarize what I've done yesterday to one paragraph based on the list below:
+
+Meetings
+- 10:00 (15 minutes) AdM Scrum
+- 14:00 (30 minutes) CM-AdM Weekly
+- 15:00 (50 minutes) AdM Testcase Meeting
+- 14:00 (50 minutes) Roah / Zune
+
+Pull requests
+- [ADM-1490] Fix: lint warning github/pull_request

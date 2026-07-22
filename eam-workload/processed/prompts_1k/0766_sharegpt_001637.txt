@@ -1,0 +1,1 @@
+2 / 2Suppose the ride-hailing platform Uber is interested in setting the wage for the gig workers and wanted to know what the optimal wage is. How should the platform design a survey to get this information? The survey covers both who are already working for Uber and who are not working for Uber. Give an example

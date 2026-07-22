@@ -1,0 +1,1 @@
+su una macchina ubuntu senza accesso ad internet devo creare un proxy per accedere a dockerhub in modo che swarm riesca a scaricare le immagini

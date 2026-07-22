@@ -1,0 +1,34 @@
+make a logical tree diagram for a computers information set architecture starting at binary. make sure you include every singe component function and system so that it could be used to recreate a complete computer. Like if someone somehow gave it to the cavemen, and all throughout time it’s been a mystery like the pyramids, and then finally someone smart enough figured out this was how to build a computer and managed to do it through generations of technological advancements, like in reality. example: this is one for a scientific portfolio: 
+Portfolio
+├── Research Papers
+│ ├── Paper 1
+│ │ ├── Abstract
+│ │ ├── Introduction
+│ │ ├── Methods
+│ │ ├── Results
+│ │ └── Conclusion
+│ └── Paper 2
+│ ├── Abstract
+│ ├── Introduction
+│ ├── Methods
+│ ├── Results
+│ └── Conclusion
+├── Projects
+│ ├── Project 1
+│ │ ├── Overview
+│ │ ├── Goals and Objectives
+│ │ ├── Methods and Techniques Used 
+| | ├── Results and Findings 
+| | └── Visuals (Images or Videos)
+| |
+| └── Project 2 
+| ├── Overview 
+| ├── Goals and Objectives 
+| └── Methods and Techniques Used 
+|
+├── Presentations 
+| └── Presentation 1 
+|
+└── Awards and Recognitions
+
+obviously it needs to be hyper detailed unlike this disgusting sorry excuse for a graph i made. THANK YOU!!!2 / 2

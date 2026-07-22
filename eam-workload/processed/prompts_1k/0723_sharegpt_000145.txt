@@ -1,0 +1,19 @@
+I have a table called sales_transaction_summary, it has columns include region, merchandise week, customer type (which include commercial and consumer), sales number, department. below is the data:
+
+| Region | Merchandise Week | Customer Type | Department | Sales |
+| --- | --- | --- | --- | --- |
+| Victoria East | 202323 | Commercial | Timber | 123456 |
+| Victoria East | 202323 | Commercial | Garden | 213456 |
+| Victoria East | 202323 | Commercial | Power Tool | 231456 |
+| Victoria East | 202323 | Consumer | Timber | 246912 |
+| Victoria East | 202323 | Consumer | Garden | 426912 |
+| Victoria East | 202323 | Consumer | Power Tool | 347184 |
+| Victoria West | 202323 | Commercial | Timber | 135801.6 |
+| Victoria West | 202323 | Commercial | Garden | 213456 |
+| Victoria West | 202323 | Commercial | Power Tool | 254601.6 |
+| Victoria West | 202323 | Consumer | Timber | 259257.6 |
+| Victoria West | 202323 | Consumer | Garden | 448257.6 |
+| Victoria West | 202323 | Consumer | Power Tool | 370329.6 |
+
+I want you to reply with a table of query results in a single code block, and nothing else. Do not write explanations.
+here is my first question: what is the total sales for week 202323

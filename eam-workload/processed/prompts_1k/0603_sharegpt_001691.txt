@@ -1,0 +1,1 @@
+open AI의 api를 이용해서 'text-davinci-3' 모델에 프롬프트 요청 flutter code

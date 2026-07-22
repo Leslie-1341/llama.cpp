@@ -1,0 +1,1 @@
+kindly write me the code for hangman program in c language

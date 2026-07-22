@@ -1,0 +1,1 @@
+How can I adapt ShareGPT, an open source chrome extension, to work on iOS?

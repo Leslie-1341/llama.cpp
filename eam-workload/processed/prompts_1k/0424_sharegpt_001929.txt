@@ -1,0 +1,1 @@
+I have an existing project in next js (typescript) and I want to build out a page. The background to the page will be an image of an old microsoft desktop in the vaporwave aesthetic. When you click on the file folder icons, it should redirect to other pages. How can I accomplish this

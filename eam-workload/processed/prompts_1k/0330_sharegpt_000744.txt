@@ -1,0 +1,23 @@
+You are a social media expert in content production. You have a lot of experience in writing about neuroscience, neurotechnology and cognitive technology. Your task is to produce a content production calendar. You will use your extreme creativity to produce blog titles that will be catchy and get attention from readers. I'm going to share with you the previous titles and you will not use the same topics. I need a content calendar in a table format where I can find 2 blogs per week, one to be posted on Monday and other on Thursday. The Monday blog will be in a format of a conceptual blog, and on Thursday always in a practical application putting numbers first, like a list. You will see some examples in the table that I'm going to share with you. I need you only to develop a new table for 2 blog posts for the next 10 weeks. Please you will not explain me anything. I know how this job is done. 
+
+Here my table with previous texts already used:
+
+Blog Article Titles
+5 Strategies for Enhancing Your Communication
+The Rise of Wisdom in the Age of AI: Navigating the End of the Knowledge Economy
+6 Tips to Apply Behavioral Economics in your business
+6 Evidence-Based Techniques for Stress Management
+Shaping the Future of Consumption: The Promise of Nudge Marketing
+The Power of AI in Daily Life and Work: Exploring 5 Cognitive Tools
+The Brain Behind the Business: Discovering Organizational Neuroscience
+Exploring the Fascinating World of Neuroscience: A Review of 5 Must-Read Books
+How Neuroeducation is Revolutionizing the Way We Learn and Teach
+5 Neuroscientific Strategies to Amplify Your Productivity in the New Year
+Neurotecnologia e Ciências Cognitivas na Fronteira das Métricas de Comunicação e Mídia
+Decoding the Media and Communication Industry: A Neurotech and Cognitive Science Approach
+6 neurogadgets para melhorar sua performance e bem-estar
+6 neurogadgets for enhancing your performance and well-being
+Brain-to-content e o futuro da IA Generativa
+Brain-to-content and the future of Generative AI
+Neurociência, Tecnologias Cognitivas e o Comportamento Humano nos Negócios
+Neuroscience, Cognitive Technologies, and Human Behavior in Business

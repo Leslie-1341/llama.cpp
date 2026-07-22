@@ -1,0 +1,32 @@
+Traceback (most recent call last):
+ File "C:\Users\vieb8\GIT\HSA-Web\Source\HSA-Web\modules\hsa\core\communication\server.py", line 350, in render_thumbnail
+ img = img_reader.get_thumbnail(scene)
+ File "C:\Users\vieb8\GIT\HSA-Web\Source\HSA-Web\modules\hsa\core\image_reader\image_reader_bioformats.py", line 218, in get_thumbnail 
+ meta = self.get_metadata(0)
+ File "C:\Users\vieb8\GIT\HSA-Web\Source\HSA-Web\modules\hsa\core\image_reader\image_reader_bioformats.py", line 66, in get_metadata 
+ ome = self.get_ome()
+ File "C:\Users\vieb8\GIT\HSA-Web\Source\HSA-Web\modules\hsa\core\image_reader\image_reader_bioformats.py", line 51, in get_ome
+ ome = bioformats.OMEXML(bioformats.get_omexml_metadata(self.filename))
+ File "c:\Users\vieb8\GIT\HSA-Web\Source\Installer\files\python\lib\site-packages\bioformats\formatreader.py", line 1019, in get_omexml_metadata
+ with ImageReader(path=path, url=url, perform_init=False) as rdr:
+ File "c:\Users\vieb8\GIT\HSA-Web\Source\Installer\files\python\lib\site-packages\bioformats\formatreader.py", line 626, in __init__ 
+ self.path)
+ File "c:\Users\vieb8\GIT\HSA-Web\Source\Installer\files\python\lib\site-packages\javabridge\jutil.py", line 1717, in make_instance 
+ klass = get_env().find_class(class_name)
+AttributeError: 'NoneType' object has no attribute 'find_class'
+Traceback (most recent call last):
+ File "C:\Users\vieb8\GIT\HSA-Web\Source\HSA-Web\modules\hsa\core\communication\server.py", line 350, in render_thumbnail
+ img = img_reader.get_thumbnail(scene)
+ File "C:\Users\vieb8\GIT\HSA-Web\Source\HSA-Web\modules\hsa\core\image_reader\image_reader_bioformats.py", line 218, in get_thumbnail 
+ meta = self.get_metadata(0)
+ File "C:\Users\vieb8\GIT\HSA-Web\Source\HSA-Web\modules\hsa\core\image_reader\image_reader_bioformats.py", line 66, in get_metadata 
+ ome = self.get_ome()
+ File "C:\Users\vieb8\GIT\HSA-Web\Source\HSA-Web\modules\hsa\core\image_reader\image_reader_bioformats.py", line 51, in get_ome
+ ome = bioformats.OMEXML(bioformats.get_omexml_metadata(self.filename))
+ File "c:\Users\vieb8\GIT\HSA-Web\Source\Installer\files\python\lib\site-packages\bioformats\formatreader.py", line 1019, in get_omexml_metadata
+ with ImageReader(path=path, url=url, perform_init=False) as rdr:
+ File "c:\Users\vieb8\GIT\HSA-Web\Source\Installer\files\python\lib\site-packages\bioformats\formatreader.py", line 626, in __init__ 
+ self.path)
+ File "c:\Users\vieb8\GIT\HSA-Web\Source\Installer\files\python\lib\site-packages\javabridge\jutil.py", line 1717, in make_instance 
+ klass = get_env().find_class(class_name)
+AttributeError: 'NoneType' object has no attribute 'find_class'

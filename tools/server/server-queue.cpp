@@ -122,7 +122,7 @@ void server_queue::terminate() {
     condition_tasks.notify_all();
 }
 
-void server_queue::start_loop(int64_t idle_sleep_ms) {
+void server_queue::start_loop(int64_t idle_sleep_ms, int64_t cont_batching_wait_us) {
     running = true;
     time_last_task = ggml_time_ms();
 
@@ -148,6 +148,29 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
             if (queue_tasks.empty()) {
                 lock.unlock();
                 break;
+            }
+            if (cont_batching_wait_us > 0 &&
+                    queue_tasks.size() == 1 &&
+                    queue_tasks.front().type == SERVER_TASK_TYPE_NEXT_RESPONSE &&
+                    callback_wait_next_response &&
+                    callback_wait_next_response()) {
+                condition_tasks.wait_for(
+                        lock,
+                        std::chrono::microseconds(cont_batching_wait_us),
+                        [&] {
+                            return !running ||
+                                queue_tasks.empty() ||
+                                queue_tasks.front().type != SERVER_TASK_TYPE_NEXT_RESPONSE ||
+                                queue_tasks.size() > 1;
+                        });
+                if (!running) {
+                    QUE_DBG("%s", "terminate\n");
+                    return;
+                }
+                if (queue_tasks.empty()) {
+                    lock.unlock();
+                    break;
+                }
             }
             server_task task = std::move(queue_tasks.front());
             queue_tasks.pop_front();

@@ -1,0 +1,9 @@
+I have socket io code written in python. I have used aiohttp and async server. below is the sample code
+
+from aiohttp import web
+import socketio
+sio = socketio.AsyncServer()
+app = web.Application()
+sio.attach(app)
+
+I want to deploy it on Ubuntu. Please guide me step by step

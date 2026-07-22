@@ -1,0 +1,19 @@
+Please answer the following question.
+
+Question title: What is the difference between a final Class and a Record?
+
+
+Question body: In simple words what is the difference between a final class and a record in Java 17? In which case should I use a record?In Java 17, records are a new feature that provide a concise syntax for defining a class that has only data fields and no methods or constructors. A final class is a class that cannot be subclassed.Here is an example of a record in Java 17:Copy coderecord Point(int x, int y) {}
+This defines a Point record with two data fields x and y of type int.Here is an example of a final class in Java:Copy codepublic final class Point {
+ private final int x;
+ private final int y;
+
+ public Point(int x, int y) {
+ this.x = x;
+ this.y = y;
+ }
+
+ public int getX() { return x; }
+ public int getY() { return y; }
+}
+You should use a record if you want to define a simple data class that has only data fields and no methods or constructors. You should use a final class if you want to prevent other classes from subclassing it.

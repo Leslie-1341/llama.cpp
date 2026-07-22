@@ -1,0 +1,10 @@
+1 / 1Can you rewrite this using a higher order function?
+
+func oldRemovingDuplicates(by keyPath: KeyPath) -&gt; [Element] {
+ var uniqueIdentifiers: Set = Set()
+ var uniqueElements: [Element] = []
+ for element in self where uniqueIdentifiers.insert(element[keyPath: keyPath]).inserted {
+ uniqueElements.append(element)
+ }
+ return uniqueElements
+ }

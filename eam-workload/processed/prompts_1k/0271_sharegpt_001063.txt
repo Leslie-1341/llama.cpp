@@ -1,0 +1,1 @@
+Un étudiant en IOT doit pour son travail de fin d'étude crée une réplique du plateau téléviser du jeux question pour un champion avec son equivalent web du jeux. Peut-tu me lister la liste des composant nécéssaire a la réalisation de ce project avec leurs technologies respective

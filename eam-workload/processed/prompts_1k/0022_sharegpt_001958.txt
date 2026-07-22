@@ -1,0 +1,12 @@
+Hi, I have a newbie JS question. I have a fetch() call that returns a page in the response. How do I have the browser load the content as a page?
+
+E.g.:
+fetch(
+ 'https://dummy.com/dummy.aspx',
+ {body: form, method: "post"}
+).then((response) => {
+ return response.text()
+}).then((text) => {
+ console.log(text)
+ // load text as a new page
+});

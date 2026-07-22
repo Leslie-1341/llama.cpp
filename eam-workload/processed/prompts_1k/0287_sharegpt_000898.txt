@@ -1,0 +1,59 @@
+Please do a code review on this file: 
+
+<?php
+
+namespace App\Billing\TakeRate\Calculators;
+
+use App\Billing\TakeRate\ParameterObjects\TutorEarningsPriceComplementConfig;
+use App\LessonBooking;
+use Illuminate\Contracts\Container\BindingResolutionException;
+
+class TutorEarningsPriceComplementCalculator
+{
+ /**
+ * @param LessonBooking $booking
+ * @param TutorEarningsPriceComplementConfig $config
+ * @return array<mixed>
+ * @throws BindingResolutionException
+ */
+ public static function calculate(LessonBooking $booking, TutorEarningsPriceComplementConfig $config) : array
+ {
+ if ($booking->tutor_earnings_price_complement !== null) {
+ $previousStudentFeePercentage = $booking->tutor_earnings_price_complement;
+ } else {
+ $previousStudentFeePercentage = self::percentageStringToInt(
+ TakeRateCalculatorFactory::make($booking->lesson->relationship->tutor, $booking->lesson->relationship)
+ ->calculate($booking)
+ ->rate
+ ) / 100;
+ }
+
+ $originalPrice = $booking->price;
+ $tutorEarnings = intval($booking->price) * (1 - $previousStudentFeePercentage);
+ $newLessonBookingPrice = min(max(floor($originalPrice * $config->upliftPercentage), $originalPrice + $config->minPriceUplift), $originalPrice + $config->maxPriceUplift);
+
+ // We must round the rate down to stay within the cap, and then we need to recalculate the total price
+ $updatedLessonBookingRate = floor($newLessonBookingPrice / ($booking->duration / 3600));
+ $newLessonBookingPrice = $updatedLessonBookingRate * ($booking->duration / 3600);
+
+ // There is no built-in round down to x precision, so we need to do this janky workaround
+ $tutorEarningsPriceComplement = floor((1 - ($tutorEarnings / $newLessonBookingPrice)) * 10000) / 10000;
+
+ return [
+ $updatedLessonBookingRate,
+ $tutorEarningsPriceComplement,
+ ];
+ }
+
+ /**
+ * Convert a string percentage to an int.
+ */
+ private static function percentageStringToInt(string $value): int
+ {
+ if (\Str::endsWith($value, '%')) {
+ $value = substr($value, 0, -1);
+ }
+
+ return (int) $value;
+ }
+}

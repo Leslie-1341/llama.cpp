@@ -1,0 +1,1 @@
+Hi there! Can you write a python script that will read a VTT caption file, identify any gaps larger than 2.5 seconds between caption frames, then using the end and start times create another VTT caption file?

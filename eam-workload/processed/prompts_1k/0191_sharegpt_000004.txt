@@ -1,0 +1,23 @@
+The following is the job of the hosting service team. Assign the roles and responsibilities of the person responsible for doing the job well. Tabulate R&R.
+
+1. Service improvement: Identification and resolution of customer complaints and feedback to improve the quality and stability of existing hosting services
+2. New Service Planning: Planning and launching new hosting services that meet the needs of the target market and align with the company's goals.
+3. Establishment and review of policies: Create guidelines and rules for service provision, regularly review and update policies
+4. Roadmap management: Establishing strategies, goals, and schedules for service development and improvement to match company goals
+5. Service QA: Develop and implement testing and review procedures, monitor service performance to ensure quality of service delivery
+6. Operation of the Service: Inventory management, ordering and collection related to the provision of the Service, ensuring adequate inventory and timely delivery, monitoring the performance of the Service and implementing improvements.
+7. Merchant Settlement: Confirmation of affiliate sales data and issuance of tax invoice for cost settlement, guaranteeing data accuracy and timely payment
+8. CS Management: Responding to customer inquiries and issues through various channels
+9. Quotation proposal: Create and provide service quotation according to customer requirements
+10. Technical Support: Supporting technical issues related to the customer's website, server or other hosting services.
+11. Revenue/Cost/ROI Management: Hosting Service Revenue Analysis, Cost Structure Management and Optimization
+12. Data Visualization: Including Potential Spam Messages and Sender ID Changes
+13. DB management: managing and maintaining databases used for service provision, ensuring data accuracy, security and accessibility
+14. DB Operation Automated Management: Automating database-related tasks to increase efficiency and reduce errors, including backup, maintenance and data migration
+15. Work Standardization Management: Work process standardization to ensure work consistency and quality
+16. Establishment of work manuals and policies: Establishment of standard operation manuals, policies and documentation
+17. External Audit Response: Preparing and responding to external audits to comply with relevant laws and regulations
+18. Report Suspicion of Forgery of KISA Sender Number, Spam SMS Occurrence: Monitoring and reporting of suspicious activity related to the service, including potential spam messages and change of sender number
+19. UDB Reserved Word Management: Managing specific words to be used as company-specific domain names
+20. Certificate Management: Manage and renew security certificates for services to ensure secure communication between clients and servers.
+21. Partner Management: Partner management, including partner contract negotiations and performance monitoring

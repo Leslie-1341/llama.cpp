@@ -1,0 +1,4 @@
+dog["over power"] = true ﻿//키에 띄어쓰기가 있거나 숫자로 시작하는 경우
+let key = "test"
+dog[key] = 1 //(= dog["test"] = 1) 변수를 키로 쓰는 경우
+dog[key + "a"] = "a" //(= dog["testa"] = "a") 이런 것도 가능하다

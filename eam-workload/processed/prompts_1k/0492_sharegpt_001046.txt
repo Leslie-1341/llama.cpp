@@ -1,0 +1,1 @@
+write next.js code using appropriate javascript libraries to take a list of queries as input, and produce a carousel on the page. each tile in the carousel must have 3 stacked images for each query from the list. the images must be lazy loaded from unsplash using their api.

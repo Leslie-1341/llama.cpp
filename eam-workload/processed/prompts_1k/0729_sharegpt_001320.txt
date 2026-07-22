@@ -1,0 +1,1 @@
+Explain the terms: Positive matrix; Non-negative matrix; Stochastic matrix; Contractivity; Explain the importance of the second eigenvalue of a strictly positive stochastic matrix

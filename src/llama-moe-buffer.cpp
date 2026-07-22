@@ -294,10 +294,43 @@ struct moe_group_state {
     uint64_t pin_epoch = 0;
     double hot_score = 0.0;
     bool pinned = false;
+
+    // Sequence-level Expert Activation Matrix (EAM). The first step used these
+    // fields only for observability; the activation-aware cache policy now also
+    // uses them to score pinned groups and eviction victims.
+    uint64_t seq_access = 0;
+    uint64_t seq_rank0_access = 0;
+    uint64_t seq_first_token_epoch = 0;
+    uint64_t seq_last_token_epoch = 0;
+    uint64_t seq_future_hints = 0;
+    uint64_t seq_future_rank0_hints = 0;
+    uint64_t seq_prefetch_queued = 0;
+    uint64_t seq_prefetch_hits = 0;
+    uint64_t seq_prefetch_late = 0;
+    uint64_t seq_prefetch_unused = 0;
+    uint64_t seq_cache_hits = 0;
+    uint64_t seq_cache_misses = 0;
+    uint64_t seq_predicted = 0;
+    uint64_t seq_pred_enqueued = 0;
+    double   seq_future_score_sum = 0.0;
+    double   seq_predict_score_sum = 0.0;
+    std::array<uint64_t, 4> seq_tensor_access = {0, 0, 0, 0}; // other, gate, up, down
+};
+
+struct moe_eamc_snapshot {
+    uint64_t id = 0;
+    uint64_t start_token = 0;
+    uint64_t end_token = 0;
+    uint64_t total = 0;
+    double norm = 0.0;
+    std::unordered_map<uint64_t, uint32_t> counts;
 };
 
 struct llama_moe_buffer_context;
 static void moe_print_stats_impl(const llama_moe_buffer_context & ctx, const char * prefix);
+static void moe_eamc_snapshot_current_locked(llama_moe_buffer_context & ctx, bool force);
+static void moe_eam_trace_append_locked(const llama_moe_buffer_context & ctx);
+static void moe_eamc_load_sidecar(llama_moe_buffer_context & ctx);
 
 struct llama_moe_buffer_context {
     llama_moe_buffer_params params;
@@ -402,6 +435,29 @@ struct llama_moe_buffer_context {
     bool                    stop = false;
     uint64_t                next_task_seq = 0;
 
+    // EAM predictor state. Guarded by mtx. The transition table learns
+    // P(next-layer expert | previous-layer expert) from real routed touches
+    // within the current sequence; generated predictions still go through the
+    // normal admission gate and never count as real activations.
+    std::unordered_map<uint64_t, std::vector<uint32_t>> eam_layer_transition;
+    std::vector<int>       eam_last_layer_experts;
+    int                    eam_last_actual_layer = -1;
+    uint64_t               eam_last_actual_token_epoch = 0;
+
+    // Request-level EAM collection (EAMC). The current request/window is kept as
+    // a sparse (layer, expert) activation vector. Completed vectors are stored in
+    // a bounded in-process collection and the closest historical vector provides
+    // a prior for prediction, cache pinning, and eviction.
+    std::unordered_map<uint64_t, uint32_t> eamc_current_counts;
+    uint64_t               eamc_current_total = 0;
+    double                 eamc_current_norm = 0.0;
+    uint64_t               eamc_current_start_token = 0;
+    uint64_t               eamc_last_snapshot_token = 0;
+    uint64_t               eamc_last_match_token = 0;
+    uint64_t               eamc_next_snapshot_id = 1;
+    std::vector<moe_eamc_snapshot> eamc_snapshots;
+    std::vector<std::pair<size_t, double>> eamc_active_matches;
+
     std::atomic<uint64_t> streams{0}, hits{0}, evictions{0}, bytes_read{0};
     std::atomic<uint64_t> enqueued{0}, worker_streams{0};
     std::atomic<uint64_t> queue_dups{0}, hebf_reordered{0};
@@ -427,6 +483,22 @@ struct llama_moe_buffer_context {
     std::atomic<uint64_t> fused_ffn_hits{0}, fused_ffn_misses{0}, fused_ffn_runs{0}, fused_ffn_pairs{0}, fused_ffn_tiles{0}, fused_ffn_fallbacks{0};
     std::atomic<uint64_t> group_touches{0}, group_evictions{0}, group_evicted_slices{0};
     std::atomic<uint64_t> pinned_hits{0}, active_hits{0}, belady_evictions{0}, lru_fallback_evictions{0};
+    std::atomic<uint64_t> eam_access{0}, eam_rank0_access{0}, eam_future_hints{0}, eam_prefetch_queued{0};
+    std::atomic<uint64_t> eam_prefetch_hits{0}, eam_prefetch_late{0}, eam_prefetch_unused{0};
+    std::atomic<uint64_t> eam_cache_hits{0}, eam_cache_misses{0};
+    std::atomic<uint64_t> eam_prefetch_admit{0}, eam_prefetch_drop{0};
+    std::atomic<uint64_t> eam_prefetch_drop_budget{0}, eam_prefetch_drop_distance{0}, eam_prefetch_drop_score{0};
+    std::atomic<uint64_t> eam_prefetch_drop_active{0}, eam_prefetch_drop_pinned{0}, eam_prefetch_drop_recent{0};
+    std::atomic<uint64_t> eam_prefetch_admit_score_x1000{0};
+    std::atomic<uint64_t> eam_prefetch_drop_score_x1000{0};
+    std::atomic<uint64_t> eam_speculative_bytes_peak{0};
+    std::atomic<uint64_t> eam_predict_runs{0}, eam_predict_candidates{0}, eam_predict_enqueued{0}, eam_predict_dropped{0};
+    std::atomic<uint64_t> eam_predict_score_x1000{0};
+    std::atomic<uint64_t> eamc_snapshot_count{0}, eamc_match_runs{0}, eamc_match_hits{0}, eamc_match_misses{0};
+    std::atomic<uint64_t> eamc_match_score_x1000{0}, eamc_prior_hits{0};
+    std::atomic<uint64_t> eam_evict_spec_unused{0}, eam_evict_low_score{0}, eam_evict_far_future{0}, eam_evict_lru_relaxed{0};
+    std::atomic<uint64_t> eam_evict_protect_active{0}, eam_evict_protect_pinned{0}, eam_evict_protect_recent{0};
+    std::atomic<uint64_t> eam_evict_protect_high{0}, eam_evict_protect_early{0};
     uint64_t              exec_epoch = 0;
     uint64_t              future_epoch = 0;
     uint64_t              pin_refresh_at = 0;
@@ -496,6 +568,11 @@ struct llama_moe_buffer_context {
             if (w.joinable()) {
                 w.join();
             }
+        }
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            moe_eamc_snapshot_current_locked(*this, true);
+            moe_eam_trace_append_locked(*this);
         }
         if (params.debug_log) {
             moe_print_stats_impl(*this, "llama_moe_buffer[teardown]");
@@ -1012,6 +1089,7 @@ std::shared_ptr<llama_moe_buffer_context> llama_moe_buffer_create(const llama_mo
     ctx->align = g_page;
     moe_sidecar_index(*ctx);
     moe_cache_create(*ctx);
+    moe_eamc_load_sidecar(*ctx);
     if (params.enabled) {
         const int n = std::max(1, params.n_workers);
         ctx->workers.reserve(n);
@@ -1536,12 +1614,732 @@ static bool moe_group_in_cooldown(const llama_moe_buffer_context & ctx, const mo
             ctx.profile_token_epoch - g.last_used_token_epoch <= (uint64_t) ctx.params.group_cooldown_tokens;
 }
 
+static bool moe_group_used_within_tokens(const llama_moe_buffer_context & ctx, const moe_group_state & g, int n_tokens) {
+    if (n_tokens <= 0 || g.last_used_token_epoch == 0) {
+        return false;
+    }
+    return ctx.profile_token_epoch <= g.last_used_token_epoch ||
+            ctx.profile_token_epoch - g.last_used_token_epoch <= (uint64_t) n_tokens;
+}
+
+static int moe_kind_index(const moe_managed & m) {
+    switch (moe_kind(m)) {
+        case moe_tensor_kind::gate: return 1;
+        case moe_tensor_kind::up:   return 2;
+        case moe_tensor_kind::down: return 3;
+        case moe_tensor_kind::other:
+        default: return 0;
+    }
+}
+
+static double moe_env_f64(const char * name, double def) {
+    const char * v = std::getenv(name);
+    return v == nullptr || v[0] == '\0' ? def : std::atof(v);
+}
+
+static int moe_env_i32(const char * name, int def) {
+    const char * v = std::getenv(name);
+    return v == nullptr || v[0] == '\0' ? def : std::atoi(v);
+}
+
+static bool moe_env_flag(const char * name, int def) {
+    return moe_env_i32(name, def) > 0;
+}
+
+static void moe_atomic_max_u64(std::atomic<uint64_t> & dst, uint64_t value) {
+    uint64_t old = dst.load(std::memory_order_relaxed);
+    while (old < value && !dst.compare_exchange_weak(old, value, std::memory_order_relaxed)) {}
+}
+
+static bool moe_eamc_enabled() {
+    return moe_env_flag("LLAMA_LAZY_MOE_EAMC", 0);
+}
+
+static int moe_eamc_max_snapshots() {
+    return std::max(1, moe_env_i32("LLAMA_LAZY_MOE_EAMC_MAX", 16));
+}
+
+static int moe_eamc_snapshot_tokens() {
+    return std::max(1, moe_env_i32("LLAMA_LAZY_MOE_EAMC_SNAPSHOT_TOKENS", 64));
+}
+
+static int moe_eamc_min_access() {
+    return std::max(1, moe_env_i32("LLAMA_LAZY_MOE_EAMC_MIN_ACCESS", 256));
+}
+
+static int moe_eamc_match_every_tokens() {
+    return std::max(1, moe_env_i32("LLAMA_LAZY_MOE_EAMC_MATCH_EVERY", 4));
+}
+
+static int moe_eamc_match_topk() {
+    return std::max(1, moe_env_i32("LLAMA_LAZY_MOE_EAMC_MATCH_TOPK", 2));
+}
+
+static double moe_eamc_min_similarity() {
+    return moe_env_f64("LLAMA_LAZY_MOE_EAMC_MIN_SIM", 0.10);
+}
+
+static int moe_max_layer_index(const llama_moe_buffer_context & ctx) {
+    int max_layer = 0;
+    for (const auto & kv : ctx.by_layer) {
+        max_layer = std::max(max_layer, kv.first);
+    }
+    return max_layer;
+}
+
+static double moe_eamc_compute_norm(const std::unordered_map<uint64_t, uint32_t> & counts) {
+    double sum = 0.0;
+    for (const auto & kv : counts) {
+        sum += (double) kv.second * (double) kv.second;
+    }
+    return std::sqrt(sum);
+}
+
+static void moe_eamc_clear_current_locked(llama_moe_buffer_context & ctx) {
+    ctx.eamc_current_counts.clear();
+    ctx.eamc_current_total = 0;
+    ctx.eamc_current_norm = 0.0;
+    ctx.eamc_current_start_token = ctx.profile_token_epoch;
+    ctx.eamc_last_snapshot_token = ctx.profile_token_epoch;
+    ctx.eamc_last_match_token = 0;
+    ctx.eamc_active_matches.clear();
+}
+
+static void moe_eamc_note_access_locked(
+        llama_moe_buffer_context & ctx,
+        int                        layer,
+        int                        expert,
+        uint64_t                   count) {
+    if (!moe_eamc_enabled() || layer < 0 || expert < 0 || count == 0) {
+        return;
+    }
+    if (ctx.eamc_current_start_token == 0) {
+        ctx.eamc_current_start_token = ctx.profile_token_epoch;
+        ctx.eamc_last_snapshot_token = ctx.profile_token_epoch;
+    }
+    const uint64_t key = moe_group_key(layer, expert);
+    uint32_t & v = ctx.eamc_current_counts[key];
+    const uint64_t nv = std::min<uint64_t>(UINT32_MAX, (uint64_t) v + count);
+    v = (uint32_t) nv;
+    ctx.eamc_current_total += count;
+}
+
+static double moe_eamc_similarity_locked(
+        const llama_moe_buffer_context & ctx,
+        const moe_eamc_snapshot &        snap) {
+    if (ctx.eamc_current_counts.empty() || snap.counts.empty()) {
+        return 0.0;
+    }
+    const double current_norm = ctx.eamc_current_norm > 0.0 ?
+        ctx.eamc_current_norm : moe_eamc_compute_norm(ctx.eamc_current_counts);
+    if (current_norm <= 0.0 || snap.norm <= 0.0) {
+        return 0.0;
+    }
+    const auto * small = &ctx.eamc_current_counts;
+    const auto * large = &snap.counts;
+    if (small->size() > large->size()) {
+        small = &snap.counts;
+        large = &ctx.eamc_current_counts;
+    }
+    double dot = 0.0;
+    for (const auto & kv : *small) {
+        auto it = large->find(kv.first);
+        if (it != large->end()) {
+            dot += (double) kv.second * (double) it->second;
+        }
+    }
+    return dot / (current_norm * snap.norm);
+}
+
+static void moe_eamc_match_locked(llama_moe_buffer_context & ctx, bool force) {
+    if (!moe_eamc_enabled()) {
+        return;
+    }
+    if (ctx.eamc_snapshots.empty() || ctx.eamc_current_total < (uint64_t) moe_eamc_min_access()) {
+        if (force) {
+            ctx.eamc_match_misses.fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
+    }
+    if (!force && ctx.eamc_last_match_token != 0 &&
+            ctx.profile_token_epoch <= ctx.eamc_last_match_token + (uint64_t) moe_eamc_match_every_tokens()) {
+        return;
+    }
+    ctx.eamc_current_norm = moe_eamc_compute_norm(ctx.eamc_current_counts);
+    struct match_candidate {
+        size_t idx = 0;
+        double sim = 0.0;
+    };
+    std::vector<match_candidate> matches;
+    matches.reserve(ctx.eamc_snapshots.size());
+    const double min_sim = moe_eamc_min_similarity();
+    for (size_t i = 0; i < ctx.eamc_snapshots.size(); ++i) {
+        const double sim = moe_eamc_similarity_locked(ctx, ctx.eamc_snapshots[i]);
+        if (sim >= min_sim) {
+            matches.push_back({i, sim});
+        }
+    }
+    std::sort(matches.begin(), matches.end(), [](const match_candidate & a, const match_candidate & b) {
+        if (a.sim != b.sim) {
+            return a.sim > b.sim;
+        }
+        return a.idx > b.idx;
+    });
+    ctx.eamc_active_matches.clear();
+    const int topk = std::min<int>(moe_eamc_match_topk(), (int) matches.size());
+    double score_sum = 0.0;
+    for (int i = 0; i < topk; ++i) {
+        ctx.eamc_active_matches.push_back({matches[(size_t) i].idx, matches[(size_t) i].sim});
+        score_sum += matches[(size_t) i].sim;
+    }
+    ctx.eamc_last_match_token = ctx.profile_token_epoch;
+    ctx.eamc_match_runs.fetch_add(1, std::memory_order_relaxed);
+    if (topk > 0) {
+        const double avg_sim = score_sum / (double) topk;
+        ctx.eamc_match_hits.fetch_add(1, std::memory_order_relaxed);
+        ctx.eamc_match_score_x1000.fetch_add((uint64_t) std::max(0.0, avg_sim * 1000.0), std::memory_order_relaxed);
+    } else {
+        ctx.eamc_match_misses.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+static void moe_eamc_snapshot_current_locked(llama_moe_buffer_context & ctx, bool force) {
+    if (!moe_eamc_enabled()) {
+        return;
+    }
+    const uint64_t age = ctx.profile_token_epoch >= ctx.eamc_current_start_token ?
+        ctx.profile_token_epoch - ctx.eamc_current_start_token : 0;
+    if (!force && age < (uint64_t) moe_eamc_snapshot_tokens()) {
+        return;
+    }
+    if (ctx.eamc_current_total < (uint64_t) moe_eamc_min_access() || ctx.eamc_current_counts.empty()) {
+        if (force) {
+            moe_eamc_clear_current_locked(ctx);
+        }
+        return;
+    }
+    moe_eamc_snapshot snap;
+    snap.id = ctx.eamc_next_snapshot_id++;
+    snap.start_token = ctx.eamc_current_start_token;
+    snap.end_token = ctx.profile_token_epoch;
+    snap.total = ctx.eamc_current_total;
+    snap.counts = ctx.eamc_current_counts;
+    snap.norm = moe_eamc_compute_norm(snap.counts);
+    if (snap.norm > 0.0) {
+        const int max_snapshots = moe_eamc_max_snapshots();
+        while ((int) ctx.eamc_snapshots.size() >= max_snapshots) {
+            ctx.eamc_snapshots.erase(ctx.eamc_snapshots.begin());
+        }
+        ctx.eamc_snapshots.push_back(std::move(snap));
+        ctx.eamc_snapshot_count.fetch_add(1, std::memory_order_relaxed);
+    }
+    moe_eamc_clear_current_locked(ctx);
+}
+
+static void moe_eamc_tick_locked(llama_moe_buffer_context & ctx) {
+    if (!moe_eamc_enabled()) {
+        return;
+    }
+    moe_eamc_match_locked(ctx, false);
+    moe_eamc_snapshot_current_locked(ctx, false);
+}
+
+static double moe_eamc_prior_locked(
+        const llama_moe_buffer_context & ctx,
+        int                              layer,
+        int                              expert) {
+    if (!moe_eamc_enabled() || ctx.eamc_active_matches.empty() || layer < 0 || expert < 0) {
+        return 0.0;
+    }
+    const uint64_t key = moe_group_key(layer, expert);
+    double weighted = 0.0;
+    double weights = 0.0;
+    for (const auto & match : ctx.eamc_active_matches) {
+        if (match.first >= ctx.eamc_snapshots.size()) {
+            continue;
+        }
+        const moe_eamc_snapshot & snap = ctx.eamc_snapshots[match.first];
+        auto it = snap.counts.find(key);
+        if (it == snap.counts.end() || snap.total == 0) {
+            continue;
+        }
+        weighted += match.second * ((double) it->second / (double) snap.total);
+        weights += match.second;
+    }
+    return weights > 0.0 ? weighted / weights : 0.0;
+}
+
+static double moe_eamc_prior(
+        const llama_moe_buffer_context & ctx,
+        int                              layer,
+        int                              expert) {
+    const double prior = moe_eamc_prior_locked(ctx, layer, expert);
+    if (prior > 0.0) {
+        const_cast<llama_moe_buffer_context &>(ctx).eamc_prior_hits.fetch_add(1, std::memory_order_relaxed);
+    }
+    return prior;
+}
+
+static void moe_eamc_load_sidecar(llama_moe_buffer_context & ctx) {
+    const char * path = std::getenv("LLAMA_LAZY_MOE_EAMC_SIDECAR");
+    if (path == nullptr || path[0] == '\0') {
+        return;
+    }
+
+    FILE * f = std::fopen(path, "rb");
+    if (f == nullptr) {
+        if (ctx.params.debug_log) {
+            std::fprintf(stderr, "llama_moe_buffer: failed to open EAMC sidecar %s\n", path);
+        }
+        return;
+    }
+
+    char magic[8] = {};
+    uint32_t version = 0;
+    uint32_t n_layer = 0;
+    uint32_t n_expert = 0;
+    uint32_t n_snapshot = 0;
+    bool ok = std::fread(magic, 1, sizeof(magic), f) == sizeof(magic) &&
+        std::fread(&version, sizeof(version), 1, f) == 1 &&
+        std::fread(&n_layer, sizeof(n_layer), 1, f) == 1 &&
+        std::fread(&n_expert, sizeof(n_expert), 1, f) == 1 &&
+        std::fread(&n_snapshot, sizeof(n_snapshot), 1, f) == 1;
+    if (!ok || std::memcmp(magic, "EAMCV1\0", 7) != 0 || version != 1) {
+        if (ctx.params.debug_log) {
+            std::fprintf(stderr, "llama_moe_buffer: invalid EAMC sidecar %s\n", path);
+        }
+        std::fclose(f);
+        return;
+    }
+
+    const int max_snapshots = moe_eamc_max_snapshots();
+    uint32_t loaded = 0;
+    for (uint32_t i = 0; i < n_snapshot; ++i) {
+        uint64_t id = 0;
+        uint64_t weight = 0;
+        uint64_t total = 0;
+        double norm = 0.0;
+        uint32_t item_count = 0;
+        ok = std::fread(&id, sizeof(id), 1, f) == 1 &&
+            std::fread(&weight, sizeof(weight), 1, f) == 1 &&
+            std::fread(&total, sizeof(total), 1, f) == 1 &&
+            std::fread(&norm, sizeof(norm), 1, f) == 1 &&
+            std::fread(&item_count, sizeof(item_count), 1, f) == 1;
+        if (!ok) {
+            break;
+        }
+
+        moe_eamc_snapshot snap;
+        snap.id = id;
+        snap.start_token = 0;
+        snap.end_token = weight;
+        snap.total = total;
+        snap.norm = norm;
+        snap.counts.reserve((size_t) item_count);
+        for (uint32_t j = 0; j < item_count; ++j) {
+            uint16_t layer = 0;
+            uint16_t expert = 0;
+            uint32_t count = 0;
+            uint32_t rank0 = 0;
+            ok = std::fread(&layer, sizeof(layer), 1, f) == 1 &&
+                std::fread(&expert, sizeof(expert), 1, f) == 1 &&
+                std::fread(&count, sizeof(count), 1, f) == 1 &&
+                std::fread(&rank0, sizeof(rank0), 1, f) == 1;
+            GGML_UNUSED(rank0);
+            if (!ok) {
+                break;
+            }
+            if (layer < n_layer && expert < n_expert && count > 0) {
+                snap.counts[moe_group_key((int) layer, (int) expert)] = count;
+            }
+        }
+        if (!ok) {
+            break;
+        }
+        if (snap.total == 0) {
+            uint64_t total_from_items = 0;
+            for (const auto & kv : snap.counts) {
+                total_from_items += kv.second;
+            }
+            snap.total = total_from_items;
+        }
+        if (snap.norm <= 0.0) {
+            snap.norm = moe_eamc_compute_norm(snap.counts);
+        }
+        if (!snap.counts.empty() && snap.total > 0 && snap.norm > 0.0 &&
+                (int) ctx.eamc_snapshots.size() < max_snapshots) {
+            ctx.eamc_snapshots.push_back(std::move(snap));
+            ++loaded;
+        }
+    }
+    std::fclose(f);
+    ctx.eamc_snapshot_count.fetch_add(loaded, std::memory_order_relaxed);
+    if (ctx.params.debug_log) {
+        std::fprintf(stderr,
+                "llama_moe_buffer: loaded %u/%u EAMC snapshots from %s (layers=%u experts=%u)\n",
+                loaded, n_snapshot, path, n_layer, n_expert);
+    }
+}
+
+static double moe_group_cache_score(
+        const llama_moe_buffer_context & ctx,
+        const moe_group_state &          g,
+        size_t                           resident_bytes) {
+    const double total_access = (double) std::max<uint64_t>(1, ctx.eam_access.load(std::memory_order_relaxed));
+    const double seq_activation_rate = (double) g.seq_access / total_access;
+    const double rank0_rate = g.seq_access > 0 ? (double) g.seq_rank0_access / (double) g.seq_access : 0.0;
+
+    const uint64_t hit = g.seq_cache_hits + g.seq_prefetch_hits;
+    const uint64_t miss = g.seq_cache_misses + g.seq_prefetch_late + g.seq_prefetch_unused;
+    const double hit_rate = (hit + miss) > 0 ? (double) hit / (double) (hit + miss) : 0.0;
+    const uint64_t age = g.seq_last_token_epoch == 0 || ctx.profile_token_epoch < g.seq_last_token_epoch ?
+        0 : ctx.profile_token_epoch - g.seq_last_token_epoch;
+    const double recency = g.seq_last_token_epoch == 0 ? 0.0 : 1.0 / (1.0 + (double) age);
+    const double recent_hit = hit_rate * recency;
+
+    const int max_layer = std::max(1, moe_max_layer_index(ctx));
+    const double early_layer_bonus = g.layer >= 0 ?
+        1.0 - std::min(1.0, (double) g.layer / (double) max_layer) : 0.0;
+    const double size_cost = (double) resident_bytes / 1048576.0;
+
+    const double a = moe_env_f64("LLAMA_LAZY_MOE_EAM_CACHE_A", 10000.0);
+    const double b = moe_env_f64("LLAMA_LAZY_MOE_EAM_CACHE_B", 40.0);
+    const double c = moe_env_f64("LLAMA_LAZY_MOE_EAM_CACHE_C", 25.0);
+    const double d = moe_env_f64("LLAMA_LAZY_MOE_EAM_CACHE_D", 20.0);
+    const double e = moe_env_f64("LLAMA_LAZY_MOE_EAM_CACHE_E", 0.50);
+    const double eamc = moe_env_f64("LLAMA_LAZY_MOE_EAMC_CACHE_W", 9000.0);
+
+    return a * seq_activation_rate +
+           b * rank0_rate +
+           c * recent_hit +
+           d * early_layer_bonus -
+           e * size_cost +
+           eamc * moe_eamc_prior(ctx, g.layer, g.expert);
+}
+
+static double moe_group_cache_score(const llama_moe_buffer_context & ctx, const moe_group_state & g) {
+    return moe_group_cache_score(ctx, g, moe_group_resident_bytes(ctx, g.layer, g.expert));
+}
+
+static int moe_forward_layer_distance(const llama_moe_buffer_context & ctx, int target_layer) {
+    if (target_layer < 0) {
+        return INT_MAX / 2;
+    }
+    const int current = ctx.profile_last_layer >= 0 ? ctx.profile_last_layer : 0;
+    const int n_layer = std::max(1, moe_max_layer_index(ctx) + 1);
+    int dist = target_layer - current;
+    if (dist < 0) {
+        dist += n_layer;
+    }
+    return std::max(0, dist);
+}
+
+static size_t moe_eam_prefetch_budget_bytes(const llama_moe_buffer_context & ctx) {
+    const int env_mb = moe_env_i32("LLAMA_LAZY_MOE_EAM_PREFETCH_MB", -1);
+    if (env_mb >= 0) {
+        return (size_t) env_mb * 1048576ull;
+    }
+    if (ctx.params.budget_bytes > 0 && ctx.params.budget_bytes <= 1536ull * 1048576ull) {
+        return 128ull * 1048576ull;
+    }
+    if (ctx.params.budget_bytes > 0 && ctx.params.budget_bytes <= 3072ull * 1048576ull) {
+        return 192ull * 1048576ull;
+    }
+    return 256ull * 1048576ull;
+}
+
+static int moe_eam_prefetch_max_distance(const llama_moe_buffer_context & ctx) {
+    const int env_dist = moe_env_i32("LLAMA_LAZY_MOE_EAM_PREFETCH_DISTANCE", -1);
+    if (env_dist >= 0) {
+        return env_dist;
+    }
+    return ctx.params.budget_bytes > 0 && ctx.params.budget_bytes <= 1536ull * 1048576ull ? 2 : 4;
+}
+
+static size_t moe_speculative_bytes_locked(const llama_moe_buffer_context & ctx) {
+    size_t total = 0;
+    for (const auto & kv : ctx.by_name) {
+        const moe_managed & m = kv.second;
+        for (int e = 0; e < m.n_expert; ++e) {
+            if (e < (int) m.queued.size() && m.queued[e]) {
+                const int bits = e < (int) m.queued_bits.size() && m.queued_bits[e] > 0 ?
+                    m.queued_bits[e] : ctx.params.base_bits;
+                total += moe_effective_stream_bytes_for_target(ctx, m, e, bits);
+            }
+            if (e < (int) m.prefetched.size() && m.prefetched[e] &&
+                    e < (int) m.resident_touched.size() && !m.resident_touched[e]) {
+                total += moe_slice_resident_bytes(m, e);
+            }
+        }
+    }
+    return total;
+}
+
+static bool moe_group_has_speculative_unused(const llama_moe_buffer_context & ctx, int layer, int expert) {
+    auto it = ctx.by_layer.find(layer);
+    if (it == ctx.by_layer.end()) {
+        return false;
+    }
+    for (const moe_managed * m : it->second) {
+        if (m == nullptr || expert < 0 || expert >= m->n_expert) {
+            continue;
+        }
+        if (expert < (int) m->prefetched.size() && m->prefetched[expert] &&
+                expert < (int) m->resident_touched.size() && !m->resident_touched[expert]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static double moe_group_seq_rate(const llama_moe_buffer_context & ctx, const moe_group_state & g) {
+    const double total_access = (double) std::max<uint64_t>(1, ctx.eam_access.load(std::memory_order_relaxed));
+    return (double) g.seq_access / total_access;
+}
+
+static bool moe_group_is_high_sequence(const llama_moe_buffer_context & ctx, const moe_group_state & g, double cache_score) {
+    const double keep_score = moe_env_f64("LLAMA_LAZY_MOE_EAM_EVICT_KEEP_SCORE", 125.0);
+    const double keep_rate = moe_env_f64("LLAMA_LAZY_MOE_EAM_EVICT_KEEP_RATE", 0.0080);
+    return cache_score >= keep_score || moe_group_seq_rate(ctx, g) >= keep_rate;
+}
+
+static bool moe_group_is_early_high_reuse(const moe_group_state & g, double cache_score) {
+    const int early_layers = moe_env_i32("LLAMA_LAZY_MOE_EAM_EVICT_EARLY_LAYERS", 4);
+    if (g.layer < 0 || g.layer > early_layers) {
+        return false;
+    }
+    const double keep_score = moe_env_f64("LLAMA_LAZY_MOE_EAM_EVICT_EARLY_KEEP_SCORE", 95.0);
+    return cache_score >= keep_score || g.seq_rank0_access >= std::max<uint64_t>(4, g.seq_access / 2);
+}
+
+static bool moe_group_speculative_unused_evictable(
+        const llama_moe_buffer_context & ctx,
+        const moe_group_state &          g,
+        uint64_t                         future_distance,
+        int                              layer_distance) {
+    const double low_score = moe_env_f64("LLAMA_LAZY_MOE_EAM_EVICT_SPEC_LOW_SCORE", 80.0);
+    if (g.hot_score <= low_score) {
+        return true;
+    }
+
+    const int layer_guard = moe_env_i32("LLAMA_LAZY_MOE_EAM_EVICT_SPEC_LAYER_GUARD", 6);
+    if (layer_distance <= layer_guard) {
+        return false;
+    }
+
+    const uint64_t reuse_guard = (uint64_t) moe_env_i32(
+            "LLAMA_LAZY_MOE_EAM_EVICT_SPEC_REUSE_GUARD",
+            std::max(2 * std::max(1, ctx.params.active_window), 24));
+    if (future_distance != UINT64_MAX && future_distance <= reuse_guard) {
+        return false;
+    }
+
+    const uint64_t hits = g.seq_prefetch_hits;
+    const uint64_t unused = g.seq_prefetch_unused;
+    const bool bad_history = unused >= std::max<uint64_t>(2, hits * 2 + 1);
+    return future_distance == UINT64_MAX || bad_history;
+}
+
+static bool moe_eam_can_reclaim_without_protected_locked(
+        llama_moe_buffer_context & ctx,
+        size_t                     needed_bytes,
+        double                     recent_score_threshold) {
+    if (ctx.params.budget_bytes == 0 || ctx.resident_bytes + needed_bytes <= ctx.params.budget_bytes) {
+        return true;
+    }
+
+    size_t reclaimable = 0;
+    for (auto it = ctx.lru.rbegin(); it != ctx.lru.rend(); ++it) {
+        moe_managed * m = it->first;
+        const int e = it->second;
+        if (m == nullptr || e < 0 || e >= m->n_expert || m->layer < 0) {
+            continue;
+        }
+        moe_group_state & g = moe_group_get(ctx, m->layer, e);
+        const bool recent_high =
+            moe_group_is_recently_used(ctx, g) &&
+            moe_group_cache_score(ctx, g) >= recent_score_threshold;
+        if (g.pinned || moe_group_is_active(ctx, g) || recent_high ||
+                moe_group_in_cooldown(ctx, g) || moe_group_has_inflight_or_queued(ctx, m->layer, e)) {
+            continue;
+        }
+        reclaimable += moe_group_resident_bytes(ctx, m->layer, e);
+        if (ctx.resident_bytes + needed_bytes <= ctx.params.budget_bytes + reclaimable) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static double moe_eam_prefetch_score_locked(
+        const llama_moe_buffer_context & ctx,
+        const moe_group_state &          g,
+        int                              target_layer,
+        int                              rank,
+        float                            clg_score,
+        size_t                           speculative_bytes) {
+    const double total_access = (double) std::max<uint64_t>(1, ctx.eam_access.load(std::memory_order_relaxed));
+    const double seq_activation_rate = (double) g.seq_access / total_access;
+    const int dist = moe_forward_layer_distance(ctx, target_layer);
+    const double proximity = 1.0 / (1.0 + (double) std::max(0, dist));
+    const double miss_cost = g.seq_access > 0 ?
+        (double) (g.seq_cache_misses + g.seq_prefetch_late) / (double) g.seq_access : 0.25;
+    const double rank_conf = 1.0 / (1.0 + (double) std::max(0, rank));
+    const double score_conf = clg_score > 0.0f ? std::min(1.0, (double) clg_score) : 0.0;
+    const double confidence = 0.75 * rank_conf + 0.25 * score_conf;
+    const double unused_rate = g.seq_prefetch_queued > 0 ?
+        (double) g.seq_prefetch_unused / (double) g.seq_prefetch_queued : 0.0;
+    const double pressure = (double) speculative_bytes /
+        (double) std::max<size_t>(1, moe_eam_prefetch_budget_bytes(ctx));
+    const double pollution_penalty = unused_rate + std::max(0.0, pressure - 0.75);
+
+    const double a = moe_env_f64("LLAMA_LAZY_MOE_EAM_PREFETCH_A", 6000.0);
+    const double b = moe_env_f64("LLAMA_LAZY_MOE_EAM_PREFETCH_B", 2.0);
+    const double c = moe_env_f64("LLAMA_LAZY_MOE_EAM_PREFETCH_C", 1.5);
+    const double d = moe_env_f64("LLAMA_LAZY_MOE_EAM_PREFETCH_D", 1.5);
+    const double e = moe_env_f64("LLAMA_LAZY_MOE_EAM_PREFETCH_E", 2.0);
+    const double hist = moe_env_f64("LLAMA_LAZY_MOE_EAMC_PREFETCH_W", 5000.0);
+    return a * seq_activation_rate +
+           b * proximity +
+           c * miss_cost +
+           d * confidence -
+           e * pollution_penalty +
+           hist * moe_eamc_prior(ctx, target_layer, g.expert);
+}
+
+enum class moe_prefetch_admit_result : uint8_t {
+    ADMIT = 0,
+    BUDGET,
+    DISTANCE,
+    SCORE,
+    ACTIVE,
+    PINNED,
+    RECENT,
+};
+
+static void moe_eam_note_prefetch_admission(
+        llama_moe_buffer_context & ctx,
+        moe_prefetch_admit_result  result,
+        double                     score,
+        size_t                     speculative_bytes) {
+    const uint64_t score_x1000 = (uint64_t) std::max(0.0, score * 1000.0);
+    moe_atomic_max_u64(ctx.eam_speculative_bytes_peak, (uint64_t) speculative_bytes);
+    if (result == moe_prefetch_admit_result::ADMIT) {
+        ctx.eam_prefetch_admit.fetch_add(1, std::memory_order_relaxed);
+        ctx.eam_prefetch_admit_score_x1000.fetch_add(score_x1000, std::memory_order_relaxed);
+        return;
+    }
+    ctx.eam_prefetch_drop.fetch_add(1, std::memory_order_relaxed);
+    ctx.eam_prefetch_drop_score_x1000.fetch_add(score_x1000, std::memory_order_relaxed);
+    switch (result) {
+        case moe_prefetch_admit_result::BUDGET:
+            ctx.eam_prefetch_drop_budget.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case moe_prefetch_admit_result::DISTANCE:
+            ctx.eam_prefetch_drop_distance.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case moe_prefetch_admit_result::SCORE:
+            ctx.eam_prefetch_drop_score.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case moe_prefetch_admit_result::ACTIVE:
+            ctx.eam_prefetch_drop_active.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case moe_prefetch_admit_result::PINNED:
+            ctx.eam_prefetch_drop_pinned.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case moe_prefetch_admit_result::RECENT:
+            ctx.eam_prefetch_drop_recent.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case moe_prefetch_admit_result::ADMIT:
+            break;
+    }
+}
+
+static moe_prefetch_admit_result moe_eam_prefetch_blocked_reason_locked(
+        llama_moe_buffer_context & ctx,
+        double                     recent_score_threshold) {
+    for (auto it = ctx.lru.rbegin(); it != ctx.lru.rend(); ++it) {
+        moe_managed * m = it->first;
+        const int e = it->second;
+        if (m == nullptr || e < 0 || e >= m->n_expert || m->layer < 0) {
+            continue;
+        }
+        moe_group_state & g = moe_group_get(ctx, m->layer, e);
+        if (g.pinned) {
+            return moe_prefetch_admit_result::PINNED;
+        }
+        if (moe_group_is_active(ctx, g)) {
+            return moe_prefetch_admit_result::ACTIVE;
+        }
+        if (moe_group_is_recently_used(ctx, g) &&
+                moe_group_cache_score(ctx, g) >= recent_score_threshold) {
+            return moe_prefetch_admit_result::RECENT;
+        }
+    }
+    return moe_prefetch_admit_result::RECENT;
+}
+
+static moe_prefetch_admit_result moe_eam_prefetch_admit_locked(
+        llama_moe_buffer_context & ctx,
+        moe_managed &              m,
+        int                        e,
+        int                        rank,
+        float                      clg_score,
+        int                        target_bits,
+        double *                   out_score,
+        size_t *                   out_speculative_bytes) {
+    const size_t speculative_bytes = moe_speculative_bytes_locked(ctx);
+    const size_t target_bytes = moe_effective_stream_bytes_for_target(ctx, m, e, target_bits);
+    const size_t budget = moe_eam_prefetch_budget_bytes(ctx);
+    moe_group_state & g = moe_group_get(ctx, m.layer, e);
+    const double score = moe_eam_prefetch_score_locked(ctx, g, m.layer, rank, clg_score, speculative_bytes);
+    if (out_score != nullptr) {
+        *out_score = score;
+    }
+    if (out_speculative_bytes != nullptr) {
+        *out_speculative_bytes = speculative_bytes + target_bytes;
+    }
+
+    const int dist = moe_forward_layer_distance(ctx, m.layer);
+    if (dist > moe_eam_prefetch_max_distance(ctx)) {
+        return moe_prefetch_admit_result::DISTANCE;
+    }
+    if (budget > 0 && speculative_bytes + target_bytes > budget) {
+        return moe_prefetch_admit_result::BUDGET;
+    }
+    const double recent_score_threshold = moe_env_f64("LLAMA_LAZY_MOE_EAM_RECENT_SCORE", 80.0);
+    if (!moe_eam_can_reclaim_without_protected_locked(ctx, target_bytes, recent_score_threshold)) {
+        return moe_eam_prefetch_blocked_reason_locked(ctx, recent_score_threshold);
+    }
+    const double min_score = moe_env_f64("LLAMA_LAZY_MOE_EAM_PREFETCH_MIN_SCORE", 1.0);
+    if (score < min_score) {
+        return moe_prefetch_admit_result::SCORE;
+    }
+    return moe_prefetch_admit_result::ADMIT;
+}
+
+static void moe_eam_note_token_locked(llama_moe_buffer_context & ctx, moe_group_state & g, uint64_t count, int rank) {
+    g.seq_access += count;
+    if (rank == 0) {
+        g.seq_rank0_access += count;
+        ctx.eam_rank0_access.fetch_add(count, std::memory_order_relaxed);
+    }
+    if (g.seq_first_token_epoch == 0) {
+        g.seq_first_token_epoch = ctx.profile_token_epoch;
+    }
+    g.seq_last_token_epoch = ctx.profile_token_epoch;
+    ctx.eam_access.fetch_add(count, std::memory_order_relaxed);
+}
+
 static void moe_group_touch_locked(llama_moe_buffer_context & ctx, moe_managed & m, int e, int rank, uint64_t count) {
     if (m.layer < 0 || e < 0 || e >= m.n_expert || count == 0) {
         return;
     }
     moe_group_state & g = moe_group_get(ctx, m.layer, e);
     g.access += count;
+    moe_eam_note_token_locked(ctx, g, count, rank);
+    moe_eamc_note_access_locked(ctx, m.layer, e, count);
+    g.seq_tensor_access[(size_t) moe_kind_index(m)] += count;
     if (rank == 0) {
         g.rank0_access += count;
     }
@@ -1550,13 +2348,67 @@ static void moe_group_touch_locked(llama_moe_buffer_context & ctx, moe_managed &
     if (g.next_use_epoch <= g.last_used_epoch) {
         g.next_use_epoch = UINT64_MAX;
     }
-    g.hot_score = (double) g.access + 4.0 * (double) g.rank0_access;
+    g.hot_score = moe_group_cache_score(ctx, g);
     ctx.group_touches.fetch_add(count, std::memory_order_relaxed);
     if (g.pinned) {
         ctx.pinned_hits.fetch_add(count, std::memory_order_relaxed);
     } else if (moe_group_is_active(ctx, g)) {
         ctx.active_hits.fetch_add(count, std::memory_order_relaxed);
     }
+    moe_eamc_tick_locked(ctx);
+}
+
+static void moe_group_note_cache_touch_locked(
+        llama_moe_buffer_context & ctx,
+        moe_managed &              m,
+        int                        e,
+        bool                       prefetch_hit,
+        bool                       cache_miss) {
+    if (m.layer < 0 || e < 0 || e >= m.n_expert) {
+        return;
+    }
+    moe_group_state & g = moe_group_get(ctx, m.layer, e);
+    if (prefetch_hit) {
+        g.seq_prefetch_hits++;
+        ctx.eam_prefetch_hits.fetch_add(1, std::memory_order_relaxed);
+    } else if (cache_miss) {
+        g.seq_cache_misses++;
+        ctx.eam_cache_misses.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        g.seq_cache_hits++;
+        ctx.eam_cache_hits.fetch_add(1, std::memory_order_relaxed);
+    }
+    g.hot_score = moe_group_cache_score(ctx, g);
+}
+
+static void moe_group_note_prefetch_late_locked(llama_moe_buffer_context & ctx, moe_managed & m, int e) {
+    if (m.layer < 0 || e < 0 || e >= m.n_expert) {
+        return;
+    }
+    moe_group_state & g = moe_group_get(ctx, m.layer, e);
+    g.seq_prefetch_late++;
+    g.hot_score = moe_group_cache_score(ctx, g);
+    ctx.eam_prefetch_late.fetch_add(1, std::memory_order_relaxed);
+}
+
+static void moe_group_note_prefetch_unused_locked(llama_moe_buffer_context & ctx, moe_managed & m, int e) {
+    if (m.layer < 0 || e < 0 || e >= m.n_expert) {
+        return;
+    }
+    moe_group_state & g = moe_group_get(ctx, m.layer, e);
+    g.seq_prefetch_unused++;
+    g.hot_score = moe_group_cache_score(ctx, g);
+    ctx.eam_prefetch_unused.fetch_add(1, std::memory_order_relaxed);
+}
+
+static void moe_group_note_prefetch_queued_locked(llama_moe_buffer_context & ctx, moe_managed & m, int e) {
+    if (m.layer < 0 || e < 0 || e >= m.n_expert) {
+        return;
+    }
+    moe_group_state & g = moe_group_get(ctx, m.layer, e);
+    g.seq_prefetch_queued++;
+    g.hot_score = moe_group_cache_score(ctx, g);
+    ctx.eam_prefetch_queued.fetch_add(1, std::memory_order_relaxed);
 }
 
 static void moe_group_future_hint_locked(llama_moe_buffer_context & ctx, int layer, int expert, int rank, float score) {
@@ -1569,7 +2421,15 @@ static void moe_group_future_hint_locked(llama_moe_buffer_context & ctx, int lay
     g.next_use_epoch = std::min(g.next_use_epoch, epoch);
     const double rank_bonus = rank == 0 ? 4.0 : 1.0 / (double) std::max(1, rank + 1);
     const double score_bonus = score > 0.0f ? std::min(8.0, (double) score) : 0.0;
-    g.hot_score = std::max(g.hot_score, (double) g.access + 4.0 * (double) g.rank0_access + rank_bonus + score_bonus);
+    g.seq_future_hints++;
+    if (rank == 0) {
+        g.seq_future_rank0_hints++;
+    }
+    if (score > 0.0f) {
+        g.seq_future_score_sum += (double) score;
+    }
+    g.hot_score = std::max(g.hot_score, moe_group_cache_score(ctx, g) + rank_bonus + score_bonus);
+    ctx.eam_future_hints.fetch_add(1, std::memory_order_relaxed);
 }
 
 static void moe_refresh_pins_locked(llama_moe_buffer_context & ctx) {
@@ -1597,11 +2457,12 @@ static void moe_refresh_pins_locked(llama_moe_buffer_context & ctx) {
     for (auto & kv : ctx.groups) {
         moe_group_state & g = kv.second;
         const size_t bytes = moe_group_resident_bytes(ctx, g.layer, g.expert);
-        if (bytes == 0 || g.hot_score <= 0.0) {
+        g.hot_score = moe_group_cache_score(ctx, g, bytes);
+        if (bytes == 0 || g.hot_score <= 0.0 || (g.seq_access == 0 && g.seq_future_hints == 0)) {
             g.pinned = false;
             continue;
         }
-        candidates.push_back({kv.first, g.layer, bytes, g.hot_score / (double) std::max<size_t>(1, bytes)});
+        candidates.push_back({kv.first, g.layer, bytes, g.hot_score});
         g.pinned = false;
     }
     std::sort(candidates.begin(), candidates.end(), [](const pin_candidate & a, const pin_candidate & b) {
@@ -1654,11 +2515,14 @@ static void moe_release_slice_locked(llama_moe_buffer_context & ctx, moe_managed
         resident_ptr = m.buf != nullptr ? m.buf + (size_t) e * m.stride : nullptr;
     }
     const size_t resident_size = m.resident_size[e];
-    if (ctx.profile) {
-        if (e < (int) m.prefetched.size() && m.prefetched[e] &&
-                e < (int) m.resident_touched.size() && !m.resident_touched[e]) {
+    if (e < (int) m.prefetched.size() && m.prefetched[e] &&
+            e < (int) m.resident_touched.size() && !m.resident_touched[e]) {
+        moe_group_note_prefetch_unused_locked(ctx, m, e);
+        if (ctx.profile) {
             ctx.prof_prefetch_unused.fetch_add(1, std::memory_order_relaxed);
         }
+    }
+    if (ctx.profile) {
         if (e < (int) m.last_evicted_token.size()) {
             m.last_evicted_token[e] = ctx.profile_token_epoch;
         }
@@ -1747,6 +2611,18 @@ static bool moe_enqueue_prefetch(
         return false;
     }
 
+    {
+        std::lock_guard<std::mutex> lk(ctx.mtx);
+        double prefetch_score = 0.0;
+        size_t speculative_bytes = 0;
+        const moe_prefetch_admit_result admit = moe_eam_prefetch_admit_locked(
+                ctx, m, e, rank, score, target_bits, &prefetch_score, &speculative_bytes);
+        moe_eam_note_prefetch_admission(ctx, admit, prefetch_score, speculative_bytes);
+        if (admit != moe_prefetch_admit_result::ADMIT) {
+            return false;
+        }
+    }
+
     if (ctx.params.dynamic_bits && ctx.params.fixed_bits <= 0) {
         switch (target_bits) {
             case 2: ctx.dyn_bit2.fetch_add(1, std::memory_order_relaxed); break;
@@ -1773,9 +2649,299 @@ static bool moe_enqueue_prefetch(
     if (e < (int) m.queued_bits.size()) {
         m.queued_bits[e] = std::max(m.queued_bits[e], target_bits);
     }
+    {
+        std::lock_guard<std::mutex> lk(ctx.mtx);
+        moe_group_note_prefetch_queued_locked(ctx, m, e);
+    }
     ctx.queue.push(task);
     ctx.enqueued.fetch_add(1, std::memory_order_relaxed);
     return true;
+}
+
+static bool moe_eam_predict_enabled() {
+    return moe_env_i32("LLAMA_LAZY_MOE_EAM_PREDICT", 0) > 0;
+}
+
+static int moe_eam_predict_depth(const llama_moe_buffer_context & ctx) {
+    const int env_depth = moe_env_i32("LLAMA_LAZY_MOE_EAM_PREDICT_DEPTH", -1);
+    if (env_depth >= 0) {
+        return env_depth;
+    }
+    if (ctx.params.budget_bytes > 0 && ctx.params.budget_bytes <= 1536ull * 1048576ull) {
+        return 2;
+    }
+    if (ctx.params.budget_bytes > 0 && ctx.params.budget_bytes <= 3072ull * 1048576ull) {
+        return 4;
+    }
+    return 6;
+}
+
+static int moe_eam_predict_max_tasks_per_layer() {
+    return std::max(1, moe_env_i32("LLAMA_LAZY_MOE_EAM_MAX_TASKS_PER_LAYER", 1));
+}
+
+static int moe_eam_predict_max_tasks_per_token() {
+    return std::max(1, moe_env_i32("LLAMA_LAZY_MOE_EAM_MAX_TASKS_PER_TOKEN", 8));
+}
+
+static double moe_eam_transition_score_locked(
+        const llama_moe_buffer_context & ctx,
+        int                              src_layer,
+        const std::vector<int> &         src_experts,
+        int                              target_expert) {
+    double acc = 0.0;
+    int n = 0;
+    for (int src_expert : src_experts) {
+        if (src_expert < 0) {
+            continue;
+        }
+        auto it = ctx.eam_layer_transition.find(moe_group_key(src_layer, src_expert));
+        if (it == ctx.eam_layer_transition.end() || target_expert < 0 ||
+                target_expert >= (int) it->second.size()) {
+            continue;
+        }
+        uint64_t total = 0;
+        for (uint32_t v : it->second) {
+            total += v;
+        }
+        if (total == 0) {
+            continue;
+        }
+        acc += (double) it->second[(size_t) target_expert] / (double) total;
+        ++n;
+    }
+    return n > 0 ? acc / (double) n : 0.0;
+}
+
+static double moe_eam_predict_score_locked(
+        const llama_moe_buffer_context & ctx,
+        const moe_group_state &          g,
+        int                              src_layer,
+        const std::vector<int> &         src_experts,
+        int                              target_layer,
+        int                              target_expert) {
+    const double total_access = (double) std::max<uint64_t>(1, ctx.eam_access.load(std::memory_order_relaxed));
+    const double seq_activation_rate = (double) g.seq_access / total_access;
+    const double rank0_rate = g.seq_access > 0 ? (double) g.seq_rank0_access / (double) g.seq_access : 0.0;
+    const uint64_t age = g.seq_last_token_epoch == 0 || ctx.profile_token_epoch < g.seq_last_token_epoch ?
+        UINT64_MAX : ctx.profile_token_epoch - g.seq_last_token_epoch;
+    const double recency = age == UINT64_MAX ? 0.0 : 1.0 / (1.0 + (double) age);
+    const double transition = moe_eam_transition_score_locked(ctx, src_layer, src_experts, target_expert);
+    const int max_layer = std::max(1, moe_max_layer_index(ctx));
+    const double early_urgency = target_layer >= 0 ?
+        1.0 - std::min(1.0, (double) target_layer / (double) max_layer) : 0.0;
+    const double miss_cost = g.seq_access > 0 ?
+        (double) (g.seq_cache_misses + g.seq_prefetch_late) / (double) g.seq_access : 0.15;
+    const double unused_rate = g.seq_prefetch_queued > 0 ?
+        (double) g.seq_prefetch_unused / (double) g.seq_prefetch_queued : 0.0;
+    const double pressure = (double) moe_speculative_bytes_locked(ctx) /
+        (double) std::max<size_t>(1, moe_eam_prefetch_budget_bytes(ctx));
+
+    const double a = moe_env_f64("LLAMA_LAZY_MOE_EAM_PREDICT_A", 9000.0);
+    const double b = moe_env_f64("LLAMA_LAZY_MOE_EAM_PREDICT_B", 35.0);
+    const double c = moe_env_f64("LLAMA_LAZY_MOE_EAM_PREDICT_C", 20.0);
+    const double d = moe_env_f64("LLAMA_LAZY_MOE_EAM_PREDICT_D", 45.0);
+    const double e = moe_env_f64("LLAMA_LAZY_MOE_EAM_PREDICT_E", 12.0);
+    const double f = moe_env_f64("LLAMA_LAZY_MOE_EAM_PREDICT_F", 8.0);
+    const double gpen = moe_env_f64("LLAMA_LAZY_MOE_EAM_PREDICT_G", 18.0);
+    const double h = moe_env_f64("LLAMA_LAZY_MOE_EAM_PREDICT_H", 5.0);
+    const double hist = moe_env_f64("LLAMA_LAZY_MOE_EAMC_PREDICT_W", 12000.0);
+
+    return a * seq_activation_rate +
+           b * rank0_rate +
+           c * recency +
+           d * transition +
+           e * early_urgency +
+           f * miss_cost -
+           gpen * unused_rate -
+           h * std::max(0.0, pressure - 0.75) +
+           hist * moe_eamc_prior(ctx, target_layer, target_expert);
+}
+
+static bool moe_prefetch_needed_unlocked(
+        const llama_moe_buffer_context & ctx,
+        const moe_managed &              m,
+        int                              e,
+        int                              target_bits) {
+    if (e < 0 || e >= m.n_expert) {
+        return false;
+    }
+    if (e < (int) m.queued.size() && m.queued[e]) {
+        const int pending_bits = e < (int) m.queued_bits.size() ? m.queued_bits[e] : 0;
+        if (pending_bits >= target_bits) {
+            return false;
+        }
+    }
+    if (m.resident[e] == ST_INFLIGHT) {
+        return false;
+    }
+    if (m.resident[e] == ST_RESIDENT &&
+            (!ctx.params.dynamic_bits_real || m.resident_bits[e] >= target_bits)) {
+        return false;
+    }
+    if (ctx.params.dynamic_bits_real && moe_mwq_resolve_loaded_bits(m, e, target_bits) > 0) {
+        return false;
+    }
+    return true;
+}
+
+static void moe_eam_update_transition_locked(
+        llama_moe_buffer_context & ctx,
+        int                        layer,
+        const std::vector<int> &   actual_experts,
+        int                        n_expert) {
+    if (layer < 0 || actual_experts.empty()) {
+        return;
+    }
+    const int n_layer = std::max(1, moe_max_layer_index(ctx) + 1);
+    const bool adjacent =
+        ctx.eam_last_actual_layer >= 0 &&
+        ctx.eam_last_actual_layer != layer &&
+        ((ctx.eam_last_actual_layer + 1) % n_layer) == layer;
+    if (adjacent && !ctx.eam_last_layer_experts.empty()) {
+        for (int prev_expert : ctx.eam_last_layer_experts) {
+            if (prev_expert < 0) {
+                continue;
+            }
+            std::vector<uint32_t> & row =
+                ctx.eam_layer_transition[moe_group_key(ctx.eam_last_actual_layer, prev_expert)];
+            if ((int) row.size() < n_expert) {
+                row.resize((size_t) n_expert, 0);
+            }
+            for (int expert : actual_experts) {
+                if (expert >= 0 && expert < n_expert && row[(size_t) expert] != UINT32_MAX) {
+                    row[(size_t) expert]++;
+                }
+            }
+        }
+    }
+    ctx.eam_last_actual_layer = layer;
+    ctx.eam_last_actual_token_epoch = ctx.profile_token_epoch;
+    ctx.eam_last_layer_experts = actual_experts;
+}
+
+static void moe_eam_predict_after_route(
+        llama_moe_buffer_context & ctx,
+        int                        layer,
+        const std::vector<int> &   actual_experts,
+        int                        n_expert) {
+    if (!moe_eam_predict_enabled() || layer < 0 || actual_experts.empty()) {
+        return;
+    }
+
+    struct predict_candidate {
+        int layer = -1;
+        int expert = -1;
+        int rank = 0;
+        double score = 0.0;
+    };
+
+    std::vector<predict_candidate> candidates;
+    const int depth = moe_eam_predict_depth(ctx);
+    const int per_layer = moe_eam_predict_max_tasks_per_layer();
+    const int per_token = moe_eam_predict_max_tasks_per_token();
+    {
+        std::lock_guard<std::mutex> lk(ctx.mtx);
+        moe_eam_update_transition_locked(ctx, layer, actual_experts, n_expert);
+        const int n_layer = std::max(1, moe_max_layer_index(ctx) + 1);
+        for (int d = 1; d <= depth; ++d) {
+            const int target_layer = (layer + d) % n_layer;
+            auto lit = ctx.by_layer.find(target_layer);
+            if (lit == ctx.by_layer.end() || lit->second.empty() || lit->second[0] == nullptr) {
+                continue;
+            }
+            const int target_n_expert = lit->second[0]->n_expert;
+            std::vector<predict_candidate> layer_candidates;
+            layer_candidates.reserve((size_t) target_n_expert);
+            for (int expert = 0; expert < target_n_expert; ++expert) {
+                bool needs_prefetch = false;
+                for (const moe_managed * m : lit->second) {
+                    if (m == nullptr) {
+                        continue;
+                    }
+                    const int target_bits = moe_target_bits_for_rank(ctx, *m, expert, 0);
+                    if (moe_prefetch_needed_unlocked(ctx, *m, expert, target_bits)) {
+                        needs_prefetch = true;
+                        break;
+                    }
+                }
+                if (!needs_prefetch) {
+                    continue;
+                }
+                moe_group_state & g = moe_group_get(ctx, target_layer, expert);
+                const double score = moe_eam_predict_score_locked(
+                        ctx, g, layer, actual_experts, target_layer, expert);
+                if (score < moe_env_f64("LLAMA_LAZY_MOE_EAM_PREDICT_MIN_SCORE", 75.0)) {
+                    continue;
+                }
+                layer_candidates.push_back({target_layer, expert, 0, score});
+            }
+            std::sort(layer_candidates.begin(), layer_candidates.end(),
+                    [](const predict_candidate & a, const predict_candidate & b) {
+                if (a.score != b.score) {
+                    return a.score > b.score;
+                }
+                return a.expert < b.expert;
+            });
+            const int n_take = std::min<int>(per_layer, (int) layer_candidates.size());
+            for (int i = 0; i < n_take && (int) candidates.size() < per_token; ++i) {
+                layer_candidates[(size_t) i].rank = i;
+                candidates.push_back(layer_candidates[(size_t) i]);
+                moe_group_state & g = moe_group_get(ctx, layer_candidates[(size_t) i].layer,
+                        layer_candidates[(size_t) i].expert);
+                g.seq_predicted++;
+                g.seq_predict_score_sum += layer_candidates[(size_t) i].score;
+            }
+        }
+    }
+
+    if (candidates.empty()) {
+        return;
+    }
+
+    ctx.eam_predict_runs.fetch_add(1, std::memory_order_relaxed);
+    ctx.eam_predict_candidates.fetch_add((uint64_t) candidates.size(), std::memory_order_relaxed);
+
+    int enqueued = 0;
+    {
+        std::lock_guard<std::mutex> lk(ctx.qmtx);
+        for (const predict_candidate & c : candidates) {
+            auto lit = ctx.by_layer.find(c.layer);
+            if (lit == ctx.by_layer.end()) {
+                continue;
+            }
+            bool any = false;
+            for (moe_managed * m : lit->second) {
+                if (m == nullptr) {
+                    continue;
+                }
+                const int target_bits = moe_target_bits_for_rank(ctx, *m, c.expert, c.rank);
+                if (!moe_prefetch_needed_unlocked(ctx, *m, c.expert, target_bits)) {
+                    continue;
+                }
+                any = moe_enqueue_prefetch(ctx, *m, c.expert, c.rank, (float) c.score) || any;
+            }
+            if (any) {
+                ++enqueued;
+                std::lock_guard<std::mutex> mlk(ctx.mtx);
+                moe_group_state & g = moe_group_get(ctx, c.layer, c.expert);
+                g.seq_pred_enqueued++;
+            }
+        }
+    }
+
+    if (enqueued > 1) {
+        ctx.cv_q.notify_all();
+    } else if (enqueued == 1) {
+        ctx.cv_q.notify_one();
+    }
+    ctx.eam_predict_enqueued.fetch_add((uint64_t) enqueued, std::memory_order_relaxed);
+    ctx.eam_predict_dropped.fetch_add((uint64_t) (candidates.size() - (size_t) enqueued), std::memory_order_relaxed);
+    uint64_t score_sum = 0;
+    for (const predict_candidate & c : candidates) {
+        score_sum += (uint64_t) std::max(0.0, c.score * 1000.0);
+    }
+    ctx.eam_predict_score_x1000.fetch_add(score_sum, std::memory_order_relaxed);
 }
 
 // Evict one ExpertGroup. Caller must hold ctx.mtx. Victim selection is a
@@ -1794,10 +2960,17 @@ static bool moe_evict_lru(llama_moe_buffer_context & ctx) {
         int expert = -1;
         double score = -1.0e300;
         bool belady = false;
+        enum reason_t {
+            SPEC_UNUSED,
+            LOW_SCORE,
+            FAR_FUTURE,
+            RELAXED,
+        } reason = LOW_SCORE;
     };
 
     victim_candidate best;
     int lru_depth = 0;
+    const int recent_tokens = moe_env_i32("LLAMA_LAZY_MOE_EAM_EVICT_RECENT_TOKENS", 1);
     for (auto it = ctx.lru.rbegin(); it != ctx.lru.rend(); ++it, ++lru_depth) {
         moe_managed * m = it->first;
         const int e = it->second;
@@ -1812,8 +2985,7 @@ static bool moe_evict_lru(llama_moe_buffer_context & ctx) {
             git = ctx.groups.find(key);
         }
         moe_group_state & g = git->second;
-        if (g.pinned || moe_group_is_recently_used(ctx, g) || moe_group_in_cooldown(ctx, g) ||
-                moe_is_hot(ctx, *m, e) || moe_group_has_inflight_or_queued(ctx, m->layer, e)) {
+        if (moe_group_has_inflight_or_queued(ctx, m->layer, e)) {
             continue;
         }
 
@@ -1822,29 +2994,64 @@ static bool moe_evict_lru(llama_moe_buffer_context & ctx) {
             continue;
         }
 
+        g.hot_score = moe_group_cache_score(ctx, g, bytes);
         const bool active = moe_group_is_active(ctx, g);
+        const bool current_layer = ctx.profile_last_layer >= 0 && m->layer == ctx.profile_last_layer;
+        const bool speculative_unused = moe_group_has_speculative_unused(ctx, m->layer, e);
+        const bool recent = moe_group_used_within_tokens(ctx, g, recent_tokens) ||
+            moe_group_is_recently_used(ctx, g) || moe_group_in_cooldown(ctx, g);
+        const bool high_sequence = moe_group_is_high_sequence(ctx, g, g.hot_score);
+        const bool early_high = moe_group_is_early_high_reuse(g, g.hot_score);
+
+        if (g.pinned) {
+            ctx.eam_evict_protect_pinned.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        if (active || current_layer) {
+            ctx.eam_evict_protect_active.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        if (!speculative_unused) {
+            if (recent) {
+                ctx.eam_evict_protect_recent.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (high_sequence || moe_is_hot(ctx, *m, e)) {
+                ctx.eam_evict_protect_high.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (early_high) {
+                ctx.eam_evict_protect_early.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+
         uint64_t dist = UINT64_MAX;
         if (g.next_use_epoch != UINT64_MAX && g.next_use_epoch > ctx.exec_epoch) {
             dist = g.next_use_epoch - ctx.exec_epoch;
         }
-        if (active && dist <= (uint64_t) std::max(0, ctx.params.active_window / 2)) {
-            if (ctx.profile) {
-                ctx.prof_evict_active_window.fetch_add(1, std::memory_order_relaxed);
-            }
-            continue;
-        }
-
-        const double dist_score = dist == UINT64_MAX ? 1.0e12 : (double) dist;
-        const double heat_penalty = g.hot_score * 4096.0;
+        const int layer_dist = moe_forward_layer_distance(ctx, m->layer);
+        const bool spec_evictable = speculative_unused &&
+            moe_group_speculative_unused_evictable(ctx, g, dist, layer_dist);
+        const double speculative_bonus = spec_evictable ?
+            moe_env_f64("LLAMA_LAZY_MOE_EAM_EVICT_SPEC_UNUSED_BONUS", 3.0e8) : 0.0;
+        const double low_score_bonus = std::max(0.0,
+                moe_env_f64("LLAMA_LAZY_MOE_EAM_EVICT_LOW_SCORE_CEIL", 140.0) - g.hot_score) * 16384.0;
+        const double dist_score = dist == UINT64_MAX ? 1.0e9 : (double) dist * 8192.0;
+        const double recent_penalty = recent ? 1.0e8 : 0.0;
+        const double spec_guard_penalty = speculative_unused && !spec_evictable ? 4.0e8 : 0.0;
         const double size_bonus = (double) bytes / 1048576.0;
         const double bit_bonus = moe_group_resident_bit_score(ctx, m->layer, e) * 8.0;
-        const double active_penalty = active ? 1.0e9 : 0.0;
-        const double score = dist_score + (double) lru_depth * 1024.0 + size_bonus + bit_bonus - heat_penalty - active_penalty;
+        const double high_penalty = high_sequence || moe_is_hot(ctx, *m, e) ? 5.0e8 : 0.0;
+        const double early_penalty = early_high ? 2.0e8 : 0.0;
+        const double score = speculative_bonus + low_score_bonus + dist_score +
+            (double) lru_depth * 1024.0 + size_bonus + bit_bonus -
+            recent_penalty - spec_guard_penalty - high_penalty - early_penalty;
         if (score > best.score) {
             best.layer = m->layer;
             best.expert = e;
             best.score = score;
             best.belady = dist != UINT64_MAX;
+            best.reason = spec_evictable ? victim_candidate::SPEC_UNUSED :
+                (dist == UINT64_MAX || dist > (uint64_t) std::max(1, ctx.params.active_window) ?
+                    victim_candidate::FAR_FUTURE : victim_candidate::LOW_SCORE);
         }
     }
 
@@ -1861,8 +3068,10 @@ static bool moe_evict_lru(llama_moe_buffer_context & ctx) {
             if (git != ctx.groups.end() && git->second.pinned) {
                 continue;
             }
-            if (git != ctx.groups.end() &&
-                    (moe_group_is_recently_used(ctx, git->second) || moe_group_in_cooldown(ctx, git->second))) {
+            if (git != ctx.groups.end() && moe_group_is_active(ctx, git->second)) {
+                continue;
+            }
+            if (ctx.profile_last_layer >= 0 && m->layer == ctx.profile_last_layer) {
                 continue;
             }
             if (moe_group_has_inflight_or_queued(ctx, m->layer, e)) {
@@ -1871,6 +3080,7 @@ static bool moe_evict_lru(llama_moe_buffer_context & ctx) {
             best.layer = m->layer;
             best.expert = e;
             best.belady = false;
+            best.reason = victim_candidate::RELAXED;
             break;
         }
     }
@@ -1893,6 +3103,20 @@ static bool moe_evict_lru(llama_moe_buffer_context & ctx) {
         ctx.belady_evictions.fetch_add(1, std::memory_order_relaxed);
     } else {
         ctx.lru_fallback_evictions.fetch_add(1, std::memory_order_relaxed);
+    }
+    switch (best.reason) {
+        case victim_candidate::SPEC_UNUSED:
+            ctx.eam_evict_spec_unused.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case victim_candidate::LOW_SCORE:
+            ctx.eam_evict_low_score.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case victim_candidate::FAR_FUTURE:
+            ctx.eam_evict_far_future.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case victim_candidate::RELAXED:
+            ctx.eam_evict_lru_relaxed.fetch_add(1, std::memory_order_relaxed);
+            break;
     }
     if (ctx.profile) {
         ctx.prof_victim_select_us.fetch_add((moe_profile_now_ns() - prof_t0) / 1000, std::memory_order_relaxed);
@@ -2247,7 +3471,9 @@ static void moe_stream_mwq_slice(llama_moe_buffer_context & ctx, moe_managed & m
                 if (m.activation[e] != UINT32_MAX) { m.activation[e]++; m.total_act++; }
                 moe_group_touch_locked(ctx, m, e, rank, 1);
                 ctx.hits.fetch_add(1, std::memory_order_relaxed);
-                if (e < (int) m.prefetched.size() && m.prefetched[e]) {
+                const bool was_prefetched = e < (int) m.prefetched.size() && m.prefetched[e];
+                moe_group_note_cache_touch_locked(ctx, m, e, was_prefetched, false);
+                if (was_prefetched) {
                     ctx.prof_prefetch_hit.fetch_add(1, std::memory_order_relaxed);
                     m.prefetched[e] = false;
                 } else {
@@ -2274,7 +3500,9 @@ static void moe_stream_mwq_slice(llama_moe_buffer_context & ctx, moe_managed & m
                     if (m.activation[e] != UINT32_MAX) { m.activation[e]++; m.total_act++; }
                     moe_group_touch_locked(ctx, m, e, rank, 1);
                     ctx.hits.fetch_add(1, std::memory_order_relaxed);
-                    if (e < (int) m.prefetched.size() && m.prefetched[e]) {
+                    const bool was_prefetched = e < (int) m.prefetched.size() && m.prefetched[e];
+                    moe_group_note_cache_touch_locked(ctx, m, e, was_prefetched, false);
+                    if (was_prefetched) {
                         ctx.prof_prefetch_hit.fetch_add(1, std::memory_order_relaxed);
                         m.prefetched[e] = false;
                     } else {
@@ -2298,7 +3526,9 @@ static void moe_stream_mwq_slice(llama_moe_buffer_context & ctx, moe_managed & m
                     if (m.activation[e] != UINT32_MAX) { m.activation[e]++; m.total_act++; }
                     moe_group_touch_locked(ctx, m, e, rank, 1);
                     ctx.hits.fetch_add(1, std::memory_order_relaxed);
-                    if (e < (int) m.prefetched.size() && m.prefetched[e]) {
+                    const bool was_prefetched = e < (int) m.prefetched.size() && m.prefetched[e];
+                    moe_group_note_cache_touch_locked(ctx, m, e, was_prefetched, false);
+                    if (was_prefetched) {
                         ctx.prof_prefetch_hit.fetch_add(1, std::memory_order_relaxed);
                         m.prefetched[e] = false;
                     } else {
@@ -2322,8 +3552,11 @@ static void moe_stream_mwq_slice(llama_moe_buffer_context & ctx, moe_managed & m
             break;
         }
         if (s == ST_INFLIGHT) {
-            if (touch && ctx.profile) {
-                ctx.prof_prefetch_late.fetch_add(1, std::memory_order_relaxed);
+            if (touch) {
+                moe_group_note_prefetch_late_locked(ctx, m, e);
+                if (ctx.profile) {
+                    ctx.prof_prefetch_late.fetch_add(1, std::memory_order_relaxed);
+                }
             }
             const auto wait_t0 = std::chrono::steady_clock::now();
             ctx.cv_done.wait(lk);
@@ -2401,6 +3634,7 @@ static void moe_stream_mwq_slice(llama_moe_buffer_context & ctx, moe_managed & m
             m.activation[e]++;
             m.total_act++;
             moe_group_touch_locked(ctx, m, e, rank, 1);
+            moe_group_note_cache_touch_locked(ctx, m, e, false, true);
         }
         ctx.streams.fetch_add(1, std::memory_order_relaxed);
         ctx.bytes_read.fetch_add((size_t) ent->encoded_size, std::memory_order_relaxed);
@@ -2453,7 +3687,9 @@ static void moe_stream_slice(llama_moe_buffer_context & ctx, moe_managed & m, in
                     if (m.activation[e] != UINT32_MAX) { m.activation[e]++; m.total_act++; }  // hot tracking
                     moe_group_touch_locked(ctx, m, e, rank, 1);
                     ctx.hits.fetch_add(1, std::memory_order_relaxed);
-                    if (e < (int) m.prefetched.size() && m.prefetched[e]) {
+                    const bool was_prefetched = e < (int) m.prefetched.size() && m.prefetched[e];
+                    moe_group_note_cache_touch_locked(ctx, m, e, was_prefetched, false);
+                    if (was_prefetched) {
                         ctx.prof_prefetch_hit.fetch_add(1, std::memory_order_relaxed);
                         m.prefetched[e] = false;
                     } else {
@@ -2474,8 +3710,11 @@ static void moe_stream_slice(llama_moe_buffer_context & ctx, moe_managed & m, in
             break;
         }
         if (s == ST_INFLIGHT) {
-            if (touch && ctx.profile) {
-                ctx.prof_prefetch_late.fetch_add(1, std::memory_order_relaxed);
+            if (touch) {
+                moe_group_note_prefetch_late_locked(ctx, m, e);
+                if (ctx.profile) {
+                    ctx.prof_prefetch_late.fetch_add(1, std::memory_order_relaxed);
+                }
             }
             const auto wait_t0 = std::chrono::steady_clock::now();
             ctx.cv_done.wait(lk);   // another thread is loading it; wait for completion
@@ -2536,6 +3775,7 @@ static void moe_stream_slice(llama_moe_buffer_context & ctx, moe_managed & m, in
             m.activation[e]++;
             m.total_act++;
             moe_group_touch_locked(ctx, m, e, rank, 1);
+            moe_group_note_cache_touch_locked(ctx, m, e, false, true);
         }
         ctx.streams.fetch_add(1, std::memory_order_relaxed);
         ctx.bytes_read.fetch_add(read_size, std::memory_order_relaxed);
@@ -2684,6 +3924,16 @@ bool llama_moe_buffer_stream_callback(ggml_tensor * op, int ith, void * user_dat
                         moe_group_touch_locked(*ctx, m, expert, best_rank, inc);
                         ctx->hits.fetch_add(add, std::memory_order_relaxed);
                     }
+                }
+                if (moe_kind(m) == moe_tensor_kind::down && moe_eam_predict_enabled()) {
+                    std::vector<int> actual_experts;
+                    actual_experts.reserve((size_t) m.n_expert);
+                    for (int expert = 0; expert < m.n_expert; ++expert) {
+                        if (op_counts[expert] > 0) {
+                            actual_experts.push_back(expert);
+                        }
+                    }
+                    moe_eam_predict_after_route(*ctx, m.layer, actual_experts, m.n_expert);
                 }
                 if (ctx->profile) {
                     ctx->prof_moe_total_us.fetch_add((moe_profile_now_ns() - callback_t0) / 1000, std::memory_order_relaxed);
@@ -5018,6 +6268,20 @@ static int moe_fused_ffn_row_tile(bool pipeline) {
     return std::max(1, std::min(pipeline ? 64 : 128, tile));
 }
 
+static bool moe_fused_ffn_fast_enabled() {
+    const char * fast = std::getenv("LLAMA_LAZY_MOE_FFN_FAST");
+    if (fast != nullptr && std::atoi(fast) > 0) {
+        return true;
+    }
+    const char * pipe = std::getenv("LLAMA_LAZY_MOE_FFN_PIPELINE");
+    return pipe != nullptr && std::atoi(pipe) > 0;
+}
+
+static bool moe_fused_ffn_serial_direct_enabled() {
+    const char * v = std::getenv("LLAMA_LAZY_MOE_FFN_SERIAL_DIRECT");
+    return v != nullptr && std::atoi(v) > 0;
+}
+
 static int moe_fused_ffn_ring_slots() {
     int slots = 3;
     if (const char * v = std::getenv("LLAMA_LAZY_MOE_FFN_BLOCK_RING")) {
@@ -5409,6 +6673,36 @@ static bool moe_swiglu_check_enabled() {
     return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
 }
 
+static bool moe_ffn_oracle_enabled() {
+    const char * v = std::getenv("LLAMA_LAZY_MOE_FFN_ORACLE");
+    return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
+}
+
+static int moe_ffn_oracle_ops() {
+    const char * v = std::getenv("LLAMA_LAZY_MOE_FFN_ORACLE_OPS");
+    return v == nullptr || v[0] == '\0' ? 1 : std::max(1, std::atoi(v));
+}
+
+static int moe_ffn_oracle_pairs() {
+    const char * v = std::getenv("LLAMA_LAZY_MOE_FFN_ORACLE_PAIRS");
+    return v == nullptr || v[0] == '\0' ? 1 : std::max(1, std::atoi(v));
+}
+
+static int moe_ffn_oracle_ff_rows() {
+    const char * v = std::getenv("LLAMA_LAZY_MOE_FFN_ORACLE_FF_ROWS");
+    return v == nullptr || v[0] == '\0' ? 8 : std::max(1, std::atoi(v));
+}
+
+static int moe_ffn_oracle_out_rows() {
+    const char * v = std::getenv("LLAMA_LAZY_MOE_FFN_ORACLE_OUT_ROWS");
+    return v == nullptr || v[0] == '\0' ? 8 : std::max(1, std::atoi(v));
+}
+
+static double moe_ffn_oracle_tol() {
+    const char * v = std::getenv("LLAMA_LAZY_MOE_FFN_ORACLE_TOL");
+    return v == nullptr || v[0] == '\0' ? 1.0e-4 : std::max(0.0, std::atof(v));
+}
+
 static float moe_f32_dot_row(const float * w, int64_t row, int64_t n_col, const char * x, size_t x_stride) {
     float acc = 0.0f;
     const float * wr = w + row * n_col;
@@ -5530,6 +6824,21 @@ static bool moe_op_all_mwq_resident(const llama_moe_buffer_context & ctx, const 
     return true;
 }
 
+static bool moe_name_has(const ggml_tensor * t, const char * needle);
+static int moe_layer_from_name(const ggml_tensor * t);
+static bool moe_dot_kernel_pair_prepare_native(
+        const mwq_kernel_pair & item,
+        size_t                  x_stride,
+        int64_t                 n_col,
+        std::vector<uint8_t> &  qx);
+static float moe_dot_kernel_pair_row(
+        const mwq_kernel_pair & item,
+        int64_t                 row,
+        int64_t                 n_col,
+        size_t                  x_stride,
+        const float *           sum_x,
+        const std::vector<uint8_t> & qx);
+
 static bool moe_make_kernel_pair(
         llama_moe_buffer_context & ctx,
         moe_managed &              m,
@@ -5583,6 +6892,409 @@ static bool moe_make_kernel_pair(
         *requested_bits_out = requested_bits;
     }
     return true;
+}
+
+static float moe_tensor_f32_read_3d(const ggml_tensor * t, int64_t row, int64_t rank, int64_t token) {
+    return *(const float *) ((const char *) t->data + row * t->nb[0] + rank * t->nb[1] + token * t->nb[2]);
+}
+
+static size_t moe_tensor_offset_3d(const ggml_tensor * t, int64_t row, int64_t rank, int64_t token) {
+    return (size_t) (row * t->nb[0] + rank * t->nb[1] + token * t->nb[2]);
+}
+
+static void llama_moe_buffer_fused_ffn_oracle_check_swiglu(
+        llama_moe_buffer_context * ctx,
+        ggml_tensor *              swiglu_op,
+        ggml_tensor *              gate_op,
+        ggml_tensor *              up_op) {
+    static std::atomic<int> checked_ops{0};
+    if (!moe_ffn_oracle_enabled() || ctx == nullptr || swiglu_op == nullptr || gate_op == nullptr || up_op == nullptr ||
+            checked_ops.load(std::memory_order_relaxed) >= moe_ffn_oracle_ops()) {
+        return;
+    }
+
+    ggml_tensor * gate_w = gate_op->src[0];
+    ggml_tensor * up_w   = up_op->src[0];
+    ggml_tensor * src1   = gate_op->src[1];
+    ggml_tensor * ids    = gate_op->src[2];
+    if (gate_w == nullptr || up_w == nullptr || src1 == nullptr || ids == nullptr ||
+            swiglu_op->op != GGML_OP_GLU ||
+            gate_op->op != GGML_OP_MUL_MAT_ID ||
+            up_op->op != GGML_OP_MUL_MAT_ID ||
+            ggml_get_glu_op(swiglu_op) != GGML_GLU_OP_SWIGLU ||
+            !moe_name_has(gate_w, ".ffn_gate_exps.weight") ||
+            !moe_name_has(up_w, ".ffn_up_exps.weight") ||
+            src1->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 ||
+            swiglu_op->type != GGML_TYPE_F32 ||
+            gate_w->ne[0] != up_w->ne[0] ||
+            gate_w->ne[1] != up_w->ne[1]) {
+        return;
+    }
+
+    const int op_index = checked_ops.fetch_add(1, std::memory_order_relaxed);
+    if (op_index >= moe_ffn_oracle_ops()) {
+        return;
+    }
+
+    auto git = ctx->by_name.find(ggml_get_name(gate_w));
+    auto uit = ctx->by_name.find(ggml_get_name(up_w));
+    if (git == ctx->by_name.end() || uit == ctx->by_name.end()) {
+        std::fprintf(stderr, "llama_moe_buffer[ffn-oracle]: swiglu_op=%d missing gate/up metadata\n", op_index);
+        return;
+    }
+    moe_managed & gate_m = git->second;
+    moe_managed & up_m   = uit->second;
+
+    const int layer = moe_layer_from_name(gate_w);
+    const int64_t n_hidden = gate_w->ne[0];
+    const int64_t n_ff = gate_w->ne[1];
+    const int64_t n_rank = ids->ne[0];
+    const int64_t n_token = ids->ne[1];
+    const int64_t n_pair = n_rank * n_token;
+    const size_t x_stride = (size_t) src1->nb[0];
+    const int pair_limit = std::min<int64_t>(moe_ffn_oracle_pairs(), n_pair);
+    const int ff_rows = std::min<int64_t>(moe_ffn_oracle_ff_rows(), n_ff);
+    const double tol = moe_ffn_oracle_tol();
+    const bool gu_ref_available = !(ctx->params.fuse_gate_up && ctx->params.fuse_direct_swiglu);
+
+    std::fprintf(stderr,
+            "llama_moe_buffer[ffn-oracle]: begin_swiglu op=%d layer=%d pairs=%lld/%lld ff_rows=%d/%lld "
+            "gu_ref_available=%d tol=%.3e swiglu=%s\n",
+            op_index, layer, (long long) pair_limit, (long long) n_pair,
+            ff_rows, (long long) n_ff, gu_ref_available ? 1 : 0, tol, ggml_get_name(swiglu_op));
+
+    double max_gate_abs = 0.0, max_up_abs = 0.0, max_swiglu_abs = 0.0;
+    bool first_mismatch_printed = false;
+    for (int64_t pair = 0; pair < pair_limit; ++pair) {
+        const int64_t rank = pair % n_rank;
+        const int64_t token = pair / n_rank;
+        const int expert = *(const int32_t *) ((const char *) ids->data + token * ids->nb[1] + rank * ids->nb[0]);
+        const int gate_bits = moe_target_bits_for_id_index(*ctx, gate_m, expert, pair);
+        const int up_bits   = moe_target_bits_for_id_index(*ctx, up_m,   expert, pair);
+        bool em = false, rf = false;
+        moe_stream_mwq_slice(*ctx, gate_m, expert, true, gate_bits, (int) rank, &em, &rf);
+        moe_stream_mwq_slice(*ctx, up_m,   expert, true, up_bits,   (int) rank, &em, &rf);
+
+        mwq_kernel_pair gate_item;
+        mwq_kernel_pair up_item;
+        int gate_requested_bits = 0;
+        int up_requested_bits = 0;
+        if (!moe_make_kernel_pair(*ctx, gate_m, gate_op, pair, n_hidden, gate_item, &gate_requested_bits) ||
+                !moe_make_kernel_pair(*ctx, up_m, up_op, pair, n_hidden, up_item, &up_requested_bits)) {
+            std::fprintf(stderr,
+                    "llama_moe_buffer[ffn-oracle]: stage=swiglu pair=%lld layer=%d expert=%d token=%lld rank=%lld "
+                    "make_pair_failed requested_bits=(g%d,u%d) stream_missing=%d stream_read_fail=%d\n",
+                    (long long) pair, layer, expert, (long long) token, (long long) rank,
+                    gate_requested_bits, up_requested_bits, em ? 1 : 0, rf ? 1 : 0);
+            continue;
+        }
+
+        const float * gate_sum_x = gate_item.backend == MOE_KERNEL_Q4K_NATIVE ? nullptr :
+            mwq_sum_x_blocks_cached(*ctx, gate_item.x, x_stride, n_hidden, gate_item.block_size);
+        const float * up_sum_x = up_item.backend == MOE_KERNEL_Q4K_NATIVE ? nullptr :
+            mwq_sum_x_blocks_cached(*ctx, up_item.x, x_stride, n_hidden, up_item.block_size);
+        std::vector<uint8_t> gate_qx;
+        std::vector<uint8_t> up_qx;
+        if (!moe_dot_kernel_pair_prepare_native(gate_item, x_stride, n_hidden, gate_qx) ||
+                !moe_dot_kernel_pair_prepare_native(up_item, x_stride, n_hidden, up_qx)) {
+            std::fprintf(stderr,
+                    "llama_moe_buffer[ffn-oracle]: stage=swiglu pair=%lld layer=%d expert=%d token=%lld rank=%lld native_prepare_failed\n",
+                    (long long) pair, layer, expert, (long long) token, (long long) rank);
+            continue;
+        }
+
+        for (int64_t row = 0; row < ff_rows; ++row) {
+            const float gate_v = moe_dot_kernel_pair_row(gate_item, row, n_hidden, x_stride, gate_sum_x, gate_qx);
+            const float up_v   = moe_dot_kernel_pair_row(up_item,   row, n_hidden, x_stride, up_sum_x,   up_qx);
+            const float fused_swiglu = moe_silu_f32(gate_v) * up_v;
+            const float swiglu_ref = moe_tensor_f32_read_3d(swiglu_op, row, rank, token);
+            const double swiglu_abs = std::fabs((double) fused_swiglu - (double) swiglu_ref);
+            const double swiglu_rel = swiglu_abs / std::max(1.0, std::fabs((double) swiglu_ref));
+            max_swiglu_abs = std::max(max_swiglu_abs, swiglu_abs);
+            if (gu_ref_available) {
+                const float gate_ref = moe_tensor_f32_read_3d(gate_op, row, rank, token);
+                const float up_ref   = moe_tensor_f32_read_3d(up_op,   row, rank, token);
+                const double gate_abs = std::fabs((double) gate_v - (double) gate_ref);
+                const double up_abs   = std::fabs((double) up_v   - (double) up_ref);
+                max_gate_abs = std::max(max_gate_abs, gate_abs);
+                max_up_abs   = std::max(max_up_abs, up_abs);
+                std::fprintf(stderr,
+                        "llama_moe_buffer[ffn-oracle]: stage=gate_up layer=%d expert=%d token=%lld rank=%lld ff_row=%lld "
+                        "gate_ref=% .9e gate_fused=% .9e gate_abs=%.9e up_ref=% .9e up_fused=% .9e up_abs=%.9e "
+                        "gate_offset=%zu up_offset=%zu\n",
+                        layer, expert, (long long) token, (long long) rank, (long long) row,
+                        (double) gate_ref, (double) gate_v, gate_abs,
+                        (double) up_ref, (double) up_v, up_abs,
+                        moe_tensor_offset_3d(gate_op, row, rank, token),
+                        moe_tensor_offset_3d(up_op, row, rank, token));
+                if (!first_mismatch_printed && (gate_abs > tol || up_abs > tol)) {
+                    first_mismatch_printed = true;
+                    std::fprintf(stderr,
+                            "llama_moe_buffer[ffn-oracle]: first_mismatch stage=gate_up layer=%d expert=%d token=%lld rank=%lld ff_row=%lld\n",
+                            layer, expert, (long long) token, (long long) rank, (long long) row);
+                }
+            }
+            std::fprintf(stderr,
+                    "llama_moe_buffer[ffn-oracle]: stage=swiglu layer=%d expert=%d token=%lld rank=%lld ff_row=%lld "
+                    "swiglu_ref=% .9e swiglu_fused=% .9e abs=%.9e rel=%.9e offset=%zu\n",
+                    layer, expert, (long long) token, (long long) rank, (long long) row,
+                    (double) swiglu_ref, (double) fused_swiglu, swiglu_abs, swiglu_rel,
+                    moe_tensor_offset_3d(swiglu_op, row, rank, token));
+            if (!first_mismatch_printed && swiglu_abs > tol) {
+                first_mismatch_printed = true;
+                std::fprintf(stderr,
+                        "llama_moe_buffer[ffn-oracle]: first_mismatch stage=swiglu layer=%d expert=%d token=%lld rank=%lld ff_row=%lld\n",
+                        layer, expert, (long long) token, (long long) rank, (long long) row);
+            }
+        }
+    }
+
+    std::fprintf(stderr,
+            "llama_moe_buffer[ffn-oracle]: summary_swiglu op=%d layer=%d checked_pairs=%d max_abs={gate:%.9e,up:%.9e,swiglu:%.9e}\n",
+            op_index, layer, pair_limit, max_gate_abs, max_up_abs, max_swiglu_abs);
+}
+
+static void llama_moe_buffer_fused_ffn_oracle_after_swiglu(
+        llama_moe_buffer_context * ctx,
+        ggml_tensor *              op,
+        ggml_tensor *              gate_op,
+        ggml_tensor *              up_op,
+        int                        ith,
+        int                        nth) {
+    if (!moe_ffn_oracle_enabled() || ctx == nullptr || op == nullptr ||
+            op->op != GGML_OP_GLU || !moe_name_has(op, "ffn_moe_swiglu")) {
+        return;
+    }
+    moe_ffn_op_barrier(*ctx, op, nth);
+    if (ith == 0) {
+        llama_moe_buffer_fused_ffn_oracle_check_swiglu(ctx, op, gate_op, up_op);
+    }
+}
+
+static void llama_moe_buffer_fused_ffn_oracle_check(
+        llama_moe_buffer_context * ctx,
+        ggml_tensor *              down_op,
+        int                        nth) {
+    static std::atomic<int> checked_ops{0};
+    if (!moe_ffn_oracle_enabled() || ctx == nullptr || down_op == nullptr ||
+            checked_ops.load(std::memory_order_relaxed) >= moe_ffn_oracle_ops()) {
+        return;
+    }
+
+    ggml_tensor * swiglu_op = down_op->src[1];
+    ggml_tensor * down_w = down_op->src[0];
+    ggml_tensor * ids = down_op->src[2];
+    ggml_tensor * gate_op = swiglu_op != nullptr ? swiglu_op->src[0] : nullptr;
+    ggml_tensor * up_op   = swiglu_op != nullptr ? swiglu_op->src[1] : nullptr;
+    ggml_tensor * gate_w  = gate_op != nullptr ? gate_op->src[0] : nullptr;
+    ggml_tensor * up_w    = up_op   != nullptr ? up_op->src[0]   : nullptr;
+    ggml_tensor * src1    = gate_op != nullptr ? gate_op->src[1] : nullptr;
+
+    if (swiglu_op == nullptr || gate_op == nullptr || up_op == nullptr ||
+            down_w == nullptr || gate_w == nullptr || up_w == nullptr ||
+            src1 == nullptr || ids == nullptr ||
+            down_op->op != GGML_OP_MUL_MAT_ID ||
+            swiglu_op->op != GGML_OP_GLU ||
+            gate_op->op != GGML_OP_MUL_MAT_ID ||
+            up_op->op != GGML_OP_MUL_MAT_ID ||
+            ggml_get_glu_op(swiglu_op) != GGML_GLU_OP_SWIGLU ||
+            !moe_name_has(down_w, ".ffn_down_exps.weight") ||
+            !moe_name_has(gate_w, ".ffn_gate_exps.weight") ||
+            !moe_name_has(up_w, ".ffn_up_exps.weight") ||
+            src1->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 ||
+            down_op->type != GGML_TYPE_F32 || swiglu_op->type != GGML_TYPE_F32 ||
+            down_op->nb[0] != (int64_t) sizeof(float) ||
+            src1->ne[0] != gate_w->ne[0] ||
+            gate_w->ne[0] != up_w->ne[0] ||
+            gate_w->ne[1] != up_w->ne[1] ||
+            gate_w->ne[1] != down_w->ne[0] ||
+            down_w->ne[1] != gate_w->ne[0]) {
+        return;
+    }
+
+    const int op_index = checked_ops.fetch_add(1, std::memory_order_relaxed);
+    if (op_index >= moe_ffn_oracle_ops()) {
+        return;
+    }
+
+    auto dit = ctx->by_name.find(ggml_get_name(down_w));
+    auto git = ctx->by_name.find(ggml_get_name(gate_w));
+    auto uit = ctx->by_name.find(ggml_get_name(up_w));
+    if (dit == ctx->by_name.end() || git == ctx->by_name.end() || uit == ctx->by_name.end()) {
+        std::fprintf(stderr, "llama_moe_buffer[ffn-oracle]: op=%d missing managed tensor metadata\n", op_index);
+        return;
+    }
+    moe_managed & down_m = dit->second;
+    moe_managed & gate_m = git->second;
+    moe_managed & up_m   = uit->second;
+
+    const int layer = moe_layer_from_name(down_w);
+    const int64_t n_hidden = gate_w->ne[0];
+    const int64_t n_ff = down_w->ne[0];
+    const int64_t n_rank = ids->ne[0];
+    const int64_t n_token = ids->ne[1];
+    const int64_t n_pair = n_rank * n_token;
+    const size_t x_stride = (size_t) src1->nb[0];
+    const int pair_limit = std::min<int64_t>(moe_ffn_oracle_pairs(), n_pair);
+    const int ff_rows = std::min<int64_t>(moe_ffn_oracle_ff_rows(), n_ff);
+    const int out_rows = std::min<int64_t>(moe_ffn_oracle_out_rows(), down_op->ne[0]);
+    const double tol = moe_ffn_oracle_tol();
+    // At the down op, graph-planner memory reuse may already have recycled the
+    // gate/up buffers. Gate/up are checked at the SWIGLU op boundary instead.
+    const bool gu_ref_available = false;
+
+    std::fprintf(stderr,
+            "llama_moe_buffer[ffn-oracle]: begin op=%d layer=%d pairs=%lld/%lld ff_rows=%d/%lld out_rows=%d/%lld "
+            "gu_ref_available=%d tol=%.3e down=%s swiglu=%s\n",
+            op_index, layer, (long long) pair_limit, (long long) n_pair,
+            ff_rows, (long long) n_ff, out_rows, (long long) down_op->ne[0],
+            gu_ref_available ? 1 : 0, tol, ggml_get_name(down_op), ggml_get_name(swiglu_op));
+
+    double max_gate_abs = 0.0, max_up_abs = 0.0, max_swiglu_abs = 0.0, max_down_abs = 0.0;
+    bool first_mismatch_printed = false;
+
+    for (int64_t pair = 0; pair < pair_limit; ++pair) {
+        const int64_t rank = pair % n_rank;
+        const int64_t token = pair / n_rank;
+        const int expert = *(const int32_t *) ((const char *) ids->data + token * ids->nb[1] + rank * ids->nb[0]);
+        const int gate_bits = moe_target_bits_for_id_index(*ctx, gate_m, expert, pair);
+        const int up_bits   = moe_target_bits_for_id_index(*ctx, up_m,   expert, pair);
+        const int down_bits = moe_target_bits_for_id_index(*ctx, down_m, expert, pair);
+        bool em = false, rf = false;
+        moe_stream_mwq_slice(*ctx, gate_m, expert, true, gate_bits, (int) rank, &em, &rf);
+        moe_stream_mwq_slice(*ctx, up_m,   expert, true, up_bits,   (int) rank, &em, &rf);
+        moe_stream_mwq_slice(*ctx, down_m, expert, true, down_bits, (int) rank, &em, &rf);
+
+        mwq_ffn_triplet item;
+        int gate_requested_bits = 0;
+        int up_requested_bits = 0;
+        int down_requested_bits = 0;
+        if (!moe_make_kernel_pair(*ctx, gate_m, gate_op, pair, n_hidden, item.gate, &gate_requested_bits) ||
+                !moe_make_kernel_pair(*ctx, up_m, up_op, pair, n_hidden, item.up, &up_requested_bits) ||
+                !moe_make_kernel_pair(*ctx, down_m, down_op, pair, n_ff, item.down, &down_requested_bits)) {
+            std::fprintf(stderr,
+                    "llama_moe_buffer[ffn-oracle]: pair=%lld layer=%d expert=%d token=%lld rank=%lld make_pair_failed "
+                    "requested_bits=(g%d,u%d,d%d) stream_missing=%d stream_read_fail=%d\n",
+                    (long long) pair, layer, expert, (long long) token, (long long) rank,
+                    gate_requested_bits, up_requested_bits, down_requested_bits, em ? 1 : 0, rf ? 1 : 0);
+            continue;
+        }
+
+        const float * gate_sum_x = item.gate.backend == MOE_KERNEL_Q4K_NATIVE ? nullptr :
+            mwq_sum_x_blocks_cached(*ctx, item.gate.x, x_stride, n_hidden, item.gate.block_size);
+        const float * up_sum_x = item.up.backend == MOE_KERNEL_Q4K_NATIVE ? nullptr :
+            mwq_sum_x_blocks_cached(*ctx, item.up.x, x_stride, n_hidden, item.up.block_size);
+
+        std::vector<uint8_t> gate_qx;
+        std::vector<uint8_t> up_qx;
+        if (!moe_dot_kernel_pair_prepare_native(item.gate, x_stride, n_hidden, gate_qx) ||
+                !moe_dot_kernel_pair_prepare_native(item.up, x_stride, n_hidden, up_qx)) {
+            std::fprintf(stderr,
+                    "llama_moe_buffer[ffn-oracle]: pair=%lld layer=%d expert=%d token=%lld rank=%lld native_prepare_failed\n",
+                    (long long) pair, layer, expert, (long long) token, (long long) rank);
+            continue;
+        }
+
+        std::vector<float> swiglu((size_t) n_ff);
+        for (int64_t row = 0; row < n_ff; ++row) {
+            const float gate_v = moe_dot_kernel_pair_row(item.gate, row, n_hidden, x_stride, gate_sum_x, gate_qx);
+            const float up_v   = moe_dot_kernel_pair_row(item.up,   row, n_hidden, x_stride, up_sum_x,   up_qx);
+            swiglu[(size_t) row] = moe_silu_f32(gate_v) * up_v;
+
+            if (row < ff_rows) {
+                const float swiglu_ref = moe_tensor_f32_read_3d(swiglu_op, row, rank, token);
+                const double swiglu_abs = std::fabs((double) swiglu[(size_t) row] - (double) swiglu_ref);
+                max_swiglu_abs = std::max(max_swiglu_abs, swiglu_abs);
+                double gate_abs = 0.0;
+                double up_abs = 0.0;
+                if (gu_ref_available) {
+                    const float gate_ref = moe_tensor_f32_read_3d(gate_op, row, rank, token);
+                    const float up_ref   = moe_tensor_f32_read_3d(up_op,   row, rank, token);
+                    gate_abs = std::fabs((double) gate_v - (double) gate_ref);
+                    up_abs   = std::fabs((double) up_v   - (double) up_ref);
+                    max_gate_abs = std::max(max_gate_abs, gate_abs);
+                    max_up_abs   = std::max(max_up_abs, up_abs);
+                    std::fprintf(stderr,
+                            "llama_moe_buffer[ffn-oracle]: stage=gu layer=%d expert=%d token=%lld rank=%lld ff_row=%lld "
+                            "gate_ref=% .9e gate_fused=% .9e gate_abs=%.9e up_ref=% .9e up_fused=% .9e up_abs=%.9e\n",
+                            layer, expert, (long long) token, (long long) rank, (long long) row,
+                            (double) gate_ref, (double) gate_v, gate_abs,
+                            (double) up_ref, (double) up_v, up_abs);
+                }
+                std::fprintf(stderr,
+                        "llama_moe_buffer[ffn-oracle]: stage=swiglu layer=%d expert=%d token=%lld rank=%lld ff_row=%lld "
+                        "swiglu_ref=% .9e swiglu_fused=% .9e abs=%.9e rel=%.9e offset=%zu\n",
+                        layer, expert, (long long) token, (long long) rank, (long long) row,
+                        (double) swiglu_ref, (double) swiglu[(size_t) row], swiglu_abs,
+                        swiglu_abs / std::max(1.0, std::fabs((double) swiglu_ref)),
+                        moe_tensor_offset_3d(swiglu_op, row, rank, token));
+                if (!first_mismatch_printed && (swiglu_abs > tol || gate_abs > tol || up_abs > tol)) {
+                    first_mismatch_printed = true;
+                    std::fprintf(stderr,
+                            "llama_moe_buffer[ffn-oracle]: first_mismatch stage=swiglu layer=%d expert=%d token=%lld rank=%lld ff_row=%lld\n",
+                            layer, expert, (long long) token, (long long) rank, (long long) row);
+                }
+            }
+        }
+
+        std::vector<float> down_sum_x;
+        const float * down_sum = nullptr;
+        if (item.down.backend != MOE_KERNEL_Q4K_NATIVE) {
+            mwq_sum_x_blocks((const char *) swiglu.data(), sizeof(float), n_ff, item.down.block_size, down_sum_x);
+            down_sum = down_sum_x.data();
+        }
+        std::vector<uint8_t> down_qx;
+        mwq_kernel_pair down_item = item.down;
+        down_item.x = (const char *) swiglu.data();
+        if (!moe_dot_kernel_pair_prepare_native(down_item, sizeof(float), n_ff, down_qx)) {
+            std::fprintf(stderr,
+                    "llama_moe_buffer[ffn-oracle]: pair=%lld layer=%d expert=%d token=%lld rank=%lld down_native_prepare_failed\n",
+                    (long long) pair, layer, expert, (long long) token, (long long) rank);
+            continue;
+        }
+        for (int64_t irow = 0; irow < out_rows; ++irow) {
+            const int64_t row = irow * std::max(1, nth);
+            if (row >= down_op->ne[0]) {
+                break;
+            }
+            const float fused = moe_dot_kernel_pair_row(down_item, row, n_ff, sizeof(float), down_sum, down_qx);
+            const float ref = moe_tensor_f32_read_3d(down_op, row, rank, token);
+            const double abs = std::fabs((double) fused - (double) ref);
+            const double rel = abs / std::max(1.0, std::fabs((double) ref));
+            max_down_abs = std::max(max_down_abs, abs);
+            std::fprintf(stderr,
+                    "llama_moe_buffer[ffn-oracle]: stage=down layer=%d expert=%d token=%lld rank=%lld out_row=%lld "
+                    "down_ref=% .9e down_fused=% .9e abs=%.9e rel=%.9e dst_offset=%zu\n",
+                    layer, expert, (long long) token, (long long) rank, (long long) row,
+                    (double) ref, (double) fused, abs, rel,
+                    moe_tensor_offset_3d(down_op, row, rank, token));
+            if (!first_mismatch_printed && abs > tol) {
+                first_mismatch_printed = true;
+                std::fprintf(stderr,
+                        "llama_moe_buffer[ffn-oracle]: first_mismatch stage=down layer=%d expert=%d token=%lld rank=%lld out_row=%lld\n",
+                        layer, expert, (long long) token, (long long) rank, (long long) row);
+            }
+        }
+    }
+
+    std::fprintf(stderr,
+            "llama_moe_buffer[ffn-oracle]: summary op=%d layer=%d checked_pairs=%d max_abs={gate:%.9e,up:%.9e,swiglu:%.9e,down:%.9e}\n",
+            op_index, layer, pair_limit, max_gate_abs, max_up_abs, max_swiglu_abs, max_down_abs);
+}
+
+static void llama_moe_buffer_fused_ffn_oracle_after_down(
+        llama_moe_buffer_context * ctx,
+        ggml_tensor *              op,
+        int                        ith,
+        int                        nth) {
+    if (!moe_ffn_oracle_enabled() || ctx == nullptr || op == nullptr ||
+            op->op != GGML_OP_MUL_MAT_ID || op->src[0] == nullptr ||
+            !moe_name_has(op->src[0], ".ffn_down_exps.weight")) {
+        return;
+    }
+    if (ith == 0) {
+        llama_moe_buffer_fused_ffn_oracle_check(ctx, op, nth);
+    }
 }
 
 static bool llama_moe_buffer_mul_mat_id_compute(ggml_tensor * op, int ith, int nth, void * user_data) {
@@ -6414,6 +8126,106 @@ static bool llama_moe_buffer_swiglu_materialize(
     return true;
 }
 
+static bool llama_moe_buffer_fused_ffn_serial_run(
+        llama_moe_buffer_context *          ctx,
+        ggml_tensor *                       down_op,
+        ggml_tensor *                       swiglu_op,
+        const std::vector<mwq_ffn_triplet> & items,
+        int64_t                             n_hidden,
+        int64_t                             n_ff,
+        size_t                              x_stride,
+        int                                 ith,
+        int                                 nth) {
+    if (ctx == nullptr || down_op == nullptr) {
+        return false;
+    }
+
+    bool ok = true;
+    if (ith == 0) {
+        std::vector<float> swiglu((size_t) n_ff);
+        std::vector<float> down_sum_x;
+        std::vector<uint8_t> gate_qx;
+        std::vector<uint8_t> up_qx;
+        std::vector<uint8_t> down_qx;
+
+        for (const mwq_ffn_triplet & item : items) {
+            const bool use_materialized_swiglu =
+                !ctx->params.fuse_direct_swiglu &&
+                swiglu_op != nullptr &&
+                swiglu_op->data != nullptr &&
+                swiglu_op->type == GGML_TYPE_F32 &&
+                swiglu_op->nb[0] == (int64_t) sizeof(float) &&
+                swiglu_op->ne[0] == n_ff;
+            const char * swiglu_x = nullptr;
+            size_t swiglu_stride = sizeof(float);
+
+            gate_qx.clear();
+            up_qx.clear();
+            down_qx.clear();
+            if (use_materialized_swiglu) {
+                swiglu_x = item.down.x;
+                swiglu_stride = (size_t) swiglu_op->nb[0];
+                for (int64_t row = 0; row < n_ff; ++row) {
+                    swiglu[(size_t) row] = *(const float *) (swiglu_x + row * swiglu_stride);
+                }
+                swiglu_x = (const char *) swiglu.data();
+                swiglu_stride = sizeof(float);
+            } else {
+                if (!moe_dot_kernel_pair_prepare_native(item.gate, x_stride, n_hidden, gate_qx) ||
+                        !moe_dot_kernel_pair_prepare_native(item.up, x_stride, n_hidden, up_qx)) {
+                    ctx->fused_ffn_misses.fetch_add(1, std::memory_order_relaxed);
+                    ok = false;
+                    break;
+                }
+
+                const float * gate_sum_x = item.gate.backend == MOE_KERNEL_Q4K_NATIVE ? nullptr :
+                    mwq_sum_x_blocks_cached(*ctx, item.gate.x, x_stride, n_hidden, item.gate.block_size);
+                const float * up_sum_x = item.up.backend == MOE_KERNEL_Q4K_NATIVE ? nullptr :
+                    mwq_sum_x_blocks_cached(*ctx, item.up.x, x_stride, n_hidden, item.up.block_size);
+
+                for (int64_t row = 0; row < n_ff; ++row) {
+                    const float gate_v = moe_dot_kernel_pair_row(item.gate, row, n_hidden, x_stride, gate_sum_x, gate_qx);
+                    const float up_v   = moe_dot_kernel_pair_row(item.up,   row, n_hidden, x_stride, up_sum_x,   up_qx);
+                    swiglu[(size_t) row] = moe_silu_f32(gate_v) * up_v;
+                }
+                swiglu_x = (const char *) swiglu.data();
+            }
+
+            mwq_ffn_triplet serial_item = item;
+            serial_item.down.x = swiglu_x;
+            down_sum_x.clear();
+            const float * down_sum = nullptr;
+            if (serial_item.down.backend != MOE_KERNEL_Q4K_NATIVE) {
+                mwq_sum_x_blocks(swiglu_x, swiglu_stride, n_ff,
+                        serial_item.down.block_size, down_sum_x);
+                down_sum = down_sum_x.data();
+            }
+            if (!moe_dot_kernel_pair_prepare_native(serial_item.down, swiglu_stride, n_ff, down_qx)) {
+                ctx->fused_ffn_misses.fetch_add(1, std::memory_order_relaxed);
+                ok = false;
+                break;
+            }
+
+            for (int64_t row = 0; row < n_hidden; ++row) {
+                item.down.dst[row] = moe_dot_kernel_pair_row(serial_item.down, row, n_ff,
+                        swiglu_stride, down_sum, down_qx);
+            }
+        }
+
+        if (ok) {
+            ctx->fused_ffn_hits.fetch_add(1, std::memory_order_relaxed);
+            ctx->fused_ffn_runs.fetch_add((uint64_t) items.size(), std::memory_order_relaxed);
+            ctx->fused_ffn_pairs.fetch_add((uint64_t) items.size(), std::memory_order_relaxed);
+            ctx->fused_ffn_tiles.fetch_add((uint64_t) items.size(), std::memory_order_relaxed);
+            ctx->mwq_kernel_ops.fetch_add(3, std::memory_order_relaxed);
+            ctx->mwq_kernel_slices.fetch_add((uint64_t) (3 * items.size()), std::memory_order_relaxed);
+        }
+    }
+
+    moe_ffn_op_barrier(*ctx, down_op, nth);
+    return ok;
+}
+
 static bool llama_moe_buffer_fused_ffn_compute(
         llama_moe_buffer_context * ctx,
         ggml_tensor *              down_op,
@@ -6481,6 +8293,21 @@ static bool llama_moe_buffer_fused_ffn_compute(
     const int64_t n_token = ids->ne[1];
     const int64_t n_pair = n_rank * n_token;
     const size_t x_stride = (size_t) src1->nb[0];
+    const bool fast_ffn = moe_fused_ffn_fast_enabled();
+
+    if (!fast_ffn && !moe_fused_ffn_serial_direct_enabled()) {
+        if (!llama_moe_buffer_swiglu_materialize(ctx, swiglu_op, gate_op, up_op, ith, nth)) {
+            if (ith == 0) ctx->fused_ffn_misses.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        const bool ok = llama_moe_buffer_mul_mat_id_compute(down_op, ith, nth, ctx);
+        if (ok && ith == 0) {
+            ctx->fused_ffn_hits.fetch_add(1, std::memory_order_relaxed);
+            ctx->fused_ffn_runs.fetch_add(1, std::memory_order_relaxed);
+            ctx->fused_ffn_pairs.fetch_add((uint64_t) n_pair, std::memory_order_relaxed);
+        }
+        return ok;
+    }
 
     bool ensure_ok;
     {
@@ -6555,7 +8382,7 @@ static bool llama_moe_buffer_fused_ffn_compute(
             if (ith == 0) ctx->fused_ffn_misses.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
-        if (!mwq_ffn_triplet_can_fuse_avx512_q2(ctx, item, x_stride, n_ff)) {
+        if (fast_ffn && !mwq_ffn_triplet_can_fuse_avx512_q2(ctx, item, x_stride, n_ff)) {
             if (ith == 0) ctx->fused_ffn_misses.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
@@ -6565,6 +8392,11 @@ static bool llama_moe_buffer_fused_ffn_compute(
             if (item.down.bits != down_requested_bits) ctx->mwq_compat_hits.fetch_add(1, std::memory_order_relaxed);
         }
         tls_mwq_ffn_triplets.push_back(item);
+    }
+
+    if (!fast_ffn) {
+        return llama_moe_buffer_fused_ffn_serial_run(ctx, down_op, swiglu_op, tls_mwq_ffn_triplets,
+                n_hidden, n_ff, x_stride, ith, nth);
     }
 
     tls_mwq_ffn_triplets_sorted = tls_mwq_ffn_triplets;
@@ -6758,6 +8590,7 @@ static bool llama_moe_buffer_swiglu_callback(llama_moe_buffer_context * ctx, ggm
 
     if (ctx->params.fuse_direct_swiglu) {
         if (llama_moe_buffer_swiglu_direct_compute(ctx, op, gate, up, ith, nth)) {
+            llama_moe_buffer_fused_ffn_oracle_after_swiglu(ctx, op, gate, up, ith, nth);
             if (ith == 0) {
                 ctx->fused_swiglu_hits.fetch_add(1, std::memory_order_relaxed);
             }
@@ -6792,6 +8625,8 @@ static bool llama_moe_buffer_swiglu_callback(llama_moe_buffer_context * ctx, ggm
         moe_vec_swiglu_f32((int) nc, dst_p, gate_p, up_p);
     }
 
+    llama_moe_buffer_fused_ffn_oracle_after_swiglu(ctx, op, gate, up, ith, nth);
+
     if (ith == 0) {
         ctx->fused_swiglu_hits.fetch_add(1, std::memory_order_relaxed);
         ctx->fused_swiglu_rows.fetch_add((uint64_t) nr, std::memory_order_relaxed);
@@ -6825,11 +8660,19 @@ bool llama_moe_buffer_mul_mat_id_callback(ggml_tensor * op, int ith, int nth, vo
                 !llama_moe_buffer_swiglu_materialize(ctx, swiglu_op, gate_op, up_op, ith, nth)) {
             return false;
         }
-        return llama_moe_buffer_mul_mat_id_compute(op, ith, nth, user_data);
+        const bool ok = llama_moe_buffer_mul_mat_id_compute(op, ith, nth, user_data);
+        if (ok) {
+            llama_moe_buffer_fused_ffn_oracle_after_down(ctx, op, ith, nth);
+        }
+        return ok;
     }
 
     if (!ctx->params.fuse_gate_up) {
-        return llama_moe_buffer_mul_mat_id_compute(op, ith, nth, user_data);
+        const bool ok = llama_moe_buffer_mul_mat_id_compute(op, ith, nth, user_data);
+        if (ok) {
+            llama_moe_buffer_fused_ffn_oracle_after_down(ctx, op, ith, nth);
+        }
+        return ok;
     }
 
     ggml_tensor * src0 = op->src[0];
@@ -6842,7 +8685,11 @@ bool llama_moe_buffer_mul_mat_id_callback(ggml_tensor * op, int ith, int nth, vo
     const bool is_up = moe_name_has(src0, ".ffn_up_exps.weight");
     const bool is_gate = moe_name_has(src0, ".ffn_gate_exps.weight");
     if (!is_up && !is_gate) {
-        return llama_moe_buffer_mul_mat_id_compute(op, ith, nth, user_data);
+        const bool ok = llama_moe_buffer_mul_mat_id_compute(op, ith, nth, user_data);
+        if (ok) {
+            llama_moe_buffer_fused_ffn_oracle_after_down(ctx, op, ith, nth);
+        }
+        return ok;
     }
 
     ggml_tensor * up_op = nullptr;
@@ -6954,6 +8801,220 @@ bool llama_moe_buffer_mul_mat_id_callback(ggml_tensor * op, int ith, int nth, vo
     return ok_up && ok_gate;
 }
 
+static int moe_eam_topn() {
+    const char * v = std::getenv("LLAMA_LAZY_MOE_EAM_TOPN");
+    return v == nullptr || v[0] == '\0' ? 12 : std::max(0, std::atoi(v));
+}
+
+static void moe_print_eam_top_impl(const llama_moe_buffer_context & ctx, const char * prefix) {
+    const int topn = moe_eam_topn();
+    if (topn <= 0 || (ctx.eam_access.load(std::memory_order_relaxed) == 0 &&
+                ctx.eam_future_hints.load(std::memory_order_relaxed) == 0)) {
+        return;
+    }
+
+    struct eam_candidate {
+        const moe_group_state * g = nullptr;
+        size_t resident_bytes = 0;
+        double bit_score = 0.0;
+    };
+    std::vector<eam_candidate> candidates;
+    candidates.reserve(ctx.groups.size());
+    for (const auto & kv : ctx.groups) {
+        const moe_group_state & g = kv.second;
+        if (g.seq_access == 0 && g.seq_future_hints == 0 && g.seq_prefetch_queued == 0) {
+            continue;
+        }
+        candidates.push_back({&g, moe_group_resident_bytes(ctx, g.layer, g.expert),
+                moe_group_resident_bit_score(ctx, g.layer, g.expert)});
+    }
+    std::sort(candidates.begin(), candidates.end(), [](const eam_candidate & a, const eam_candidate & b) {
+        const moe_group_state & ga = *a.g;
+        const moe_group_state & gb = *b.g;
+        if (ga.seq_access != gb.seq_access) {
+            return ga.seq_access > gb.seq_access;
+        }
+        if (ga.seq_rank0_access != gb.seq_rank0_access) {
+            return ga.seq_rank0_access > gb.seq_rank0_access;
+        }
+        if (ga.seq_prefetch_hits != gb.seq_prefetch_hits) {
+            return ga.seq_prefetch_hits > gb.seq_prefetch_hits;
+        }
+        if (ga.seq_future_hints != gb.seq_future_hints) {
+            return ga.seq_future_hints > gb.seq_future_hints;
+        }
+        if (ga.layer != gb.layer) {
+            return ga.layer < gb.layer;
+        }
+        return ga.expert < gb.expert;
+    });
+
+    const uint64_t total = std::max<uint64_t>(1, ctx.eam_access.load(std::memory_order_relaxed));
+    const int limit = std::min<int>(topn, (int) candidates.size());
+    for (int i = 0; i < limit; ++i) {
+        const moe_group_state & g = *candidates[i].g;
+        const uint64_t age = g.seq_last_token_epoch == 0 || ctx.profile_token_epoch < g.seq_last_token_epoch ?
+            0 : ctx.profile_token_epoch - g.seq_last_token_epoch;
+        const double rate = (double) g.seq_access / (double) total;
+        const double avg_hint_score = g.seq_future_hints > 0 ?
+            g.seq_future_score_sum / (double) g.seq_future_hints : 0.0;
+        const double avg_pred_score = g.seq_predicted > 0 ?
+            g.seq_predict_score_sum / (double) g.seq_predicted : 0.0;
+        std::fprintf(stderr,
+                "%s[eam_top]: #%d layer=%d expert=%d access=%llu rank0=%llu rate=%.6f "
+                "token={first:%llu,last:%llu,age:%llu} future={hints:%llu,rank0:%llu,avg_score:%.4f} "
+                "predict={picked:%llu,enq:%llu,avg_score:%.4f} "
+                "prefetch={queued:%llu,hit:%llu,late:%llu,unused:%llu} cache={hit:%llu,miss:%llu} "
+                "tensor={other:%llu,gate:%llu,up:%llu,down:%llu} resident=%.1f MiB bit=%.2f pinned=%d active=%d cache_score=%.3f\n",
+                prefix, i + 1, g.layer, g.expert,
+                (unsigned long long) g.seq_access,
+                (unsigned long long) g.seq_rank0_access,
+                rate,
+                (unsigned long long) g.seq_first_token_epoch,
+                (unsigned long long) g.seq_last_token_epoch,
+                (unsigned long long) age,
+                (unsigned long long) g.seq_future_hints,
+                (unsigned long long) g.seq_future_rank0_hints,
+                avg_hint_score,
+                (unsigned long long) g.seq_predicted,
+                (unsigned long long) g.seq_pred_enqueued,
+                avg_pred_score,
+                (unsigned long long) g.seq_prefetch_queued,
+                (unsigned long long) g.seq_prefetch_hits,
+                (unsigned long long) g.seq_prefetch_late,
+                (unsigned long long) g.seq_prefetch_unused,
+                (unsigned long long) g.seq_cache_hits,
+                (unsigned long long) g.seq_cache_misses,
+                (unsigned long long) g.seq_tensor_access[0],
+                (unsigned long long) g.seq_tensor_access[1],
+                (unsigned long long) g.seq_tensor_access[2],
+                (unsigned long long) g.seq_tensor_access[3],
+                candidates[i].resident_bytes / 1048576.0,
+                candidates[i].bit_score,
+                g.pinned ? 1 : 0,
+                moe_group_is_active(ctx, g) ? 1 : 0,
+                g.hot_score);
+    }
+}
+
+static void moe_json_write_escaped(FILE * f, const char * s) {
+    std::fputc('"', f);
+    if (s != nullptr) {
+        for (const unsigned char * p = (const unsigned char *) s; *p != '\0'; ++p) {
+            switch (*p) {
+                case '\\': std::fputs("\\\\", f); break;
+                case '"':  std::fputs("\\\"", f); break;
+                case '\b': std::fputs("\\b", f); break;
+                case '\f': std::fputs("\\f", f); break;
+                case '\n': std::fputs("\\n", f); break;
+                case '\r': std::fputs("\\r", f); break;
+                case '\t': std::fputs("\\t", f); break;
+                default:
+                    if (*p < 0x20) {
+                        std::fprintf(f, "\\u%04x", (unsigned) *p);
+                    } else {
+                        std::fputc(*p, f);
+                    }
+                    break;
+            }
+        }
+    }
+    std::fputc('"', f);
+}
+
+static const char * moe_env_str(const char * name, const char * def = "") {
+    const char * v = std::getenv(name);
+    return v == nullptr ? def : v;
+}
+
+static void moe_eam_trace_append_locked(const llama_moe_buffer_context & ctx) {
+    const char * path = std::getenv("LLAMA_LAZY_MOE_EAM_TRACE");
+    if (path == nullptr || path[0] == '\0') {
+        return;
+    }
+    FILE * f = std::fopen(path, "ab");
+    if (f == nullptr) {
+        if (ctx.params.debug_log) {
+            std::fprintf(stderr, "llama_moe_buffer: failed to append EAM trace %s\n", path);
+        }
+        return;
+    }
+
+    struct trace_item {
+        const moe_group_state * g = nullptr;
+    };
+    std::vector<trace_item> items;
+    items.reserve(ctx.groups.size());
+    for (const auto & kv : ctx.groups) {
+        const moe_group_state & g = kv.second;
+        if (g.seq_access == 0) {
+            continue;
+        }
+        items.push_back({&g});
+    }
+    std::sort(items.begin(), items.end(), [](const trace_item & a, const trace_item & b) {
+        if (a.g->layer != b.g->layer) {
+            return a.g->layer < b.g->layer;
+        }
+        return a.g->expert < b.g->expert;
+    });
+
+    std::fputc('{', f);
+    std::fputs("\"request_id\":", f);
+    moe_json_write_escaped(f, moe_env_str("LLAMA_LAZY_MOE_EAM_TRACE_REQUEST_ID", "unknown"));
+    std::fputs(",\"workload_index\":", f);
+    std::fputs(moe_env_str("LLAMA_LAZY_MOE_EAM_TRACE_WORKLOAD_INDEX", "-1"), f);
+    std::fputs(",\"prompt_file\":", f);
+    moe_json_write_escaped(f, moe_env_str("LLAMA_LAZY_MOE_EAM_TRACE_PROMPT_FILE", ""));
+    std::fputs(",\"prompt_length_bucket\":", f);
+    moe_json_write_escaped(f, moe_env_str("LLAMA_LAZY_MOE_EAM_TRACE_BUCKET", "unknown"));
+    std::fputs(",\"prompt_chars\":", f);
+    std::fputs(moe_env_str("LLAMA_LAZY_MOE_EAM_TRACE_CHARS", "0"), f);
+    std::fputs(",\"decode_tokens\":", f);
+    std::fputs(moe_env_str("LLAMA_LAZY_MOE_EAM_TRACE_DECODE_TOKENS", "0"), f);
+    std::fprintf(f,
+            ",\"token_epoch\":%llu,\"total_access\":%llu,\"rank0_access\":%llu,"
+            "\"prefetch\":{\"queued\":%llu,\"hit\":%llu,\"late\":%llu,\"unused\":%llu},"
+            "\"cache\":{\"hit\":%llu,\"miss\":%llu},\"experts\":[",
+            (unsigned long long) ctx.profile_token_epoch,
+            (unsigned long long) ctx.eam_access.load(std::memory_order_relaxed),
+            (unsigned long long) ctx.eam_rank0_access.load(std::memory_order_relaxed),
+            (unsigned long long) ctx.eam_prefetch_queued.load(std::memory_order_relaxed),
+            (unsigned long long) ctx.eam_prefetch_hits.load(std::memory_order_relaxed),
+            (unsigned long long) ctx.eam_prefetch_late.load(std::memory_order_relaxed),
+            (unsigned long long) ctx.eam_prefetch_unused.load(std::memory_order_relaxed),
+            (unsigned long long) ctx.eam_cache_hits.load(std::memory_order_relaxed),
+            (unsigned long long) ctx.eam_cache_misses.load(std::memory_order_relaxed));
+    for (size_t i = 0; i < items.size(); ++i) {
+        const moe_group_state & g = *items[i].g;
+        if (i > 0) {
+            std::fputc(',', f);
+        }
+        std::fprintf(f,
+                "{\"layer\":%d,\"expert\":%d,\"count\":%llu,\"rank0\":%llu,"
+                "\"first_token\":%llu,\"last_token\":%llu,"
+                "\"prefetch_queued\":%llu,\"prefetch_hit\":%llu,\"prefetch_unused\":%llu,"
+                "\"cache_hit\":%llu,\"cache_miss\":%llu,"
+                "\"tensor\":[%llu,%llu,%llu,%llu]}",
+                g.layer, g.expert,
+                (unsigned long long) g.seq_access,
+                (unsigned long long) g.seq_rank0_access,
+                (unsigned long long) g.seq_first_token_epoch,
+                (unsigned long long) g.seq_last_token_epoch,
+                (unsigned long long) g.seq_prefetch_queued,
+                (unsigned long long) g.seq_prefetch_hits,
+                (unsigned long long) g.seq_prefetch_unused,
+                (unsigned long long) g.seq_cache_hits,
+                (unsigned long long) g.seq_cache_misses,
+                (unsigned long long) g.seq_tensor_access[0],
+                (unsigned long long) g.seq_tensor_access[1],
+                (unsigned long long) g.seq_tensor_access[2],
+                (unsigned long long) g.seq_tensor_access[3]);
+    }
+    std::fputs("]}\n", f);
+    std::fclose(f);
+}
+
 static void moe_print_stats_impl(const llama_moe_buffer_context & ctx, const char * prefix) {
     const double lru_bytes = (double) (ctx.resident_bytes > ctx.pinned_resident_bytes.load(std::memory_order_relaxed) ?
             ctx.resident_bytes - ctx.pinned_resident_bytes.load(std::memory_order_relaxed) : 0);
@@ -6966,6 +9027,11 @@ static void moe_print_stats_impl(const llama_moe_buffer_context & ctx, const cha
             "fuse_gu=%llu/%llu/%llu fuse_swiglu=%llu/%llu/%llu direct_swiglu=%llu/%llu/%llu down_prefetch=%llu "
             "fuse_ffn=%llu/%llu runs=%llu pairs=%llu tiles=%llu fallback=%llu "
             "egroup_touch=%llu egroup_evict=%llu/%llu pinned_hit=%llu active_hit=%llu belady=%llu lru_fb=%llu "
+            "eam={access:%llu,rank0:%llu,future:%llu,queued:%llu,prefetch_hit:%llu,late:%llu,unused:%llu,cache_hit:%llu,cache_miss:%llu} "
+            "eam_admit={ok:%llu,drop:%llu,budget:%llu,distance:%llu,score:%llu,active:%llu,pinned:%llu,recent:%llu,avg_ok:%.3f,avg_drop:%.3f,spec_peak:%.1f MiB} "
+            "eam_predict={runs:%llu,cand:%llu,enq:%llu,drop:%llu,avg_score:%.3f} "
+            "eamc={snap:%llu,stored:%zu,match:%llu,hit:%llu,miss:%llu,active:%zu,avg_sim:%.3f,prior:%llu} "
+            "eam_evict={spec_unused:%llu,low:%llu,far:%llu,relaxed:%llu,protect_active:%llu,pinned:%llu,recent:%llu,high:%llu,early:%llu} "
             "dyn_eff=%.1f MiB dyn_saved=%.1f MiB wait=%llu/%.1f ms mwq_actual_saved=%.1f/%.1f MiB "
             "stream_fail_total=%llu direct_swiglu_fail={precheck:%llu,byname:%llu,entry_missing:%llu,read:%llu,range:%llu,kernelpair:%llu,native_prep:%llu,other:%llu}\n",
             prefix,
@@ -7034,6 +9100,52 @@ static void moe_print_stats_impl(const llama_moe_buffer_context & ctx, const cha
             (unsigned long long) ctx.active_hits.load(),
             (unsigned long long) ctx.belady_evictions.load(),
             (unsigned long long) ctx.lru_fallback_evictions.load(),
+            (unsigned long long) ctx.eam_access.load(),
+            (unsigned long long) ctx.eam_rank0_access.load(),
+            (unsigned long long) ctx.eam_future_hints.load(),
+            (unsigned long long) ctx.eam_prefetch_queued.load(),
+            (unsigned long long) ctx.eam_prefetch_hits.load(),
+            (unsigned long long) ctx.eam_prefetch_late.load(),
+            (unsigned long long) ctx.eam_prefetch_unused.load(),
+            (unsigned long long) ctx.eam_cache_hits.load(),
+            (unsigned long long) ctx.eam_cache_misses.load(),
+            (unsigned long long) ctx.eam_prefetch_admit.load(),
+            (unsigned long long) ctx.eam_prefetch_drop.load(),
+            (unsigned long long) ctx.eam_prefetch_drop_budget.load(),
+            (unsigned long long) ctx.eam_prefetch_drop_distance.load(),
+            (unsigned long long) ctx.eam_prefetch_drop_score.load(),
+            (unsigned long long) ctx.eam_prefetch_drop_active.load(),
+            (unsigned long long) ctx.eam_prefetch_drop_pinned.load(),
+            (unsigned long long) ctx.eam_prefetch_drop_recent.load(),
+            ctx.eam_prefetch_admit.load() > 0 ?
+                (double) ctx.eam_prefetch_admit_score_x1000.load() / 1000.0 / (double) ctx.eam_prefetch_admit.load() : 0.0,
+            ctx.eam_prefetch_drop.load() > 0 ?
+                (double) ctx.eam_prefetch_drop_score_x1000.load() / 1000.0 / (double) ctx.eam_prefetch_drop.load() : 0.0,
+            ctx.eam_speculative_bytes_peak.load() / 1048576.0,
+            (unsigned long long) ctx.eam_predict_runs.load(),
+            (unsigned long long) ctx.eam_predict_candidates.load(),
+            (unsigned long long) ctx.eam_predict_enqueued.load(),
+            (unsigned long long) ctx.eam_predict_dropped.load(),
+            ctx.eam_predict_candidates.load() > 0 ?
+                (double) ctx.eam_predict_score_x1000.load() / 1000.0 / (double) ctx.eam_predict_candidates.load() : 0.0,
+            (unsigned long long) ctx.eamc_snapshot_count.load(),
+            ctx.eamc_snapshots.size(),
+            (unsigned long long) ctx.eamc_match_runs.load(),
+            (unsigned long long) ctx.eamc_match_hits.load(),
+            (unsigned long long) ctx.eamc_match_misses.load(),
+            ctx.eamc_active_matches.size(),
+            ctx.eamc_match_hits.load() > 0 ?
+                (double) ctx.eamc_match_score_x1000.load() / 1000.0 / (double) ctx.eamc_match_hits.load() : 0.0,
+            (unsigned long long) ctx.eamc_prior_hits.load(),
+            (unsigned long long) ctx.eam_evict_spec_unused.load(),
+            (unsigned long long) ctx.eam_evict_low_score.load(),
+            (unsigned long long) ctx.eam_evict_far_future.load(),
+            (unsigned long long) ctx.eam_evict_lru_relaxed.load(),
+            (unsigned long long) ctx.eam_evict_protect_active.load(),
+            (unsigned long long) ctx.eam_evict_protect_pinned.load(),
+            (unsigned long long) ctx.eam_evict_protect_recent.load(),
+            (unsigned long long) ctx.eam_evict_protect_high.load(),
+            (unsigned long long) ctx.eam_evict_protect_early.load(),
             ctx.dyn_effective_bytes.load() / 1048576.0,
             ctx.dyn_saved_bytes.load() / 1048576.0,
             (unsigned long long) ctx.stream_wait_count.load(),
@@ -7049,6 +9161,7 @@ static void moe_print_stats_impl(const llama_moe_buffer_context & ctx, const cha
             (unsigned long long) ctx.direct_swiglu_fail_kernelpair.load(),
             (unsigned long long) ctx.direct_swiglu_fail_native_prepare.load(),
             (unsigned long long) ctx.direct_swiglu_fail_other.load());
+    moe_print_eam_top_impl(ctx, prefix);
     if (ctx.profile) {
         const uint64_t wait_us = ctx.stream_wait_ns.load(std::memory_order_relaxed) / 1000;
         std::fprintf(stderr,

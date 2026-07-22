@@ -1,0 +1,1 @@
+1 / 1When you setup steam integration with unreal engine, do you need to manually handle the case of a none steam client attempting to join a steam dedicated server ? Does it makes sense to check if the joining client/player is a valid steam client and if not then kick them ? Or is that handled automatically

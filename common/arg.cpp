@@ -2189,6 +2189,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CONT_BATCHING"));
     add_opt(common_arg(
+        {"--cont-batching-wait-us"}, "N",
+        string_format("server: max microseconds to wait before an internal decode tick so new requests can join the next continuous batch (default: %d)", params.cont_batching_wait_us),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value: cont-batching-wait-us must be non-negative");
+            }
+            params.cont_batching_wait_us = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CONT_BATCHING_WAIT_US"));
+    add_opt(common_arg(
+        {"--cont-batching-min"}, "N",
+        string_format("server: with --cont-batching-wait-us, wait only while fewer than N slots are processing (default: %d, 0 = disabled)", params.cont_batching_min),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value: cont-batching-min must be non-negative");
+            }
+            params.cont_batching_min = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CONT_BATCHING_MIN"));
+    add_opt(common_arg(
         {"-mm", "--mmproj"}, "FILE",
         "path to a multimodal projector file. see tools/mtmd/README.md\n"
         "note: if -hf is used, this argument can be omitted",

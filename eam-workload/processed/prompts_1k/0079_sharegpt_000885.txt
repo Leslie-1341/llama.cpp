@@ -1,0 +1,1 @@
+openapi swagger, can i make the host optional

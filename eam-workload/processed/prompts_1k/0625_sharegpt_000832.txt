@@ -1,0 +1,3 @@
+i have a table in bigquery, partitioned by _partitiontime. I want to create materialized view that would return all records, but only once per product_id, and with the latest date:
+
+this is an example query for which i need materialized view mentioned above: SELECT * FROM `ekuep-ga4-prod.ekuep_sf_products.ekuep_sf_products_daily`

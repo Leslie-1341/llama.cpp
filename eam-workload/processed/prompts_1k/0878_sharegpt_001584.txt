@@ -1,0 +1,1 @@
+I want to build a DIY pool heater controller for my Mastertemp 250 pool heater. I have an ARDUINO UNO WiFi REV2 to use for this project. Can you help me to know what else I'll need physically to do this project? I can handle the coding myself.

@@ -1,0 +1,1 @@
+a step-by-step guide to draw the velocity and acceleration diagram for a crank mechanism rotating at 300 radians per second to find linear and angular acceleration. BA is 50mm long, BC is 170mm long and angle BAC is 60 degrees

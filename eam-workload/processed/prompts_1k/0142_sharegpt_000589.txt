@@ -1,0 +1,27 @@
+Now that you’ve identified the problems in an existing domain model, let’s try writing one from scratch. For this task, we’ll look at a domain you should all be very familiar with: a student learning management system. When you’re writing a domain model it’s important to work with only one or two use cases at a time. This will help to prevent your diagrams growing too quickly, becoming overly complex, and being hard to read. The two use cases we’re going to focus on are:
+1. An instructor creating an assignment, and
+2. Students uploading an assignment submission.
+The interactions for these use cases are defined as follows:
+Creating an Assignment
+1. The instructor logs into the LMS
+2. The instructor creates a new assessment item
+(a) The instructor uploads the assessment instructions as a PDF
+(b) The instructor chooses a method of assessment upload (either TurnItIn or ZIP file upload)
+3. The instructor makes the assessment item available to students
+ Tip: You may use one of the real-time collaborative tools mentioned above. You should also share your screen to allow your tutor observe your active participation.
+Figure 3: An incorrect domain model for a streaming service
+ 4
+Uploading an Assignment Submission
+1. The student logs in to the LMS
+2. The student selects the appropriate assessment item
+3. The student attaches their submission to the assessment item
+4. The student confirms the submission, and optionally adds a note 5. The student is emailed a receipt of the transaction
+Complete the following tasks based on the two use cases described above:
+1. Draw a use case diagram in Draw.IO for the described system
+2. List candidate conceptual classes using noun phrase identification
+3. Draw a domain model including these classes on Draw.IO
+4. Add associations (including multiplicity and naming) between these domain classes for ‘need-to- know’ relationships
+5. Add any required attributes
+Remember that we are modelling the domain – your model should only contain conceptual classes, not software classes.
+
+Identify the conceptual classes for these use cases

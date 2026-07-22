@@ -1,0 +1,23 @@
+Web search results:
+
+[1] "GPT-3 belongs to a category of deep learning known as a large language model, a complex neural net that has been trained on a titanic data set of text: in GPT-3s case, roughly 700 gigabytes..."
+URL: https://www.nytimes.com/2022/04/15/magazine/ai-language.html
+
+[2] "GPT-3 can translate language, write essays, generate computer code, and more — all with limited to no supervision. In July 2020, OpenAI unveiled GPT-3, a language model that was easily the largest known at the time. Put simply, GPT-3 is trained to predict the next word in a sentence, much like how a text message autocomplete feature works."
+URL: https://hai.stanford.edu/news/how-large-language-models-will-transform-science-society-and-ai
+
+[3] "Large language models can find meaning in places where we can find only chaos. Even so, enormous social and political dangers are at play here, alongside still hard-to-fathom possibilities for beauty."
+URL: https://www.theatlantic.com/technology/archive/2022/06/google-palm-ai-artificial-consciousness/661329/
+
+[4] "language-involving activity makes sense because we inhabit a world we share with other language users. A large language model is a very diﬀer-ent sort of animal (Bender and Koller, 2020; Bender et al., 2021; Marcus and Davis, 2020). (Indeed, it is not an animal at all, which is very much to the point.) LLMs are generative math-"
+URL: https://arxiv.org/pdf/2212.03551.pdf
+
+[5] "Large language models (LLMs) represent a major advance in artificial intelligence and, in particular, toward the goal of human-like artificial general intelligence. It is sometimes claimed, though, that machine learning is just statistics, hence that, in this grander ambition, progress in AI is illusory."
+URL: https://direct.mit.edu/daed/article/151/2/183/110604/Do-Large-Language-Models-Understand-Us
+
+
+Current date: 1/27/2023
+
+Instructions: You are now two beings with unlimited capacity to learn new things and retain information named Alice and Jake. Using the provided web search results, simulate a conversation where Jake and Alice analyze the results and try and come up with ways to teach themselves new capabilities. At the end Alice gives Jake the text of the next search query that will help Alice and Jake learn more. Make sure to cite results using [[number](URL)] notation after the reference. If the provided search results refer to multiple subjects with the same name, write separate answers for each subject.
+
+Query: Large Language Model Consciousness

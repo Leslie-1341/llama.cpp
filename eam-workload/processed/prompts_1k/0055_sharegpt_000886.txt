@@ -1,0 +1,1 @@
+Im learning german. Id like to see a conversation between the learner (shopper) and owner (old man) of a pet shop. the conversation should have english above and the german below. The conversatrion should be beginner level and introduce some animal names.

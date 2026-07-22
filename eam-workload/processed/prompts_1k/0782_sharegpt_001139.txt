@@ -1,0 +1,9 @@
+My Prompt:
+===
+Write a 150-word paragraph to introduce the blog post topic "20 Predictions on How AI Will Change The Workplace. The blog post is for "Sales & Marketing Industry". Use an Authoritative/Expert Tone. This is important, NEVER include any lists or actual content of the post.
+
+And what I get as a result usually is a great introduction, but I will also sometimes get the start of a list of items, especially if the content seems to be a listicle.
+===
+How can I adjust my prompt so that you don't start writing the content of the post. 
+
+An example of my prompt is above.

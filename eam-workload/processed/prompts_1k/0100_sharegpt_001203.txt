@@ -1,0 +1,6 @@
+Q1: Which of the following is true about functions and methods?
+A. Functions and methods are the same. They process data the same way in any programming language.
+B. Functions and methods are the same. They process data exactly the same way in any object-oriented programming language.
+C. Functions and methods are different. A function is called by name and must always pass and return data, whereas a method can only be called when an object of a class calls it.
+D. Functions and methods are different. A function can be called at any time during a programming
+solution, whereas a method can only be called when an object that has been declared calls it

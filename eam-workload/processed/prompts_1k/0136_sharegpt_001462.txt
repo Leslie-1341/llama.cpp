@@ -1,0 +1,2 @@
+write a weather news report on this information: Current information: Center location 16.7 N 57.7 W Maximum sustained wind 175 mph Movement W at 14 mph
+Forecast positions: Tropical Cyclone Sustained winds:D < 39 mph S 39-73 mph H 74-110 mph M> 110 mph

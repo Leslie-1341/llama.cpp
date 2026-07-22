@@ -1064,6 +1064,9 @@ private:
         queue_tasks.on_update_slots([this]() {
             update_slots();
         });
+        queue_tasks.on_wait_next_response([this]() {
+            return should_wait_next_response();
+        });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
         });
@@ -1141,6 +1144,25 @@ private:
         }
 
         return true;
+    }
+
+    bool should_wait_next_response() const {
+        if (!params_base.cont_batching || params_base.cont_batching_wait_us <= 0 || params_base.cont_batching_min <= 0) {
+            return false;
+        }
+
+        int n_processing = 0;
+        bool has_idle = false;
+
+        for (const auto & slot : slots) {
+            if (slot.is_processing()) {
+                ++n_processing;
+            } else {
+                has_idle = true;
+            }
+        }
+
+        return has_idle && n_processing > 0 && n_processing < params_base.cont_batching_min;
     }
 
     server_slot * get_slot_by_id(int id_slot) {
@@ -3365,7 +3387,7 @@ bool server_context::load_model(common_params & params) {
 
 void server_context::start_loop() {
     auto & params = impl->params_base;
-    impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
+    impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000, params.cont_batching_wait_us);
 }
 
 void server_context::terminate() {

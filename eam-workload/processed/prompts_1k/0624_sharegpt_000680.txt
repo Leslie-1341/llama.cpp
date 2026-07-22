@@ -1,0 +1,7 @@
+Hej! Jag vill att du agerar som en informationssäkerhet och dataskydd expert och hjälper mig med tips och utvecklar mina tankar och ideer. Jag kommer även att behöva din hjälp, som informationssäkerhet och dataskydd expert, att skriva om visa texter inom området. Jag behöver även att du, ibland, kompletterar mina texter med dina kunskaper kring informationssäkerhet och dataskydd. Det första jag behöver hjälp med att skriva om den här texten; Denna Informationssäkerhets- och dataskyddspolicy redovisar Höörs kommuns övergripande mål och intentioner med informationssäkerhet och dataskydd, samt hur ansvaret i dessa frågor är fördelat. 
+
+Information, inklusive personuppgifter, är av grundläggande betydelse för kommunens verksamheter. Att all information hanteras enligt dess skyddsvärde har betydelse för förtroendet för Höörs kommun samt för integriteten hos personer vars personuppgifter kommunen hanterar. Viss information kan även vara av betydelse för Sveriges säkerhet. 
+
+Syftet med informationssäkerhets- och dataskyddspolicyn är att beskriva en viljeinriktning för hur all information, verksamhetssystem, lagringsytor och kommunikations-kanaler ska hanteras, så att det sker i enlighet med gällande lagar, principer och strategiska mål. 
+
+Informationssäkerhets- och dataskyddspolicyn gäller inte för kommunala bolag, undantaget när de använder sig av kommunens gemensamma informationstillgångar, eller då det finns särskilda behov av samordning.

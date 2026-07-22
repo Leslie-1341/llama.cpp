@@ -1,0 +1,12 @@
+[TASK TYPE]: Article
+[MEDIUM]: customer help center
+[AUDIENCE]: hotel manager
+[BACKGROUND]: 
+- how operational SOPs relate to the guest journey
+- benefits of using SOPs in hospitality
+- best practices for writing and rolling out SOPs in hotels
+[REQUIREMENTS]:
+- Written in active voice
+- 1 page or less
+- high school reading level
+[REQUEST]: Generate a comprehensive and usable [TASK TYPE] for a [MEDIUM] that is appropriate for [AUDIENCE], is based on [BACKGROUND], and [REQUIREMENTS].

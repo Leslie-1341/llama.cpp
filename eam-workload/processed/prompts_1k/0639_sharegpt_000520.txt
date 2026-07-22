@@ -1,0 +1,13 @@
+Write me a critical piece based on this text:
+Transformers have largely replaced traditional language and deep learning models, such as Recurrent Neural Networks (RNNs) and Convolutional Neural Networks (CNNs), in mainstream NLP. In the field of clinical data, transformers have the potential to significantly improve the accuracy and efficiency of data analysis and decision-making[Searle].
+
+Significant benefits Transformers language models have, comparing traditional models, include:
+
+- **Increased amount of data**: Transformers can process large volumes of clinical data and retain context, resulting in improved prediction accuracy compared to traditional machine learning models. Self-attention mechanism enables a better understanding of the relationships between data, allowing for accurate predictions even with a large amount of data[Vaswani].
+- **Increased speed:** Transformer language models have faster training time than RNNs if you can access sufficient computing because of the paralysation method. Decreases recurrence in favour of drawing global relationships between input and output.
+- **Increased accuracy:** Transformer language models have been shown to outperform traditional language models in terms of accuracy.
+- **Increased flexibility:** Transformers are more flexible, allowing for the use of different types of data (e.g., images and text) and tasks (e.g., classification and generation).
+- **Increased interpretability**: They are easier to interpret, making it easier to comprehend how the model works and what it has learned.
+- **Increased efficiency**: They are more efficient, requiring less training data and computational resources. It allows for substantially higher parallelisation and takes much less time to train.
+
+Transformers have achieved a new state-of-the-art (SOTA) translation quality, outperforming other models.

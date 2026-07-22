@@ -1,0 +1,12 @@
+Hello my friend.
+
+We have 3 Azure environments (Lab, Preprod and Prod). Each of these environment has a distinct Azure Queue Storage with a queue named test-queue.
+
+Each environment also have an app service each. 
+
+The app service is a REST api that will use AWS SES and c# SDK to send an email.
+The email delivery status is tracked using notifications and the notification calls an AWS Lambda Function that in turns, forwards the SNS notification message to our Azure Queue Storage test-queue.
+
+We would like the Lambda Function to only send to prod queue if the email originates from prod app service, same for lab and preprod.
+
+How can we have multiple environment on the AWS side of things?

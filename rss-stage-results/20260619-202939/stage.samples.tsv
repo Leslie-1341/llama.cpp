@@ -1,1 +1,0 @@
-seq	ts	stage	label	rss_kb	pss_kb	private_clean_kb	private_dirty_kb	shared_clean_kb	shared_dirty_kb	anonymous_kb	file_kb	swap_kb	smaps_file	extra

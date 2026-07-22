@@ -1,0 +1,1 @@
+Ik heb een tabel 0Area.S4SD_VW_SCZLIENT. Daar staan onder andere kolommen KODE_WYK en Clientnummer in. Ik heb een andere tabel genaamd SD.DimClient waar ook een Clientnummer in staat. Maak een left outer join waarin de kolom KODE_WYK wordt toegevoegd aan SD.DimClient waarbij de join wordt gedaan op Clientnummer

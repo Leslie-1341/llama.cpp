@@ -1,0 +1,3 @@
+please explain this tweet to me:
+
+An interesting consequence of the wave of startups building on LLMs is that for the first time I can remember, many YC startups are facing more technology risk than market risk. The main question is not if people want it, but if it's possible to build it.

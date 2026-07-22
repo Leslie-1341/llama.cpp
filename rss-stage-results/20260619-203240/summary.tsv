@@ -1,4 +1,0 @@
-status	ok
-out_dir	/root/llama.cpp/rss-stage-results/20260619-203240
-timeline_peak	ts=1781901180.275953484 rss_kb=5641088 hwm_kb=5641088 pss_kb=5643821
-stage_peak	seq=201 ts=1781901180.712473217 stage=H label=before_first_decode_token rss_kb=5647628 pss_kb=5643672 smaps=201_H_before_first_decode_token.smaps_rollup extra=subgraphs=33

@@ -1,0 +1,1 @@
+how to make 24/7 lofi streaming on youtube which only contains video and background music? what resource? can i use linux and a little bit of script? i dont want to use obs because i will run it on the server

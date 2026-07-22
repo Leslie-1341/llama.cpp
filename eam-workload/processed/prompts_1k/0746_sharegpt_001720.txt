@@ -1,0 +1,4 @@
+how to represent the Fashion-MNIST dataset where each image will be represented by a 784-
+dimensional features vector, where the first 28 elements in the vector are the 28 pixels of the first 
+row in the image, and the elements in column 29 to column 56 are the 28 pixels of the second raw 
+in the image, and so on.

@@ -1,0 +1,5 @@
+```js
+console.log(isSuperiorGender('male'));
+console.log(isSuperiorGender('female'));
+```
+can you mock the output of this code

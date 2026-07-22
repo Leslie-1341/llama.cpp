@@ -1,0 +1,1 @@
+You as a software architetor, I want to create a no-code mobile app. where I can able to give solutions for user to add their visited home with Brocker name and home photos and details. So in future they can check again and compare price

@@ -1,0 +1,1 @@
+Different ways to develop an offline social network that interacts using Bluetooth ,WiFi and has ability to create groups based on the strength of WiFi strength from the main router using any web tech stack

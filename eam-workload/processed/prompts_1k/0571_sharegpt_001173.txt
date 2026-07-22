@@ -1,0 +1,68 @@
+Help me solve this error message. I'm trying to build llvm for wasm
+
+-- bolt project is disabled
+-- clang project is enabled
+-- clang-tools-extra project is disabled
+-- compiler-rt project is disabled
+-- cross-project-tests project is disabled
+-- libc project is disabled
+-- libclc project is disabled
+-- lld project is disabled
+-- lldb project is disabled
+-- mlir project is disabled
+-- openmp project is disabled
+-- polly project is disabled
+-- pstl project is disabled
+-- flang project is disabled
+-- Could NOT find LibXml2 (missing: LIBXML2_LIBRARY LIBXML2_INCLUDE_DIR) 
+-- Could NOT find LibEdit (missing: LibEdit_INCLUDE_DIRS LibEdit_LIBRARIES) 
+-- Native target X86 is not selected; lli will not JIT code
+-- Threads enabled.
+-- Doxygen disabled.
+-- Ninja version: 1.10.1
+-- Could NOT find OCaml (missing: OCAMLFIND OCAML_VERSION OCAML_STDLIB_PATH) 
+-- Could NOT find OCaml (missing: OCAMLFIND OCAML_VERSION OCAML_STDLIB_PATH) 
+-- OCaml bindings disabled.
+-- LLVM host triple: x86_64-unknown-linux-gnu
+-- LLVM default target triple: 
+-- Building with -fPIC
+-- Targeting WebAssembly
+-- Clang version: 17.0.0
+-- Registering ExampleIRTransforms as a pass plugin (static build: OFF)
+-- Registering Bye as a pass plugin (static build: OFF)
+-- git version: v0.0.0-dirty normalized to 0.0.0
+-- Version: 1.6.0
+-- Performing Test HAVE_GNU_POSIX_REGEX -- failed to compile
+-- Performing Test HAVE_POSIX_REGEX -- success
+-- Performing Test HAVE_STEADY_CLOCK -- success
+-- Configuring done (46.5s)
+-- Generating done (4.5s)
+-- Build files have been written to: /workspaces/llvm-box/build/llvm-native
+ninja: no work to do.
+configure: cmake -G Ninja -S llvm -B build/llvm-wasm -DCMAKE_BUILD_TYPE=Release -DLLVM_TARGETS_TO_BUILD=WebAssembly -DLLVM_ENABLE_PROJECTS=clang;lld;clang-tools-extra -DLLVM_ENABLE_DUMP=OFF -DLLVM_ENABLE_ASSERTIONS=OFF -DLLVM_ENABLE_EXPENSIVE_CHECKS=OFF -DLLVM_ENABLE_BACKTRACES=OFF -DLLVM_BUILD_TOOLS=OFF -DLLVM_ENABLE_THREADS=OFF -DLLVM_BUILD_LLVM_DYLIB=OFF -DLLVM_INCLUDE_TESTS=OFF -DLLVM_TABLEGEN=build/llvm-native/bin/llvm-tblgen -DCLANG_TABLEGEN=build/llvm-native/bin/clang-tblgen -DCMAKE_TOOLCHAIN_FILE=/usr/local/emsdk/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake -DCMAKE_CROSSCOMPILING_EMULATOR=/usr/local/emsdk/node/14.18.2_64bit/bin/node;--experimental-wasm-bulk-memory;--experimental-wasm-threads
+-- The ASM compiler identification is unknown
+-- Found assembler: /usr/local/emsdk/upstream/emscripten/emcc
+-- Warning: Did not find file Compiler/-ASM
+-- bolt project is disabled
+-- clang project is enabled
+-- clang-tools-extra project is enabled
+-- compiler-rt project is disabled
+-- cross-project-tests project is disabled
+-- libc project is disabled
+-- libclc project is disabled
+-- lld project is enabled
+-- lldb project is disabled
+-- mlir project is disabled
+-- openmp project is disabled
+-- polly project is disabled
+-- pstl project is disabled
+-- flang project is disabled
+CMake Error at cmake/modules/CheckCompilerVersion.cmake:88 (message):
+ libstdc++ version must be at least 7.1.
+Call Stack (most recent call first):
+ cmake/config-ix.cmake:15 (include)
+ CMakeLists.txt:857 (include)
+
+
+-- Configuring incomplete, errors occurred!
+emcmake: error: 'cmake -G Ninja -S llvm -B build/llvm-wasm -DCMAKE_BUILD_TYPE=Release -DLLVM_TARGETS_TO_BUILD=WebAssembly -DLLVM_ENABLE_PROJECTS=clang;lld;clang-tools-extra -DLLVM_ENABLE_DUMP=OFF -DLLVM_ENABLE_ASSERTIONS=OFF -DLLVM_ENABLE_EXPENSIVE_CHECKS=OFF -DLLVM_ENABLE_BACKTRACES=OFF -DLLVM_BUILD_TOOLS=OFF -DLLVM_ENABLE_THREADS=OFF -DLLVM_BUILD_LLVM_DYLIB=OFF -DLLVM_INCLUDE_TESTS=OFF -DLLVM_TABLEGEN=build/llvm-native/bin/llvm-tblgen -DCLANG_TABLEGEN=build/llvm-native/bin/clang-tblgen -DCMAKE_TOOLCHAIN_FILE=/usr/local/emsdk/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake -DCMAKE_CROSSCOMPILING_EMULATOR=/usr/local/emsdk/node/14.18.2_64bit/bin/node;--experimental-wasm-bulk-memory;--experimental-wasm-threads' failed (returned 1)

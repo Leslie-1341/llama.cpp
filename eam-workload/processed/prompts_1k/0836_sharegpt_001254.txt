@@ -1,0 +1,14 @@
+The mechanism of attention has been thoroughly studied in neural network community. Compelling results confirm that we pay attention to information related to a specific task at hand.
+However, there is few work on how to select an appropriate representation, to be fed into the network, among many. Motivated by the fact that our brain usually has multiple views of the task
+while processing, we propose a novel Mr-CNN architecture. The basic idea is to first construct
+multiple planes so that multiple representations of the text can be simultaneously fed into the
+networks, each of which stands for a specific language modeling of the text such as subjective or
+objective models, and then use CNN to focus attention on the most relevant aspects, ignoring noise
+and redundancies in the multiples. Existing CNNs applied to NLP tasks use one-dimensional
+(temporal) convolution to the concatenate of vector encoding of each word in a text. Unlike prior
+works, we apply multi-dimension (spatial) convolution of CNN to multiple representations of the
+input text, in which the convolution kernel acts as attention.
+In this section, we first introduce the model architecture and then describe the embedding
+strategies used in the model.
+
+this is section 2 of it do you understand this?

@@ -1,0 +1,1 @@
+In vb.net, how do I check if a variable contains http, and if it does, replace it with https?

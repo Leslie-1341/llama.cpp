@@ -1,0 +1,27 @@
+1 / 1I recently installed Oh My Zsh for use with Zsh. Whenever I use Zsh via Gnome Terminal now, however, I see this output: 
+
+(anon):2: scalar parameter virtualenvwrapper created globally in function (anon)
+_histdb_start_sqlite_pipe:4: numeric parameter HISTDB_FD created globally in function _histdb_start_sqlite_pipe
+update_current_git_vars:4: scalar parameter _GIT_STATUS created globally in function update_current_git_vars
+update_current_git_vars:5: array parameter __CURRENT_GIT_STATUS created globally in function update_current_git_vars
+update_current_git_vars:6: scalar parameter GIT_BRANCH created globally in function update_current_git_vars
+update_current_git_vars:7: scalar parameter GIT_AHEAD created globally in function update_current_git_vars
+update_current_git_vars:8: scalar parameter GIT_BEHIND created globally in function update_current_git_vars
+update_current_git_vars:9: scalar parameter GIT_STAGED created globally in function update_current_git_vars
+update_current_git_vars:10: scalar parameter GIT_CONFLICTS created globally in function update_current_git_vars
+update_current_git_vars:11: scalar parameter GIT_CHANGED created globally in function update_current_git_vars
+update_current_git_vars:12: scalar parameter GIT_UNTRACKED created globally in function update_current_git_vars
+update_current_git_vars:13: scalar parameter GIT_STASHED created globally in function update_current_git_vars
+update_current_git_vars:14: scalar parameter GIT_CLEAN created globally in function update_current_git_vars
+update_current_git_vars:15: scalar parameter GIT_DELETED created globally in function update_current_git_vars
+update_current_git_vars:18: scalar parameter GIT_UPSTREAM created globally in function update_current_git_vars
+
+My zshrc file automatically activates the following plugins and sources the following shell-scripts: 
+
+zsh-syntax-highlighting aliases alias-finder autoenv autopep8 bazel colorize colored-man-pages compleat cp gh git git-auto-fetch git-escape-magic git-extras gitfast git-flow github git-prompt gnu-utils history history-substring-search man pep8 pip pipenv poetry pyenv pylint python rsync supervisor svn svn-fast-info themes torrent toolbox urltools virtualenv virtualenvwrapper vscode web-search zsh-interactive-cd zsh-navigation-tools
+
+source "/usr/share/zsh/site-functions/zsh-autosuggestions.zsh"
+source "/usr/share/zsh/site-functions/async.zsh"
+source "/usr/share/zsh/plugins/zsh-histdb/histdb-interactive.zsh"
+source "/usr/share/zsh/plugins/zsh-histdb/sqlite-history.zsh"
+source "/usr/share/zsh/site-contrib/auto-fu.zsh"
