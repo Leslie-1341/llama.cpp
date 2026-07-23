@@ -138,12 +138,36 @@ ENUMS = {
         "layout_unsupported", "swap_enabled", "not_ingraph", "no_layers", "no_row_idx",
         "legacy_active", "stale", "not_pressure", "cooldown",
         "structurally_disabled", "ownership_aborted"},
-    "trigger": {"first", "state", "source", "stale", "periodic", "wake_completion"},
 }
+TRIGGERS = {"first", "state", "source", "stale", "periodic", "wake_completion"}
+
+def _validate_trigger_value(marker: str, value: str, case: str) -> None:
+    """Validate comma-separated trigger values (fail-closed).
+
+    The server producer emits triggers as comma-separated combinations
+    (e.g. ``first,state,source``) via event_trigger().  Single values
+    (``periodic``, ``wake_completion``) are also valid.  Empty components,
+    duplicate entries, and unknown tokens are always rejected.
+    """
+    if not value.strip():
+        raise ProtocolError(f"{case}: {marker} trigger is empty")
+    components = value.split(",")
+    if any(not component for component in components):
+        raise ProtocolError(f"{case}: {marker} trigger has empty component in {value!r}")
+    if len(components) != len(set(components)):
+        raise ProtocolError(f"{case}: {marker} trigger has duplicate values in {value!r}")
+    for component in components:
+        if component not in TRIGGERS:
+            raise ProtocolError(
+                f"{case}: {marker} trigger has unknown value {component!r} in {value!r}")
+
 
 def _validate_value(marker: str, key: str, value: str, case: str) -> None:
     if key in BOOL_FIELDS and value not in {"0", "1"}:
         raise ProtocolError(f"{case}: {marker} {key} must be 0 or 1")
+    if key == "trigger":
+        _validate_trigger_value(marker, value, case)
+        return
     if key in ENUMS and value not in ENUMS[key]:
         raise ProtocolError(f"{case}: {marker} {key} has invalid value {value!r}")
     if key not in BOOL_FIELDS and key not in ENUMS and key != "contract":

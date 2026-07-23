@@ -35,11 +35,14 @@ class ParserArtifactTest(unittest.TestCase):
 
     @staticmethod
     def telemetry() -> str:
+        # Real server output produces combinations like first,state,source.
+        # Single-value triggers (periodic, wake_completion) are also valid.
         return ("kv_pressure_telemetry state=CRITICAL previous_state=PRESSURE "
                 "source=RSS_ABSOLUTE sample_valid=1 stale=0 config_valid=1 rss_kb=1000 "
                 "cgroup_current_bytes=0 cgroup_max_bytes=0 cgroup_current_kb=0 "
                 "cgroup_max_kb=0 cgroup_high_kb=0 psi_some_avg10=0 psi_full_avg10=0 "
-                "sample_latency_ns=1 sample_count=1 skip_count=0 idle=0 trigger=first\n")
+                "sample_latency_ns=1 sample_count=1 skip_count=0 idle=0 "
+                "trigger=first,state,source\n")
 
     @staticmethod
     def dry_marker() -> str:
@@ -411,6 +414,63 @@ class ParserArtifactTest(unittest.TestCase):
                 break
         path.write_text("\n".join(lines))
         self.assert_failure("duplicates field")
+
+    # --- trigger field regression (Stage 3A-2C v4 parser fix) ---
+
+    def test_trigger_periodic_single_value_valid(self) -> None:
+        """trigger=periodic (single value) must be accepted."""
+        path = self.art / "bounded_off/server.stderr"
+        path.write_text(path.read_text().replace(
+            "trigger=first,state,source", "trigger=periodic"))
+        result = self.run_parser()
+        self.assertEqual(result.returncode, 0,
+                         f"periodic single trigger should pass; got: {result.stderr}")
+
+    def test_trigger_first_single_value_valid(self) -> None:
+        """trigger=first (single value) must be accepted."""
+        path = self.art / "bounded_off/server.stderr"
+        path.write_text(path.read_text().replace(
+            "trigger=first,state,source", "trigger=first"))
+        result = self.run_parser()
+        self.assertEqual(result.returncode, 0,
+                         f"first single trigger should pass; got: {result.stderr}")
+
+    def test_trigger_wake_completion_single_value_valid(self) -> None:
+        """trigger=wake_completion (single value) must be accepted."""
+        path = self.art / "bounded_off/server.stderr"
+        path.write_text(path.read_text().replace(
+            "trigger=first,state,source", "trigger=wake_completion"))
+        result = self.run_parser()
+        self.assertEqual(result.returncode, 0,
+                         f"wake_completion trigger should pass; got: {result.stderr}")
+
+    def test_trigger_unknown_value_fail_closed(self) -> None:
+        """trigger containing an unknown token must be rejected."""
+        path = self.art / "bounded_off/server.stderr"
+        path.write_text(path.read_text().replace(
+            "trigger=first,state,source", "trigger=first,bogus"))
+        self.assert_failure("trigger has unknown value 'bogus'")
+
+    def test_trigger_empty_component_fail_closed(self) -> None:
+        """trigger with an empty component (leading/trailing/double comma) must be rejected."""
+        path = self.art / "bounded_off/server.stderr"
+        path.write_text(path.read_text().replace(
+            "trigger=first,state,source", "trigger=first,,state"))
+        self.assert_failure("trigger has empty component")
+
+    def test_trigger_duplicate_value_fail_closed(self) -> None:
+        """trigger with duplicate entries must be rejected."""
+        path = self.art / "bounded_off/server.stderr"
+        path.write_text(path.read_text().replace(
+            "trigger=first,state,source", "trigger=first,first"))
+        self.assert_failure("trigger has duplicate values")
+
+    def test_trigger_empty_fail_closed(self) -> None:
+        """trigger with empty value must be rejected (caught as malformed field)."""
+        path = self.art / "bounded_off/server.stderr"
+        path.write_text(path.read_text().replace(
+            "trigger=first,state,source", "trigger="))
+        self.assert_failure("malformed field 'trigger='")
 
 
 if __name__ == "__main__":
