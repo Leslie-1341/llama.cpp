@@ -310,10 +310,10 @@ Core result **不得**包含 mincore/RSS/cgroup/PSI 等 server/runner observatio
 Transaction terminal 与 block terminal 是不同事件和不同闭包层级。Transaction terminal payload 至少包含：
 
 ```text
-entered_block_transition_ids[]
-committed_block_transition_ids[]
-aborted_block_transition_ids[]
-quarantined_block_transition_ids[]
+entered_block_event_refs[]
+committed_block_event_refs[]
+aborted_block_event_refs[]
+quarantined_block_event_refs[]
 entered_count
 committed_count
 aborted_count
@@ -321,7 +321,7 @@ quarantined_count
 fail_stop_latched
 ```
 
-Core 在每个 `block.transition.begin` 分配唯一 `block_transition_id`，对应 terminal event 必须复用同一 ID。`committed/aborted/quarantined` 三个 terminal ID 集合必须两两互斥，三者并集严格等于 `entered_block_transition_ids[]`；每个 entered transition 恰好落入一个 terminal 集合，counts 与各集合长度一致；`failed` 必须把触发 fail-stop 的 quarantine refs 明确关联。独立 block events 仍是 parser authority，terminal payload 是闭包索引。Core action result 必须在 transaction terminal 之后发布，并与 terminal payload 和独立 block event 聚合完全一致。
+`committed/aborted/quarantined` 三个 terminal 引用集合必须两两互斥，三者并集严格等于 `entered_block_event_refs[]`；每个 entered block 恰好落入一个 terminal 集合，counts 与各集合长度一致；`failed` 必须把触发 fail-stop 的 quarantine refs 明确关联。独立 block events 仍是 parser authority，terminal payload 是闭包索引。Core action result 必须在 transaction terminal 之后发布，并与 terminal payload 和独立 block event 聚合完全一致。
 
 ### 8.3 Server action observation 与 runner observation
 
