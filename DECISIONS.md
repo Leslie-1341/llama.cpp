@@ -506,3 +506,90 @@ D-0010 提交的 `paged_release_blocks_bounded()` 是 per-call budget 控制的 
 - `scripts/os-agent/checks/run-checks.sh`：534 行，10 个 check 函数。
 - `scripts/os-agent/tests/test-harness.sh`：526 行，15 E2E 合成测试——**15/15 PASS**。
 - Audit gate 实际运行：`bash scripts/os-agent/gate-runner audit` → `OS_AGENT_GATE_RESULT mode=audit verdict=PASS code=0 checks=8 pass=5 fail=0 skip=3 unresolved=0`。
+
+## D-0013 — 冻结 KV 三轴生命周期目标状态机，runtime 改造以 overlay 与唯一 commit visibility 为准
+
+- Date: 2026-07-23
+- Status: accepted（**目标契约**；尚非 runtime 实现决策完成态）
+- Evidence commit/worktree: `a532c53ad3e21c42d032f097b97fb96da48d9df0`（clean，新增 `docs/kv_block_lifecycle_contract.md`）
+- Supersedes: none；为 D-0008/D-0010 的现有单一 block enum 与 bounded-release 语义提供后续目标判定基准
+- Superseded by: none
+
+**Context**
+
+现有 `UNUSED/RESIDENT/RELEASED/SWAPPED/PENDING_WRITE/INVALID` 单一 block enum 混合内容、驻留与事务语义，且已知 prepare/commit visibility、owner overlay 与 quarantine 门禁仍有 P0 缺口。
+
+**Decision**
+
+冻结三轴目标模型：内容（`EMPTY/VALID/QUARANTINED`）、驻留（`RESIDENT/EVICTING/OFFLOADED/PREFETCHING/DISCARDED`）与写事务（`CLOSED/PREPARED/APPLIED/COMPUTE_STARTED`）。未提交写入由 owner-checked、per-cell overlay 表达；`write.commit` 是唯一 committed visibility 发布点；compute-started 失败收敛到 quarantine/fail-stop，且只有 explicit clear/reset 可解除。reset 保留 cache instance、递增 epoch 并重置新 epoch generation。
+
+**Alternatives rejected**
+
+- 延续 block 级 `PENDING_WRITE` 并仅补充计数：不能表达 owner 隔离、per-cell visibility 或 commit 前零 committed mutation。
+- 将 compute-started failure 作为普通 rollback：backend 可能已部分写入，无法证明旧/新内容仍可信。
+
+**Consequences and limits**
+
+这是后续实现与 P0 测试的 authority，不是当前 runtime 已满足的声明。实现前不得把现有 `INVALID`、block-level `PENDING_WRITE` 或 aggregate counter 等同于本决策中的 quarantine、overlay 或逐 block generation 闭包。
+
+**Evidence**
+
+- `docs/kv_block_lifecycle_contract.md` §1–§10，尤其 §9 当前实现差距矩阵与 §10 完成判定。
+
+## D-0014 — 冻结 server 策略与 lifecycle core 状态 authority 的分层及动作优先级
+
+- Date: 2026-07-23
+- Status: accepted（**目标契约**；尚非统一 scheduler runtime）
+- Evidence commit/worktree: `a532c53ad3e21c42d032f097b97fb96da48d9df0`（clean，新增 `docs/kv_pressure_scheduler_contract.md`）
+- Supersedes: D-0003 的一般 core/driver 分层在 KV pressure lifecycle 领域的目标细化；不废止现有 runtime 行为
+- Superseded by: none
+
+**Context**
+
+当前 bounded-release server 路径已有部分 core 调用基础，但 offload/prefetch 未经统一仲裁，server marker、core result 与系统观测混合，且 active-required prefetch 必须先于 reclaim 的优先级尚未在真实路径闭合。
+
+**Decision**
+
+冻结 server/core/runner/parser 四层 authority：server 只消费不可变快照、选择逻辑对象并提交带预算的策略意图；core 独占 logical-to-physical 解析、最终 ownership/recheck、状态/authority/free-list/transaction 变更与 transaction ID；runner 只记录原始事实；parser 为 verdict authority。统一目标动作是 `NOOP/EVALUATE/RELEASE/OFFLOAD/PREFETCH`，优先级固定为 fail-stop → correctness-required prefetch → release → offload → noop；每个 decision 最多一个 state-changing core transaction。
+
+**Alternatives rejected**
+
+- server 根据 private block state 直接挑选并转换 physical block：破坏 core correctness authority，无法在 decision 与 mutation 间重新验证 owner/generation/transaction。
+- 用 pressure cooldown 延迟 active/resume prefetch：会允许未恢复的 active KV 进入 graph compute。
+
+**Consequences and limits**
+
+这是 P0/P1 runtime 改造边界。当前实现只有部分 bounded-release server→core 调用，不能据此声称五种动作、统一 request/result、逐候选 recheck 或 active prefetch 优先级已经实现。
+
+**Evidence**
+
+- `docs/kv_pressure_scheduler_contract.md` §1–§11，尤其 §10 当前实现差距与 §11 完成判定。
+
+## D-0015 — 冻结统一 lifecycle 证据协议，parser fail-closed 且不以系统观测冒充状态 truth
+
+- Date: 2026-07-23
+- Status: accepted（**目标协议**；当前 telemetry/runner/parser 尚未满足）
+- Evidence commit/worktree: `a532c53ad3e21c42d032f097b97fb96da48d9df0`（clean，新增 `docs/kv_lifecycle_evidence_protocol.md`）
+- Supersedes: none；细化 D-0005、D-0011 中各阶段 runner/parser 的局部协议边界
+- Superseded by: none
+
+**Context**
+
+现有 marker 与 aggregate counter 不能完整关联 pressure decision、core transaction、physical block generation、物理操作、系统观测和后续 correctness；`madvise` 返回、mincore/RSS 变化或 HTTP 成功也都不能单独证明 lifecycle transition。
+
+**Decision**
+
+冻结统一身份与事件协议：authority producer 生成 server/cache/episode/sample/decision/transaction/block-transition ID、physical block identity/generation 与严格连续 `event_stream_id + event_seq`。事件严格分离 transition truth、backing/I/O/madvise physical truth 与 mincore/RSS/cgroup/PSI observation；runner 记录 provenance 与原始事实，不写 PASS；parser 对 schema、身份、顺序、关联、block/transaction terminal、generation/reset、lifecycle 闭包及物理归因 fail-closed。
+
+**Alternatives rejected**
+
+- 从 stderr marker 的出现顺序或 aggregate result 推断完整 transaction：不能检测 block terminal 缺失、跨实例/epoch 错配或 partial transaction 闭包不完整。
+- 将 process-wide strace/mincore/RSS 作为 transition 成功的唯一依据：缺少 transaction/block correlation，且系统观测不等于 authority 状态。
+
+**Consequences and limits**
+
+现有 Stage 3A-2C runner/parser 的身份、dirty snapshot、部分 fixture 与 shutdown 记录只是基础，不能升级为完整 lifecycle protocol 或性能结论。任何未来正式结论仍需 clean-HEAD、身份完整且 parser PASS 的 artifact。
+
+**Evidence**
+
+- `docs/kv_lifecycle_evidence_protocol.md` §1–§16，尤其 §15 当前协议差距与 §16 完成判定。

@@ -2,11 +2,11 @@
 
 > 当前项目快照。仅记录可验证事实；历史决策和实验结果分别进入 `DECISIONS.md` 与 `EXPERIMENTS.md`。
 
-- Last updated: 2026-07-21
-- Evidence commit: `fd51455b79af08f629810621578965e772ce0685`
+- Last updated: 2026-07-23
+- Evidence commit: `a532c53ad3e21c42d032f097b97fb96da48d9df0`（三份 KV 目标契约冻结）
 - Branch: `fix/kv-p0-b1-bounded-store`
-- Worktree: **dirty**（10 tracked modified + 3 untracked = Stage 3A-2C 未提交改动；详见"In Progress"）
-- Upstream relation: 相对 `origin/fix/kv-p0-b1-bounded-store` ahead 11
+- Worktree: **dirty**（25 tracked modified + 4 untracked；其中包含 Stage 3A-2C runtime/协议改动，尚未构建或验证）
+- Upstream relation: 目前无法确认；本轮未查询远端引用
 
 ## Goal
 
@@ -14,9 +14,9 @@
 
 ## Current Stage
 
-**Stage 3A-2B pressure-driven KV reclaim dry-run 稳定节点 + Harness v1 已提交并 VALID。** HEAD `fd51455b7` 在 Stage 3A-2B dry-run 之上新增 diff-aware validation harness（`scripts/os-agent/`）——gate-runner 支持 implement/review/review-fix/audit 四种模式，通过 diff 分析自动分类变更文件、mapping C/C++ 源文件到已验证 CMake targets，并以唯一结构化 marker `OS_AGENT_GATE_RESULT` 输出 verdict。自测 15/15 E2E PASS，四模式均产出有效 marker。
+**KV 生命周期、pressure scheduler 与统一证据的目标契约已冻结；对应 runtime 尚未实现。** HEAD `a532c53ad` 新增三份仅定义目标 authority 与完成判定的文档：`docs/kv_block_lifecycle_contract.md`、`docs/kv_pressure_scheduler_contract.md`、`docs/kv_lifecycle_evidence_protocol.md`。三份文档均明确：目标语义、统一 action/事件与证据闭包不等于当前源码已满足；现有 runtime 只具有部分基础，仍存在 P0/P1 语义和证据差距。
 
-**工作树当前有 10 tracked modified + 3 untracked = Stage 3A-2C 未提交改动**：将 destructive `paged_release_blocks_bounded()` 接入 server scheduler 的 PRESSURE/CRITICAL 分支（替换 dry-run scanner），执行真实 MADV_DONTNEED。该改动尚未提交、构建或验证，不得描述为已实现。
+**Stage 3A-2C runtime/协议工作树仍未验证。** 当前有 25 tracked modified + 4 untracked；其中包括 bounded destructive release 的 server 接入、生命周期相关 core 改动及 runner/parser/test。该工作树尚未构建、测试、review 或通过 implement gate；不得将其或三份冻结契约描述为 runtime 已实现。Harness v1 的既有提交证据仍见下文，但不替代本轮 runtime 验证。
 
 ## Implemented and Verified
 
@@ -76,15 +76,15 @@
 
 ## In Progress
 
-- **Stage 3A-2C destructive bounded release server 接入**：源码改动已存在于 10 tracked modified + 3 untracked 文件中（`src/llama-kv-cache-release.h`、`src/llama-kv-cache.cpp`、`src/llama-kv-cache.h`、`src/llama-memory.h`、`tests/CMakeLists.txt`、`tests/test-server-kv-pressure-static.py`、`tests/test-server-kv-pressure.cpp`、`tools/server/server-context.cpp`、`tools/server/server-kv-pressure.cpp`、`tools/server/server-kv-pressure.h` 以及 3 个 untracked runner/parser/test 文件），**尚未提交、构建或验证**。不得描述为已实现或已验证。
+- **Stage 3A-2C 及生命周期 runtime/协议改动**：源码、测试、runner/parser 与 Harness 改动共 25 个 tracked 文件和 4 个 untracked 文件；当前工作树状态是**尚未提交、构建、测试、review 或 gate 验证**。三份冻结契约已将其目标语义与 P0/P1 缺口列明，但不构成对该 runtime 的实现或验证声明。
 
 ## Blocked
 
-- 无已知功能门禁阻塞。dry-run 控制链路已验证通过；destructive reclaim（Stage 3A-2C）源码改动已在工作树中，待构建和受控验证。
+- 目标契约的 runtime 实现存在 P0 语义与证据缺口：三轴状态/overlay、prepare 零 committed mutation、唯一 visibility commit、quarantine 闭合、统一 scheduler action/result/event 与完整 lifecycle parser 尚未实现。当前 Stage 3A-2C 工作树亦未完成构建和验证。
 
 ## Next Gate
 
-**唯一下一门禁：Stage 3A-2C — 固定 target 的真实 bounded destructive reclaim 受控验证。** 将 `paged_release_blocks_bounded()` 接入 PRESSURE/CRITICAL 分支（替换 dry-run scanner），执行真实 `MADV_DONTNEED`。验收要求：
+**唯一下一门禁：先将当前 runtime 改动与冻结目标契约逐项对照，关闭 P0 生命周期/调度/证据缺口并完成定向构建、测试、review 和 implement gate；随后才能进行 Stage 3A-2C 固定 target 的真实 bounded destructive reclaim 受控验证。** 该受控验证仍需将 `paged_release_blocks_bounded()` 接入 PRESSURE/CRITICAL 分支（替换 dry-run scanner），执行真实 `MADV_DONTNEED`。既有验收要求：
 1. OFF/ON controlled A/B：OFF 零 release marker + 零 MADV_DONTNEED；ON 产生真实 release marker（`paged_block_release_bytes > 0`、`paged_blocks_released > 0`）。
 2. 响应 byte-identical（release 不误伤 active-owned block）。
 3. strace 确认 MADV_DONTNEED 仅发生于 ON variant 且数量与 release marker 一致。

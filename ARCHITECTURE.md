@@ -6,6 +6,16 @@
 - Evidence commit: `fd51455b79af08f629810621578965e772ce0685`
 - Verification scope: 当前源码、Git history（`02f8cd5ed`→`fd51455b7` diff）、Harness v1 实现（`scripts/os-agent/` 全部文件）、test-harness.sh 15/15 E2E PASS、audit gate verdict PASS、四模式 marker 验证
 
+## Frozen KV Target Contract Authority (not current runtime)
+
+HEAD `a532c53ad` 冻结以下**目标契约**。它们是后续实现、review 与验收的 authority；不描述为当前 runtime 架构或已验证数据流：
+
+- [`docs/kv_block_lifecycle_contract.md`](docs/kv_block_lifecycle_contract.md)：block/cell 的内容、驻留与事务三轴状态，transaction-owned per-cell overlay，commit/rollback/quarantine/reset、generation 与生命周期测试边界。
+- [`docs/kv_pressure_scheduler_contract.md`](docs/kv_pressure_scheduler_contract.md)：server 只提交策略意图与逻辑对象，lifecycle core 独占候选解析和状态转换；`NOOP/EVALUATE/RELEASE/OFFLOAD/PREFETCH` 动作、固定优先级及 core/server/runner 分层。
+- [`docs/kv_lifecycle_evidence_protocol.md`](docs/kv_lifecycle_evidence_protocol.md)：身份、严格事件顺序、transition/physical-operation/system-observation 分层，以及 release/offload/prefetch/reuse/quarantine 的 fail-closed 证据闭包。
+
+目标边界：server 不直接修改 block/cell、backing、free-list 或事务；core 不接受 server 对最终 physical block 的强制状态命令；runner 只记录原始事实；parser 才是 protocol verdict authority。三份文档的“必须”均为目标要求，直到其各自完成判定具备源码、review 与相应证据后，才可进入下方“当前源码可验证的稳定结构”。
+
 ## System Boundary
 
 - 基础系统为 `llama.cpp` / `ggml`。项目扩展位于模型加载、CPU weight-stream callback、KV cache、attention graph 输入、server scheduler 和独立 example/runner 层。
