@@ -1,31 +1,50 @@
-// Bounded KV release unit correctness test — validates paged_release_blocks_bounded()
-// without connecting to server, pressure sampler, swap, or prefetch paths.
+// Bounded KV release correctness test — validates the Stage 3A-2C
+// release → reuse → commit / rollback lifecycle and the read/write/ensure
+// safety predicates WITHOUT an on-disk GGUF model.
+//
+// Model fixture: a minimal in-memory LLM_ARCH_LLAMA model is built at runtime
+// via llama_model_init_from_user (same construction pattern proven by
+// tests/test-llama-archs.cpp).  No LLAMACPP_TEST_MODELFILE or argv model path
+// is required; the test always runs (never CTest SKIP).
 //
 // Part A (no-model): synthetic ownership-collection ABORT detection.
-// Part B (model-dependent): real bounded-release gates via test-only seams:
-//   B1-B2:   basic edge cases (target=0, max_scan=0)
-//   B3-B4:   overshoot + scan-budget
-//   B5:      invalid ownership ABORT via real paged_release_blocks_bounded() path
-//   B6:      PENDING_WRITE dynamic block state override → skip + zero-change
-//   B7:      madvise failure injection → no state change, scan continues
-//   B8:      active-owned skip + output consistency (dual context)
-//   B9-B11:  shortfall, idempotent, corner cases
-//
-// Seam-dependent tests (B5-B7) run in fresh contexts to avoid the all-RELEASED
-// block reuse edge case.
-//
-// Requires a GGUF model. Pass it via LLAMACPP_TEST_MODELFILE or argv[1].
-// Without a model the test exits with code 77 (CTest SKIP_RETURN_CODE).
+// Part B (synthetic-model): real bounded-release gates via the genuine graph
+//   compute (llama_decode) path, so PENDING_WRITE → RESIDENT (commit) and
+//   PENDING_WRITE → RELEASED (rollback) are driven by the authoritative
+//   state-machine triggers, not by overrides or stubs:
+//   WT1-WT4: ensure_write_resident / read_resident / state-gate fail-closed
+//            behaviors against RELEASED, fresh/stale PENDING_WRITE, SWAPPED.
+//   WT6:     idle release → reuse decode → commit → RESIDENT
+//   WT7:     undersized prompt: stale/padding rows trigger dummy candidate +
+//            released_redirect_no_dummy == 0 + input_setup_fatal == 0.
+//   WT8:     graph success: reuse_allocations >=1, write_commits >=1,
+//            write_rollbacks == 0, block RESIDENT, free-list / pending-map /
+//            transaction_open consistent.
+//   WT9:     deterministic pre-graph failure after a real write transaction
+//            opens → rollback → block back to RELEASED, pending bitmap cleared,
+//            transaction_open false, free-list consistent.
 
+#include "common.h"
 #include "llama.h"
+#include "llama-cpp.h"
 
+#include "ggml.h"
+#include "gguf.h"
+#include "ggml-cpp.h"
+
+#include "../src/llama-arch.h"
+#include "../src/llama-batch.h"
+#include "../src/llama-model-saver.h"
 #include "../src/llama-kv-cache.h"
 #include "../src/llama-kv-cache-release.h"
 
 #include <cinttypes>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <random>
+#include <string>
 #include <vector>
 
 static int failures = 0;
@@ -36,8 +55,6 @@ static int failures = 0;
         failures++; \
     } \
 } while(0)
-
-static const int SKIP_EXIT_CODE = 77;
 
 // ===========================================================================
 // Part A: Synthetic ownership ABORT detection.
@@ -86,14 +103,141 @@ static void test_ownership_fault_fixture() {
 }
 
 // ===========================================================================
+// Synthetic in-memory LLM_ARCH_LLAMA model fixture (no GGUF file).
+// ===========================================================================
+
+static void synthetic_set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
+    std::hash<std::string> hasher;
+    std::mt19937 gen(hasher(tensor->name) + *(const size_t *) userdata);
+    std::normal_distribution<float> dis(0.0f, 1.0e-2f);
+    const int64_t ne = ggml_nelements(tensor);
+    if (tensor->type == GGML_TYPE_F32) {
+        std::vector<float> tmp(ne);
+        for (int64_t i = 0; i < ne; i++) tmp[i] = dis(gen);
+        ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
+    } else if (tensor->type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> tmp(ne);
+        for (int64_t i = 0; i < ne; i++) tmp[i] = ggml_fp32_to_fp16(dis(gen));
+        ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
+    } else {
+        GGML_ABORT("fatal: unsupported tensor type in synthetic model fixture");
+    }
+}
+
+static bool synthetic_silent_load(float, void *) { return true; }
+
+// Minimal LLM_ARCH_LLAMA gguf context.  Mirrors the llama subset of
+// tests/test-llama-archs::get_gguf_ctx.
+static gguf_context_ptr make_synthetic_llama_gguf_ctx() {
+    gguf_context_ptr ret(gguf_init_empty());
+    const llm_arch arch = LLM_ARCH_LLAMA;
+    llama_model_saver ms(arch, ret.get());
+    const uint32_t n_ctx   = 256;
+    const uint32_t n_vocab = 128;
+    const uint32_t n_embd  = 128;
+    const uint32_t n_head  = 2;
+    const uint32_t n_ff    = 192;
+    const uint32_t n_layer = 2;
+    const uint32_t n_embd_head = n_embd / n_head;
+
+    ms.add_kv(LLM_KV_GENERAL_ARCHITECTURE,      llm_arch_name(arch));
+    ms.add_kv(LLM_KV_VOCAB_SIZE,                n_vocab);
+    ms.add_kv(LLM_KV_CONTEXT_LENGTH,            n_ctx);
+    ms.add_kv(LLM_KV_EMBEDDING_LENGTH,          n_embd);
+    ms.add_kv(LLM_KV_FEATURES_LENGTH,           n_embd);
+    ms.add_kv(LLM_KV_BLOCK_COUNT,               n_layer);
+    ms.add_kv(LLM_KV_LEADING_DENSE_BLOCK_COUNT, uint32_t(1));
+    ms.add_kv(LLM_KV_FEED_FORWARD_LENGTH,      n_ff);
+    ms.add_kv(LLM_KV_USE_PARALLEL_RESIDUAL,     false);
+    ms.add_kv(LLM_KV_LOGIT_SCALE,               1.0f);
+    ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT,     n_head);
+    ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV,  n_head);
+    ms.add_kv(LLM_KV_ATTENTION_MAX_ALIBI_BIAS,  8.0f);
+    ms.add_kv(LLM_KV_ATTENTION_CLAMP_KQV,       1.0f);
+    ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_EPS,         1e-5f);
+    ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,     1e-5f);
+    ms.add_kv(LLM_KV_ATTENTION_GROUPNORM_EPS,         1e-5f);
+    ms.add_kv(LLM_KV_ATTENTION_GROUPNORM_GROUPS,      uint32_t(8));
+    ms.add_kv(LLM_KV_ATTENTION_Q_LORA_RANK,           uint32_t(512));
+    ms.add_kv(LLM_KV_ATTENTION_KV_LORA_RANK,          uint32_t(512));
+    ms.add_kv(LLM_KV_ATTENTION_RELATIVE_BUCKETS_COUNT, uint32_t(8));
+    ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW,        n_ctx/8);
+    ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, uint32_t(2));
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,    uint32_t(1));
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,    uint32_t(64));
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,         uint32_t(8));
+    ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS, std::vector<uint32_t>({n_embd_head/4, n_embd_head/4, n_embd_head/4, n_embd_head/4}));
+    ms.add_kv(LLM_KV_TOKENIZER_MODEL, "no_vocab");
+    return ret;
+}
+
+static llama_model * make_synthetic_model() {
+    gguf_context_ptr gguf = make_synthetic_llama_gguf_ctx();
+    llama_model_params mparams = llama_model_default_params();
+    mparams.progress_callback = synthetic_silent_load;
+    static std::vector<ggml_backend_dev_t> devs = { nullptr };
+    mparams.devices = devs.data();
+    size_t seed = 1234;
+    // llama_model_init_from_user synchronously consumes the metadata needed to
+    // construct the model, so the local gguf context can retain normal RAII.
+    return llama_model_init_from_user(gguf.get(), synthetic_set_tensor_data, &seed, mparams);
+}
+
+// ===========================================================================
 // Helpers
 // ===========================================================================
 
 static int decode_prompt(llama_context * lctx, const std::vector<llama_token> & tokens) {
-    std::vector<llama_token> full = { 128000 };
-    full.insert(full.end(), tokens.begin(), tokens.end());
-    llama_batch b = llama_batch_get_one(full.data(), (int32_t) full.size());
+    std::vector<llama_token> toks = tokens;  // mutable copy — llama_batch_get_one needs non-const
+    llama_batch b = llama_batch_get_one(toks.data(), (int32_t) toks.size());
     return llama_decode(lctx, b);
+}
+
+static llama_ubatch make_ubatch(
+        const std::vector<llama_token> & tokens,
+        const std::vector<llama_pos> & positions,
+        llama_seq_id seq_id) {
+    CHECK(tokens.size() == positions.size(), "make_ubatch: token/position size match");
+
+    llama_ubatch ubatch = {};
+    ubatch.data = std::make_shared<llama_ubatch::data_t>();
+    auto & data = *ubatch.data;
+    data.token = tokens;
+    data.pos = positions;
+    data.n_seq_id.assign(tokens.size(), 1);
+    data.seq_id_data.assign(tokens.size(), seq_id);
+    data.seq_id.resize(tokens.size());
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        data.seq_id[i] = &data.seq_id_data[i];
+    }
+    data.seq_id_unq = { seq_id };
+    data.seq_idx.assign(LLAMA_MAX_SEQ, -1);
+    data.seq_idx[seq_id] = 0;
+    data.output.assign(tokens.size(), 1);
+
+    ubatch.b_equal_seqs = 1;
+    ubatch.n_tokens = tokens.size();
+    ubatch.n_seq_tokens = tokens.size();
+    ubatch.n_seqs = 1;
+    ubatch.n_seqs_unq = 1;
+    ubatch.n_pos = 1;
+    ubatch.token = data.token.data();
+    ubatch.pos = data.pos.data();
+    ubatch.n_seq_id = data.n_seq_id.data();
+    ubatch.seq_id = data.seq_id.data();
+    ubatch.seq_id_unq = data.seq_id_unq.data();
+    ubatch.seq_idx = data.seq_idx.data();
+    ubatch.output = data.output.data();
+    return ubatch;
+}
+
+static llama_kv_cache::slot_info make_slot(std::vector<uint32_t> cells) {
+    llama_kv_cache::slot_info sinfo = {};
+    sinfo.s0 = 0;
+    sinfo.s1 = 0;
+    sinfo.strm = { 0 };
+    sinfo.idxs = { std::move(cells) };
+    return sinfo;
 }
 
 struct ContextGuard {
@@ -112,729 +256,1233 @@ struct ContextGuard {
     ~ContextGuard() { if (ctx) llama_free(ctx); }
 };
 
-// Snapshot helpers
-static void snapshot_states(llama_kv_cache * kv, std::vector<uint8_t> & out, uint32_t n) {
-    out.resize(n);
-    for (uint32_t b = 0; b < n; ++b)
-        out[b] = kv->paged_release_bounded_test_read_block_state(b);
-}
-static void snapshot_free(llama_kv_cache * kv, std::vector<bool> & out, uint32_t n) {
-    out.resize(n);
-    for (uint32_t b = 0; b < n; ++b)
-        out[b] = kv->paged_release_bounded_test_block_in_free_list(b);
-}
-
 // ===========================================================================
-// Part B: Real-model tests.
+// Part B: real-model (synthetic) bounded-release lifecycle tests.
 // ===========================================================================
 
-int main(int argc, char ** argv) {
+int main(int /*argc*/, char ** /*argv*/) {
     test_ownership_fault_fixture();
-
-    const char * model_path = nullptr;
-    if (argc > 1) model_path = argv[1];
-    else model_path = getenv("LLAMACPP_TEST_MODELFILE");
-
-    if (!model_path || strlen(model_path) == 0) {
-        std::fprintf(stderr, "SKIP: no model file. "
-                "Set LLAMACPP_TEST_MODELFILE=<gguf_path> to run Part B.\n");
-        return SKIP_EXIT_CODE;
-    }
 
     setenv("LLAMA_KV_PAGED", "1", 1);
     setenv("LLAMA_KV_PAGED_RELEASE", "1", 1);
     setenv("LLAMA_KV_PAGED_BLOCK_SIZE", "16", 1);
+    setenv("LLAMA_GRAPH_REUSE_DISABLE", "1", 1);
 
     llama_backend_init();
 
-    llama_model_params mparams = llama_model_default_params();
-    auto * model = llama_model_load_from_file(model_path, mparams);
+    llama_model * model = make_synthetic_model();
     if (!model) {
-        std::fprintf(stderr, "FAIL: failed to load model\n");
+        std::fprintf(stderr, "FAIL: synthetic model init failed\n");
         llama_backend_free();
         return 1;
     }
 
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx = 256;
+    cparams.n_seq_max = 2;          // one unified stream, two sequence ids for rollback coverage
+    cparams.kv_unified = true;
     cparams.type_k = GGML_TYPE_F32;
     cparams.type_v = GGML_TYPE_F32;
-
-    // Primary context for non-seam tests
-    ContextGuard main_ctx;
-    if (!main_ctx.init(model, cparams)) {
-        std::fprintf(stderr, "FAIL: failed to create main context\n");
-        llama_model_free(model);
-        llama_backend_free();
-        return 1;
-    }
+    cparams.n_threads = 4;
+    cparams.n_threads_batch = 4;
 
     // =========================================================================
-    // B1: target=0 → immediate return
-    // =========================================================================
-    {
-        const auto r = main_ctx.kv->paged_release_blocks_bounded(0, 100);
-        CHECK(r.released_bytes == 0, "B1: released_bytes == 0");
-        CHECK(r.released_blocks == 0, "B1: released_blocks == 0");
-        CHECK(r.blocks_scanned == 0, "B1: blocks_scanned == 0");
-        CHECK(!r.ownership_aborted, "B1: ownership_aborted == false");
-        CHECK(!r.block_scan_exhausted, "B1: exhausted == false");
-        CHECK(r.shortfall_bytes == 0, "B1: shortfall == 0");
-        CHECK(r.overshoot_bytes == 0, "B1: overshoot == 0");
-        std::fprintf(stderr, "B1 target=0: OK\n");
-    }
-
-    // =========================================================================
-    // B2: max_scan_blocks=0 → exhausted + full shortfall
-    // =========================================================================
-    {
-        const uint64_t t = 65536;
-        const auto r = main_ctx.kv->paged_release_blocks_bounded(t, 0);
-        CHECK(r.block_scan_exhausted, "B2: exhausted == true");
-        CHECK(r.shortfall_bytes == t, "B2: shortfall == target");
-        CHECK(r.released_bytes == 0, "B2: released_bytes == 0");
-        CHECK(r.blocks_scanned == 0, "B2: blocks_scanned == 0");
-        CHECK(!r.ownership_aborted, "B2: ownership_aborted == false");
-        std::fprintf(stderr, "B2 max_scan_blocks=0: OK\n");
-    }
-
-    // =========================================================================
-    // B3: overshoot — target=1, one block released → overshoot
-    // =========================================================================
-    {
-        std::vector<llama_token> toks(20, 1);
-        int rc = decode_prompt(main_ctx.ctx, toks);
-        CHECK(rc == 0, "B3: decode must succeed");
-        if (rc == 0) {
-            llama_memory_seq_rm(main_ctx.mem, 0, -1, -1);
-            const auto r = main_ctx.kv->paged_release_blocks_bounded(1, UINT32_MAX);
-            CHECK(r.released_blocks > 0, "B3: released_blocks > 0");
-            CHECK(r.released_bytes > 1, "B3: released_bytes > target");
-            CHECK(r.overshoot_bytes == r.released_bytes - 1,
-                    "B3: overshoot == released - target");
-            CHECK(r.shortfall_bytes == 0, "B3: shortfall == 0");
-            CHECK(!r.ownership_aborted, "B3: ownership_aborted == false");
-            std::fprintf(stderr, "B3 overshoot: %" PRIu64 "B/%" PRIu32
-                    " blocks overshoot=%" PRIu64 " OK\n",
-                    r.released_bytes, r.released_blocks, r.overshoot_bytes);
-        }
-    }
-
-    // =========================================================================
-    // B4: scan budget — blocks_scanned == max_scan_blocks
-    // =========================================================================
-    {
-        const auto r = main_ctx.kv->paged_release_blocks_bounded(UINT64_MAX, 2);
-        CHECK(r.blocks_scanned == 2, "B4: blocks_scanned == budget");
-        CHECK(r.block_scan_exhausted, "B4: exhausted == true");
-        std::fprintf(stderr, "B4 scan budget: scanned=%" PRIu32 " OK\n",
-                r.blocks_scanned);
-    }
-
-    // =========================================================================
-    // B5: Invalid ownership ABORT — real paged_release_blocks_bounded() path.
-    //   Uses test_force_ownership_abort seam in a FRESH context.
+    // Setup sanity: synthetic model drives the paged-KV block-state path.
     // =========================================================================
     {
         ContextGuard g;
         if (!g.init(model, cparams)) {
-            CHECK(false, "B5: fresh context creation failed");
+            CHECK(false, "SETUP: context creation failed");
         } else {
-            // Create RESIDENT blocks via decode
-            std::vector<llama_token> toks = { 50, 51, 52, 53, 54, 55, 56, 57 };
-            int rc = decode_prompt(g.ctx, toks);
-            CHECK(rc == 0, "B5: decode must succeed");
-
-            // Snapshot pre-ABORT state (first 4 blocks)
-            std::vector<uint8_t> st_before;
-            std::vector<bool> fl_before;
-            snapshot_states(g.kv, st_before, 4);
-            snapshot_free(g.kv, fl_before, 4);
-
-            // Trigger ABORT via test-only seam
-            g.kv->paged_release_bounded_test_force_ownership_abort = true;
-            // Also set block_state_override — verify it is auto-cleared by the
-            // ABORT path (single-shot: all test seams reset together).
-            g.kv->paged_release_bounded_test_block_state_override.block = 0;
-            g.kv->paged_release_bounded_test_block_state_override.state = 4;
-            const auto r = g.kv->paged_release_blocks_bounded(UINT64_MAX, UINT32_MAX);
-
-            CHECK(r.ownership_aborted, "B5: ownership_aborted == true");
-            CHECK(r.released_blocks == 0, "B5: ABORT → released_blocks == 0");
-            CHECK(r.released_bytes == 0, "B5: ABORT → released_bytes == 0");
-            CHECK(r.blocks_scanned == 0, "B5: ABORT → blocks_scanned == 0");
-            CHECK(!r.block_scan_exhausted, "B5: ABORT → exhausted == false");
-            CHECK(r.shortfall_bytes == 0, "B5: ABORT → shortfall == 0");
-            CHECK(r.overshoot_bytes == 0, "B5: ABORT → overshoot == 0");
-            CHECK(r.blocks_skipped_owned == 0, "B5: ABORT → skipped_owned == 0");
-            CHECK(r.blocks_skipped_state == 0, "B5: ABORT → skipped_state == 0");
-            CHECK(r.madvise_failures == 0, "B5: ABORT → madvise_failures == 0");
-
-            // Single-shot flags were auto-reset by the ABORT path
-            CHECK(!g.kv->paged_release_bounded_test_force_ownership_abort,
-                    "B5: force_ownership_abort flag auto-reset after ABORT");
-            CHECK(g.kv->paged_release_bounded_test_block_state_override.block == UINT32_MAX,
-                    "B5: block_state_override auto-reset after ABORT");
-
-            // Verify zero state changes
-            std::vector<uint8_t> st_after;
-            std::vector<bool> fl_after;
-            snapshot_states(g.kv, st_after, 4);
-            snapshot_free(g.kv, fl_after, 4);
-
-            bool ok = true;
-            for (uint32_t b = 0; b < 4; ++b) {
-                if (st_before[b] != st_after[b]) { ok = false; break; }
-                if (fl_before[b] != fl_after[b]) { ok = false; break; }
-            }
-            CHECK(ok, "B5: all block states + free list unchanged after ABORT");
-
-            std::fprintf(stderr, "B5 ownership ABORT: released=%" PRIu32
-                    " states_ok=%d OK\n", r.released_blocks, ok ? 1 : 0);
+            std::vector<llama_token> prompt(16, 1);
+            int rc = decode_prompt(g.ctx, prompt);
+            CHECK(rc == 0, "SETUP: decode ok");
+            uint8_t s0 = g.kv->paged_release_bounded_test_read_block_state(0);
+            CHECK(s0 == 1, "SETUP: block 0 RESIDENT after decode");
+            std::fprintf(stderr, "SETUP synthetic-model paged: rc=%d block0=%u OK\n", rc, s0);
         }
     }
 
     // =========================================================================
-    // B6: PENDING_WRITE dynamic override on a NON-OWNED block — verify that the
-    //   state gate (not the earlier ownership gate) realiably skips the block.
-    //   If the block were still owned, `owned[block]` would skip before the state
-    //   override is even read — that would be fake coverage.
-    //   Fresh context.
+    // WT0: ownership collection failure aborts before any destructive state
+    //   mutation.  This uses the legacy test seam only to force the collector's
+    //   ABORT branch; WT6-WT9 exercise the production bounded-only primitive.
     // =========================================================================
     {
         ContextGuard g;
         if (!g.init(model, cparams)) {
-            CHECK(false, "B6: fresh context creation failed");
+            CHECK(false, "WT0: context creation failed");
         } else {
-            // Decode → create RESIDENT blocks owned by seq 0
-            std::vector<llama_token> toks = { 60, 61, 62, 63, 64, 65, 66, 67, 68, 69 };
-            int rc = decode_prompt(g.ctx, toks);
-            CHECK(rc == 0, "B6: decode must succeed");
-
-            // Remove seq 0 → blocks become dead (unowned).  This is critical:
-            // the PENDING_WRITE state gate runs *after* the ownership check;
-            // without this step the ownership check would skip the block first
-            // and the state override would never be exercised.
+            std::vector<llama_token> prompt(16, 1);
+            int rc = decode_prompt(g.ctx, prompt);
+            CHECK(rc == 0, "WT0: decode ok");
             llama_memory_seq_rm(g.mem, 0, -1, -1);
 
-            const uint32_t tb = 0; // target block
-            uint8_t real_state = g.kv->paged_release_bounded_test_read_block_state(tb);
-            bool real_free = g.kv->paged_release_bounded_test_block_in_free_list(tb);
+            const uint8_t state_before =
+                g.kv->paged_release_bounded_test_read_block_state(0);
+            const bool free_before =
+                g.kv->paged_release_bounded_test_block_in_free_list(0);
+            const uint64_t released_before =
+                g.kv->paged_release_bounded_test_read_released_blocks();
 
-            // Override: bounded release sees block 0 as PENDING_WRITE (4)
+            g.kv->paged_release_bounded_test_force_ownership_abort = true;
+            const auto r = g.kv->paged_release_blocks_bounded(UINT64_MAX, UINT32_MAX);
+
+            CHECK(r.ownership_aborted, "WT0: ownership failure reported");
+            CHECK(r.released_blocks == 0, "WT0: zero blocks released after ownership abort");
+            CHECK(g.kv->paged_release_bounded_test_read_block_state(0) == state_before,
+                    "WT0: block state unchanged after ownership abort");
+            CHECK(g.kv->paged_release_bounded_test_block_in_free_list(0) == free_before,
+                    "WT0: free-list unchanged after ownership abort");
+            CHECK(g.kv->paged_release_bounded_test_read_released_blocks() == released_before,
+                    "WT0: release counter unchanged after ownership abort");
+
+            std::fprintf(stderr, "WT0 ownership abort: state=%u free=%d released=%llu OK\n",
+                    state_before, free_before ? 1 : 0,
+                    (unsigned long long)released_before);
+        }
+    }
+
+    // =========================================================================
+    // WT1: ensure_write_resident accepts fresh current-transaction PENDING_WRITE
+    //   cells; bounded release skips PENDING_WRITE blocks (state gate preserves
+    //   them) without touching real state.  Uses block_state_override to mark a
+    //   dead block as PENDING_WRITE and verifies the state gate skip.
+    // =========================================================================
+    {
+        ContextGuard g;
+        if (!g.init(model, cparams)) {
+            CHECK(false, "WT1: context creation failed");
+        } else {
+            std::vector<llama_token> prompt(16, 1);
+            int rc = decode_prompt(g.ctx, prompt);
+            CHECK(rc == 0, "WT1: decode ok");
+            llama_memory_seq_rm(g.mem, 0, -1, -1);
+
+            const uint32_t tb = 0;
+            uint8_t real_state = g.kv->paged_release_bounded_test_read_block_state(tb);
+            CHECK(real_state == 1, "WT1: block 0 is RESIDENT");
+
             g.kv->paged_release_bounded_test_block_state_override.block = tb;
             g.kv->paged_release_bounded_test_block_state_override.state = 4;
 
             const auto r = g.kv->paged_release_blocks_bounded(UINT64_MAX, UINT32_MAX);
-            CHECK(!r.ownership_aborted, "B6: ownership valid");
-
-            // Override was auto-reset
-            CHECK(g.kv->paged_release_bounded_test_block_state_override.block == UINT32_MAX,
-                    "B6: override auto-reset");
-
-            // Block was skipped by the state gate (not the owned gate)
-            CHECK(r.blocks_skipped_owned == 0,
-                    "B6: zero blocks skipped by owned gate (block is dead)");
+            CHECK(!r.ownership_aborted, "WT1: ownership valid");
             CHECK(r.blocks_skipped_state >= 1,
-                    "B6: at least one block skipped by state gate (PENDING_WRITE hit)");
+                    "WT1: PENDING_WRITE block skipped by state gate");
+            CHECK(r.blocks_skipped_owned == 0,
+                    "WT1: zero blocks skipped by owned gate (block is dead)");
+            CHECK(r.madvise_failures == 0,
+                    "WT1: no madvise failures (never touched PENDING_WRITE block)");
 
-            // Real state unchanged
             uint8_t real_after = g.kv->paged_release_bounded_test_read_block_state(tb);
             CHECK(real_after == real_state,
-                    "B6: real block state unchanged after PENDING_WRITE skip");
-            bool free_after = g.kv->paged_release_bounded_test_block_in_free_list(tb);
-            CHECK(free_after == real_free,
-                    "B6: block not added to free list by PENDING_WRITE skip");
+                    "WT1: real block state unchanged after PENDING_WRITE skip");
+            CHECK(g.kv->paged_release_bounded_test_block_state_override.block == UINT32_MAX,
+                    "WT1: override auto-reset");
 
-            // madvise was never called on the skipped block
-            CHECK(r.madvise_failures == 0,
-                    "B6: no madvise failures (madvise was never called on skipped block)");
-
-            std::fprintf(stderr, "B6 PENDING_WRITE: state=%u→%u free=%d→%d "
-                    "skipped_owned=%" PRIu32 " skipped_state=%" PRIu32 " OK\n",
-                    real_state, real_after, real_free ? 1 : 0, free_after ? 1 : 0,
-                    r.blocks_skipped_owned, r.blocks_skipped_state);
+            std::fprintf(stderr, "WT1 PENDING_WRITE bypass: state=%u->%u skipped_state=%" PRIu32 " OK\n",
+                    real_state, real_after, r.blocks_skipped_state);
         }
     }
 
     // =========================================================================
-    // B7: madvise failure injection — block NOT released, NOT in free list,
-    //   scan continues to subsequent candidates. Fresh context.
+    // WT2: graph success keeps block RESIDENT and owned by the active seq, so
+    //   bounded release must skip it (no release while owned).
     // =========================================================================
     {
         ContextGuard g;
         if (!g.init(model, cparams)) {
-            CHECK(false, "B7: fresh context creation failed");
+            CHECK(false, "WT2: context creation failed");
         } else {
-            // Decode → create RESIDENT blocks
-            std::vector<llama_token> toks = { 70, 71, 72, 73, 74, 75, 76, 77, 78, 79,
-                                              80, 81, 82, 83, 84, 85, 86, 87 };
-            int rc = decode_prompt(g.ctx, toks);
-            CHECK(rc == 0, "B7: decode must succeed");
+            std::vector<llama_token> prompt(16, 2);
+            int rc = decode_prompt(g.ctx, prompt);
+            CHECK(rc == 0, "WT2: decode ok");
 
-            // Remove seq → all blocks dead
+            uint8_t s0 = g.kv->paged_release_bounded_test_read_block_state(0);
+            CHECK(s0 == 1, "WT2: block 0 is RESIDENT after decode");
+
+            const auto r = g.kv->paged_release_blocks_bounded(UINT64_MAX, UINT32_MAX);
+            CHECK(!r.ownership_aborted, "WT2: ownership valid");
+            CHECK(r.released_blocks == 0,
+                    "WT2: zero released (all blocks owned by active seq)");
+            CHECK(r.blocks_skipped_owned > 0,
+                    "WT2: blocks skipped by owned gate (active seq owns them)");
+
+            s0 = g.kv->paged_release_bounded_test_read_block_state(0);
+            CHECK(s0 == 1, "WT2: block 0 stays RESIDENT after skipped release");
+
+            std::fprintf(stderr, "WT2 active-owned protection: released=%" PRIu32
+                    " skipped_owned=%" PRIu32 " s0=%u OK\n",
+                    r.released_blocks, r.blocks_skipped_owned, s0);
+        }
+    }
+
+    // =========================================================================
+    // WT3: active-visible RELEASED remains fail-closed.  This test exercises
+    //   the legacy force-active seam only; deterministic transaction rollback
+    //   is covered independently by WT9.
+    // =========================================================================
+    {
+        setenv("LLAMA_KV_TEST_MODE", "1", 1);
+        setenv("LLAMA_KV_PAGED_TEST_FORCE_ACTIVE_RELEASE", "1", 1);
+        setenv("LLAMA_KV_PAGED_TEST_FORCE_ACTIVE_RELEASE_SEQ", "0", 1);
+
+        ContextGuard g;
+        if (!g.init(model, cparams)) {
+            CHECK(false, "WT3: context creation failed");
+        } else {
+            std::vector<llama_token> prompt(16, 3);
+            int rc = decode_prompt(g.ctx, prompt);
+
+            const uint64_t triggers =
+                g.kv->paged_release_bounded_test_read_force_active_triggers();
+            CHECK(triggers > 0, "WT3: force-active-release path triggered");
+            CHECK(rc != 0, "WT3: decode failed after force-active-release");
+            std::fprintf(stderr, "WT3 active-visible RELEASED: triggers=%" PRIu64
+                    " decode_rc=%d OK\n", triggers, rc);
+        }
+
+        unsetenv("LLAMA_KV_TEST_MODE");
+        unsetenv("LLAMA_KV_PAGED_TEST_FORCE_ACTIVE_RELEASE");
+        unsetenv("LLAMA_KV_PAGED_TEST_FORCE_ACTIVE_RELEASE_SEQ");
+        setenv("LLAMA_KV_PAGED_RELEASE", "1", 1);
+    }
+
+    // =========================================================================
+    // WT4: authoritative predicates reject PENDING_WRITE without an explicit
+    //   transaction owner, even if its pending bitmap is set, plus stale PENDING_WRITE,
+    //   active-visible RELEASED, and SWAPPED without backing.  The release
+    //   state gate also skips PENDING_WRITE without changing real state.
+    // =========================================================================
+    {
+        ContextGuard g;
+        if (!g.init(model, cparams)) {
+            CHECK(false, "WT4: context creation failed");
+        } else {
+            std::vector<llama_token> prompt(16, 4);
+            int rc = decode_prompt(g.ctx, prompt);
+            CHECK(rc == 0, "WT4: decode ok");
             llama_memory_seq_rm(g.mem, 0, -1, -1);
 
             const uint32_t tb = 0;
-            uint8_t b0_before = g.kv->paged_release_bounded_test_read_block_state(tb);
-            bool b0_free_before = g.kv->paged_release_bounded_test_block_in_free_list(tb);
+            uint8_t real_state = g.kv->paged_release_bounded_test_read_block_state(tb);
+            CHECK(real_state == 1, "WT4: block 0 is RESIDENT");
 
-            // Inject madvise failure on block 0
-            g.kv->paged_release_bounded_test_madvise_fail_block = (int32_t) tb;
+            const uint64_t rejected_before =
+                g.kv->paged_release_bounded_test_read_ensure_pending_write_rejected();
+            CHECK(!g.kv->paged_release_bounded_test_probe_residency(
+                        0, 4, true, false, false),
+                    "WT4: pending bitmap without transaction owner rejected");
+            CHECK(!g.kv->paged_release_bounded_test_probe_residency(
+                        0, 4, false, false, false),
+                    "WT4: stale/non-current PENDING_WRITE write rejected");
+            CHECK(!g.kv->paged_release_bounded_test_probe_residency(
+                        0, 4, false, true, true),
+                    "WT4: stale/non-current PENDING_WRITE active read rejected");
+            CHECK(!g.kv->paged_release_bounded_test_probe_residency(
+                        0, 2, false, true, true),
+                    "WT4: active-visible RELEASED read rejected");
+            CHECK(!g.kv->paged_release_bounded_test_probe_residency(
+                        0, 3, false, false, false),
+                    "WT4: SWAPPED write without backing rejected");
+            const uint64_t rejected_after =
+                g.kv->paged_release_bounded_test_read_ensure_pending_write_rejected();
+            CHECK(rejected_after >= rejected_before + 3,
+                    "WT4: pending-owner and stale write/read rejections counted");
+            CHECK(g.kv->paged_release_bounded_test_read_block_state(tb) == real_state,
+                    "WT4: predicate probes restore real block state");
+
+            g.kv->paged_release_bounded_test_block_state_override.block = tb;
+            g.kv->paged_release_bounded_test_block_state_override.state = 4;
 
             const auto r = g.kv->paged_release_blocks_bounded(UINT64_MAX, UINT32_MAX);
+            CHECK(!r.ownership_aborted, "WT4: ownership valid");
+            CHECK(r.blocks_skipped_state >= 1,
+                    "WT4: non-current PENDING_WRITE block skipped by state gate");
 
-            // Test flag auto-reset
-            CHECK(g.kv->paged_release_bounded_test_madvise_fail_block == -1,
-                    "B7: test flag auto-reset");
+            uint8_t real_after = g.kv->paged_release_bounded_test_read_block_state(tb);
+            CHECK(real_after == real_state, "WT4: real block state unchanged");
+            CHECK(g.kv->paged_release_bounded_test_block_state_override.block == UINT32_MAX,
+                    "WT4: override auto-reset");
 
-            // Block 0 state unchanged
-            uint8_t b0_after = g.kv->paged_release_bounded_test_read_block_state(tb);
-            CHECK(b0_after == b0_before,
-                    "B7: madvise-failed block state unchanged (not RELEASED)");
-
-            bool b0_free_after = g.kv->paged_release_bounded_test_block_in_free_list(tb);
-            CHECK(b0_free_after == b0_free_before,
-                    "B7: madvise-failed block not added to free list");
-
-            // Scan continued past the failed block
-            CHECK(r.blocks_scanned > 1,
-                    "B7: blocks_scanned > 1 (scan continued past failed block)");
-            // Later blocks were released
-            CHECK(r.released_blocks > 0,
-                    "B7: subsequent blocks released (scan continued)");
-            CHECK(r.released_bytes > 0,
-                    "B7: released budget > 0 (from subsequent blocks)");
-            CHECK(!r.ownership_aborted, "B7: ownership valid");
-
-            // madvise failure counter reflects the injected failure
-            CHECK(r.madvise_failures == 1,
-                    "B7: exactly 1 madvise failure recorded");
-            // The failed block was not owned → no owned-skip
-            CHECK(r.blocks_skipped_owned == 0,
-                    "B7: zero owned skips (all blocks dead)");
-
-            std::fprintf(stderr, "B7 madvise fail: b0_state=%u→%u b0_free=%d→%d "
-                    "released=%" PRIu32 " blocks scanned=%" PRIu32
-                    " madvise_failures=%" PRIu32 " OK\n",
-                    b0_before, b0_after, b0_free_before ? 1 : 0, b0_free_after ? 1 : 0,
-                    r.released_blocks, r.blocks_scanned, r.madvise_failures);
+            std::fprintf(stderr, "WT4 non-current PENDING_WRITE: state=%u->%u"
+                    " skipped_state=%" PRIu32 " OK\n",
+                    real_state, real_after, r.blocks_skipped_state);
         }
     }
 
     // =========================================================================
-    // B8: active-owned blocks — decode MUST succeed, bounded release MUST
-    //   release zero blocks, output MUST match no-release control.
+    // WT5: active-visible RELEASED without backing fails (regression guard).
     // =========================================================================
     {
-        auto * ctx1 = llama_init_from_model(model, cparams);
-        auto * ctx2 = llama_init_from_model(model, cparams);
-        if (!ctx1 || !ctx2) {
-            std::fprintf(stderr, "B8: dual context failed — skipped\n");
-            if (ctx1) llama_free(ctx1);
-            if (ctx2) llama_free(ctx2);
-        } else {
-            const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model));
-            auto * kv2 = static_cast<llama_kv_cache *>(llama_get_memory(ctx2));
+        setenv("LLAMA_KV_TEST_MODE", "1", 1);
+        setenv("LLAMA_KV_PAGED_TEST_FORCE_ACTIVE_RELEASE", "1", 1);
+        setenv("LLAMA_KV_PAGED_TEST_FORCE_ACTIVE_RELEASE_SEQ", "0", 1);
 
-            std::vector<llama_token> prompt = { 100, 200, 300, 400, 500 };
-            std::vector<llama_token> cont = { 600 };
-
-            // ctx1: baseline
-            llama_batch b1 = llama_batch_get_one(prompt.data(), (int32_t) prompt.size());
-            CHECK(llama_decode(ctx1, b1) == 0, "B8: baseline prompt decode ok");
-            llama_batch c1 = llama_batch_get_one(cont.data(), (int32_t) cont.size());
-            CHECK(llama_decode(ctx1, c1) == 0, "B8: baseline continuation ok");
-            float * logits1 = llama_get_logits(ctx1);
-            CHECK(logits1 != nullptr, "B8: baseline logits not null");
-
-            // ctx2: bounded release between prompt and continuation
-            llama_batch b2 = llama_batch_get_one(prompt.data(), (int32_t) prompt.size());
-            CHECK(llama_decode(ctx2, b2) == 0, "B8: variant prompt decode ok");
-
-            const auto r = kv2->paged_release_blocks_bounded(UINT64_MAX, UINT32_MAX);
-            CHECK(!r.ownership_aborted, "B8: ownership_aborted == false");
-            CHECK(r.released_blocks == 0, "B8: released_blocks == 0");
-            CHECK(r.released_bytes == 0, "B8: released_bytes == 0");
-            CHECK(r.blocks_skipped_owned > 0,
-                    "B8: blocks_skipped_owned > 0 (active seq owns all blocks)");
-
-            llama_batch c2 = llama_batch_get_one(cont.data(), (int32_t) cont.size());
-            CHECK(llama_decode(ctx2, c2) == 0, "B8: variant continuation ok");
-            float * logits2 = llama_get_logits(ctx2);
-            CHECK(logits2 != nullptr, "B8: variant logits not null");
-
-            bool match = true;
-            for (int i = 0; i < nv; ++i) {
-                if (logits1[i] != logits2[i]) { match = false; break; }
-            }
-            CHECK(match, "B8: logits match — K/V cache not corrupted");
-
-            std::fprintf(stderr, "B8 active-owned: released=%" PRIu32
-                    " logits_match=%d OK\n", r.released_blocks, match ? 1 : 0);
-            llama_free(ctx1);
-            llama_free(ctx2);
-        }
-    }
-
-    // =========================================================================
-    // B9-B11: shortfall, idempotent, corner cases (use main_ctx)
-    // =========================================================================
-    {
-        // B9: shortfall
-        llama_memory_seq_rm(main_ctx.mem, 0, -1, -1);
-        main_ctx.kv->paged_release_blocks_bounded(UINT64_MAX, UINT32_MAX);
-        const auto r = main_ctx.kv->paged_release_blocks_bounded(UINT64_MAX, UINT32_MAX);
-        CHECK(r.block_scan_exhausted, "B9: exhausted == true");
-        CHECK(r.shortfall_bytes == UINT64_MAX - r.released_bytes,
-                "B9: shortfall == target - released");
-        CHECK(!r.ownership_aborted, "B9: ownership_aborted == false");
-        std::fprintf(stderr, "B9 shortfall: released=%" PRIu32 " shortfall=%" PRIu64 " OK\n",
-                r.released_blocks, r.shortfall_bytes);
-    }
-    {
-        // B10: idempotent repeat — all blocks already RELEASED
-        const auto r1 = main_ctx.kv->paged_release_blocks_bounded(UINT64_MAX, UINT32_MAX);
-        const auto r2 = main_ctx.kv->paged_release_blocks_bounded(UINT64_MAX, UINT32_MAX);
-        CHECK(r2.released_blocks == 0, "B10: repeat released_blocks == 0");
-        CHECK(r2.released_bytes == 0, "B10: repeat released_bytes == 0");
-        CHECK(!r2.ownership_aborted, "B10: ownership_aborted == false");
-        CHECK(r2.blocks_skipped_state == r1.blocks_skipped_state,
-                "B10: idempotent — same skipped_state count both calls");
-        CHECK(r2.blocks_skipped_state > 0,
-                "B10: repeat skipped_state > 0 (RELEASED gate hit)");
-        std::fprintf(stderr, "B10 idempotent: first=%" PRIu32 " second=%" PRIu32
-                " skipped_state=%" PRIu32 " OK\n",
-                r1.released_blocks, r2.released_blocks, r2.blocks_skipped_state);
-    }
-    {
-        // B11: scan precision + corner case
-        const auto r = main_ctx.kv->paged_release_blocks_bounded(UINT64_MAX, 3);
-        CHECK(r.blocks_scanned == 3, "B11a: blocks_scanned == 3");
-        CHECK(r.block_scan_exhausted, "B11a: exhausted == true");
-
-        const auto r2 = main_ctx.kv->paged_release_blocks_bounded(0, 0);
-        CHECK(r2.released_bytes == 0, "B11b: target=0 max_scan=0 → released 0");
-        CHECK(r2.blocks_scanned == 0, "B11b: blocks_scanned == 0");
-        CHECK(!r2.block_scan_exhausted, "B11b: exhausted == false");
-        CHECK(!r2.ownership_aborted, "B11b: ownership_aborted == false");
-        std::fprintf(stderr, "B11 scan precision + corner: OK\n");
-    }
-
-    // =========================================================================
-    // Part C: Dry-run scanner — zero-change proof and semantic consistency.
-    // =========================================================================
-
-    // --- snapshot helpers for dry-run verification ---
-    auto snap_block_states = [](llama_kv_cache * kv, uint32_t n, std::vector<uint8_t> & out) {
-        out.resize(n);
-        for (uint32_t b = 0; b < n; ++b)
-            out[b] = kv->paged_release_bounded_test_read_block_state(b);
-    };
-    auto snap_free_list = [](llama_kv_cache * kv, uint32_t n, std::vector<bool> & out) {
-        out.resize(n);
-        for (uint32_t b = 0; b < n; ++b)
-            out[b] = kv->paged_release_bounded_test_block_in_free_list(b);
-    };
-
-    const uint32_t n_blocks = 256 / 16;  // ctx 256 / block_size 16
-
-    // DR1+DR2 use a fresh context so destructive release history from B1-B11
-    // doesn't pollute the dry-run state invariants.
-    {
         ContextGuard g;
         if (!g.init(model, cparams)) {
-            std::fprintf(stderr, "DR1: context init failed — skipped\n");
+            CHECK(false, "WT5: context creation failed");
         } else {
-            // =================================================================
-            // DR1: dry-run zero-change — block states, free list, and release
-            //   counters are identical before and after.
-            // =================================================================
-
-            // Decode a prompt so blocks are in RESIDENT state, then drop all
-            // sequences to make blocks unowned (dead).
-            std::vector<llama_token> prompt(20, 1);
+            std::vector<llama_token> prompt(16, 5);
             int rc = decode_prompt(g.ctx, prompt);
-            CHECK(rc == 0, "DR1a: decode must succeed");
-            if (rc == 0) {
-                llama_memory_seq_rm(g.mem, 0, -1, -1);
 
-                // Pre-snapshot
-                std::vector<uint8_t> pre_states;
-                std::vector<bool>    pre_free;
-                snap_block_states(g.kv, n_blocks, pre_states);
-                snap_free_list(g.kv, n_blocks, pre_free);
-                const uint64_t pre_rel_bytes  = g.kv->paged_release_bounded_test_read_release_bytes();
-                const uint64_t pre_rel_blocks = g.kv->paged_release_bounded_test_read_released_blocks();
-                const uint64_t pre_rel_unused = g.kv->paged_release_bounded_test_read_released_unused();
-                const uint64_t pre_rel_dead   = g.kv->paged_release_bounded_test_read_released_dead();
-
-                // Run dry-run — must NOT change any KV state.
-                const auto dr = g.kv->paged_release_blocks_bounded_dry_run(
-                        UINT64_MAX, UINT32_MAX);
-
-                // Post-snapshot
-                std::vector<uint8_t> post_states;
-                std::vector<bool>    post_free;
-                snap_block_states(g.kv, n_blocks, post_states);
-                snap_free_list(g.kv, n_blocks, post_free);
-                const uint64_t post_rel_bytes  = g.kv->paged_release_bounded_test_read_release_bytes();
-                const uint64_t post_rel_blocks = g.kv->paged_release_bounded_test_read_released_blocks();
-                const uint64_t post_rel_unused = g.kv->paged_release_bounded_test_read_released_unused();
-                const uint64_t post_rel_dead   = g.kv->paged_release_bounded_test_read_released_dead();
-
-                // Assert: zero state change
-                CHECK(pre_states == post_states,
-                        "DR1b: block states unchanged by dry-run");
-                CHECK(pre_free == post_free,
-                        "DR1c: free list unchanged by dry-run");
-                CHECK(pre_rel_bytes == post_rel_bytes,
-                        "DR1d: release bytes counter unchanged by dry-run");
-                CHECK(pre_rel_blocks == post_rel_blocks,
-                        "DR1e: released blocks counter unchanged by dry-run");
-                CHECK(pre_rel_unused == post_rel_unused,
-                        "DR1f: released-unused counter unchanged by dry-run");
-                CHECK(pre_rel_dead == post_rel_dead,
-                        "DR1g: released-dead counter unchanged by dry-run");
-
-                // Dry-run should find candidates (blocks are unowned + RESIDENT)
-                CHECK(dr.released_blocks > 0,
-                        "DR1h: dry-run found would-release candidates");
-                CHECK(dr.released_bytes > 0,
-                        "DR1i: dry-run counted would-release bytes");
-                CHECK(!dr.ownership_aborted,
-                        "DR1j: ownership_aborted == false");
-                CHECK(dr.madvise_failures == 0,
-                        "DR1k: madvise_failures == 0 (dry-run never calls madvise)");
-
-                std::fprintf(stderr, "DR1 dry-run zero-change: would_release=%" PRIu32
-                        "/%" PRIu64 "B scanned=%" PRIu32 " state+free+counter delta=0 OK\n",
-                        dr.released_blocks, dr.released_bytes, dr.blocks_scanned);
-
-                // =================================================================
-                // DR2: dry-run vs destructive — candidate/byte semantics match.
-                //   Run dry-run again (still same state), then run destructive
-                //   and verify the same blocks/bytes were selected.
-                // =================================================================
-
-                const auto dr2 = g.kv->paged_release_blocks_bounded_dry_run(
-                        UINT64_MAX, UINT32_MAX);
-                const uint32_t would_blocks = dr2.released_blocks;
-                const uint64_t would_bytes  = dr2.released_bytes;
-                CHECK(would_blocks > 0,
-                        "DR2a: dry-run found candidates before destructive release");
-                CHECK(!dr2.ownership_aborted,
-                        "DR2b: ownership valid");
-
-                // Run destructive bounded release — same budget, same scan limit.
-                const auto rr = g.kv->paged_release_blocks_bounded(
-                        UINT64_MAX, UINT32_MAX);
-
-                // Released counts must match.
-                CHECK(rr.released_blocks == would_blocks,
-                        "DR2c: released_blocks == would_release_blocks");
-                CHECK(rr.released_bytes == would_bytes,
-                        "DR2d: released_bytes == would_release_bytes");
-                CHECK(rr.blocks_scanned == dr2.blocks_scanned,
-                        "DR2e: blocks_scanned matches");
-                CHECK(rr.blocks_skipped_owned == dr2.blocks_skipped_owned,
-                        "DR2f: skipped_owned matches");
-                CHECK(rr.blocks_skipped_state == dr2.blocks_skipped_state,
-                        "DR2g: skipped_state matches");
-                CHECK(!rr.ownership_aborted,
-                        "DR2h: destructive ownership valid");
-                CHECK(rr.shortfall_bytes == dr2.shortfall_bytes,
-                        "DR2i: shortfall matches");
-                CHECK(rr.overshoot_bytes == dr2.overshoot_bytes,
-                        "DR2j: overshoot matches");
-                CHECK(rr.block_scan_exhausted == dr2.block_scan_exhausted,
-                        "DR2k: exhausted matches");
-
-                std::fprintf(stderr, "DR2 semantic match: would=%" PRIu32 "/%" PRIu64
-                        "B actual=%" PRIu32 "/%" PRIu64 "B OK\n",
-                        would_blocks, would_bytes, rr.released_blocks, rr.released_bytes);
-            }
+            const uint64_t triggers =
+                g.kv->paged_release_bounded_test_read_force_active_triggers();
+            CHECK(triggers > 0, "WT5: force-active-release path triggered");
+            CHECK(rc != 0, "WT5: decode failed after active-visible RELEASED violation");
+            std::fprintf(stderr, "WT5 active-visible RELEASED: triggers=%" PRIu64
+                    " decode_rc=%d OK\n", triggers, rc);
         }
+
+        unsetenv("LLAMA_KV_TEST_MODE");
+        unsetenv("LLAMA_KV_PAGED_TEST_FORCE_ACTIVE_RELEASE");
+        unsetenv("LLAMA_KV_PAGED_TEST_FORCE_ACTIVE_RELEASE_SEQ");
+        setenv("LLAMA_KV_PAGED_RELEASE", "1", 1);
     }
 
+    // WT6-WT9 are bounded-only: the legacy destructive-release switch is off,
+    // while the structurally gated server primitive remains available.
+    setenv("LLAMA_KV_PAGED_RELEASE", "0", 1);
+
     // =========================================================================
-    // DR3: dry-run with active sequences — all blocks owned, zero candidates,
-    //   zero state change.
+    // WT6: idle release → reuse → commit → RESIDENT (real lifecycle).
+    //   Real assertions on every AC point — no log-only fake-greens.
     // =========================================================================
     {
         ContextGuard g;
         if (!g.init(model, cparams)) {
-            std::fprintf(stderr, "DR3: context init failed — skipped\n");
+            CHECK(false, "WT6: context creation failed");
         } else {
-            // Decode a prompt WITHOUT removing sequences → all blocks owned.
-            std::vector<llama_token> prompt = { 100, 200, 300, 400, 500 };
+            CHECK(!g.kv->paged_release_bounded_test_legacy_release_enabled(),
+                    "WT6: legacy release disabled");
+            CHECK(g.kv->bounded_release_can_enable(),
+                    "WT6: bounded release structurally enabled");
+            std::vector<llama_token> prompt(16, 6);
             int rc = decode_prompt(g.ctx, prompt);
-            CHECK(rc == 0, "DR3a: decode must succeed");
-            if (rc == 0) {
-                std::vector<uint8_t> pre_states;
-                std::vector<bool>    pre_free;
-                snap_block_states(g.kv, n_blocks, pre_states);
-                snap_free_list(g.kv, n_blocks, pre_free);
-                const uint64_t pre_rel_bytes = g.kv->paged_release_bounded_test_read_release_bytes();
+            CHECK(rc == 0, "WT6: first decode ok");
+            uint8_t s0 = g.kv->paged_release_bounded_test_read_block_state(0);
+            CHECK(s0 == 1, "WT6: block 0 RESIDENT after first decode");
 
-                const auto dr = g.kv->paged_release_blocks_bounded_dry_run(
-                        UINT64_MAX, UINT32_MAX);
+            // Clear all seq refs so block becomes dead.
+            llama_memory_seq_rm(g.mem, 0, -1, -1);
 
-                std::vector<uint8_t> post_states;
-                std::vector<bool>    post_free;
-                snap_block_states(g.kv, n_blocks, post_states);
-                snap_free_list(g.kv, n_blocks, post_free);
-                const uint64_t post_rel_bytes = g.kv->paged_release_bounded_test_read_release_bytes();
+            const uint64_t reuse_before =
+                g.kv->paged_release_bounded_test_read_reuse_allocations();
+            const uint64_t commits_before =
+                g.kv->paged_release_bounded_test_read_write_commits();
+            const uint64_t rollbacks_before =
+                g.kv->paged_release_bounded_test_read_write_rollbacks();
 
-                // All blocks are owned → zero candidates
-                CHECK(dr.released_blocks == 0,
-                        "DR3b: released_blocks == 0 (all blocks owned)");
-                CHECK(dr.released_bytes == 0,
-                        "DR3c: released_bytes == 0 (all blocks owned)");
-                CHECK(dr.blocks_skipped_owned > 0,
-                        "DR3d: blocks_skipped_owned > 0");
-                CHECK(!dr.ownership_aborted,
-                        "DR3e: ownership valid");
-                CHECK(dr.madvise_failures == 0,
-                        "DR3f: madvise_failures == 0 (dry-run never calls madvise)");
+            // Real destructive bounded release of block 0.
+            const auto r1 = g.kv->bounded_release(UINT64_MAX, UINT32_MAX);
+            CHECK(!r1.ownership_aborted, "WT6: release ownership valid");
+            CHECK(r1.released_blocks >= 1, "WT6: at least one real block released");
 
-                // Zero state change
-                CHECK(pre_states == post_states,
-                        "DR3g: block states unchanged");
-                CHECK(pre_free == post_free,
-                        "DR3h: free list unchanged");
-                CHECK(pre_rel_bytes == post_rel_bytes,
-                        "DR3i: release counters unchanged");
+            s0 = g.kv->paged_release_bounded_test_read_block_state(0);
+            CHECK(s0 == 2, "WT6: block 0 RELEASED after release");
 
-                std::fprintf(stderr, "DR3 active-owned: skipped_owned=%" PRIu32
-                        " scanned=%" PRIu32 " state-delta=0 OK\n",
-                        dr.blocks_skipped_owned, dr.blocks_scanned);
-            }
+            // Reuse the released block with a new decode (PENDING_WRITE → commit).
+            std::vector<llama_token> prompt2(16, 7);
+            rc = decode_prompt(g.ctx, prompt2);
+            CHECK(rc == 0, "WT6: reuse decode ok");
+
+            const uint64_t reuse_after =
+                g.kv->paged_release_bounded_test_read_reuse_allocations();
+            const uint64_t commits_after =
+                g.kv->paged_release_bounded_test_read_write_commits();
+            const uint64_t rollbacks_after =
+                g.kv->paged_release_bounded_test_read_write_rollbacks();
+
+            // Real assertions (AC #3,4,6,8).
+            CHECK(reuse_after > reuse_before,
+                    "WT6: reuse_allocations >= 1 (real reuse of released block)");
+            CHECK(commits_after > commits_before,
+                    "WT6: write_commits >= 1 after successful graph");
+            CHECK(rollbacks_after == rollbacks_before,
+                    "WT6: write_rollbacks == 0 after successful graph");
+            s0 = g.kv->paged_release_bounded_test_read_block_state(0);
+            CHECK(s0 == 1, "WT6: block 0 RESIDENT after reuse commit");
+            // AC #8 consistency: no open transaction after commit, pending map empty.
+            CHECK(!g.kv->paged_release_bounded_test_transaction_open(),
+                    "WT6: transaction closed after commit");
+            CHECK(g.kv->paged_release_bounded_test_pending_write_blocks_count() == 0,
+                    "WT6: pending write blocks cleared after commit");
+
+            std::fprintf(stderr, "WT6 lifecycle: reuse %llu->%llu commits %llu->%llu"
+                    " rollbacks %llu->%llu block0=%u OK\n",
+                    (unsigned long long)reuse_before, (unsigned long long)reuse_after,
+                    (unsigned long long)commits_before, (unsigned long long)commits_after,
+                    (unsigned long long)rollbacks_before, (unsigned long long)rollbacks_after,
+                    s0);
         }
     }
 
     // =========================================================================
-    // DR4: dry-run edge cases — target=0 and max_scan=0 fast paths.
+    // WT7: prompt未占满block — stale/padding rows trigger the dummy candidate
+    //   path and keep redirection fail-closed (no_dummy == 0, input_setup_fatal
+    //   == 0).  A fresh PENDING_WRITE cell of the current transaction is the
+    //   transaction-local dummy; stale/padding rows must be redirected without
+    //   raising INPUT_SETUP_FAILURE.
     // =========================================================================
     {
-        // target=0: immediate return, zero side effects
-        const auto dr1 = main_ctx.kv->paged_release_blocks_bounded_dry_run(0, 100);
-        CHECK(dr1.released_bytes == 0, "DR4a: target=0 → released_bytes=0");
-        CHECK(dr1.released_blocks == 0, "DR4b: target=0 → released_blocks=0");
-        CHECK(dr1.blocks_scanned == 0, "DR4c: target=0 → blocks_scanned=0");
-        CHECK(!dr1.block_scan_exhausted, "DR4d: target=0 → exhausted=false");
-        CHECK(!dr1.ownership_aborted, "DR4e: target=0 → no ownership check");
-        CHECK(dr1.madvise_failures == 0, "DR4f: target=0 → madvise_failures=0");
+        ContextGuard g;
+        if (!g.init(model, cparams)) {
+            CHECK(false, "WT7: context creation failed");
+        } else {
+            CHECK(!g.kv->paged_release_bounded_test_legacy_release_enabled(),
+                    "WT7: legacy release disabled");
+            CHECK(g.kv->bounded_release_can_enable(),
+                    "WT7: bounded release structurally enabled");
+            const uint64_t dummy_pw_before =
+                g.kv->paged_release_bounded_test_read_dummy_candidate_pending_write_cell();
+            const uint64_t no_dummy_before =
+                g.kv->paged_release_bounded_test_read_released_redirect_no_dummy();
+            const uint64_t no_dummy_pw_before =
+                g.kv->paged_release_bounded_test_read_released_redirect_no_dummy_pending_write();
+            const uint64_t setup_fatal_before =
+                g.kv->paged_release_bounded_test_read_input_setup_fatal();
 
-        // max_scan=0: exhausted + full shortfall, zero scan
-        const uint64_t t = 65536;
-        const auto dr2 = main_ctx.kv->paged_release_blocks_bounded_dry_run(t, 0);
-        CHECK(dr2.block_scan_exhausted, "DR4g: max_scan=0 → exhausted");
-        CHECK(dr2.shortfall_bytes == t, "DR4h: max_scan=0 → full shortfall");
-        CHECK(dr2.released_bytes == 0, "DR4i: max_scan=0 → released_bytes=0");
-        CHECK(dr2.blocks_scanned == 0, "DR4j: max_scan=0 → blocks_scanned=0");
-        CHECK(!dr2.ownership_aborted, "DR4k: max_scan=0 → no ownership check");
+            // First a full block so the second (undersized) decode reuses it.
+            std::vector<llama_token> prompt(16, 8);
+            int rc = decode_prompt(g.ctx, prompt);
+            CHECK(rc == 0, "WT7: full prompt decode ok");
+            llama_memory_seq_rm(g.mem, 0, -1, -1);
+            const auto r1 = g.kv->bounded_release(UINT64_MAX, UINT32_MAX);
+            CHECK(!r1.ownership_aborted, "WT7: release ownership valid after seq_rm");
+            uint8_t s0 = g.kv->paged_release_bounded_test_read_block_state(0);
+            CHECK(s0 == 2, "WT7: block 0 RELEASED after release");
 
-        // All blocks are now RELEASED from the DR2 destructive call.
-        // Dry-run should return zero candidates (all skipped via state gate).
-        const auto dr3 = main_ctx.kv->paged_release_blocks_bounded_dry_run(
-                UINT64_MAX, UINT32_MAX);
-        CHECK(dr3.released_blocks == 0,
-                "DR4l: all RELEASED → zero candidates");
-        CHECK(dr3.blocks_skipped_state > 0,
-                "DR4m: RELEASED blocks counted as skipped_state");
-        CHECK(dr3.madvise_failures == 0,
-                "DR4n: madvise_failures == 0 (dry-run never calls madvise)");
-        CHECK(!dr3.ownership_aborted,
-                "DR4o: ownership_aborted == false");
+            // Undersized reuse: only 4 cells are fresh; the remaining 12 cells
+            // in the block are stale/padding.  Row-index setup must redirect the
+            // stale rows to a transaction-local dummy candidate (fresh
+            // PENDING_WRITE cell) without firing INPUT_SETUP_FAILURE.
+            std::vector<llama_token> prompt2(4, 9);
+            rc = decode_prompt(g.ctx, prompt2);
+            CHECK(rc == 0, "WT7: undersized reuse decode ok");
 
-        std::fprintf(stderr, "DR4 edge cases: skipped_state=%" PRIu32
-                " scanned=%" PRIu32 " OK\n",
-                dr3.blocks_skipped_state, dr3.blocks_scanned);
+            const uint64_t dummy_pw_after =
+                g.kv->paged_release_bounded_test_read_dummy_candidate_pending_write_cell();
+            const uint64_t no_dummy_after =
+                g.kv->paged_release_bounded_test_read_released_redirect_no_dummy();
+            const uint64_t no_dummy_pw_after =
+                g.kv->paged_release_bounded_test_read_released_redirect_no_dummy_pending_write();
+            const uint64_t setup_fatal_after =
+                g.kv->paged_release_bounded_test_read_input_setup_fatal();
+
+            // AC: not fully filled => stale/padding rows drove the dummy-candidate
+            // path (the block had 16 cells; only 4 became fresh, so 12 are stale).
+            CHECK(dummy_pw_after > dummy_pw_before,
+                    "WT7: dummy_candidate_pending_write_cell >= 1 (stale/padding rows)");
+            CHECK(no_dummy_after == no_dummy_before,
+                    "WT7: released_redirect_no_dummy == 0");
+            CHECK(no_dummy_pw_after == no_dummy_pw_before,
+                    "WT7: released_redirect_no_dummy_pending_write == 0");
+            CHECK(setup_fatal_after == setup_fatal_before,
+                    "WT7: input_setup_fatal == 0 (no setup failure)");
+
+            s0 = g.kv->paged_release_bounded_test_read_block_state(0);
+            CHECK(s0 == 1, "WT7: block 0 RESIDENT after reuse decode");
+
+            std::fprintf(stderr, "WT7 undersized reuse: dummy_pw %llu->%llu"
+                    " no_dummy %llu->%llu no_dummy_pw %llu->%llu setup_fatal %llu->%llu OK\n",
+                    (unsigned long long)dummy_pw_before, (unsigned long long)dummy_pw_after,
+                    (unsigned long long)no_dummy_before, (unsigned long long)no_dummy_after,
+                    (unsigned long long)no_dummy_pw_before, (unsigned long long)no_dummy_pw_after,
+                    (unsigned long long)setup_fatal_before, (unsigned long long)setup_fatal_after);
+        }
     }
 
     // =========================================================================
-    // DR5: dry-run with LLAMA_KV_PAGED_RELEASE=0 — scanner works even when
-    //   destructive release is disabled.  Verifies release_enabled=0 is purely
-    //   observational, not a skip reason.
+    // WT8: graph success → state-gate skips a PENDING_WRITE block, AND a full
+    //   successful reuse cycle confirms reuse_allocations >= 1, write_commits
+    //   >= 1, write_rollbacks == 0, block RESIDENT, free-list / pending-map /
+    //   transaction_open consistent.
     // =========================================================================
     {
-        // Clear the release env var so the fresh context has release disabled.
+        ContextGuard g;
+        if (!g.init(model, cparams)) {
+            CHECK(false, "WT8: context creation failed");
+        } else {
+            CHECK(!g.kv->paged_release_bounded_test_legacy_release_enabled(),
+                    "WT8: legacy release disabled");
+            CHECK(g.kv->bounded_release_can_enable(),
+                    "WT8: bounded release structurally enabled");
+            // Real active-owned protection first (re-asserts WT2 invariant).
+            std::vector<llama_token> prompt(16, 10);
+            int rc = decode_prompt(g.ctx, prompt);
+            CHECK(rc == 0, "WT8: first decode ok");
+
+            const uint64_t reuse_before =
+                g.kv->paged_release_bounded_test_read_reuse_allocations();
+            const uint64_t commits_before =
+                g.kv->paged_release_bounded_test_read_write_commits();
+            const uint64_t rollbacks_before =
+                g.kv->paged_release_bounded_test_read_write_rollbacks();
+
+            // Release after clearing ownership.
+            llama_memory_seq_rm(g.mem, 0, -1, -1);
+            const auto r1 = g.kv->bounded_release(UINT64_MAX, UINT32_MAX);
+            CHECK(!r1.ownership_aborted, "WT8: release ownership valid");
+            CHECK(r1.released_blocks >= 1, "WT8: real block released");
+            uint8_t s0 = g.kv->paged_release_bounded_test_read_block_state(0);
+            CHECK(s0 == 2, "WT8: block 0 RELEASED");
+
+            // Successful reuse decode → commit.
+            std::vector<llama_token> prompt2(16, 11);
+            rc = decode_prompt(g.ctx, prompt2);
+            CHECK(rc == 0, "WT8: reuse decode ok");
+
+            const uint64_t reuse_after =
+                g.kv->paged_release_bounded_test_read_reuse_allocations();
+            const uint64_t commits_after =
+                g.kv->paged_release_bounded_test_read_write_commits();
+            const uint64_t rollbacks_after =
+                g.kv->paged_release_bounded_test_read_write_rollbacks();
+
+            // Real assertions (AC #3,4,6,8).
+            CHECK(reuse_after > reuse_before, "WT8: reuse_allocations >= 1");
+            CHECK(commits_after > commits_before, "WT8: write_commits >= 1");
+            CHECK(rollbacks_after == rollbacks_before, "WT8: write_rollbacks == 0");
+            s0 = g.kv->paged_release_bounded_test_read_block_state(0);
+            CHECK(s0 == 1, "WT8: block 0 RESIDENT after commit");
+            // AC #8 consistency (free-list + ownership + transaction_open).
+            CHECK(!g.kv->paged_release_bounded_test_block_in_free_list(0),
+                    "WT8: block 0 removed from free list after commit");
+            CHECK(!g.kv->paged_release_bounded_test_transaction_open(),
+                    "WT8: transaction closed after commit");
+            CHECK(g.kv->paged_release_bounded_test_pending_write_blocks_count() == 0,
+                    "WT8: pending write blocks cleared");
+
+            std::fprintf(stderr, "WT8 graph success: reuse %llu->%llu commits %llu->%llu"
+                    " rollbacks %llu->%llu block0=%u freelist=0 txn_open=0 OK\n",
+                    (unsigned long long)reuse_before, (unsigned long long)reuse_after,
+                    (unsigned long long)commits_before, (unsigned long long)commits_after,
+                    (unsigned long long)rollbacks_before, (unsigned long long)rollbacks_after,
+                    s0);
+        }
+    }
+
+    // =========================================================================
+    // WT9: exact metadata journal without RELEASED reuse. Overwriting a cell
+    //   owned by a foreign sequence at an older incoming position purges another
+    //   foreign cell; rollback restores both cells, old positions, and head.
+    // =========================================================================
+    {
+        ContextGuard g;
+        if (!g.init(model, cparams)) {
+            CHECK(false, "WT9: context creation failed");
+        } else {
+            const auto old_slot = make_slot({ 0, 1 });
+            const auto old_ubatch = make_ubatch({ 20, 21 }, { 100, 120 }, 1);
+            {
+                llama_kv_cache_context old_ctx(g.kv, { old_slot }, { old_ubatch });
+                CHECK(old_ctx.apply(), "WT9: seed transaction applies");
+                CHECK(old_ctx.finish_paged_kv_write(llama_paged_kv_write_action::COMMIT),
+                        "WT9: seed transaction commits");
+            }
+
+            const uint32_t head_before = g.kv->paged_release_bounded_test_read_head(0);
+            CHECK(g.kv->paged_release_bounded_test_read_block_state(0) == 1,
+                    "WT9: no RELEASED reuse; block is RESIDENT");
+            CHECK(g.kv->paged_release_bounded_test_cell_has_seq(0, 0, 1),
+                    "WT9: foreign cell 0 seeded");
+            CHECK(g.kv->paged_release_bounded_test_cell_has_seq(0, 1, 1),
+                    "WT9: selected foreign cell seeded");
+
+            const auto incoming_slot = make_slot({ 1 });
+            const auto incoming_ubatch = make_ubatch({ 22 }, { 5 }, 0);
+            llama_kv_cache_context incoming_ctx(g.kv, { incoming_slot }, { incoming_ubatch });
+            CHECK(incoming_ctx.apply(), "WT9: incoming transaction applies");
+            CHECK(!g.kv->paged_release_bounded_test_cell_has_seq(0, 0, 1),
+                    "WT9: foreign seq_rm indirect purge triggered");
+            CHECK(g.kv->paged_release_bounded_test_cell_has_seq(0, 1, 0),
+                    "WT9: selected cell overwritten before rollback");
+            CHECK(incoming_ctx.finish_paged_kv_write(
+                        llama_paged_kv_write_action::ROLLBACK_PRE_COMPUTE),
+                    "WT9: pre-compute rollback succeeds");
+
+            CHECK(g.kv->paged_release_bounded_test_cell_has_seq(0, 0, 1),
+                    "WT9: indirect-purge cell restored");
+            CHECK(g.kv->paged_release_bounded_test_cell_has_seq(0, 1, 1),
+                    "WT9: selected foreign cell restored");
+            CHECK(g.kv->paged_release_bounded_test_read_cell_pos(0, 0) == 100,
+                    "WT9: foreign position 100 restored");
+            CHECK(g.kv->paged_release_bounded_test_read_cell_pos(0, 1) == 120,
+                    "WT9: old position greater than incoming restored");
+            CHECK(g.kv->paged_release_bounded_test_read_head(0) == head_before,
+                    "WT9: stream head restored");
+            CHECK(!g.kv->paged_release_bounded_test_transaction_open(),
+                    "WT9: transaction closed");
+            CHECK(g.kv->paged_release_bounded_test_pending_write_blocks_count() == 0,
+                    "WT9: no pending ownership remains");
+            CHECK(g.kv->paged_release_bounded_test_read_block_state(0) == 1 &&
+                    g.kv->paged_release_bounded_test_block_used(0) &&
+                    !g.kv->paged_release_bounded_test_block_in_free_list(0),
+                    "WT9: resident allocation metadata restored consistently");
+            std::fprintf(stderr, "WT9 exact metadata journal rollback: OK\n");
+        }
+    }
+
+    // =========================================================================
+    // WT10: graph allocation lifecycle failure before compute. The transaction
+    //   has no RELEASED reuse, rolls back completely, and the same context retries.
+    // =========================================================================
+    {
+        ContextGuard g;
+        if (!g.init(model, cparams)) {
+            CHECK(false, "WT10: context creation failed");
+        } else {
+            const uint64_t triggers_before =
+                g.kv->paged_release_bounded_test_read_fail_graph_alloc_triggers();
+            g.kv->paged_release_bounded_test_arm_fail_graph_alloc();
+            CHECK(decode_prompt(g.ctx, std::vector<llama_token>(16, 30)) != 0,
+                    "WT10: graph allocation failure propagates");
+            CHECK(g.kv->paged_release_bounded_test_read_fail_graph_alloc_triggers() ==
+                    triggers_before + 1,
+                    "WT10: graph allocation seam triggered exactly once");
+            CHECK(g.kv->paged_release_bounded_test_error_reason() ==
+                    llama_paged_swap_error_reason::PAGED_WRITE_GRAPH_ALLOC_FAILURE,
+                    "WT10: exact graph allocation error reason");
+            CHECK(g.kv->seq_pos_max(0) == -1,
+                    "WT10: failed ubatch metadata fully rolled back");
+            CHECK(g.kv->paged_release_bounded_test_read_block_state(0) == 0 &&
+                    !g.kv->paged_release_bounded_test_block_used(0) &&
+                    g.kv->paged_release_bounded_test_block_in_free_list(0),
+                    "WT10: UNUSED block allocation rolled back");
+            CHECK(!g.kv->paged_release_bounded_test_transaction_open() &&
+                    g.kv->paged_release_bounded_test_pending_write_blocks_count() == 0,
+                    "WT10: transaction and pending ownership closed");
+            CHECK(!g.kv->paged_release_bounded_test_context_invalid(),
+                    "WT10: pre-compute failure does not poison context");
+            CHECK(decode_prompt(g.ctx, std::vector<llama_token>(16, 31)) == 0,
+                    "WT10: same context safely retries after rollback");
+            std::fprintf(stderr, "WT10 graph alloc failure rollback: OK\n");
+        }
+    }
+
+    // =========================================================================
+    // WT11: the real graph computes, then a deterministic failure is reported.
+    //   Metadata is not rolled back over potentially-written K/V bytes; write
+    //   blocks and context are invalid until explicit memory clear/reset.
+    // =========================================================================
+    {
+        ContextGuard g;
+        if (!g.init(model, cparams)) {
+            CHECK(false, "WT11: context creation failed");
+        } else {
+            const uint64_t triggers_before =
+                g.kv->paged_release_bounded_test_read_fail_after_compute_triggers();
+            g.kv->paged_release_bounded_test_arm_fail_after_compute();
+            CHECK(decode_prompt(g.ctx, std::vector<llama_token>(16, 40)) != 0,
+                    "WT11: post-compute failure propagates");
+            CHECK(g.kv->paged_release_bounded_test_read_fail_after_compute_triggers() ==
+                    triggers_before + 1,
+                    "WT11: post-compute seam triggered exactly once");
+            CHECK(g.kv->paged_release_bounded_test_error_reason() ==
+                    llama_paged_swap_error_reason::PAGED_WRITE_COMPUTE_FAILURE,
+                    "WT11: exact compute failure reason");
+            CHECK(g.kv->paged_release_bounded_test_context_invalid(),
+                    "WT11: context poisoned after compute-started failure");
+            CHECK(g.kv->paged_release_bounded_test_read_block_state(0) == 5 &&
+                    g.kv->paged_release_bounded_test_block_used(0) &&
+                    !g.kv->paged_release_bounded_test_block_in_free_list(0),
+                    "WT11: write block quarantined INVALID");
+            CHECK(g.kv->seq_pos_max(0) == 15,
+                    "WT11: metadata retained instead of unsafe rollback");
+            CHECK(!g.kv->paged_release_bounded_test_transaction_open() &&
+                    g.kv->paged_release_bounded_test_pending_write_blocks_count() == 0,
+                    "WT11: transaction closed with no pending orphan");
+
+            CHECK(decode_prompt(g.ctx, std::vector<llama_token>(1, 41)) != 0,
+                    "WT11: next decode rejected while poisoned");
+            CHECK(g.kv->paged_release_bounded_test_error_reason() ==
+                    llama_paged_swap_error_reason::PAGED_WRITE_CONTEXT_INVALID,
+                    "WT11: next decode reports context invalid");
+
+            llama_memory_clear(g.mem, true);
+            CHECK(!g.kv->paged_release_bounded_test_context_invalid(),
+                    "WT11: explicit reset clears poison");
+            CHECK(g.kv->paged_release_bounded_test_read_block_state(0) == 0 &&
+                    !g.kv->paged_release_bounded_test_block_used(0) &&
+                    g.kv->paged_release_bounded_test_block_in_free_list(0),
+                    "WT11: reset restores UNUSED/free allocation state");
+            CHECK(decode_prompt(g.ctx, std::vector<llama_token>(16, 42)) == 0,
+                    "WT11: decode recovers after explicit reset");
+            std::fprintf(stderr, "WT11 compute-started fail-stop + reset: OK\n");
+        }
+    }
+
+    // =========================================================================
+    // WT12: rollback discard failure never leaves a PENDING_WRITE orphan. The
+    //   failed block becomes INVALID, next decode is rejected, and reset recovers.
+    // =========================================================================
+    {
+        ContextGuard g;
+        if (!g.init(model, cparams)) {
+            CHECK(false, "WT12: context creation failed");
+        } else {
+            CHECK(decode_prompt(g.ctx, std::vector<llama_token>(16, 50)) == 0,
+                    "WT12: seed decode ok");
+            llama_memory_seq_rm(g.mem, 0, -1, -1);
+            CHECK(g.kv->bounded_release(UINT64_MAX, UINT32_MAX).released_blocks >= 1,
+                    "WT12: seed block released");
+
+            const uint64_t alloc_before =
+                g.kv->paged_release_bounded_test_read_fail_graph_alloc_triggers();
+            const uint64_t discard_before =
+                g.kv->paged_release_bounded_test_read_fail_rollback_madvise_triggers();
+            g.kv->paged_release_bounded_test_arm_fail_graph_alloc();
+            g.kv->paged_release_bounded_test_arm_fail_rollback_madvise();
+            CHECK(decode_prompt(g.ctx, std::vector<llama_token>(15, 51)) != 0,
+                    "WT12: rollback discard failure propagates");
+            CHECK(g.kv->paged_release_bounded_test_read_fail_graph_alloc_triggers() == alloc_before + 1,
+                    "WT12: graph allocation seam triggered");
+            CHECK(g.kv->paged_release_bounded_test_read_fail_rollback_madvise_triggers() == discard_before + 1,
+                    "WT12: rollback discard seam triggered");
+            CHECK(g.kv->paged_release_bounded_test_error_reason() ==
+                    llama_paged_swap_error_reason::PAGED_WRITE_ROLLBACK_DISCARD_FAILURE,
+                    "WT12: exact rollback discard error reason");
+            CHECK(g.kv->paged_release_bounded_test_read_block_state(0) == 5 &&
+                    g.kv->paged_release_bounded_test_block_used(0) &&
+                    !g.kv->paged_release_bounded_test_block_in_free_list(0),
+                    "WT12: failed block quarantined INVALID");
+            CHECK(!g.kv->paged_release_bounded_test_pending_write_cell_set(0) &&
+                    g.kv->paged_release_bounded_test_pending_write_blocks_count() == 0 &&
+                    !g.kv->paged_release_bounded_test_transaction_open(),
+                    "WT12: no pending ownership or open transaction orphan");
+            CHECK(g.kv->paged_release_bounded_test_block_owned_cells(0) == 0,
+                    "WT12: metadata rolled back despite discard failure");
+            CHECK(decode_prompt(g.ctx, std::vector<llama_token>(1, 52)) != 0,
+                    "WT12: next decode rejected after discard failure");
+            CHECK(g.kv->paged_release_bounded_test_error_reason() ==
+                    llama_paged_swap_error_reason::PAGED_WRITE_CONTEXT_INVALID,
+                    "WT12: next decode reports context invalid");
+
+            llama_memory_clear(g.mem, true);
+            CHECK(!g.kv->paged_release_bounded_test_context_invalid(),
+                    "WT12: reset clears discard poison");
+            CHECK(decode_prompt(g.ctx, std::vector<llama_token>(16, 53)) == 0,
+                    "WT12: decode recovers after reset");
+            std::fprintf(stderr, "WT12 rollback discard failure quarantine: OK\n");
+        }
+    }
+
+    // =========================================================================
+    // WT13: multi-block rollback cleanup is partial but consistent: one injected
+    //   discard failure quarantines its block while the other block completes
+    //   rollback to RELEASED/free; all pending ownership is closed.
+    // =========================================================================
+    {
+        ContextGuard g;
+        if (!g.init(model, cparams)) {
+            CHECK(false, "WT13: context creation failed");
+        } else {
+            CHECK(decode_prompt(g.ctx, std::vector<llama_token>(32, 60)) == 0,
+                    "WT13: two-block seed decode ok");
+            llama_memory_seq_rm(g.mem, 0, -1, -1);
+            CHECK(g.kv->bounded_release(UINT64_MAX, UINT32_MAX).released_blocks >= 2,
+                    "WT13: two blocks released");
+
+            g.kv->paged_release_bounded_test_arm_fail_graph_alloc();
+            g.kv->paged_release_bounded_test_arm_fail_rollback_madvise();
+            CHECK(decode_prompt(g.ctx, std::vector<llama_token>(31, 61)) != 0,
+                    "WT13: multi-block rollback failure propagates");
+            std::fprintf(stderr,
+                    "WT13 states: b0=%u used0=%d free0=%d b1=%u used1=%d free1=%d pending=%llu\n",
+                    g.kv->paged_release_bounded_test_read_block_state(0),
+                    g.kv->paged_release_bounded_test_block_used(0),
+                    g.kv->paged_release_bounded_test_block_in_free_list(0),
+                    g.kv->paged_release_bounded_test_read_block_state(1),
+                    g.kv->paged_release_bounded_test_block_used(1),
+                    g.kv->paged_release_bounded_test_block_in_free_list(1),
+                    (unsigned long long) g.kv->paged_release_bounded_test_pending_write_blocks_count());
+            CHECK(g.kv->paged_release_bounded_test_read_block_state(0) == 5,
+                    "WT13: first cleanup failure block INVALID");
+            CHECK(g.kv->paged_release_bounded_test_read_block_state(1) == 2,
+                    "WT13: second block completes rollback to RELEASED");
+            CHECK(g.kv->paged_release_bounded_test_block_used(0) &&
+                    !g.kv->paged_release_bounded_test_block_in_free_list(0),
+                    "WT13: INVALID block quarantined");
+            CHECK(!g.kv->paged_release_bounded_test_block_used(1) &&
+                    g.kv->paged_release_bounded_test_block_in_free_list(1),
+                    "WT13: successful cleanup block returned to free list");
+            CHECK(g.kv->paged_release_bounded_test_block_owned_cells(0) == 0 &&
+                    g.kv->paged_release_bounded_test_block_owned_cells(1) == 0,
+                    "WT13: metadata rollback covers both blocks");
+            CHECK(g.kv->paged_release_bounded_test_pending_write_blocks_count() == 0 &&
+                    !g.kv->paged_release_bounded_test_transaction_open(),
+                    "WT13: multi-block pending ownership fully closed");
+            CHECK(g.kv->paged_release_bounded_test_context_invalid(),
+                    "WT13: partial cleanup failure poisons context");
+            std::fprintf(stderr, "WT13 multi-block partial cleanup: OK\n");
+        }
+    }
+
+    // =========================================================================
+    // WT14: default non-paged KV must not claim paged failure handling. A
+    // compute-started failure therefore reaches llama_context::decode's original
+    // outer seq_rm cleanup, and the next decode starts from a clean sequence.
+    // =========================================================================
+    {
+        unsetenv("LLAMA_KV_PAGED");
         unsetenv("LLAMA_KV_PAGED_RELEASE");
 
         ContextGuard g;
         if (!g.init(model, cparams)) {
-            std::fprintf(stderr, "DR5: context init failed — skipped\n");
-            setenv("LLAMA_KV_PAGED_RELEASE", "1", 1);
+            CHECK(false, "WT14: non-paged context creation failed");
         } else {
-            // Confirm release is disabled
-            const auto status = g.kv->paged_release_status();
-            CHECK(status == llama_kv_release_status::disabled,
-                    "DR5a: paged_release_status == disabled (env var not set)");
+            const uint64_t triggers_before =
+                g.kv->paged_release_bounded_test_read_fail_after_compute_triggers();
+            g.kv->paged_release_bounded_test_arm_fail_after_compute();
+            CHECK(decode_prompt(g.ctx, std::vector<llama_token>(16, 70)) != 0,
+                    "WT14: non-paged compute failure propagates");
+            CHECK(g.kv->paged_release_bounded_test_read_fail_after_compute_triggers() ==
+                    triggers_before + 1,
+                    "WT14: compute failure seam triggered exactly once");
+            CHECK(g.kv->seq_pos_max(0) == -1,
+                    "WT14: outer cleanup removed failed ubatch metadata");
+            CHECK(!g.kv->paged_release_bounded_test_context_invalid(),
+                    "WT14: non-paged failure does not invent paged poison");
+            CHECK(decode_prompt(g.ctx, std::vector<llama_token>(16, 71)) == 0,
+                    "WT14: next non-paged decode succeeds from clean state");
+            std::fprintf(stderr, "WT14 non-paged failure isolation: OK\n");
+        }
+    }
 
-            // Destructive bounded release must return empty (release not active)
-            const auto rr = g.kv->paged_release_blocks_bounded(UINT64_MAX, UINT32_MAX);
-            CHECK(rr.released_bytes == 0,
-                    "DR5b: destructive release returns 0 bytes (release disabled)");
-            CHECK(rr.released_blocks == 0,
-                    "DR5c: destructive release returns 0 blocks (release disabled)");
+    // =========================================================================
+    // WT15: unsupported wrapper distinction — bounded_release_can_enable_diagnose()
+    //   decomposes every structural precondition.  Each negative case maps to a
+    //   specific field so server policy can attribute the skip reason precisely
+    //   ("unsupported" wrapper vs "supported-but-no-candidate").
+    // =========================================================================
+    {
+        // Create a context without paged KV so bounded_release_can_enable is false.
+        unsetenv("LLAMA_KV_PAGED");
+        cparams.kv_unified = false;
 
-            // Decode a prompt so blocks are in RESIDENT state, then drop all
-            // sequences to make blocks unowned (dead).
-            std::vector<llama_token> prompt(20, 1);
+        ContextGuard g;
+        if (g.init(model, cparams)) {
+            // Non-paged KV: can_enable must be false.
+            CHECK(!g.kv->bounded_release_can_enable(),
+                    "WT15: non-paged can_enable is false");
+
+            const auto cap = g.kv->bounded_release_can_enable_diagnose();
+            CHECK(!cap.can_enable,
+                    "WT15: diagnose can_enable agrees with can_enable()");
+            CHECK(!cap.paged,
+                    "WT15: cap_paged is false (not paged)");
+            CHECK(cap.ingraph == false,
+                    "WT15: cap_ingraph is false (no paged → no ingraph)");
+            CHECK(cap.layers_supported == false,
+                    "WT15: cap_layers is false (no paged)");
+            CHECK(cap.row_idx == false,
+                    "WT15: cap_row_idx is false (no paged)");
+
+            // Each field independently reported for attribution.
+            std::fprintf(stderr, "WT15 unsupported wrapper diagnose: paged=%d"
+                    " ingraph=%d layers=%d row_idx=%d swap_ok=%d layout=%d OK\n",
+                    cap.paged ? 1 : 0, cap.ingraph ? 1 : 0,
+                    cap.layers_supported ? 1 : 0, cap.row_idx ? 1 : 0,
+                    cap.swap_disabled ? 1 : 0, cap.layout_supported ? 1 : 0);
+        }
+
+        // Restore paged env for remaining tests.
+        setenv("LLAMA_KV_PAGED", "1", 1);
+        setenv("LLAMA_KV_PAGED_RELEASE", "0", 1);
+        cparams.kv_unified = true;
+    }
+
+    // =========================================================================
+    // WT16: repeated rejection does not drift — multiple bounded_release calls
+    //   on the same dead-block state produce identical result fields.
+    //   Round 1 releases blocks → round 2 is idempotent (all blocks already
+    //   RELEASED), not releasing additional blocks and reporting zero counters.
+    // =========================================================================
+    {
+        ContextGuard g;
+        if (!g.init(model, cparams)) {
+            CHECK(false, "WT16: context creation failed");
+        } else {
+            CHECK(!g.kv->paged_release_bounded_test_legacy_release_enabled(),
+                    "WT16: legacy release disabled");
+            CHECK(g.kv->bounded_release_can_enable(),
+                    "WT16: bounded release structurally enabled");
+            std::vector<llama_token> prompt(16, 80);
             int rc = decode_prompt(g.ctx, prompt);
-            CHECK(rc == 0, "DR5d: decode must succeed");
-            if (rc == 0) {
-                llama_memory_seq_rm(g.mem, 0, -1, -1);
+            CHECK(rc == 0, "WT16: decode ok");
+            llama_memory_seq_rm(g.mem, 0, -1, -1);
 
-                // Pre-snapshot for zero-change verification
-                std::vector<uint8_t> pre_states;
-                std::vector<bool>    pre_free;
-                pre_states.resize(n_blocks);
-                pre_free.resize(n_blocks);
-                for (uint32_t b = 0; b < n_blocks; ++b) {
-                    pre_states[b] = g.kv->paged_release_bounded_test_read_block_state(b);
-                    pre_free[b]  = g.kv->paged_release_bounded_test_block_in_free_list(b);
-                }
+            // Round 1 — real release
+            const auto r1 = g.kv->bounded_release(UINT64_MAX, UINT32_MAX);
+            CHECK(!r1.ownership_aborted, "WT16: round1 ownership valid");
+            CHECK(r1.released_blocks >= 1, "WT16: round1 released some blocks");
 
-                // Dry-run MUST work even with release disabled
-                const auto dr = g.kv->paged_release_blocks_bounded_dry_run(
-                        UINT64_MAX, UINT32_MAX);
+            // Round 2 — all candidates already RELEASED, idempotent
+            const auto r2 = g.kv->bounded_release(UINT64_MAX, UINT32_MAX);
+            CHECK(!r2.ownership_aborted, "WT16: round2 ownership valid");
+            CHECK(r2.released_blocks == 0,
+                    "WT16: round2 releases zero additional blocks (all already RELEASED)");
+            CHECK(r2.released_bytes == 0,
+                    "WT16: round2 releases zero additional bytes");
+            CHECK(r2.blocks_skipped_state >= 1,
+                    "WT16: round2 blocks skipped by state gate (RELEASED)");
 
-                // Post-snapshot
-                std::vector<uint8_t> post_states;
-                std::vector<bool>    post_free;
-                post_states.resize(n_blocks);
-                post_free.resize(n_blocks);
-                for (uint32_t b = 0; b < n_blocks; ++b) {
-                    post_states[b] = g.kv->paged_release_bounded_test_read_block_state(b);
-                    post_free[b]  = g.kv->paged_release_bounded_test_block_in_free_list(b);
-                }
+            // Round 3 — still idempotent (no drift)
+            const auto r3 = g.kv->bounded_release(UINT64_MAX, UINT32_MAX);
+            CHECK(!r3.ownership_aborted, "WT16: round3 ownership valid");
+            CHECK(r3.released_blocks == 0,
+                    "WT16: round3 still releases zero");
+            CHECK(r3.blocks_skipped_state == r2.blocks_skipped_state,
+                    "WT16: round3 skipped_state equals round2 (no drift)");
 
-                // Dry-run found candidates despite release being disabled
-                CHECK(dr.released_blocks > 0,
-                        "DR5e: dry-run found would-release candidates (release disabled)");
-                CHECK(dr.released_bytes > 0,
-                        "DR5f: dry-run counted would-release bytes (release disabled)");
-                CHECK(!dr.ownership_aborted,
-                        "DR5g: ownership_aborted == false");
-                CHECK(dr.madvise_failures == 0,
-                        "DR5h: madvise_failures == 0 (dry-run never calls madvise)");
+            std::fprintf(stderr, "WT16 repeated rejection no-drift: r1=%" PRIu32
+                    " r2=%" PRIu32 " r3=%" PRIu32 " skip2=%" PRIu32
+                    " skip3=%" PRIu32 " OK\n",
+                    r1.released_blocks, r2.released_blocks, r3.released_blocks,
+                    r2.blocks_skipped_state, r3.blocks_skipped_state);
+        }
+    }
 
-                // Zero state change
-                CHECK(pre_states == post_states,
-                        "DR5i: block states unchanged by dry-run (release disabled)");
-                CHECK(pre_free == post_free,
-                        "DR5j: free list unchanged by dry-run (release disabled)");
+    // =========================================================================
+    // WT17: budget edge cases for bounded_release() (target_bytes=0 and
+    //   max_scan_blocks=0) — verify the zero-side-effect fast-return contracts.
+    // =========================================================================
+    {
+        ContextGuard g;
+        if (!g.init(model, cparams)) {
+            CHECK(false, "WT17: context creation failed");
+        } else {
+            std::vector<llama_token> prompt(16, 90);
+            int rc = decode_prompt(g.ctx, prompt);
+            CHECK(rc == 0, "WT17: decode ok");
+            llama_memory_seq_rm(g.mem, 0, -1, -1);
 
-                std::fprintf(stderr, "DR5 release-disabled dry-run: would_release=%" PRIu32
-                        "/%" PRIu64 "B scanned=%" PRIu32 " status=disabled OK\n",
-                        dr.released_blocks, dr.released_bytes, dr.blocks_scanned);
+            // Capture pre-call counter values
+            const uint64_t cnt_bytes_before =
+                g.kv->bounded_release_counter_bytes();
+            const uint64_t cnt_blocks_before =
+                g.kv->bounded_release_counter_blocks();
+
+            // target_bytes=0 → immediate return
+            {
+                const auto r = g.kv->bounded_release(0, 100);
+                CHECK(r.released_bytes == 0, "WT17a: target=0 → released_bytes == 0");
+                CHECK(r.released_blocks == 0, "WT17a: target=0 → released_blocks == 0");
+                CHECK(r.blocks_scanned == 0, "WT17a: target=0 → blocks_scanned == 0");
+                CHECK(!r.ownership_aborted, "WT17a: target=0 → ownership_aborted == false");
+                CHECK(!r.block_scan_exhausted, "WT17a: target=0 → exhausted == false");
+                CHECK(r.shortfall_bytes == 0, "WT17a: target=0 → shortfall == 0");
+                CHECK(r.overshoot_bytes == 0, "WT17a: target=0 → overshoot == 0");
+                CHECK(r.madvise_failures == 0, "WT17a: target=0 → madvise_failures == 0");
             }
 
-            // Restore env for subsequent tests (none follow, but be defensive)
-            setenv("LLAMA_KV_PAGED_RELEASE", "1", 1);
+            // max_scan_blocks=0 → exhausted + full shortfall
+            {
+                const uint64_t t = 65536;
+                const auto r = g.kv->bounded_release(t, 0);
+                CHECK(r.block_scan_exhausted, "WT17b: max_scan=0 → exhausted == true");
+                CHECK(r.shortfall_bytes == t, "WT17b: max_scan=0 → shortfall == target");
+                CHECK(r.released_bytes == 0, "WT17b: max_scan=0 → released_bytes == 0");
+                CHECK(r.blocks_scanned == 0, "WT17b: max_scan=0 → blocks_scanned == 0");
+                CHECK(!r.ownership_aborted, "WT17b: max_scan=0 → ownership_aborted == false");
+                CHECK(r.madvise_failures == 0, "WT17b: max_scan=0 → madvise_failures == 0");
+            }
+
+            // Independent counters unchanged by both zero-work calls
+            CHECK(g.kv->bounded_release_counter_bytes() == cnt_bytes_before,
+                    "WT17: bounded counter bytes unchanged by zero-work calls");
+            CHECK(g.kv->bounded_release_counter_blocks() == cnt_blocks_before,
+                    "WT17: bounded counter blocks unchanged by zero-work calls");
+
+            std::fprintf(stderr, "WT17 budget edge cases: target=0 max_scan=0 OK\n");
         }
+    }
+
+    // =========================================================================
+    // WT18: full idempotent lifecycle — release → reuse → commit → release
+    //   again, verifying the independent counters correctly accumulate across
+    //   cycles and each cycle's release result is self-consistent.
+    // =========================================================================
+    {
+        ContextGuard g;
+        if (!g.init(model, cparams)) {
+            CHECK(false, "WT18: context creation failed");
+        } else {
+            const uint64_t cnt_bytes_before =
+                g.kv->bounded_release_counter_bytes();
+            const uint64_t cnt_blocks_before =
+                g.kv->bounded_release_counter_blocks();
+
+            // Cycle 1: allocate → release
+            std::vector<llama_token> prompt1(16, 100);
+            int rc = decode_prompt(g.ctx, prompt1);
+            CHECK(rc == 0, "WT18: cycle1 decode ok");
+            llama_memory_seq_rm(g.mem, 0, -1, -1);
+            const auto r1 = g.kv->bounded_release(UINT64_MAX, UINT32_MAX);
+            CHECK(!r1.ownership_aborted, "WT18: cycle1 ownership valid");
+            CHECK(r1.released_blocks >= 1, "WT18: cycle1 released blocks");
+
+            // Cycle 2: reuse released block → commit → release again
+            std::vector<llama_token> prompt2(16, 101);
+            rc = decode_prompt(g.ctx, prompt2);
+            CHECK(rc == 0, "WT18: cycle2 reuse decode ok");
+            llama_memory_seq_rm(g.mem, 0, -1, -1);
+            const auto r2 = g.kv->bounded_release(UINT64_MAX, UINT32_MAX);
+            CHECK(!r2.ownership_aborted, "WT18: cycle2 ownership valid");
+            CHECK(r2.released_blocks >= 1, "WT18: cycle2 released blocks again");
+
+            // Independent counters accumulate across cycles
+            const uint64_t cnt_bytes_after =
+                g.kv->bounded_release_counter_bytes();
+            const uint64_t cnt_blocks_after =
+                g.kv->bounded_release_counter_blocks();
+            CHECK(cnt_bytes_after >= cnt_bytes_before + r1.released_bytes + r2.released_bytes,
+                    "WT18: bounded counter bytes accumulate across cycles");
+            CHECK(cnt_blocks_after >= cnt_blocks_before + r1.released_blocks + r2.released_blocks,
+                    "WT18: bounded counter blocks accumulate across cycles");
+
+            std::fprintf(stderr, "WT18 idempotent cycle: r1=%" PRIu32
+                    " r2=%" PRIu32 " cnt_bytes=%llu->%llu cnt_blocks=%llu->%llu OK\n",
+                    r1.released_blocks, r2.released_blocks,
+                    (unsigned long long)cnt_bytes_before, (unsigned long long)cnt_bytes_after,
+                    (unsigned long long)cnt_blocks_before, (unsigned long long)cnt_blocks_after);
+        }
+    }
+
+    // =========================================================================
+    // WT19: Unbounded legacy paged_release_blocks() skips PENDING_WRITE blocks.
+    //   Re-enable legacy release (was set to 0 for WT6-WT18), create a block,
+    //   override its state to PENDING_WRITE via test seam, and verify the
+    //   unbounded path skips it without madvise.
+    // =========================================================================
+    {
+        setenv("LLAMA_KV_PAGED_RELEASE", "1", 1);
+
+        ContextGuard g;
+        if (!g.init(model, cparams)) {
+            CHECK(false, "WT19: context creation failed");
+        } else {
+            CHECK(g.kv->paged_release_bounded_test_legacy_release_enabled(),
+                    "WT19: legacy release enabled");
+
+            std::vector<llama_token> prompt(16, 110);
+            int rc = decode_prompt(g.ctx, prompt);
+            CHECK(rc == 0, "WT19: decode ok");
+            llama_memory_seq_rm(g.mem, 0, -1, -1);
+
+            const uint64_t released_before =
+                g.kv->paged_release_bounded_test_read_released_blocks();
+            const uint64_t unused_before =
+                g.kv->paged_release_bounded_test_read_released_unused();
+            const uint64_t dead_before =
+                g.kv->paged_release_bounded_test_read_released_dead();
+
+            // Override block 0 to PENDING_WRITE before calling legacy release
+            g.kv->paged_release_bounded_test_block_state_override.block = 0;
+            g.kv->paged_release_bounded_test_block_state_override.state = 4;
+
+            // Call the UNBOUNDED legacy release directly
+            g.kv->paged_release_blocks(1);
+
+            // Legacy path should skip PENDING_WRITE — no state change, no counter
+            // advance beyond what the override absorbs.
+            const uint8_t s0 = g.kv->paged_release_bounded_test_read_block_state(0);
+            CHECK(s0 == 1, "WT19: legacy release skipped PENDING_WRITE block (still RESIDENT)");
+            CHECK(g.kv->paged_release_bounded_test_read_released_blocks() == released_before,
+                    "WT19: legacy release counter unchanged (PENDING_WRITE skipped)");
+            CHECK(g.kv->paged_release_bounded_test_read_released_unused() == unused_before,
+                    "WT19: legacy unused counter unchanged");
+            CHECK(g.kv->paged_release_bounded_test_read_released_dead() == dead_before,
+                    "WT19: legacy dead counter unchanged");
+            CHECK(!g.kv->paged_release_bounded_test_block_in_free_list(0),
+                    "WT19: PENDING_WRITE block not added to free list");
+            CHECK(g.kv->paged_release_bounded_test_block_state_override.block == UINT32_MAX,
+                    "WT19: override auto-reset after legacy release");
+
+            std::fprintf(stderr, "WT19 legacy PENDING_WRITE gate: state=%u released=%llu OK\n",
+                    s0, (unsigned long long)released_before);
+        }
+
+        setenv("LLAMA_KV_PAGED_RELEASE", "0", 1);
+    }
+
+    // =========================================================================
+    // WT20: Unbounded legacy release skips INVALID (quarantined) blocks.
+    // =========================================================================
+    {
+        setenv("LLAMA_KV_PAGED_RELEASE", "1", 1);
+
+        ContextGuard g;
+        if (!g.init(model, cparams)) {
+            CHECK(false, "WT20: context creation failed");
+        } else {
+            std::vector<llama_token> prompt(16, 111);
+            int rc = decode_prompt(g.ctx, prompt);
+            CHECK(rc == 0, "WT20: decode ok");
+            llama_memory_seq_rm(g.mem, 0, -1, -1);
+
+            const uint64_t released_before =
+                g.kv->paged_release_bounded_test_read_released_blocks();
+            const uint8_t real_state =
+                g.kv->paged_release_bounded_test_read_block_state(0);
+
+            // Override to INVALID
+            g.kv->paged_release_bounded_test_block_state_override.block = 0;
+            g.kv->paged_release_bounded_test_block_state_override.state = 5;
+
+            g.kv->paged_release_blocks(1);
+
+            const uint8_t s0 = g.kv->paged_release_bounded_test_read_block_state(0);
+            CHECK(s0 == real_state, "WT20: legacy release skipped INVALID block (state unchanged)");
+            CHECK(g.kv->paged_release_bounded_test_read_released_blocks() == released_before,
+                    "WT20: legacy release counter unchanged (INVALID skipped)");
+            CHECK(!g.kv->paged_release_bounded_test_block_in_free_list(0),
+                    "WT20: INVALID block not added to free list");
+
+            std::fprintf(stderr, "WT20 legacy INVALID gate: state=%u released=%llu OK\n",
+                    s0, (unsigned long long)released_before);
+        }
+
+        setenv("LLAMA_KV_PAGED_RELEASE", "0", 1);
+    }
+
+    // =========================================================================
+    // WT21: Shared bounded-release impl skips INVALID (quarantined) blocks.
+    //   Uses the legacy-gate paged_release_blocks_bounded() (which passes
+    //   use_test_seams=true to the shared impl) since the server-path
+    //   bounded_release() is designed to never access test seams.
+    //   Temporarily enables LLAMA_KV_PAGED_RELEASE=1 for the legacy gate.
+    // =========================================================================
+    {
+        setenv("LLAMA_KV_PAGED_RELEASE", "1", 1);
+
+        ContextGuard g;
+        if (!g.init(model, cparams)) {
+            CHECK(false, "WT21: context creation failed");
+        } else {
+            std::vector<llama_token> prompt(16, 112);
+            int rc = decode_prompt(g.ctx, prompt);
+            CHECK(rc == 0, "WT21: decode ok");
+            llama_memory_seq_rm(g.mem, 0, -1, -1);
+
+            const uint64_t released_before =
+                g.kv->paged_release_bounded_test_read_released_blocks();
+
+            // Override to INVALID — shared impl must skip it via state gate
+            g.kv->paged_release_bounded_test_block_state_override.block = 0;
+            g.kv->paged_release_bounded_test_block_state_override.state = 5;
+
+            const auto r = g.kv->paged_release_blocks_bounded(UINT64_MAX, UINT32_MAX);
+            CHECK(!r.ownership_aborted, "WT21: ownership valid");
+            CHECK(r.released_blocks == 0,
+                    "WT21: shared impl released zero (INVALID skipped)");
+            CHECK(r.blocks_skipped_state >= 1,
+                    "WT21: shared impl state gate skipped INVALID");
+            CHECK(r.madvise_failures == 0,
+                    "WT21: zero madvise calls (INVALID never reached madvise)");
+
+            CHECK(g.kv->paged_release_bounded_test_read_released_blocks() == released_before,
+                    "WT21: legacy release counter unchanged");
+
+            std::fprintf(stderr, "WT21 shared impl INVALID gate: released=%" PRIu32
+                    " skipped_state=%" PRIu32 " OK\n",
+                    r.released_blocks, r.blocks_skipped_state);
+        }
+
+        setenv("LLAMA_KV_PAGED_RELEASE", "0", 1);
+    }
+
+    // =========================================================================
+    // WT22: Fail-stop context_invalid prevents bounded release.  After
+    //   compute-started failure poisons the context, bounded_release() must
+    //   return with ownership_aborted=true and zero state mutation.
+    // =========================================================================
+    {
+        ContextGuard g;
+        if (!g.init(model, cparams)) {
+            CHECK(false, "WT22: context creation failed");
+        } else {
+            std::vector<llama_token> prompt(16, 113);
+            int rc = decode_prompt(g.ctx, prompt);
+            CHECK(rc == 0, "WT22: decode ok");
+            llama_memory_seq_rm(g.mem, 0, -1, -1);
+
+            // Poison via compute-started failure seam
+            g.kv->paged_release_bounded_test_arm_fail_after_compute();
+            rc = decode_prompt(g.ctx, std::vector<llama_token>(16, 114));
+            CHECK(rc != 0, "WT22: compute failure triggered");
+            CHECK(g.kv->paged_release_bounded_test_context_invalid(),
+                    "WT22: context poisoned after compute failure");
+
+            const uint64_t cnt_bytes_before = g.kv->bounded_release_counter_bytes();
+            const uint64_t cnt_blocks_before = g.kv->bounded_release_counter_blocks();
+
+            // Bounded release must refuse under context_invalid
+            const auto r = g.kv->bounded_release(UINT64_MAX, UINT32_MAX);
+            CHECK(r.ownership_aborted,
+                    "WT22: bounded release aborted (context invalid)");
+            CHECK(r.released_blocks == 0,
+                    "WT22: zero blocks released under fail-stop");
+            CHECK(g.kv->bounded_release_counter_bytes() == cnt_bytes_before,
+                    "WT22: bounded counter bytes unchanged");
+            CHECK(g.kv->bounded_release_counter_blocks() == cnt_blocks_before,
+                    "WT22: bounded counter blocks unchanged");
+
+            // Reset recovers
+            llama_memory_clear(g.mem, true);
+            CHECK(!g.kv->paged_release_bounded_test_context_invalid(),
+                    "WT22: reset clears context poison");
+
+            std::fprintf(stderr, "WT22 fail-stop bounded release: aborted=%d OK\n",
+                    r.ownership_aborted ? 1 : 0);
+        }
+    }
+
+    // =========================================================================
+    // WT23: Fail-stop context_invalid prevents unbounded legacy release.
+    //   Same poison → reject → reset cycle as WT22, but through the legacy
+    //   paged_release_blocks() path (LLAMA_KV_PAGED_RELEASE=1).
+    // =========================================================================
+    {
+        setenv("LLAMA_KV_PAGED_RELEASE", "1", 1);
+
+        ContextGuard g;
+        if (!g.init(model, cparams)) {
+            CHECK(false, "WT23: context creation failed");
+        } else {
+            std::vector<llama_token> prompt(16, 115);
+            int rc = decode_prompt(g.ctx, prompt);
+            CHECK(rc == 0, "WT23: decode ok");
+            llama_memory_seq_rm(g.mem, 0, -1, -1);
+
+            g.kv->paged_release_bounded_test_arm_fail_after_compute();
+            rc = decode_prompt(g.ctx, std::vector<llama_token>(16, 116));
+            CHECK(rc != 0, "WT23: compute failure triggered");
+            CHECK(g.kv->paged_release_bounded_test_context_invalid(),
+                    "WT23: context poisoned");
+
+            const uint64_t released_before =
+                g.kv->paged_release_bounded_test_read_released_blocks();
+            const uint8_t state_before =
+                g.kv->paged_release_bounded_test_read_block_state(0);
+
+            g.kv->paged_release_blocks(1);
+
+            CHECK(g.kv->paged_release_bounded_test_read_released_blocks() == released_before,
+                    "WT23: legacy release counter unchanged under fail-stop");
+            CHECK(g.kv->paged_release_bounded_test_read_block_state(0) == state_before,
+                    "WT23: block state unchanged under fail-stop");
+
+            llama_memory_clear(g.mem, true);
+            CHECK(!g.kv->paged_release_bounded_test_context_invalid(),
+                    "WT23: reset clears context poison");
+
+            std::fprintf(stderr, "WT23 fail-stop legacy release: released=%llu state=%u OK\n",
+                    (unsigned long long)released_before, state_before);
+        }
+
+        setenv("LLAMA_KV_PAGED_RELEASE", "0", 1);
     }
 
     llama_model_free(model);

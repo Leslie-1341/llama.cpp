@@ -485,6 +485,148 @@ test_e2e_build_dir_flag() {
 }
 
 # ============================================================
+# E2E-16: knownfail;selected → UNRESOLVED (blocking)
+# ============================================================
+test_e2e_knownfail_selected_blocks() {
+    local name="E2E_knownfail_selected_blocks"
+    printf '\n[TEST %d] %s\n' "$((TOTAL + 1))" "$name"
+
+    cd "$REPO_ROOT"
+
+    # Create a dummy parser test file whose name we'll inject as knownfail;selected
+    local dummy="$REPO_ROOT/tests/test-gate-harness-knownfail-sel-parser.py"
+    cat > "$dummy" << 'PYEOF'
+#!/usr/bin/env python3
+"""Dummy parser — knownfail;selected."""
+print("this would fail in real life")
+import sys; sys.exit(0)
+PYEOF
+
+    # Inject a knownfail;selected entry into the registry
+    local reg_file="$REPO_ROOT/scripts/os-agent/checks/run-checks.sh"
+    local bak="$reg_file.bak-$$"
+    cp "$reg_file" "$bak"
+
+    # Insert the selected knownfail entry before the closing ")" of the array
+    sed -i '/^)$/i\    "test-gate-harness-knownfail-sel|tests/test-gate-harness-knownfail-sel-parser.py|knownfail;selected"' "$reg_file"
+
+    local output rc=0
+    set +e
+    output=$(GATE_ARTIFACT_PREFIX="$TEST_ARTIFACT_PREFIX" bash "$GATE_RUNNER" review-fix --quiet 2>&1)
+    rc=$?
+    set -e
+
+    # Restore immediately
+    mv "$bak" "$reg_file"
+    rm -f "$dummy"
+
+    local marker
+    marker=$(echo "$output" | grep 'OS_AGENT_GATE_RESULT' | head -1)
+    if [[ -z "$marker" ]]; then
+        fail_test "$name" "no marker (rc=$rc)"
+    elif echo "$marker" | grep -qE 'unresolved=[1-9]'; then
+        pass_test "$name"
+    else
+        fail_test "$name" "expected unresolved>0 for selected knownfail, got: $marker"
+    fi
+}
+
+# ============================================================
+# E2E-17: knownfail;unrelated → non-blocking (gate PASS)
+# ============================================================
+test_e2e_knownfail_unrelated_nonblocking() {
+    local name="E2E_knownfail_unrelated_nonblocking"
+    printf '\n[TEST %d] %s\n' "$((TOTAL + 1))" "$name"
+
+    cd "$REPO_ROOT"
+
+    local dummy="$REPO_ROOT/tests/test-gate-harness-knownfail-unrel-parser.py"
+    cat > "$dummy" << 'PYEOF'
+#!/usr/bin/env python3
+"""Dummy parser — knownfail;unrelated."""
+print("pre-existing, unrelated failure")
+import sys; sys.exit(0)
+PYEOF
+
+    local reg_file="$REPO_ROOT/scripts/os-agent/checks/run-checks.sh"
+    local bak="$reg_file.bak-$$"
+    cp "$reg_file" "$bak"
+
+    sed -i '/^)$/i\    "test-gate-harness-knownfail-unrel|tests/test-gate-harness-knownfail-unrel-parser.py|knownfail;unrelated"' "$reg_file"
+
+    local output rc=0
+    set +e
+    output=$(GATE_ARTIFACT_PREFIX="$TEST_ARTIFACT_PREFIX" bash "$GATE_RUNNER" review-fix --quiet 2>&1)
+    rc=$?
+    set -e
+
+    mv "$bak" "$reg_file"
+    rm -f "$dummy"
+
+    local marker
+    marker=$(echo "$output" | grep 'OS_AGENT_GATE_RESULT' | head -1)
+    if [[ -z "$marker" ]]; then
+        fail_test "$name" "no marker (rc=$rc)"
+    elif echo "$marker" | grep -qE 'unresolved=0' && echo "$marker" | grep -qE 'verdict=PASS'; then
+        pass_test "$name"
+    else
+        fail_test "$name" "expected unresolved=0 verdict=PASS for unrelated knownfail, got: $marker"
+    fi
+}
+
+# ============================================================
+# E2E-18: New failure CANNOT disguise as knownfail
+# ============================================================
+test_e2e_new_failure_not_disguised() {
+    local name="E2E_new_failure_not_disguised"
+    printf '\n[TEST %d] %s\n' "$((TOTAL + 1))" "$name"
+
+    cd "$REPO_ROOT"
+
+    # Create a parser test that ACTUALLY FAILS (exit 1)
+    local dummy="$REPO_ROOT/tests/test-gate-harness-new-fail-parser.py"
+    cat > "$dummy" << 'PYEOF'
+#!/usr/bin/env python3
+"""A genuinely broken parser test — must FAIL the gate, not be absorbed."""
+import sys
+print("FAIL: this test is genuinely broken", file=sys.stderr)
+sys.exit(1)
+PYEOF
+
+    # Register it as selfcontained (NOT knownfail)
+    local reg_file="$REPO_ROOT/scripts/os-agent/checks/run-checks.sh"
+    local bak="$reg_file.bak-$$"
+    cp "$reg_file" "$bak"
+
+    sed -i '/^)$/i\    "test-gate-harness-new-fail|tests/test-gate-harness-new-fail-parser.py|selfcontained"' "$reg_file"
+
+    local output rc=0
+    set +e
+    output=$(GATE_ARTIFACT_PREFIX="$TEST_ARTIFACT_PREFIX" bash "$GATE_RUNNER" review-fix --quiet 2>&1)
+    rc=$?
+    set -e
+
+    mv "$bak" "$reg_file"
+    rm -f "$dummy"
+
+    local marker
+    marker=$(echo "$output" | grep 'OS_AGENT_GATE_RESULT' | head -1)
+    if [[ -z "$marker" ]]; then
+        fail_test "$name" "no marker (rc=$rc)"
+    elif echo "$marker" | grep -qE 'fail=[1-9]'; then
+        # A genuinely broken non-knownfail test MUST produce a FAIL, not
+        # be silently absorbed as knownfail/unresolved.
+        if echo "$marker" | grep -qE 'unresolved=[1-9]'; then
+            fail_test "$name" "new failure must FAIL (not UNRESOLVED): $marker"
+        else
+            pass_test "$name"
+        fi
+    else
+        fail_test "$name" "expected fail>0 for broken non-knownfail test, got: $marker"
+    fi
+}
+
+# ============================================================
 # Main
 # ============================================================
 main() {
@@ -510,6 +652,9 @@ main() {
     test_e2e_parser_unresolved
     test_e2e_mode_dispatch
     test_e2e_build_dir_flag
+    test_e2e_knownfail_selected_blocks
+    test_e2e_knownfail_unrelated_nonblocking
+    test_e2e_new_failure_not_disguised
 
     printf '\n========================================\n'
     printf 'Results: %d/%d passed\n' "$PASS_COUNT" "$TOTAL"

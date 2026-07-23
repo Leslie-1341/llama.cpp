@@ -137,6 +137,8 @@ void llama_memory_recurrent::clear(bool data) {
 
     head = 0;
     used = 0;
+    find_slot_failed_ = false;
+    test_fail_after_find_slot_ = false;
 
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
@@ -485,14 +487,13 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
 }
 
 bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
+    if (find_slot_failed_) {
+        LLAMA_LOG_ERROR("%s: recurrent memory is invalid; clear it before retrying\n", __func__);
+        return false;
+    }
+
     const uint32_t n_seq_tokens = ubatch.n_seq_tokens;
     const uint32_t n_seqs       = ubatch.n_seqs;
-
-    // if we have enough unused cells before the current head ->
-    //   better to start searching from the beginning of the cache, hoping to fill it
-    if (head > used + 2*n_seqs) {
-        head = 0;
-    }
 
     // For recurrent state architectures (like Mamba or RWKV),
     // each cache cell can store the state for a whole sequence.
@@ -504,33 +505,43 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     int32_t min = size - 1;
     int32_t max = 0;
 
-    // everything should fit if all seq_ids are smaller than the max
+    // Validate every sequence id before changing any tail or cell metadata.
     for (uint32_t s = 0; s < n_seqs; ++s) {
-        const uint32_t i = s*n_seq_tokens; // first token of sequence set s
+        const uint32_t i = s*n_seq_tokens;
         const uint32_t n_seq_id = ubatch.n_seq_id[i];
 
         for (uint32_t j = 0; j < n_seq_id; ++j) {
             const llama_seq_id seq_id = ubatch.seq_id[i][j];
-
             if (seq_id < 0 || (uint32_t) seq_id >= size) {
-                // too big seq_id
-                // TODO: would it be possible to resize the cache instead?
                 LLAMA_LOG_ERROR("%s: seq_id=%d >= n_seq_max=%u Try using a bigger --parallel value\n", __func__, seq_id, n_seq_max);
                 return false;
             }
-            if (j > 0) {
-                auto & seq = cells[seq_id];
-                if (seq.tail >= 0) {
-                    auto & cell = cells[seq.tail];
-                    // clear cells from seq_ids that become shared
-                    // (should not normally happen, but let's handle it anyway)
-                    cell.seq_id.erase(seq_id);
-                    seq.tail = -1;
-                    if (cell.seq_id.empty()) {
-                        cell.pos = -1;
-                        cell.src = -1;
-                        used -= 1;
-                    }
+        }
+    }
+
+    // if we have enough unused cells before the current head ->
+    //   better to start searching from the beginning of the cache, hoping to fill it
+    if (head > used + 2*n_seqs) {
+        head = 0;
+    }
+
+    // Secondary sequence ids become shared by this ubatch. This mutation only
+    // runs after all fallible id validation has completed.
+    for (uint32_t s = 0; s < n_seqs; ++s) {
+        const uint32_t i = s*n_seq_tokens;
+        const uint32_t n_seq_id = ubatch.n_seq_id[i];
+
+        for (uint32_t j = 1; j < n_seq_id; ++j) {
+            const llama_seq_id seq_id = ubatch.seq_id[i][j];
+            auto & seq = cells[seq_id];
+            if (seq.tail >= 0) {
+                auto & cell = cells[seq.tail];
+                cell.seq_id.erase(seq_id);
+                seq.tail = -1;
+                if (cell.seq_id.empty()) {
+                    cell.pos = -1;
+                    cell.src = -1;
+                    used -= 1;
                 }
             }
         }
@@ -691,8 +702,39 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     used = std::count_if(cells.begin(), cells.end(),
         [](const mem_cell & cell){ return !cell.is_empty(); });
 
-    // sanity check
-    return n >= n_seqs;
+    // A late failure means metadata may already have changed. Refuse all
+    // further use until clear() establishes a fresh recurrent state.
+    if (n < n_seqs) {
+        find_slot_failed_ = true;
+        return false;
+    }
+
+    return true;
+}
+
+bool llama_memory_recurrent::find_slot_failed() const {
+    return find_slot_failed_;
+}
+
+void llama_memory_recurrent::invalidate_find_slot() {
+    find_slot_failed_ = true;
+}
+
+void llama_memory_recurrent::test_arm_fail_after_find_slot() {
+    test_fail_after_find_slot_ = true;
+}
+
+bool llama_memory_recurrent::test_consume_fail_after_find_slot() {
+    if (!test_fail_after_find_slot_) {
+        return false;
+    }
+    test_fail_after_find_slot_ = false;
+    test_fail_after_find_slot_triggers_ += 1;
+    return true;
+}
+
+uint64_t llama_memory_recurrent::test_read_fail_after_find_slot_triggers() const {
+    return test_fail_after_find_slot_triggers_;
 }
 
 bool llama_memory_recurrent::get_can_shift() const {
@@ -1194,6 +1236,10 @@ bool llama_memory_recurrent_context::next() {
 bool llama_memory_recurrent_context::apply() {
     assert(!llama_memory_status_is_fail(status));
 
+    failure_handled = false;
+    applied = false;
+    compute_started = false;
+
     // no ubatches -> this is an update
     if (ubatches.empty()) {
         // recurrent cache never performs updates
@@ -1202,9 +1248,40 @@ bool llama_memory_recurrent_context::apply() {
         return true;
     }
 
-    mem->find_slot(ubatches[i_next]);
+    if (!mem->find_slot(ubatches[i_next])) {
+        return false;
+    }
+
+    applied = true;
+    if (mem->test_consume_fail_after_find_slot()) {
+        mem->invalidate_find_slot();
+        return false;
+    }
 
     return true;
+}
+
+void llama_memory_recurrent_context::mark_paged_kv_compute_started() {
+    compute_started = applied;
+}
+
+bool llama_memory_recurrent_context::finish_paged_kv_write(llama_paged_kv_write_action action) {
+    failure_handled = false;
+
+    if (action == llama_paged_kv_write_action::INVALIDATE_COMPUTE_STARTED || compute_started) {
+        mem->invalidate_find_slot();
+        failure_handled = true;
+    } else if (mem && mem->find_slot_failed()) {
+        failure_handled = true;
+    }
+
+    applied = false;
+    compute_started = false;
+    return true;
+}
+
+bool llama_memory_recurrent_context::paged_kv_failure_handled() const {
+    return failure_handled;
 }
 
 llama_memory_status llama_memory_recurrent_context::get_status() const {

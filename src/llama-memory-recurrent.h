@@ -59,6 +59,13 @@ public:
     // find a contiguous slot of memory cells and emplace the ubatch there
     bool find_slot(const llama_ubatch & ubatch);
 
+    bool find_slot_failed() const;
+    void invalidate_find_slot();
+
+    void test_arm_fail_after_find_slot();
+    bool test_consume_fail_after_find_slot();
+    uint64_t test_read_fail_after_find_slot_triggers() const;
+
     bool get_can_shift() const override;
 
     // state write/load
@@ -83,6 +90,10 @@ public:
 
     // first zero-ed state
     int32_t rs_z = -1;
+
+    bool find_slot_failed_ = false;
+    bool test_fail_after_find_slot_ = false;
+    uint64_t test_fail_after_find_slot_triggers_ = 0;
 
     // TODO: optimize for recurrent state needs
     struct mem_cell {
@@ -156,6 +167,10 @@ public:
     bool next()  override;
     bool apply() override;
 
+    void mark_paged_kv_compute_started() override;
+    bool finish_paged_kv_write(llama_paged_kv_write_action action) override;
+    bool paged_kv_failure_handled() const override;
+
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
@@ -181,6 +196,10 @@ private:
     size_t i_next = 0;
 
     std::vector<llama_ubatch> ubatches;
+
+    bool applied = false;
+    bool compute_started = false;
+    bool failure_handled = false;
 
     //
     // data needed for building the compute graph for the current ubatch:

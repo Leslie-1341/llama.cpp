@@ -45,6 +45,16 @@ enum class llama_paged_swap_error_reason : uint8_t {
     PAGED_WRITE_MAPPING_INVALID,
     ACTIVE_ROW_NOT_RESIDENT,
     INPUT_SETUP_FAILURE,
+    PAGED_WRITE_ROLLBACK_DISCARD_FAILURE,
+    PAGED_WRITE_GRAPH_ALLOC_FAILURE,
+    PAGED_WRITE_COMPUTE_FAILURE,
+    PAGED_WRITE_CONTEXT_INVALID,
+};
+
+enum class llama_paged_kv_write_action : uint8_t {
+    COMMIT,
+    ROLLBACK_PRE_COMPUTE,
+    INVALIDATE_COMPUTE_STARTED,
 };
 
 struct llama_paged_swap_error {
@@ -95,9 +105,21 @@ struct llama_memory_context_i {
     virtual void clear_paged_swap_error() {}
     virtual bool has_paged_swap_error() const { return false; }
     virtual llama_paged_swap_error get_paged_swap_error() const { return {}; }
-    // Complete or abort any fresh-write transaction opened while applying this ubatch.
-    virtual void finish_paged_kv_write(bool success) { GGML_UNUSED(success); }
+    // Complete the metadata/KV write transaction opened while applying this ubatch.
+    // Pre-compute failures roll back metadata and fresh allocations. Once compute may
+    // have written K/V bytes, failure must invalidate the cache until an explicit reset.
+    virtual void mark_paged_kv_compute_started() {}
+    virtual bool finish_paged_kv_write(llama_paged_kv_write_action action) {
+        GGML_UNUSED(action);
+        return true;
+    }
     virtual bool needs_paged_kv_post_graph_sync() const { return false; }
+    virtual bool paged_kv_failure_handled() const { return false; }
+
+    // Deterministic test-only failure injection at the real process_ubatch lifecycle
+    // boundaries. Default memory contexts never inject.
+    virtual bool test_paged_kv_fail_graph_alloc() { return false; }
+    virtual bool test_paged_kv_fail_after_compute() { return false; }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;
@@ -175,6 +197,52 @@ struct llama_memory_i {
     virtual llama_kv_release_status paged_release_status() const {
         return llama_kv_release_status::not_paged;
     }
+
+    // Bounded destructive release: per-call budget-controlled MADV_DONTNEED
+    // of eligible dead/unused KV blocks.  Default no-op returns empty result.
+    // Only paged-KV memory implementations provide a real release path.
+    // This is gated by LLAMA_KV_PRESSURE_BOUNDED_RELEASE (server policy),
+    // NOT LLAMA_KV_PAGED_RELEASE (legacy apply-path gate).
+    virtual llama_kv_bounded_release_result bounded_release(
+            uint64_t target_bytes, uint32_t max_scan_blocks) {
+        GGML_UNUSED(target_bytes);
+        GGML_UNUSED(max_scan_blocks);
+        return {};
+    }
+
+    // Read-only KV resident-page sampling via mincore(2).  Walks every KV
+    // layer's K/V tensor data range, page-aligns, and counts resident pages.
+    // Returns the total resident byte count across all KV tensors, or 0 if
+    // mincore is not available on this platform / backend.
+    // This is a diagnostic operation, NOT a hot-path call — it is O(n_layers ×
+    // kv_size) in page-table walks.  Callers must rate-limit accordingly.
+    virtual uint64_t sample_kv_resident_bytes() const {
+        return 0;
+    }
+
+    // Structural capability query for bounded destructive release,
+    // independent of LLAMA_KV_PAGED_RELEASE or any legacy policy state.
+    // Returns true when paged KV is active with a valid layout, in-graph
+    // row-index gather, and swap is disabled — the mechanical preconditions
+    // for safe MADV_DONTNEED of KV blocks.
+    virtual bool bounded_release_can_enable() const {
+        return false;
+    }
+
+    // Per-condition decomposition of bounded_release_can_enable() for precise
+    // diagnostic skip-reason attribution.  Each field reports whether the
+    // corresponding structural precondition is met.
+    // Default (no-paged-KV) returns all-false.
+    virtual llama_kv_bounded_release_capability bounded_release_can_enable_diagnose() const {
+        return {};
+    }
+
+    // Independent bounded-release cumulative counters.  These are separate
+    // from the legacy paged_block_release_* counters and are only incremented
+    // by the bounded_release() path (LLAMA_KV_PRESSURE_BOUNDED_RELEASE).
+    // Used by server pressure policy to cross-check per-call result attribution.
+    virtual uint64_t bounded_release_counter_bytes() const  { return 0; }
+    virtual uint64_t bounded_release_counter_blocks() const { return 0; }
 
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
 

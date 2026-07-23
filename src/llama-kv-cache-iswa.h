@@ -117,8 +117,12 @@ public:
     void clear_paged_swap_error() override;
     bool has_paged_swap_error() const override;
     llama_paged_swap_error get_paged_swap_error() const override;
-    void finish_paged_kv_write(bool success) override;
+    void mark_paged_kv_compute_started() override;
+    bool finish_paged_kv_write(llama_paged_kv_write_action action) override;
     bool needs_paged_kv_post_graph_sync() const override;
+    bool paged_kv_failure_handled() const override;
+    bool test_paged_kv_fail_graph_alloc() override;
+    bool test_paged_kv_fail_after_compute() override;
 
     //
     // llama_kv_cache_iswa_context specific API

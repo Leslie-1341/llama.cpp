@@ -250,12 +250,15 @@ bool llama_memory_hybrid_context::next() {
 bool llama_memory_hybrid_context::apply() {
     assert(!llama_memory_status_is_fail(status));
 
-    bool res = true;
+    paged_failure_handled = false;
+    attn_applied = ctx_attn->apply();
+    if (!attn_applied) {
+        return false;
+    }
 
-    res = res & ctx_attn->apply();
-    res = res & ctx_recr->apply();
-
-    return res;
+    recr_apply_attempted = true;
+    recr_applied = ctx_recr->apply();
+    return recr_applied;
 }
 
 llama_memory_status llama_memory_hybrid_context::get_status() const {
@@ -292,14 +295,41 @@ llama_paged_swap_error llama_memory_hybrid_context::get_paged_swap_error() const
     return {};
 }
 
-void llama_memory_hybrid_context::finish_paged_kv_write(bool success) {
-    if (ctx_attn) ctx_attn->finish_paged_kv_write(success);
-    if (ctx_recr) ctx_recr->finish_paged_kv_write(success);
+void llama_memory_hybrid_context::mark_paged_kv_compute_started() {
+    if (ctx_attn) ctx_attn->mark_paged_kv_compute_started();
+    if (ctx_recr) ctx_recr->mark_paged_kv_compute_started();
+}
+
+bool llama_memory_hybrid_context::finish_paged_kv_write(llama_paged_kv_write_action action) {
+    const bool attn_finished = !ctx_attn || ctx_attn->finish_paged_kv_write(action);
+    const bool recr_finished = !ctx_recr || ctx_recr->finish_paged_kv_write(action);
+    const bool recurrent_safe = !recr_apply_attempted ||
+        (ctx_recr && ctx_recr->paged_kv_failure_handled());
+    paged_failure_handled = action != llama_paged_kv_write_action::COMMIT &&
+        (!ctx_attn || ctx_attn->paged_kv_failure_handled()) && recurrent_safe;
+    attn_applied = false;
+    recr_apply_attempted = false;
+    recr_applied = false;
+    return attn_finished && recr_finished;
 }
 
 bool llama_memory_hybrid_context::needs_paged_kv_post_graph_sync() const {
     return (ctx_attn && ctx_attn->needs_paged_kv_post_graph_sync()) ||
            (ctx_recr && ctx_recr->needs_paged_kv_post_graph_sync());
+}
+
+bool llama_memory_hybrid_context::paged_kv_failure_handled() const {
+    return paged_failure_handled;
+}
+
+bool llama_memory_hybrid_context::test_paged_kv_fail_graph_alloc() {
+    if (ctx_attn && ctx_attn->test_paged_kv_fail_graph_alloc()) return true;
+    return ctx_recr && ctx_recr->test_paged_kv_fail_graph_alloc();
+}
+
+bool llama_memory_hybrid_context::test_paged_kv_fail_after_compute() {
+    if (ctx_attn && ctx_attn->test_paged_kv_fail_after_compute()) return true;
+    return ctx_recr && ctx_recr->test_paged_kv_fail_after_compute();
 }
 
 const llama_kv_cache_context * llama_memory_hybrid_context::get_attn() const {

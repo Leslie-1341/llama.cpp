@@ -30,6 +30,19 @@ struct llama_kv_bounded_release_result {
     bool     ownership_aborted    = false;
 };
 
+// Per-condition decomposition of bounded_release_can_enable() for diagnostic use.
+// Each field reports whether the corresponding structural precondition is met.
+// can_enable is true iff all fields are true.
+struct llama_kv_bounded_release_capability {
+    bool can_enable       = false;
+    bool paged            = false;  // kv_paged_enabled
+    bool ingraph          = false;  // paged_ingraph_enabled
+    bool layers_supported = false;  // paged_layers_supported: !layers.empty() && all layers have K and V F32 tensors
+    bool row_idx          = false;  // paged_row_idx_enabled: paged && ingraph && layers_supported && !identity_fast_path
+    bool swap_disabled    = false;  // !paged_swap_enabled
+    bool layout_supported = false;  // !v_trans && n_stream==1 && block_size>0 && n_blocks>0
+};
+
 inline bool llama_kv_destructive_release_can_enable(
         bool paged_enabled,
         bool ingraph_enabled,

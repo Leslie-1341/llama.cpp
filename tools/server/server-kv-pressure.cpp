@@ -228,7 +228,7 @@ bool parse_uint64_env(const char * name, uint64_t & out, std::string & error) {
 
 bool parse_uint32_env(const char * name, uint32_t minimum, uint32_t & out,
                       std::string & error) {
-    uint64_t val = 0;
+    uint64_t val = out;
     if (!parse_uint64_env(name, val, error)) return false;
     if (val > UINT32_MAX) { error = std::string(name) + " is out of range"; return false; }
     out = std::max<uint32_t>((uint32_t) val, minimum);
@@ -278,36 +278,30 @@ bool server_kv_pressure_dry_run_config_from_env(
 
 bool server_kv_pressure_runtime::dry_run_due(
         time_point now, kv_pressure_state state,
-        bool stale) const {
-    if (!dry_run_config_.enabled || dry_run_config_.target_bytes == 0) {
+        bool stale) {
+    if (!dry_run_config_.enabled || dry_run_config_.target_bytes == 0 || stale) {
         return false;
     }
-    if (stale) {
-        return false;
-    }
+
     if (state != kv_pressure_state::PRESSURE &&
             state != kv_pressure_state::CRITICAL) {
+        dry_run_episode_active_ = false;
+        last_dry_run_ = time_point {};
+        last_dry_run_state_ = kv_pressure_state::NORMAL;
+        current_cooldown_ms_ = dry_run_config_.cooldown_ms;
         return false;
     }
 
-    // State-entry semantics: when the pressure state transitions INTO
-    // PRESSURE or CRITICAL from a different state, we are entering a new
-    // episode.  Reset the cooldown timer so the first evaluation fires
-    // without waiting.
-    //
-    // CRITICAL entry: bypass cooldown entirely for the first evaluation
-    // within the new episode.  Sustained CRITICAL calls are still rate-limited.
-    //
-    // PRESSURE entry: first evaluation fires immediately (cooldown was
-    // reset).  Subsequent calls are rate-limited by the base cooldown.
-    const bool state_entered = (state != last_dry_run_state_);
-    if (state_entered) {
+    if (!dry_run_episode_active_) {
+        dry_run_episode_active_ = true;
         last_dry_run_state_ = state;
         last_dry_run_ = time_point {};
-        return true;  // Evaluate immediately on state entry.
+        current_cooldown_ms_ = dry_run_config_.cooldown_ms;
+        return true;
     }
 
-    // Within the same state episode: apply cooldown.
+    last_dry_run_state_ = state;
+
     if (last_dry_run_ == time_point {}) {
         return true;
     }
@@ -353,6 +347,135 @@ std::string server_kv_pressure_dry_run_format_marker(
         << " skipped_reason=" << reason
         << " cooldown_ms=" << event.cooldown_ms
         << " sample_count=" << event.sample_count
+        << " idle=" << (event.idle ? 1 : 0);
+    return out.str();
+}
+
+// --- Bounded destructive release policy --------------------------------------
+
+bool server_kv_pressure_bounded_release_config_from_env(
+        server_kv_pressure_bounded_release_config & config, std::string & error) {
+    server_kv_pressure_bounded_release_config parsed;
+    error.clear();
+
+    parsed.enabled = parse_bool_env("LLAMA_KV_PRESSURE_BOUNDED_RELEASE");
+
+    if (!parse_uint64_env("LLAMA_KV_PRESSURE_BOUNDED_RELEASE_TARGET_BYTES",
+                          parsed.target_bytes, error)) {
+        return false;
+    }
+
+    if (!parse_uint32_env("LLAMA_KV_PRESSURE_BOUNDED_RELEASE_MAX_SCAN_BLOCKS",
+                          1, parsed.max_scan_blocks, error)) {
+        return false;
+    }
+
+    if (!parse_uint32_env("LLAMA_KV_PRESSURE_BOUNDED_RELEASE_COOLDOWN_MS",
+                          server_kv_pressure_bounded_release_config::MIN_COOLDOWN_MS,
+                          parsed.cooldown_ms, error)) {
+        return false;
+    }
+
+    if (!parse_uint32_env("LLAMA_KV_PRESSURE_BOUNDED_RELEASE_BACKOFF_MS",
+                          server_kv_pressure_bounded_release_config::MIN_COOLDOWN_MS,
+                          parsed.backoff_ms, error)) {
+        return false;
+    }
+
+    // target_bytes=0: treat as effectively disabled
+    if (parsed.enabled && parsed.target_bytes == 0) {
+        parsed.enabled = false;
+    }
+
+    config = parsed;
+    return true;
+}
+
+bool server_kv_pressure_runtime::bounded_release_due(
+        time_point now, kv_pressure_state state,
+        bool stale) {
+    if (!bounded_release_config_.enabled || bounded_release_config_.target_bytes == 0 || stale) {
+        return false;
+    }
+
+    if (state != kv_pressure_state::PRESSURE &&
+            state != kv_pressure_state::CRITICAL) {
+        bounded_release_episode_active_ = false;
+        last_bounded_release_ = time_point {};
+        last_bounded_release_state_ = kv_pressure_state::NORMAL;
+        bounded_release_current_cooldown_ms_ = bounded_release_config_.cooldown_ms;
+        return false;
+    }
+
+    if (!bounded_release_episode_active_) {
+        bounded_release_episode_active_ = true;
+        last_bounded_release_state_ = state;
+        last_bounded_release_ = time_point {};
+        bounded_release_current_cooldown_ms_ = bounded_release_config_.cooldown_ms;
+        return true;
+    }
+
+    last_bounded_release_state_ = state;
+
+    if (last_bounded_release_ == time_point {}) {
+        return true;
+    }
+
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - last_bounded_release_);
+    return elapsed.count() >= (int64_t) bounded_release_current_cooldown_ms_;
+}
+
+void server_kv_pressure_runtime::bounded_release_record(
+        bool had_shortfall, time_point now) {
+    last_bounded_release_ = now;
+    if (had_shortfall) {
+        bounded_release_current_cooldown_ms_ = bounded_release_config_.backoff_ms;
+    } else {
+        bounded_release_current_cooldown_ms_ = bounded_release_config_.cooldown_ms;
+    }
+}
+
+std::string server_kv_pressure_bounded_release_format_marker(
+        const server_kv_pressure_bounded_release_event & event) {
+    const auto & r = event.result;
+
+    const char * reason = event.skipped_reason;
+    if (!reason) reason = "none";
+
+    std::ostringstream out;
+    out << "kv_pressure_bounded_release"
+        << " state=" << kv_pressure_state_name(event.pressure_state)
+        << " source=" << kv_pressure_source_name(event.pressure_source)
+        << " stale=" << (event.stale ? 1 : 0)
+        << " released_bytes=" << r.released_bytes
+        << " released_blocks=" << r.released_blocks
+        << " blocks_scanned=" << r.blocks_scanned
+        << " blocks_skipped_owned=" << r.blocks_skipped_owned
+        << " blocks_skipped_state=" << r.blocks_skipped_state
+        << " madvise_failures=" << r.madvise_failures
+        << " shortfall_bytes=" << r.shortfall_bytes
+        << " overshoot_bytes=" << r.overshoot_bytes
+        << " block_scan_exhausted=" << (r.block_scan_exhausted ? 1 : 0)
+        << " ownership_aborted=" << (r.ownership_aborted ? 1 : 0)
+        << " target_bytes=" << event.target_bytes
+        << " max_scan_blocks=" << event.max_scan_blocks
+        << " legacy_enabled=" << (event.legacy_enabled ? 1 : 0)
+        << " sample_count=" << event.sample_count
+        << " episode=" << event.episode
+        << " cooldown_ms=" << event.cooldown_ms
+        << " mincore_before_bytes=" << event.mincore_before_bytes
+        << " mincore_after_bytes=" << event.mincore_after_bytes
+        << " bounded_cnt_bytes_delta=" << event.bounded_cnt_bytes_delta
+        << " bounded_cnt_blocks_delta=" << event.bounded_cnt_blocks_delta
+        << " can_enable=" << event.can_enable
+        << " cap_paged=" << event.cap_paged
+        << " cap_ingraph=" << event.cap_ingraph
+        << " cap_layers=" << event.cap_layers
+        << " cap_row_idx=" << event.cap_row_idx
+        << " cap_swap_disabled=" << event.cap_swap_disabled
+        << " cap_layout=" << event.cap_layout
+        << " skipped_reason=" << reason
         << " idle=" << (event.idle ? 1 : 0);
     return out.str();
 }

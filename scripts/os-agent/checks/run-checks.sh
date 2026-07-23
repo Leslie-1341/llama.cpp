@@ -324,6 +324,27 @@ check_clang_tidy() {
 # Registry: "name|path|flags"
 # Each entry is a parser test that can run without external artifacts.
 # Flags: selfcontained (runs without models/artifacts)
+#        knownfail (pre-existing failure — see below)
+#
+# knownfail handling:
+#   A knownfail entry is a parser test that fails for reasons the operator has
+#   confirmed are PRE-EXISTING and unrelated to the current diff/stage.  The
+#   gate distinguishes two cases:
+#
+#     knownfail;unrelated (default)  — failure is NOT selected by the current
+#       diff/stage: RECORD it (logged + emitted in marker unresolved tally
+#       NOTE) but do NOT block the verdict.  A separate baseline-vs-worktree
+#       failure-signature comparison (see PROJECT_STATE / EXPERIMENTS) is the
+#       evidence that the failure is pre-existing.
+#     knownfail;selected             — failure IS selected by the current
+#       diff/stage (e.g. the stage explicitly targets this module) → UNRESOLVED
+#       and blocks until the operator resolves it.
+#
+#   Design intent (validation-policy): a newly-broken parser may NEVER disguise
+#   itself as a pre-existing knownfail.  An unregistered new test resolves to
+#   `unregistered` → UNRESOLVED.  A registered, non-knownfail test that fails
+#   → FAIL.  Only an entry EXPLICITLY marked knownfail;unrelated can be a
+#   non-blocking record, and that marking is human-curated against the diff.
 declare -a PARSER_TEST_REGISTRY=(
     "test-kv-paged-identity-e2i-parser|tests/test-kv-paged-identity-e2i-parser.py|selfcontained"
     "test-kv-e0-e2-e5-single-turn-parser|tests/test-kv-e0-e2-e5-single-turn-parser.py|selfcontained"
@@ -331,9 +352,11 @@ declare -a PARSER_TEST_REGISTRY=(
     "test-kv-dry-run-stage3a-2b-parser|tests/test-kv-dry-run-stage3a-2b-parser.py|selfcontained"
     "test-kv-final-controlled-e0-e5-parser|tests/test-kv-final-controlled-e0-e5-parser.py|selfcontained"
     "test-kv-bounded-release-stage3a-2c-parser|tests/test-kv-bounded-release-stage3a-2c-parser.py|selfcontained"
-    # knownfail — registered but skipped: pre-existing test failures unrelated to gate harness
-    "test-server-kv-pressure-stage3a-1c-parser|tests/test-server-kv-pressure-stage3a-1c-parser.py|knownfail"
-    "test-kv-paged-identity-controlled-ab-parser|tests/test-kv-paged-identity-controlled-ab-parser.py|knownfail"
+    # knownfail — pre-existing failures unrelated to Stage 3A-2C bounded-release diff
+    # (baseline-vs-worktree failure-signature comparison confirms both fail identically
+    # at HEAD=a2da80f52 without the working-tree diff; neither test file is in the diff.)
+    "test-server-kv-pressure-stage3a-1c-parser|tests/test-server-kv-pressure-stage3a-1c-parser.py|knownfail;unrelated"
+    "test-kv-paged-identity-controlled-ab-parser|tests/test-kv-paged-identity-controlled-ab-parser.py|knownfail;unrelated"
 )
 
 check_parser_test() {
@@ -356,7 +379,8 @@ check_parser_test() {
 
     # Phase 2: match candidates against registry
     local -a run_list=()
-    local -a knownfail_list=()
+    local -a knownfail_selected=()
+    local -a knownfail_unrelated=()
     local -a unregistered=()
     local -a excluded_reasons=()
 
@@ -368,8 +392,13 @@ check_parser_test() {
             if [[ "$bn" == "$(basename "$reg_path")" ]]; then
                 matched=1
                 if [[ "$reg_flags" == *"knownfail"* ]]; then
-                    knownfail_list+=("$bn")
-                    excluded_reasons+=("$bn: knownfail — pre-existing failure, not gate-related")
+                    if [[ "$reg_flags" == *"selected"* ]]; then
+                        knownfail_selected+=("$bn")
+                        excluded_reasons+=("$bn: knownfail;selected — this stage explicitly targets its module")
+                    else
+                        knownfail_unrelated+=("$bn")
+                        excluded_reasons+=("$bn: knownfail;unrelated — pre-existing failure, baseline-vs-worktree confirmed unrelated")
+                    fi
                 else
                     run_list+=("$candidate")
                 fi
@@ -382,7 +411,36 @@ check_parser_test() {
         fi
     done
 
-    # Phase 3: if unregistered files exist, we have an UNRESOLVED situation
+    # Phase 3a: selected knownfail — BLOCKING UNRESOLVED.
+    # These are knownfail tests explicitly marked as relevant to the current
+    # diff/stage.  The operator must resolve them before the gate can PASS.
+    if (( ${#knownfail_selected[@]} > 0 )); then
+        gate_log 1 "$name: UNRESOLVED — ${#knownfail_selected[@]} selected knownfail tests"
+        for reason in "${excluded_reasons[@]}"; do
+            if [[ "$reason" == *"knownfail;selected"* ]]; then
+                gate_log 2 "$name: selected: $reason"
+            fi
+        done
+        gate_record_check "$name" "UNRESOLVED" \
+            "${#knownfail_selected[@]} selected knownfail tests: ${knownfail_selected[*]}"
+        return
+    fi
+
+    # Phase 3b: unrelated knownfail — NON-BLOCKING record.
+    # These are pre-existing failures confirmed (via baseline-vs-worktree
+    # failure-signature comparison) to be unrelated to the current diff.
+    # They are LOGGED but do NOT block the gate verdict.
+    if (( ${#knownfail_unrelated[@]} > 0 )); then
+        gate_log 1 "$name: NOTED — ${#knownfail_unrelated[@]} unrelated knownfail tests (non-blocking)"
+        for reason in "${excluded_reasons[@]}"; do
+            if [[ "$reason" == *"knownfail;unrelated"* ]]; then
+                gate_log 2 "$name: unrelated: $reason"
+            fi
+        done
+        # Do NOT return — continue through remaining phases.
+    fi
+
+    # Phase 4: if unregistered files exist, we have an UNRESOLVED situation
     if (( ${#unregistered[@]} > 0 )); then
         gate_log 1 "$name: UNRESOLVED — ${#unregistered[@]} parser tests not in registry"
         for reason in "${excluded_reasons[@]}"; do
@@ -393,15 +451,27 @@ check_parser_test() {
         return
     fi
 
-    # Phase 4: skip if no relevant changes
+    # Phase 5: skip if no relevant changes — but mark as UNVERIFIED
+    # (not SKIP) since registered parser tests could validate the diff.
     if [[ -z "${DIFF_CLASSES[py]:-}" ]] && [[ -z "${DIFF_CLASSES[cpp]:-}" ]] && [[ -z "${DIFF_CLASSES[sh]:-}" ]]; then
-        gate_record_check "$name" "SKIP" "no relevant changes"
+        gate_record_check "$name" "UNVERIFIED" \
+            "no relevant py/cpp/sh changes — cannot verify parser tests are unrelated"
         return
     fi
 
-    # Phase 5: run registered tests
+    # Phase 6: run registered (non-knownfail) tests
+    local kf_note=""
+    if (( ${#knownfail_unrelated[@]} > 0 )); then
+        kf_note="; ${#knownfail_unrelated[@]} unrelated knownfail noted (non-blocking): ${knownfail_unrelated[*]}"
+    fi
     local failed=0 passed=0 total=${#run_list[@]}
     local log_file="$GATE_ARTIFACT_DIR/parser-test.log"
+
+    if (( total == 0 )); then
+        # All matched tests are unrelated knownfail — run nothing, note them.
+        gate_record_check "$name" "PASS" "no runnable tests (all unrelated knownfail)${kf_note}"
+        return
+    fi
 
     for pt in "${run_list[@]}"; do
         gate_log 2 "$name: $(basename "$pt")"
@@ -414,9 +484,9 @@ check_parser_test() {
     done
 
     if (( failed > 0 )); then
-        gate_record_check "$name" "FAIL" "$failed/$total parser tests failed"
+        gate_record_check "$name" "FAIL" "$failed/$total parser tests failed${kf_note}"
     else
-        gate_record_check "$name" "PASS" "$total parser tests OK"
+        gate_record_check "$name" "PASS" "$total parser tests OK${kf_note}"
     fi
 }
 

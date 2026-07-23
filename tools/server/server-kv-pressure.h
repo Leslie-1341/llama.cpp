@@ -74,6 +74,55 @@ bool server_kv_pressure_dry_run_config_from_env(
 std::string server_kv_pressure_dry_run_format_marker(
         const server_kv_pressure_dry_run_event & event);
 
+// --- Bounded destructive release types (server pressure path) ---
+
+struct server_kv_pressure_bounded_release_config {
+    static constexpr uint32_t DEFAULT_MAX_SCAN_BLOCKS = 64;
+    static constexpr uint32_t DEFAULT_COOLDOWN_MS     = 2000;
+    static constexpr uint32_t DEFAULT_BACKOFF_MS      = 10000;
+    static constexpr uint32_t MIN_COOLDOWN_MS         = 500;
+
+    bool     enabled         = false;   // LLAMA_KV_PRESSURE_BOUNDED_RELEASE=1
+    uint64_t target_bytes    = 0;       // LLAMA_KV_PRESSURE_BOUNDED_RELEASE_TARGET_BYTES
+    uint32_t max_scan_blocks = DEFAULT_MAX_SCAN_BLOCKS;
+    uint32_t cooldown_ms     = DEFAULT_COOLDOWN_MS;
+    uint32_t backoff_ms      = DEFAULT_BACKOFF_MS;
+};
+
+struct server_kv_pressure_bounded_release_event {
+    llama_kv_bounded_release_result result;
+    kv_pressure_state pressure_state   = kv_pressure_state::NORMAL;
+    kv_pressure_source pressure_source = kv_pressure_source::NONE;
+    bool    stale           = false;
+    bool    idle             = false;
+    bool    legacy_enabled   = false;  // paged_block_release_enabled at sample time
+    uint64_t sample_count    = 0;
+    uint64_t episode         = 0;      // pressure-episode counter
+    uint64_t target_bytes    = 0;
+    uint32_t max_scan_blocks = 0;
+    uint32_t cooldown_ms     = 0;
+    uint64_t mincore_before_bytes = 0; // KV resident bytes before release (mincore)
+    uint64_t mincore_after_bytes  = 0; // KV resident bytes after release (mincore)
+    uint64_t bounded_cnt_bytes_delta  = 0; // independent counter increment this call
+    uint64_t bounded_cnt_blocks_delta = 0;
+    const char * skipped_reason = nullptr;
+    // Per-condition capability decomposition at evaluation time.
+    // Populated from bounded_release_can_enable_diagnose().
+    int can_enable        = -1;  // -1 = not queried
+    int cap_paged         = -1;
+    int cap_ingraph       = -1;
+    int cap_layers        = -1;
+    int cap_row_idx       = -1;
+    int cap_swap_disabled = -1;
+    int cap_layout        = -1;
+};
+
+bool server_kv_pressure_bounded_release_config_from_env(
+        server_kv_pressure_bounded_release_config & config, std::string & error);
+
+std::string server_kv_pressure_bounded_release_format_marker(
+        const server_kv_pressure_bounded_release_event & event);
+
 // --- Runtime class ---
 
 class server_kv_pressure_runtime {
@@ -131,6 +180,7 @@ public:
         dry_run_config_ = cfg;
         last_dry_run_ = time_point {};
         last_dry_run_state_ = kv_pressure_state::NORMAL;
+        dry_run_episode_active_ = false;
         current_cooldown_ms_ = cfg.cooldown_ms;
     }
 
@@ -138,6 +188,7 @@ public:
         dry_run_config_.enabled = false;
         last_dry_run_ = time_point {};
         last_dry_run_state_ = kv_pressure_state::NORMAL;
+        dry_run_episode_active_ = false;
         current_cooldown_ms_ = 0;
     }
 
@@ -145,14 +196,15 @@ public:
     //   - master enable + target_bytes > 0
     //   - only PRESSURE / CRITICAL states (fail-closed on NORMAL / RECOVERY)
     //   - stale rejection (no valid sample → no evaluation)
-    //   - cooldown / backoff between evaluations within the same state episode
+    //   - cooldown / backoff between evaluations within one pressure episode
+    //   - NORMAL / RECOVERY end the episode and clear retained cadence state
     //   - state-entry semantics: entering PRESSURE or CRITICAL resets the
     //     cooldown timer so the first evaluation fires immediately.
     //   - CRITICAL: on state entry, bypasses cooldown entirely for that first
     //     evaluation only; subsequent evaluations in sustained CRITICAL are
     //     still subject to cooldown.
     bool dry_run_due(time_point now, kv_pressure_state state,
-                     bool stale) const;
+                     bool stale);
 
     // Advance cooldown after a completed dry-run scan.
     // now: the time_point used for the evaluation (usually the same `now`
@@ -162,6 +214,36 @@ public:
 
     const server_kv_pressure_dry_run_config & dry_run_config() const {
         return dry_run_config_;
+    }
+
+    // --- bounded destructive release policy ---
+
+    void bounded_release_enable(const server_kv_pressure_bounded_release_config & cfg) {
+        bounded_release_config_ = cfg;
+        last_bounded_release_ = time_point {};
+        last_bounded_release_state_ = kv_pressure_state::NORMAL;
+        bounded_release_episode_active_ = false;
+        bounded_release_current_cooldown_ms_ = cfg.cooldown_ms;
+    }
+
+    void bounded_release_disable() {
+        bounded_release_config_.enabled = false;
+        last_bounded_release_ = time_point {};
+        last_bounded_release_state_ = kv_pressure_state::NORMAL;
+        bounded_release_episode_active_ = false;
+        bounded_release_current_cooldown_ms_ = 0;
+    }
+
+    // Returns true when a bounded destructive release should be evaluated.
+    // Same episode reset, cooldown, state-entry, and backoff semantics as dry_run_due().
+    bool bounded_release_due(time_point now, kv_pressure_state state,
+                             bool stale);
+
+    // Advance cooldown after a completed bounded release call.
+    void bounded_release_record(bool had_shortfall, time_point now = clock::now());
+
+    const server_kv_pressure_bounded_release_config & bounded_release_config() const {
+        return bounded_release_config_;
     }
 
 private:
@@ -181,10 +263,15 @@ private:
     uint64_t sample_count_ = 0;
     uint64_t skip_count_ = 0;
 
-    // dry-run state — mutable so dry_run_due() can track state-entry and
-    // cooldown semantics without forcing the caller to drop const.
     server_kv_pressure_dry_run_config dry_run_config_;
-    mutable time_point last_dry_run_ {};
-    mutable kv_pressure_state last_dry_run_state_ = kv_pressure_state::NORMAL;
-    mutable uint32_t current_cooldown_ms_ = 0;
+    time_point last_dry_run_ {};
+    kv_pressure_state last_dry_run_state_ = kv_pressure_state::NORMAL;
+    bool dry_run_episode_active_ = false;
+    uint32_t current_cooldown_ms_ = 0;
+
+    server_kv_pressure_bounded_release_config bounded_release_config_;
+    time_point last_bounded_release_ {};
+    kv_pressure_state last_bounded_release_state_ = kv_pressure_state::NORMAL;
+    bool bounded_release_episode_active_ = false;
+    uint32_t bounded_release_current_cooldown_ms_ = 0;
 };

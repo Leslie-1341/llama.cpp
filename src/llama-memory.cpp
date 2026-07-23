@@ -12,6 +12,14 @@ const char * llama_paged_swap_error_reason_name(llama_paged_swap_error_reason re
         case llama_paged_swap_error_reason::PAGED_WRITE_MAPPING_INVALID:     return "PAGED_WRITE_MAPPING_INVALID";
         case llama_paged_swap_error_reason::ACTIVE_ROW_NOT_RESIDENT:         return "ACTIVE_ROW_NOT_RESIDENT";
         case llama_paged_swap_error_reason::INPUT_SETUP_FAILURE:             return "INPUT_SETUP_FAILURE";
+        case llama_paged_swap_error_reason::PAGED_WRITE_ROLLBACK_DISCARD_FAILURE:
+            return "PAGED_WRITE_ROLLBACK_DISCARD_FAILURE";
+        case llama_paged_swap_error_reason::PAGED_WRITE_GRAPH_ALLOC_FAILURE:
+            return "PAGED_WRITE_GRAPH_ALLOC_FAILURE";
+        case llama_paged_swap_error_reason::PAGED_WRITE_COMPUTE_FAILURE:
+            return "PAGED_WRITE_COMPUTE_FAILURE";
+        case llama_paged_swap_error_reason::PAGED_WRITE_CONTEXT_INVALID:
+            return "PAGED_WRITE_CONTEXT_INVALID";
     }
 
     return "UNKNOWN";

@@ -10,6 +10,7 @@ readonly EXIT_FAIL=1
 readonly EXIT_UNRESOLVED=2
 readonly EXIT_INCOMPLETE=3
 readonly EXIT_NO_CHANGES=4
+readonly EXIT_UNVERIFIED=5  # necessary check was skipped — cannot determine PASS/FAIL
 
 # --- log level ---
 declare GATE_LOG_LEVEL="${GATE_LOG_LEVEL:-1}"  # 0=quiet 1=normal 2=verbose
@@ -53,25 +54,37 @@ gate_verdict_name() {
         2) printf 'UNRESOLVED' ;;
         3) printf 'INCOMPLETE' ;;
         4) printf 'NO_CHANGES' ;;
+        5) printf 'UNVERIFIED' ;;
         *) printf 'UNKNOWN(%d)' "$code" ;;
     esac
 }
 
 # Summarize all check results and determine final exit code.
-# Priority: FAIL > UNRESOLVED > INCOMPLETE > PASS > NO_CHANGES
+# Priority: FAIL > UNRESOLVED > UNVERIFIED > INCOMPLETE > PASS > NO_CHANGES
+# UNVERIFIED triggers when a necessary check was SKIPped — cannot determine
+# PASS/FAIL without running the check.  Also triggers when knownfail tests
+# were excluded without confirmation they're unrelated to current diff.
 gate_final_verdict() {
     local worst=4  # start at NO_CHANGES
+    local has_unverified=0
     for name in "${CHECK_ORDER[@]}"; do
         local v="${CHECK_RESULTS[$name]}"
         case "$v" in
             FAIL)        worst=1 ;;  # FAIL beats everything, unconditionally
-            UNRESOLVED)  [[ $worst -gt 2 || $worst -eq 0 ]] && worst=2 ;;  # overrides PASS/INCOMPLETE/NO_CHANGES
+            UNRESOLVED)  [[ $worst -gt 2 || $worst -eq 0 ]] && worst=2 ;;  # overrides PASS/UNVERIFIED/INCOMPLETE/NO_CHANGES
+            UNVERIFIED)  has_unverified=1
+                         [[ $worst -gt 3 ]] && worst=5 ;;  # overrides PASS/NO_CHANGES only
             INCOMPLETE)  [[ $worst -gt 3 ]] && worst=3 ;;  # only overrides NO_CHANGES
             PASS)        [[ $worst -eq 4 ]] && worst=0 ;;  # only if nothing worse (was NO_CHANGES)
             SKIP)        ;;
             NO_CHANGES)  ;;
         esac
     done
+    # If a necessary check was SKIPped with an UNVERIFIED record, and
+    # nothing worse than INCOMPLETE happened, the verdict is UNVERIFIED.
+    if [[ $has_unverified -eq 1 ]] && [[ $worst -eq 0 || $worst -eq 3 || $worst -eq 4 ]]; then
+        worst=5
+    fi
     return $worst
 }
 
@@ -97,6 +110,7 @@ checks_pass=$(for n in "${CHECK_ORDER[@]}"; do [[ "${CHECK_RESULTS[$n]:-}" == "P
 checks_fail=$(for n in "${CHECK_ORDER[@]}"; do [[ "${CHECK_RESULTS[$n]:-}" == "FAIL" ]] && echo x; done | wc -l)
 checks_skip=$(for n in "${CHECK_ORDER[@]}"; do [[ "${CHECK_RESULTS[$n]:-}" == "SKIP" ]] && echo x; done | wc -l)
 checks_unresolved=$(for n in "${CHECK_ORDER[@]}"; do [[ "${CHECK_RESULTS[$n]:-}" == "UNRESOLVED" ]] && echo x; done | wc -l)
+checks_unverified=$(for n in "${CHECK_ORDER[@]}"; do [[ "${CHECK_RESULTS[$n]:-}" == "UNVERIFIED" ]] && echo x; done | wc -l)
 ---
 EOF
     for name in "${CHECK_ORDER[@]}"; do
@@ -104,13 +118,14 @@ EOF
     done
 
     # Single compact summary marker to stdout — this is the ONLY place it's emitted
-    printf 'OS_AGENT_GATE_RESULT mode=%s verdict=%s code=%d checks=%d pass=%d fail=%d skip=%d unresolved=%d artifact=%s\n' \
+    printf 'OS_AGENT_GATE_RESULT mode=%s verdict=%s code=%d checks=%d pass=%d fail=%d skip=%d unresolved=%d unverified=%d artifact=%s\n' \
         "$GATE_MODE" "$final_name" "$final_code" \
         "${#CHECK_ORDER[@]}" \
         "$(for n in "${CHECK_ORDER[@]}"; do [[ "${CHECK_RESULTS[$n]:-}" == "PASS" ]] && echo x; done | wc -l)" \
         "$(for n in "${CHECK_ORDER[@]}"; do [[ "${CHECK_RESULTS[$n]:-}" == "FAIL" ]] && echo x; done | wc -l)" \
         "$(for n in "${CHECK_ORDER[@]}"; do [[ "${CHECK_RESULTS[$n]:-}" == "SKIP" ]] && echo x; done | wc -l)" \
         "$(for n in "${CHECK_ORDER[@]}"; do [[ "${CHECK_RESULTS[$n]:-}" == "UNRESOLVED" ]] && echo x; done | wc -l)" \
+        "$(for n in "${CHECK_ORDER[@]}"; do [[ "${CHECK_RESULTS[$n]:-}" == "UNVERIFIED" ]] && echo x; done | wc -l)" \
         "$GATE_ARTIFACT_DIR"
 }
 

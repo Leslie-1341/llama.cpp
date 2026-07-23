@@ -299,12 +299,11 @@ bool llama_kv_cache_iswa_context::next() {
 bool llama_kv_cache_iswa_context::apply() {
     assert(!llama_memory_status_is_fail(status));
 
-    bool res = true;
+    if (!ctx_base->apply()) {
+        return false;
+    }
 
-    res = res & ctx_base->apply();
-    res = res & ctx_swa ->apply();
-
-    return res;
+    return ctx_swa->apply();
 }
 
 llama_memory_status llama_kv_cache_iswa_context::get_status() const {
@@ -342,14 +341,35 @@ llama_paged_swap_error llama_kv_cache_iswa_context::get_paged_swap_error() const
     return {};
 }
 
-void llama_kv_cache_iswa_context::finish_paged_kv_write(bool success) {
-    if (ctx_base) ctx_base->finish_paged_kv_write(success);
-    if (ctx_swa)  ctx_swa->finish_paged_kv_write(success);
+void llama_kv_cache_iswa_context::mark_paged_kv_compute_started() {
+    if (ctx_base) ctx_base->mark_paged_kv_compute_started();
+    if (ctx_swa)  ctx_swa->mark_paged_kv_compute_started();
+}
+
+bool llama_kv_cache_iswa_context::finish_paged_kv_write(llama_paged_kv_write_action action) {
+    const bool base_finished = !ctx_base || ctx_base->finish_paged_kv_write(action);
+    const bool swa_finished  = !ctx_swa  || ctx_swa->finish_paged_kv_write(action);
+    return base_finished && swa_finished;
 }
 
 bool llama_kv_cache_iswa_context::needs_paged_kv_post_graph_sync() const {
     return (ctx_base && ctx_base->needs_paged_kv_post_graph_sync()) ||
            (ctx_swa  && ctx_swa->needs_paged_kv_post_graph_sync());
+}
+
+bool llama_kv_cache_iswa_context::paged_kv_failure_handled() const {
+    return (!ctx_base || ctx_base->paged_kv_failure_handled()) &&
+           (!ctx_swa  || ctx_swa->paged_kv_failure_handled());
+}
+
+bool llama_kv_cache_iswa_context::test_paged_kv_fail_graph_alloc() {
+    if (ctx_base && ctx_base->test_paged_kv_fail_graph_alloc()) return true;
+    return ctx_swa && ctx_swa->test_paged_kv_fail_graph_alloc();
+}
+
+bool llama_kv_cache_iswa_context::test_paged_kv_fail_after_compute() {
+    if (ctx_base && ctx_base->test_paged_kv_fail_after_compute()) return true;
+    return ctx_swa && ctx_swa->test_paged_kv_fail_after_compute();
 }
 
 const llama_kv_cache_context * llama_kv_cache_iswa_context::get_base() const {

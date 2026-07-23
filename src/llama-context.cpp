@@ -1256,7 +1256,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     if (mctx && !mctx->apply()) {
-        mctx->finish_paged_kv_write(false);
+        mctx->finish_paged_kv_write(llama_paged_kv_write_action::ROLLBACK_PRE_COMPUTE);
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
@@ -1294,18 +1294,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         if (!gf) {
             if (mctx) {
-                mctx->finish_paged_kv_write(false);
+                mctx->finish_paged_kv_write(llama_paged_kv_write_action::ROLLBACK_PRE_COMPUTE);
             }
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
 
-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+        const bool graph_allocated = ggml_backend_sched_alloc_graph(sched.get(), gf);
+        const bool inject_graph_alloc_failure = mctx && mctx->test_paged_kv_fail_graph_alloc();
+        if (!graph_allocated || inject_graph_alloc_failure) {
             if (mctx) {
-                mctx->finish_paged_kv_write(false);
+                mctx->finish_paged_kv_write(llama_paged_kv_write_action::ROLLBACK_PRE_COMPUTE);
             }
-            LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+            LLAMA_LOG_ERROR("%s: failed to allocate graph%s\n", __func__,
+                    inject_graph_alloc_failure ? " (test injection)" : "");
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
@@ -1334,20 +1337,28 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR(
                 "KV_PAGED_PRE_GRAPH_FAILURE reason=%s graph_compute_skipped=1\n",
                 llama_paged_swap_error_reason_name(err.reason));
-        mctx->finish_paged_kv_write(false);
+        mctx->finish_paged_kv_write(llama_paged_kv_write_action::ROLLBACK_PRE_COMPUTE);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
 
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (mctx) {
+        mctx->mark_paged_kv_compute_started();
+    }
+    auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    const bool inject_compute_failure = mctx && mctx->test_paged_kv_fail_after_compute();
+    if (inject_compute_failure && status == GGML_STATUS_SUCCESS) {
+        status = GGML_STATUS_FAILED;
+    }
     if (status != GGML_STATUS_SUCCESS) {
         if (mctx) {
             if (mctx->needs_paged_kv_post_graph_sync()) {
                 ggml_backend_sched_synchronize(sched.get());
             }
-            mctx->finish_paged_kv_write(false);
+            mctx->finish_paged_kv_write(llama_paged_kv_write_action::INVALIDATE_COMPUTE_STARTED);
         }
-        LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+        LLAMA_LOG_ERROR("%s: failed to compute graph%s, compute status: %d\n", __func__,
+                inject_compute_failure ? " (test injection after compute)" : "", status);
         ret = status;
         return nullptr;
     }
@@ -1357,7 +1368,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         if (mctx->needs_paged_kv_post_graph_sync()) {
             ggml_backend_sched_synchronize(sched.get());
         }
-        mctx->finish_paged_kv_write(true);
+        if (!mctx->finish_paged_kv_write(llama_paged_kv_write_action::COMMIT)) {
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
     }
 
     return res;
@@ -1832,6 +1846,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
         if (!res) {
+            if (mctx->paged_kv_failure_handled()) {
+                switch (status) {
+                    case GGML_STATUS_ABORTED:      return  2;
+                    case GGML_STATUS_ALLOC_FAILED: return -2;
+                    case GGML_STATUS_FAILED:       return -3;
+                    case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
+                }
+            }
+
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
             llama_pos pos_min[LLAMA_MAX_SEQ];
             for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {

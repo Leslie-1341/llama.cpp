@@ -201,13 +201,19 @@ if (UNIX)
     llama_build_and_test(test-kv-paged-identity-fast-path.cpp)
     llama_build_and_test(test-kv-paged-release-ownership.cpp)
     llama_build_and_test(test-kv-paged-release-bounded.cpp)
-    set_property(TEST test-kv-paged-release-bounded PROPERTY SKIP_RETURN_CODE 77)
+    # No SKIP_RETURN_CODE: this test builds an in-memory synthetic
+    # LLM_ARCH_LLAMA model (llama_model_init_from_user) and always runs —
+    # never needs an external GGUF model file.
     llama_build_and_test(test-kv-pressure-sampler.cpp)
     if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
         llama_build_and_test(test-server-kv-pressure.cpp ${PROJECT_SOURCE_DIR}/tools/server/server-kv-pressure.cpp)
         target_include_directories(test-server-kv-pressure PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/src)
         llama_test_cmd(python3 NAME test-server-kv-pressure-static
             ARGS ${PROJECT_SOURCE_DIR}/tests/test-server-kv-pressure-static.py LABEL python)
+        llama_test_cmd(python3 NAME test-kv-bounded-release-stage3a-2c-parser
+            ARGS ${PROJECT_SOURCE_DIR}/tests/test-kv-bounded-release-stage3a-2c-parser.py LABEL python)
+        llama_test_cmd(python3 NAME test-runner-bounded-release-stage3a-2c
+            ARGS ${PROJECT_SOURCE_DIR}/tests/test-runner-bounded-release-stage3a-2c.py LABEL python)
     endif()
 endif()
 

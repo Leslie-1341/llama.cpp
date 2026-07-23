@@ -701,6 +701,11 @@ private:
     // Dry-run bounded release evaluation: enabled only when LLAMA_KV_PRESSURE_DRY_RUN=1.
     // Shared config lives on the runtime; the copy here is the authoritative parsed source.
     server_kv_pressure_dry_run_config kv_pressure_dry_run_config;
+
+    // Bounded destructive release: enabled only when LLAMA_KV_PRESSURE_BOUNDED_RELEASE=1.
+    // Independent of LLAMA_KV_PAGED_RELEASE (legacy apply-path gate).
+    server_kv_pressure_bounded_release_config kv_pressure_bounded_release_config;
+    uint64_t kv_pressure_bounded_release_episode = 0;
 #endif
 
     server_metrics metrics;
@@ -752,7 +757,10 @@ private:
             kv_pressure_sampler_owner.reset();
             kv_pressure_runtime.disable();
             kv_pressure_runtime.dry_run_disable();
+            kv_pressure_runtime.bounded_release_disable();
             kv_pressure_dry_run_config = server_kv_pressure_dry_run_config{};
+            kv_pressure_bounded_release_config = server_kv_pressure_bounded_release_config{};
+            kv_pressure_bounded_release_episode = 0;
 #endif
             destroy();
         } else {
@@ -1080,7 +1088,10 @@ private:
         kv_pressure_sampler_owner.reset();
         kv_pressure_runtime.disable();
         kv_pressure_runtime.dry_run_disable();
+        kv_pressure_runtime.bounded_release_disable();
         kv_pressure_dry_run_config = server_kv_pressure_dry_run_config{};
+        kv_pressure_bounded_release_config = server_kv_pressure_bounded_release_config{};
+        kv_pressure_bounded_release_episode = 0;
 
         const kv_pressure_enablement enablement = kv_pressure_sampler_environment_enablement();
         if (enablement == kv_pressure_enablement::KV_PRESSURE_ENABLEMENT_DISABLED) {
@@ -1121,6 +1132,76 @@ private:
             }
         }
 
+        // Parse bounded destructive release config independently.
+        // Mutual exclusion checks:
+        // - LLAMA_KV_PAGED_RELEASE=1 AND LLAMA_KV_PRESSURE_BOUNDED_RELEASE=1 → fail-closed
+        // - LLAMA_KV_PRESSURE_DRY_RUN=1 AND LLAMA_KV_PRESSURE_BOUNDED_RELEASE=1 → fail-closed
+        {
+            server_kv_pressure_bounded_release_config bounded_cfg;
+            std::string bounded_error;
+            if (!server_kv_pressure_bounded_release_config_from_env(
+                        bounded_cfg, bounded_error)) {
+                SRV_WRN("KV pressure bounded release disabled: %s\n",
+                        bounded_error.c_str());
+            } else if (bounded_cfg.enabled) {
+                bool bounded_disabled = false;
+
+                // Legacy mutual exclusion
+                const bool legacy_active = (std::getenv("LLAMA_KV_PAGED_RELEASE") &&
+                    std::strcmp(std::getenv("LLAMA_KV_PAGED_RELEASE"), "1") == 0);
+                if (legacy_active) {
+                    SRV_ERR("%s",
+                            "LLAMA_KV_PAGED_RELEASE=1 and "
+                            "LLAMA_KV_PRESSURE_BOUNDED_RELEASE=1 are mutually "
+                            "exclusive; bounded release disabled\n");
+                    bounded_disabled = true;
+                }
+
+                // Dry-run mutual exclusion: cannot run dry-run AND destructive
+                // bounded release simultaneously — they are alternative paths.
+                if (!bounded_disabled && kv_pressure_dry_run_config.enabled) {
+                    SRV_ERR("%s",
+                            "LLAMA_KV_PRESSURE_DRY_RUN=1 and "
+                            "LLAMA_KV_PRESSURE_BOUNDED_RELEASE=1 are mutually "
+                            "exclusive; bounded release disabled\n");
+                    bounded_disabled = true;
+                }
+
+                if (!bounded_disabled) {
+                    kv_pressure_bounded_release_config = bounded_cfg;
+                    kv_pressure_runtime.bounded_release_enable(bounded_cfg);
+                    kv_pressure_bounded_release_episode = 0;
+                    SRV_INF("KV pressure bounded release enabled: target_bytes=%"
+                            PRIu64 " max_scan_blocks=%" PRIu32 " cooldown_ms=%"
+                            PRIu32 " backoff_ms=%" PRIu32 "\n",
+                            bounded_cfg.target_bytes,
+                            bounded_cfg.max_scan_blocks,
+                            bounded_cfg.cooldown_ms,
+                            bounded_cfg.backoff_ms);
+
+                    // Emit structural capability diagnostic at init time so
+                    // every skip reason can be traced back to a specific condition.
+                    if (ctx_tgt) {
+                        auto * mem = llama_get_memory(ctx_tgt);
+                        if (mem) {
+                            const auto cap = mem->bounded_release_can_enable_diagnose();
+                            SRV_INF("kv_pressure_bounded_release_capability"
+                                    " can_enable=%d"
+                                    " paged=%d ingraph=%d layers_supported=%d"
+                                    " row_idx=%d swap_disabled=%d layout_supported=%d\n",
+                                    cap.can_enable ? 1 : 0,
+                                    cap.paged ? 1 : 0,
+                                    cap.ingraph ? 1 : 0,
+                                    cap.layers_supported ? 1 : 0,
+                                    cap.row_idx ? 1 : 0,
+                                    cap.swap_disabled ? 1 : 0,
+                                    cap.layout_supported ? 1 : 0);
+                        }
+                    }
+                }
+            }
+        }
+
         try {
             auto sampler = std::make_unique<kv_pressure_sampler>();
             if (!sampler->init(enablement)) {
@@ -1153,6 +1234,13 @@ private:
             const std::string marker = server_kv_pressure_format_marker(event);
             SRV_INF("%s\n", marker.c_str());
         }
+
+        // Per-sample defensive gating: at most one of dry-run or bounded
+        // release may be evaluated per sample cycle.  Under normal operation the
+        // init-time mutual-exclusion checks guarantee that only one path is
+        // enabled, but this flag provides defense-in-depth against config errors
+        // or runtime state corruption.
+        bool destructive_phase_did_work = false;
 
         // --- Dry-run bounded release evaluation (read-only, never mutates KV) ---
         {
@@ -1232,11 +1320,164 @@ private:
             }
 
             if (skip_reason) {
+                destructive_phase_did_work = true;
                 dry_event.skipped_reason = skip_reason;
                 const std::string marker =
                     server_kv_pressure_dry_run_format_marker(dry_event);
                 // Ownership ABORT is a correctness anomaly — escalate to WARNING.
                 if (dry_event.result.ownership_aborted) {
+                    SRV_WRN("%s\n", marker.c_str());
+                } else {
+                    SRV_INF("%s\n", marker.c_str());
+                }
+            }
+        }
+
+        // --- Bounded destructive release evaluation (Phase C) ---
+        // Mutually exclusive with dry-run Phase B at the per-sample level:
+        // if dry-run already ran, bounded release is skipped this sample.
+        //
+        // Also performs a defensive per-sample legacy contamination check:
+        // if LLAMA_KV_PAGED_RELEASE=1 is detected at sample time, bounded
+        // release is skipped even if the init-time check missed it.
+        {
+            const auto & telemetry = kv_pressure_sampler_owner->telemetry();
+
+            server_kv_pressure_bounded_release_event bounded_event;
+            bounded_event.pressure_state   = telemetry.state;
+            bounded_event.pressure_source  = telemetry.source;
+            bounded_event.stale            = telemetry.stale;
+            bounded_event.idle             = idle;
+            bounded_event.legacy_enabled   = false;  // set below after check
+            bounded_event.sample_count     = kv_pressure_runtime.sample_count();
+            bounded_event.episode          = kv_pressure_bounded_release_episode;
+            bounded_event.target_bytes     = kv_pressure_bounded_release_config.target_bytes;
+            bounded_event.max_scan_blocks  = kv_pressure_bounded_release_config.max_scan_blocks;
+
+            const auto now2 = server_kv_pressure_runtime::clock::now();
+
+            bool should_evaluate_bounded = false;
+            const char * bounded_skip_reason = nullptr;
+
+            // Master switch
+            if (!kv_pressure_bounded_release_config.enabled ||
+                    kv_pressure_bounded_release_config.target_bytes == 0) {
+                // Bounded release disabled — no marker.
+            } else if (destructive_phase_did_work) {
+                // Defense-in-depth: dry-run Phase B already evaluated this
+                // sample — skip bounded release to prevent double-execution.
+                bounded_skip_reason = "dry_run_active";
+            } else if (!ctx_tgt || !llama_get_memory(ctx_tgt)) {
+                bounded_skip_reason = "no_memory";
+            } else {
+                // Structural capability check (independent of legacy policy).
+                // Use paged_release_status for precise reason granularity
+                // and supplement with per-condition diagnose for exact attribution.
+                auto * mem = llama_get_memory(ctx_tgt);
+
+                // Populate per-condition capability fields for marker attribution
+                {
+                    const auto cap = mem->bounded_release_can_enable_diagnose();
+                    bounded_event.can_enable        = cap.can_enable ? 1 : 0;
+                    bounded_event.cap_paged         = cap.paged ? 1 : 0;
+                    bounded_event.cap_ingraph       = cap.ingraph ? 1 : 0;
+                    bounded_event.cap_layers        = cap.layers_supported ? 1 : 0;
+                    bounded_event.cap_row_idx       = cap.row_idx ? 1 : 0;
+                    bounded_event.cap_swap_disabled = cap.swap_disabled ? 1 : 0;
+                    bounded_event.cap_layout        = cap.layout_supported ? 1 : 0;
+                }
+
+                if (!mem->bounded_release_can_enable()) {
+                    const auto status = mem->paged_release_status();
+                    switch (status) {
+                    case llama_kv_release_status::not_paged:
+                        bounded_skip_reason = "not_paged"; break;
+                    case llama_kv_release_status::layout_unsupported:
+                        bounded_skip_reason = "layout_unsupported"; break;
+                    case llama_kv_release_status::swap_enabled:
+                        bounded_skip_reason = "swap_enabled"; break;
+                    default: {
+                        // available or disabled means the basic paged+layout+!swap
+                        // checks passed.  Use per-condition diagnose for exact
+                        // skip reason — no catch-all "structurally_disabled".
+                        const auto cap = mem->bounded_release_can_enable_diagnose();
+                        if (!cap.ingraph) {
+                            bounded_skip_reason = "not_ingraph";
+                        } else if (!cap.layers_supported) {
+                            bounded_skip_reason = "no_layers";
+                        } else if (!cap.row_idx) {
+                            bounded_skip_reason = "no_row_idx";
+                        } else {
+                            // Defensive: all diagnose fields are true but
+                            // can_enable is still false — this should not
+                            // happen; report as unknown structural block.
+                            bounded_skip_reason = "structurally_disabled";
+                        }
+                        break;
+                    }
+                    }
+                } else {
+                    // Per-sample legacy contamination check: if legacy release
+                    // is active, bounded release must not execute (fail-closed).
+                    const bool legacy_active =
+                        (std::getenv("LLAMA_KV_PAGED_RELEASE") &&
+                         std::strcmp(std::getenv("LLAMA_KV_PAGED_RELEASE"), "1") == 0);
+                    bounded_event.legacy_enabled = legacy_active;
+                    if (legacy_active) {
+                        bounded_skip_reason = "legacy_active";
+                    }
+                }
+
+                if (!bounded_skip_reason && telemetry.stale) {
+                    bounded_skip_reason = "stale";
+                }
+
+                if (!bounded_skip_reason &&
+                        telemetry.state != kv_pressure_state::PRESSURE &&
+                        telemetry.state != kv_pressure_state::CRITICAL) {
+                    // NORMAL or RECOVERY — no evaluation, no marker.
+                } else if (!bounded_skip_reason) {
+                    should_evaluate_bounded =
+                        kv_pressure_runtime.bounded_release_due(
+                                now2, telemetry.state, telemetry.stale);
+                }
+            }
+
+            if (should_evaluate_bounded) {
+                auto * mem = llama_get_memory(ctx_tgt);
+                // Capture independent counter values before release for delta
+                // attribution — these counters are the authoritative source,
+                // distinct from process-wide strace page-discard syscalls.
+                const uint64_t cnt_bytes_before  = mem->bounded_release_counter_bytes();
+                const uint64_t cnt_blocks_before = mem->bounded_release_counter_blocks();
+                // Sample KV resident pages before release (mincore hard gate)
+                bounded_event.mincore_before_bytes = mem->sample_kv_resident_bytes();
+                bounded_event.result = mem->bounded_release(
+                        kv_pressure_bounded_release_config.target_bytes,
+                        kv_pressure_bounded_release_config.max_scan_blocks);
+                // Sample KV resident pages after release
+                bounded_event.mincore_after_bytes = mem->sample_kv_resident_bytes();
+                const uint64_t cnt_bytes_after  = mem->bounded_release_counter_bytes();
+                const uint64_t cnt_blocks_after = mem->bounded_release_counter_blocks();
+                bounded_event.bounded_cnt_bytes_delta  = cnt_bytes_after - cnt_bytes_before;
+                bounded_event.bounded_cnt_blocks_delta = cnt_blocks_after - cnt_blocks_before;
+                const bool had_shortfall =
+                    bounded_event.result.shortfall_bytes > 0 &&
+                    bounded_event.result.block_scan_exhausted;
+                kv_pressure_runtime.bounded_release_record(had_shortfall, now2);
+                bounded_event.cooldown_ms =
+                    kv_pressure_bounded_release_config.cooldown_ms;
+                bounded_skip_reason = "none";
+                // Advance episode counter on successful evaluation
+                kv_pressure_bounded_release_episode += 1;
+                bounded_event.episode = kv_pressure_bounded_release_episode;
+            }
+
+            if (bounded_skip_reason) {
+                bounded_event.skipped_reason = bounded_skip_reason;
+                const std::string marker =
+                    server_kv_pressure_bounded_release_format_marker(bounded_event);
+                if (bounded_event.result.ownership_aborted) {
                     SRV_WRN("%s\n", marker.c_str());
                 } else {
                     SRV_INF("%s\n", marker.c_str());

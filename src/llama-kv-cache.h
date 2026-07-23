@@ -381,6 +381,17 @@ public:
     llama_kv_bounded_release_result bounded_release_dry_run(
             uint64_t target_bytes, uint32_t max_scan_blocks) override;
     llama_kv_release_status paged_release_status() const override;
+    llama_kv_bounded_release_result bounded_release(
+            uint64_t target_bytes, uint32_t max_scan_blocks) override;
+    bool bounded_release_can_enable() const override;
+    llama_kv_bounded_release_capability bounded_release_can_enable_diagnose() const override;
+    uint64_t sample_kv_resident_bytes() const override;
+    uint64_t bounded_release_counter_bytes() const override {
+        return paged_bounded_release_bytes;
+    }
+    uint64_t bounded_release_counter_blocks() const override {
+        return paged_bounded_release_blocks;
+    }
     void defer_idle_swapout(int32_t n_steps);
     void prefetch_seq_last_stats(
             uint64_t & owned_blocks,
@@ -467,6 +478,13 @@ public:
             uint64_t target_bytes,
             uint32_t max_scan_blocks);
 
+    // Bounded release for server pressure path — gated on
+    // LLAMA_KV_PRESSURE_BOUNDED_RELEASE (not LLAMA_KV_PAGED_RELEASE).
+    // Enforces every safety gate the legacy path does (layout, ownership,
+    // PENDING_WRITE, SWAPPED, RELEASED, madvise, neighbour-page protection)
+    // but uses independent counters.  Never accesses test-only seams.
+    // (Declared in the public override block above — no duplicate here.)
+
     // Dry-run bounded release: same ownership + state-gate scan as the destructive
     // variant, but NEVER calls paged_madvise_block(MADV_DONTNEED) or modifies KV state.
     // Returns would-release counts — candidate blocks, their byte totals,
@@ -489,6 +507,13 @@ public:
     //   Uses uint8_t to avoid private-enum access issues; cast to paged_block_state at use site.
     mutable bool    paged_release_bounded_test_force_ownership_abort = false;
     mutable int32_t paged_release_bounded_test_madvise_fail_block = -1;
+    // Single-shot failures injected at process_ubatch lifecycle boundaries.
+    mutable bool     paged_release_bounded_test_fail_graph_alloc = false;
+    mutable uint64_t paged_release_bounded_test_fail_graph_alloc_triggers = 0;
+    mutable bool     paged_release_bounded_test_fail_after_compute = false;
+    mutable uint64_t paged_release_bounded_test_fail_after_compute_triggers = 0;
+    mutable bool     paged_release_bounded_test_fail_rollback_madvise = false;
+    mutable uint64_t paged_release_bounded_test_fail_rollback_madvise_triggers = 0;
     struct {
         uint32_t block = UINT32_MAX;
         uint8_t  state = 0;  // cast to paged_block_state (UNUSED=0)
@@ -516,6 +541,137 @@ public:
     }
     uint64_t paged_release_bounded_test_read_released_dead() const {
         return paged_blocks_released_dead;
+    }
+    uint64_t paged_release_bounded_test_read_write_commits() const {
+        return paged_release_write_commits;
+    }
+    uint64_t paged_release_bounded_test_read_write_rollbacks() const {
+        return paged_release_write_rollbacks;
+    }
+    uint64_t paged_release_bounded_test_read_ensure_pending_write_rejected() const {
+        return paged_block_ensure_pending_write_rejected;
+    }
+    uint64_t paged_release_bounded_test_read_force_active_triggers() const {
+        return paged_test_force_active_release_triggers;
+    }
+    bool paged_release_bounded_test_legacy_release_enabled() const {
+        return paged_block_release_enabled;
+    }
+    void paged_release_bounded_test_arm_fail_graph_alloc() {
+        paged_release_bounded_test_fail_graph_alloc = true;
+    }
+    uint64_t paged_release_bounded_test_read_fail_graph_alloc_triggers() const {
+        return paged_release_bounded_test_fail_graph_alloc_triggers;
+    }
+    void paged_release_bounded_test_arm_fail_after_compute() {
+        paged_release_bounded_test_fail_after_compute = true;
+    }
+    uint64_t paged_release_bounded_test_read_fail_after_compute_triggers() const {
+        return paged_release_bounded_test_fail_after_compute_triggers;
+    }
+    void paged_release_bounded_test_arm_fail_rollback_madvise() {
+        paged_release_bounded_test_fail_rollback_madvise = true;
+    }
+    uint64_t paged_release_bounded_test_read_fail_rollback_madvise_triggers() const {
+        return paged_release_bounded_test_fail_rollback_madvise_triggers;
+    }
+    // Test-only accessors for the Stage 3A-2C write-transaction lifecycle
+    // (release → reuse → commit / rollback).  These expose counters and
+    // per-block state that WT6–WT9 assert on directly so the tests use REAL
+    // assertions instead of log-only or override-driven fake-greens.
+    uint64_t paged_release_bounded_test_read_reuse_allocations() const {
+        return paged_block_release_reuse_allocations;
+    }
+    uint64_t paged_release_bounded_test_read_dummy_candidate_pending_write_cell() const {
+        return paged_dummy_candidate_pending_write_cell;
+    }
+    uint64_t paged_release_bounded_test_read_released_redirect_no_dummy() const {
+        return paged_released_redirect_no_dummy;
+    }
+    uint64_t paged_release_bounded_test_read_released_redirect_no_dummy_pending_write() const {
+        return paged_released_redirect_no_dummy_pending_write;
+    }
+    uint64_t paged_release_bounded_test_read_input_setup_fatal() const {
+        return paged_input_setup_fatal;
+    }
+    bool paged_release_bounded_test_transaction_open() const {
+        return paged_write_transaction_owner != nullptr;
+    }
+    bool paged_release_bounded_test_context_invalid() const {
+        return paged_write_context_invalid;
+    }
+    llama_paged_swap_error_reason paged_release_bounded_test_error_reason() const {
+        return paged_swap_error.reason;
+    }
+    bool paged_release_bounded_test_block_used(uint32_t block) const {
+        return block < paged_block_used.size() && paged_block_used[block] != 0;
+    }
+    uint32_t paged_release_bounded_test_read_head(uint32_t stream) const {
+        return stream < v_heads.size() ? v_heads[stream] : UINT32_MAX;
+    }
+    llama_pos paged_release_bounded_test_read_cell_pos(uint32_t stream, uint32_t cell) const {
+        return stream < v_cells.size() && cell < v_cells[stream].size() ?
+            v_cells[stream].pos_get(cell) : -1;
+    }
+    bool paged_release_bounded_test_cell_has_seq(
+            uint32_t stream, uint32_t cell, llama_seq_id seq_id) const {
+        return stream < v_cells.size() && cell < v_cells[stream].size() &&
+            v_cells[stream].seq_has(cell, seq_id);
+    }
+    // Per-cell pending-write bitmap membership for the block owning phys_cell.
+    // Used to assert the pending bitmap is cleared after commit / rollback.
+    bool paged_release_bounded_test_pending_write_cell_set(uint32_t phys_cell) const {
+        if (phys_cell >= paged_pending_write_cells.size()) return false;
+        return paged_pending_write_cells[phys_cell] != 0;
+    }
+    uint64_t paged_release_bounded_test_pending_write_blocks_count() const {
+        return paged_pending_write_blocks.size();
+    }
+    uint32_t paged_release_bounded_test_block_owned_cells(uint32_t block) const {
+        if (block >= paged_n_blocks || paged_block_size == 0) return 0;
+        uint32_t owned = 0;
+        for (const auto & cells : v_cells) {
+            for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+                if (!cells.is_empty(cell) && cell / paged_block_size == block) {
+                    owned += 1;
+                }
+            }
+        }
+        return owned;
+    }
+    // Temporarily install an actual block state and pending-cell membership,
+    // invoke the authoritative read/write predicate, then restore all state.
+    // Counters intentionally remain advanced so tests can assert rejection.
+    bool paged_release_bounded_test_probe_residency(
+            uint32_t phys_cell,
+            uint8_t block_state,
+            bool pending_fresh,
+            bool read,
+            bool required_by_active) {
+        if (paged_block_size == 0 || phys_cell >= paged_pending_write_cells.size()) {
+            return false;
+        }
+        const uint32_t block = phys_cell / paged_block_size;
+        if (block >= paged_block_states.size()) {
+            return false;
+        }
+
+        const paged_block_state saved_state = paged_block_states[block];
+        const uint8_t saved_pending = paged_pending_write_cells[phys_cell];
+        const llama_paged_swap_error saved_error = paged_swap_error;
+
+        paged_block_states[block] = static_cast<paged_block_state>(block_state);
+        paged_pending_write_cells[phys_cell] = pending_fresh ? 1 : 0;
+        paged_swap_error = {};
+
+        const bool result = read
+            ? paged_check_read_resident_impl(phys_cell, required_by_active)
+            : paged_ensure_write_resident(phys_cell);
+
+        paged_block_states[block] = saved_state;
+        paged_pending_write_cells[phys_cell] = saved_pending;
+        paged_swap_error = saved_error;
+        return result;
     }
 
     void paged_swap_out_window(uint32_t n_kv);
@@ -673,7 +829,15 @@ private:
         uint64_t before_resident = 0;
         uint32_t block = UINT32_MAX;
     };
-    void paged_finish_write_transaction(bool success, const slot_info & sinfo);
+    bool paged_begin_write_transaction(const llama_kv_cache_context * owner);
+    bool paged_finish_write_transaction(
+            llama_paged_kv_write_action action,
+            const slot_info & sinfo,
+            const llama_kv_cache_context * owner);
+    void paged_invalidate_write_context(
+            llama_paged_swap_error_reason reason,
+            uint32_t physical_block = UINT32_MAX,
+            uint32_t physical_cell = UINT32_MAX);
     uint64_t paged_sample_release_ranges(
             const std::vector<paged_release_range> & ranges,
             uint64_t * total_bytes = nullptr) const;
@@ -694,6 +858,27 @@ private:
             uint64_t & skipped,
             uint64_t & skip_live,
             std::vector<paged_release_range> * advised_ranges = nullptr) const;
+
+    // Counter sink for paged_release_blocks_bounded_impl — separates legacy
+    // cumulative counters from independent bounded-release counters.
+    struct paged_bounded_release_counters {
+        uint64_t * calls  = nullptr;
+        uint64_t * blocks = nullptr;
+        uint64_t * bytes  = nullptr;
+        uint64_t * unused = nullptr;
+        uint64_t * dead   = nullptr;
+    };
+
+    // Common destructive release implementation shared by the legacy
+    // paged_release_blocks_bounded() path and the server bounded_release() path.
+    // Both callers must verify their respective authorisation gate
+    // (paged_block_release_enabled or bounded_release_can_enable()) before entry.
+    // use_test_seams=true allows the legacy test-only seam injection path.
+    llama_kv_bounded_release_result paged_release_blocks_bounded_impl(
+            uint64_t target_bytes,
+            uint32_t max_scan_blocks,
+            const paged_bounded_release_counters & cnt,
+            bool use_test_seams);
     // Stage 5E-1: read-only KV resident page sampling via mincore(2). Walks every KV layer's
     // K/V tensor, page-aligns each tensor's [data, data+nbytes) interval (same align rule as
     // paged_madvise_block), and counts resident pages. Updates the kv_mincore_* counters and
@@ -733,12 +918,14 @@ private:
         RELEASED = 2,
         SWAPPED  = 3,
         PENDING_WRITE = 4,
+        INVALID = 5,
     };
 
     bool     kv_paged_enabled  = false;
     bool     kv_paged_warned   = false;
     bool     paged_ingraph_enabled = true;
     bool     paged_row_idx_enabled = false;
+    bool     paged_layers_supported = false;  // unified: non-empty && all layers have K/V F32 tensors
     bool     paged_nonidentity_probe_requested = false;
     bool     paged_identity_fast_path_enabled = false;
     uint32_t paged_identity_fast_path_layers = 0;
@@ -756,6 +943,9 @@ private:
     mutable std::vector<size_t>   paged_swap_sizes;
     mutable std::vector<uint8_t>  paged_pending_write_cells;
     mutable std::vector<uint32_t> paged_pending_write_blocks;
+    const llama_kv_cache_context * paged_write_transaction_owner = nullptr;
+    bool paged_write_context_invalid = false;
+    llama_paged_swap_error_reason paged_write_context_invalid_cause = llama_paged_swap_error_reason::NONE;
     mutable std::vector<paged_release_range> paged_release_post_ranges;
     mutable std::vector<std::vector<paged_release_range>> paged_released_ranges_by_block;
     std::vector<uint32_t> paged_free_list;
@@ -809,6 +999,17 @@ private:
     uint64_t paged_block_release_metadata_stale = 0;
     uint64_t paged_block_release_idempotent = 0;
     uint64_t paged_blocks_released_dead = 0;
+
+    // Bounded-release independent counters (server pressure path, gated by
+    // LLAMA_KV_PRESSURE_BOUNDED_RELEASE).  These are separate from the legacy
+    // cumulative counters above so that the two paths do not corrupt each
+    // other's attribution.
+    uint64_t paged_bounded_release_calls  = 0;
+    uint64_t paged_bounded_release_blocks = 0;
+    uint64_t paged_bounded_release_bytes  = 0;
+    uint64_t paged_bounded_release_unused = 0;
+    uint64_t paged_bounded_release_dead   = 0;
+
     uint64_t paged_block_release_skip_unaligned = 0;
     uint64_t paged_block_release_fail = 0;
     uint64_t paged_block_release_rss_samples = 0;
@@ -820,6 +1021,7 @@ private:
     uint64_t paged_block_release_rss_drop_max_kb = 0;
     mutable uint64_t paged_block_ensure_calls = 0;
     mutable uint64_t paged_block_ensure_released = 0;
+    mutable uint64_t paged_block_ensure_pending_write_rejected = 0;
     uint64_t paged_block_release_reuse_allocations = 0;
     mutable uint64_t paged_release_violation = 0;
     mutable uint64_t paged_active_release_violation = 0;
@@ -827,6 +1029,9 @@ private:
     mutable uint64_t paged_released_redirect_rows = 0;
     mutable uint64_t paged_released_redirect_blocks = 0;
     mutable uint64_t paged_released_redirect_no_dummy = 0;
+    mutable uint64_t paged_released_redirect_no_dummy_pending_write = 0;
+    mutable uint64_t paged_dummy_candidate_resident = 0;
+    mutable uint64_t paged_dummy_candidate_pending_write_cell = 0;
     mutable uint64_t paged_release_mincore_samples = 0;
     mutable uint64_t paged_release_mincore_before_last = 0;
     mutable uint64_t paged_release_mincore_after_last = 0;
@@ -1402,8 +1607,12 @@ public:
     void clear_paged_swap_error() override;
     bool has_paged_swap_error() const override;
     llama_paged_swap_error get_paged_swap_error() const override;
-    void finish_paged_kv_write(bool success) override;
+    void mark_paged_kv_compute_started() override;
+    bool finish_paged_kv_write(llama_paged_kv_write_action action) override;
     bool needs_paged_kv_post_graph_sync() const override;
+    bool paged_kv_failure_handled() const override;
+    bool test_paged_kv_fail_graph_alloc() override;
+    bool test_paged_kv_fail_after_compute() override;
 
     //
     // llama_kv_cache_context specific API
@@ -1488,5 +1697,30 @@ private:
 
     bool     paged_shadow_pending = false;
     uint32_t paged_shadow_n_kv    = 0;
-    bool paged_write_transaction_open = false;
+
+    enum class paged_write_transaction_state : uint8_t {
+        CLOSED,
+        APPLIED,
+        COMPUTE_STARTED,
+    };
+
+    struct paged_write_metadata_delta {
+        uint32_t stream;
+        std::vector<uint32_t> cells;
+        llama_kv_cells cells_before;
+        uint32_t head_before;
+    };
+
+    struct paged_write_block_delta {
+        uint32_t block;
+        llama_kv_cache::paged_block_state state_before;
+        bool used_before;
+        bool in_free_list_before;
+    };
+
+    paged_write_transaction_state paged_write_transaction_state_ =
+        paged_write_transaction_state::CLOSED;
+    bool paged_write_failure_handled = false;
+    std::vector<paged_write_metadata_delta> paged_write_metadata_deltas;
+    std::vector<paged_write_block_delta> paged_write_block_deltas;
 };

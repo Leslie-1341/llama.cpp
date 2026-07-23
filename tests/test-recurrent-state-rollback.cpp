@@ -2,6 +2,12 @@
 #include "common.h"
 #include "llama.h"
 
+#include "../src/llama-kv-cache-iswa.h"
+#include "../src/llama-kv-cache.h"
+#include "../src/llama-memory-hybrid-iswa.h"
+#include "../src/llama-memory-hybrid.h"
+#include "../src/llama-memory-recurrent.h"
+
 #include <algorithm>
 #include <clocale>
 #include <cmath>
@@ -15,6 +21,29 @@ static llama_context * make_ctx(const common_params & params, llama_model * mode
     cparams.n_batch   = std::max(cparams.n_batch,  (uint32_t) (cparams.n_rs_seq + 1));
     cparams.n_ubatch  = std::max(cparams.n_ubatch, (uint32_t) (cparams.n_rs_seq + 1));
     return llama_init_from_model(model, cparams);
+}
+
+static llama_memory_recurrent * get_recurrent_memory(llama_memory_t mem) {
+    if (auto * recurrent = dynamic_cast<llama_memory_recurrent *>(mem)) {
+        return recurrent;
+    }
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        return hybrid->get_mem_recr();
+    }
+    if (auto * hybrid_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
+        return hybrid_iswa->get_mem_recr();
+    }
+    return nullptr;
+}
+
+static llama_kv_cache * get_attention_memory(llama_memory_t mem) {
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        return hybrid->get_mem_attn();
+    }
+    if (auto * hybrid_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
+        return hybrid_iswa->get_mem_attn()->get_base();
+    }
+    return nullptr;
 }
 
 static bool decode_tokens(llama_context * ctx, const std::vector<llama_token> & tokens, uint32_t count) {
@@ -78,6 +107,73 @@ int main(int argc, char ** argv) {
         llama_free(ctx_dst);
         return 0;
     }
+
+    llama_memory_t mem_src = llama_get_memory(ctx_src);
+    llama_memory_recurrent * recurrent = get_recurrent_memory(mem_src);
+    if (recurrent == nullptr) {
+        fprintf(stderr, "%s : failed to resolve recurrent memory\n", __func__);
+        return 1;
+    }
+
+    // A hybrid pre-compute graph-allocation failure must roll attention back and
+    // preserve the original outer cleanup for recurrent metadata. It must not
+    // be promoted to compute-started poison merely because recurrent apply ran.
+    if (llama_model_is_hybrid(model)) {
+        llama_kv_cache * attention = get_attention_memory(mem_src);
+        if (attention == nullptr) {
+            fprintf(stderr, "%s : failed to resolve hybrid attention memory\n", __func__);
+            return 1;
+        }
+
+        llama_memory_clear(mem_src, true);
+        const uint64_t trigger_before =
+            attention->paged_release_bounded_test_read_fail_graph_alloc_triggers();
+        attention->paged_release_bounded_test_arm_fail_graph_alloc();
+        if (decode_one(ctx_src, 1, 0)) {
+            fprintf(stderr, "%s : hybrid graph-allocation fault was not triggered\n", __func__);
+            return 1;
+        }
+        if (attention->paged_release_bounded_test_read_fail_graph_alloc_triggers() != trigger_before + 1) {
+            fprintf(stderr, "%s : hybrid graph-allocation seam trigger mismatch\n", __func__);
+            return 1;
+        }
+        if (attention->seq_pos_max(0) != -1 || recurrent->seq_pos_max(0) != -1 ||
+                recurrent->find_slot_failed()) {
+            fprintf(stderr, "%s : hybrid pre-compute failure left inconsistent memory state\n", __func__);
+            return 1;
+        }
+        if (!decode_one(ctx_src, 2, 0)) {
+            fprintf(stderr, "%s : hybrid retry after pre-compute cleanup failed\n", __func__);
+            return 1;
+        }
+    }
+
+    // Inject failure only after the production recurrent find_slot() has
+    // changed metadata. apply() must propagate the failure, the memory must
+    // reject subsequent use, and explicit clear() must restore service.
+    llama_memory_clear(mem_src, true);
+    const uint64_t recurrent_trigger_before =
+        recurrent->test_read_fail_after_find_slot_triggers();
+    recurrent->test_arm_fail_after_find_slot();
+    if (decode_one(ctx_src, 3, 0)) {
+        fprintf(stderr, "%s : recurrent post-find_slot fault was not propagated\n", __func__);
+        return 1;
+    }
+    if (recurrent->test_read_fail_after_find_slot_triggers() != recurrent_trigger_before + 1 ||
+            !recurrent->find_slot_failed()) {
+        fprintf(stderr, "%s : recurrent post-find_slot fail-stop was not established\n", __func__);
+        return 1;
+    }
+    if (decode_one(ctx_src, 4, 0)) {
+        fprintf(stderr, "%s : poisoned recurrent memory accepted another decode\n", __func__);
+        return 1;
+    }
+    llama_memory_clear(mem_src, true);
+    if (recurrent->find_slot_failed() || !decode_one(ctx_src, 5, 0)) {
+        fprintf(stderr, "%s : recurrent memory did not recover after clear\n", __func__);
+        return 1;
+    }
+    llama_memory_clear(mem_src, true);
 
     std::vector<llama_token> tokens = common_tokenize(ctx_src, "The quick brown fox jumps", true);
     const uint32_t n_rs_seq = llama_n_rs_seq(ctx_src);

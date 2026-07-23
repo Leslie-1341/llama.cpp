@@ -1497,9 +1497,9 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
-    bool layers_supported = !layers.empty();
+    paged_layers_supported = !layers.empty();
     for (const auto & layer : layers) {
-        layers_supported = layers_supported && layer.k && layer.v &&
+        paged_layers_supported = paged_layers_supported && layer.k && layer.v &&
             layer.k->type == GGML_TYPE_F32 && layer.v->type == GGML_TYPE_F32;
     }
 
@@ -1519,18 +1519,18 @@ llama_kv_cache::llama_kv_cache(
         /* .mapping_write_fault = */ paged_test_mapping_fault_.scope == paged_test_mapping_fail_scope::WRITE,
         /* .swapin_fault        = */ paged_test_swapin_fault_.scope != paged_test_swapin_fail_scope::OFF,
         /* .backing_io_fault    = */ paged_test_io_fault_.scope != paged_test_io_fail_scope::OFF,
-        /* .layers_supported = */ layers_supported,
+        /* .layers_supported = */ paged_layers_supported,
     });
     paged_identity_fast_path_enabled = fast_path.enabled;
     paged_identity_fast_path_reject = fast_path.reject;
     paged_identity_fast_path_layers = fast_path.enabled ? (uint32_t) map_layer_ids.size() : 0;
-    paged_row_idx_enabled = kv_paged_enabled && paged_ingraph_enabled && layers_supported && !fast_path.enabled;
+    paged_row_idx_enabled = kv_paged_enabled && paged_ingraph_enabled && paged_layers_supported && !fast_path.enabled;
 
     if (paged_dynamic_release_requested) {
         paged_block_release_enabled = llama_kv_destructive_release_can_enable(
                 kv_paged_enabled,
                 paged_ingraph_enabled,
-                layers_supported,
+                paged_layers_supported,
                 paged_row_idx_enabled,
                 paged_swap_enabled);
         if (paged_block_release_enabled) {
@@ -1539,7 +1539,7 @@ llama_kv_cache::llama_kv_cache(
                     "paged=%d ingraph=%d layers_supported=%d row_idx=%d\n",
                     kv_paged_enabled ? 1 : 0,
                     paged_ingraph_enabled ? 1 : 0,
-                    layers_supported ? 1 : 0,
+                    paged_layers_supported ? 1 : 0,
                     paged_row_idx_enabled ? 1 : 0);
         } else {
             paged_test_force_active_release = false;
@@ -1550,7 +1550,7 @@ llama_kv_cache::llama_kv_cache(
                     "paged=%d ingraph=%d layers_supported=%d row_idx=%d swap=%d\n",
                     kv_paged_enabled ? 1 : 0,
                     paged_ingraph_enabled ? 1 : 0,
-                    layers_supported ? 1 : 0,
+                    paged_layers_supported ? 1 : 0,
                     paged_row_idx_enabled ? 1 : 0,
                     paged_swap_enabled ? 1 : 0);
         }
@@ -2838,6 +2838,10 @@ void llama_kv_cache::paged_init(uint32_t kv_size) {
     paged_swap_sizes.assign(kv_size, 0);
     paged_pending_write_cells.assign(kv_size, 0);
     paged_pending_write_blocks.clear();
+    paged_write_transaction_owner = nullptr;
+    paged_write_context_invalid = false;
+    paged_write_context_invalid_cause = llama_paged_swap_error_reason::NONE;
+    paged_swap_error = {};
     paged_release_post_ranges.clear();
     paged_released_ranges_by_block.assign(paged_n_blocks, {});
     paged_free_list.resize(paged_n_blocks);
@@ -2865,6 +2869,10 @@ void llama_kv_cache::paged_reset() {
     paged_swap_sizes.assign(paged_kv_size, 0);
     paged_pending_write_cells.assign(paged_kv_size, 0);
     paged_pending_write_blocks.clear();
+    paged_write_transaction_owner = nullptr;
+    paged_write_context_invalid = false;
+    paged_write_context_invalid_cause = llama_paged_swap_error_reason::NONE;
+    paged_swap_error = {};
     paged_release_post_ranges.clear();
     paged_released_ranges_by_block.assign(paged_n_blocks, {});
     paged_free_list.resize(paged_n_blocks);
@@ -3156,6 +3164,14 @@ bool llama_kv_cache::paged_validate_write_mapping(uint32_t phys_cell) const {
 
 void llama_kv_cache::clear_paged_swap_error() {
     paged_swap_error = {};
+    if (paged_write_context_invalid) {
+        set_paged_swap_error(
+                llama_paged_swap_error_reason::PAGED_WRITE_CONTEXT_INVALID,
+                PAGED_BLOCK_INVALID,
+                PAGED_BLOCK_INVALID,
+                static_cast<int>(paged_write_context_invalid_cause));
+        return;
+    }
     if (paged_test_io_fault_.scope == paged_test_io_fail_scope::ACTIVE_SWAP_IN &&
             paged_test_io_fault_.failed_block != PAGED_BLOCK_INVALID &&
             paged_test_io_fault_.failed_block < paged_block_states.size() &&
@@ -3167,6 +3183,7 @@ void llama_kv_cache::clear_paged_swap_error() {
                 case paged_block_state::RELEASED: return "RELEASED";
                 case paged_block_state::SWAPPED:  return "SWAPPED";
                 case paged_block_state::PENDING_WRITE: return "PENDING_WRITE";
+                case paged_block_state::INVALID: return "INVALID";
             }
             return "UNKNOWN";
         };
@@ -3241,8 +3258,14 @@ llama_paged_swap_error llama_kv_cache::get_paged_swap_error() const {
 }
 
 bool llama_kv_cache::paged_ensure_write_resident(uint32_t phys_cell) const {
-    if (!kv_paged_enabled || (!paged_block_release_enabled && !paged_swap_enabled) ||
-            phys_cell == PAGED_BLOCK_INVALID || paged_block_size == 0) {
+    // Safety is driven by actual block state, NOT by the legacy
+    // paged_block_release_enabled / paged_swap_enabled gates.  In a bounded-only
+    // configuration (LLAMA_KV_PRESSURE_BOUNDED_RELEASE set, LLAMA_KV_PAGED_RELEASE
+    // and LLAMA_KV_SWAP_PAGED unset) both legacy flags are false, so gating on
+    // them would short-circuit to `return true` here and bypass every
+    // RELEASED / PENDING_WRITE / SWAPPED check — a fail-open hole.  Only the
+    // non-paged case (no block state exists at all) may return true early.
+    if (!kv_paged_enabled || phys_cell == PAGED_BLOCK_INVALID || paged_block_size == 0) {
         return true;
     }
 
@@ -3251,6 +3274,13 @@ bool llama_kv_cache::paged_ensure_write_resident(uint32_t phys_cell) const {
     const uint32_t physical_block = phys_cell / paged_block_size;
     if (physical_block >= paged_block_states.size()) {
         return true;
+    }
+
+    if (paged_block_states[physical_block] == paged_block_state::INVALID) {
+        set_paged_swap_error(
+                llama_paged_swap_error_reason::PAGED_WRITE_CONTEXT_INVALID,
+                physical_block, phys_cell);
+        return false;
     }
 
     if (paged_block_states[physical_block] == paged_block_state::RELEASED) {
@@ -3274,8 +3304,24 @@ bool llama_kv_cache::paged_ensure_write_resident(uint32_t phys_cell) const {
         }
     }
 
-    return paged_block_states[physical_block] == paged_block_state::RESIDENT ||
-        paged_block_states[physical_block] == paged_block_state::PENDING_WRITE;
+    if (paged_block_states[physical_block] == paged_block_state::PENDING_WRITE) {
+        // PENDING_WRITE is only valid if the cell belongs to the current
+        // write transaction. Reject stale PENDING_WRITE cells left over
+        // from a different (aborted / concurrent) transaction.
+        if (paged_write_transaction_owner != nullptr &&
+                phys_cell < paged_pending_write_cells.size() &&
+                paged_pending_write_cells[phys_cell]) {
+            return true;
+        }
+        paged_block_ensure_pending_write_rejected += 1;
+        paged_write_mapping_invalid_fatal += 1;
+        set_paged_swap_error(
+                llama_paged_swap_error_reason::PAGED_WRITE_MAPPING_INVALID,
+                physical_block, phys_cell);
+        return false;
+    }
+
+    return paged_block_states[physical_block] == paged_block_state::RESIDENT;
 }
 
 bool llama_kv_cache::paged_check_read_resident(uint32_t phys_cell, bool required_by_active) const {
@@ -3291,14 +3337,27 @@ bool llama_kv_cache::paged_check_read_resident(uint32_t phys_cell, bool required
 }
 
 bool llama_kv_cache::paged_check_read_resident_impl(uint32_t phys_cell, bool required_by_active) const {
-    if (!kv_paged_enabled || (!paged_block_release_enabled && !paged_swap_enabled) ||
-            phys_cell == PAGED_BLOCK_INVALID || paged_block_size == 0) {
+    // Safety is driven by actual block state, NOT by the legacy
+    // paged_block_release_enabled / paged_swap_enabled gates.  In a bounded-only
+    // configuration (LLAMA_KV_PRESSURE_BOUNDED_RELEASE set, LLAMA_KV_PAGED_RELEASE
+    // and LLAMA_KV_SWAP_PAGED unset) both legacy flags are false, so gating on
+    // them would short-circuit to `return true` here and silently allow reads of
+    // RELEASED / stale-PENDING_WRITE / SWAPPED blocks — a fail-open hole.  Only
+    // the non-paged case (no block state exists at all) may return true early.
+    if (!kv_paged_enabled || phys_cell == PAGED_BLOCK_INVALID || paged_block_size == 0) {
         return true;
     }
 
     const uint32_t physical_block = phys_cell / paged_block_size;
     if (physical_block >= paged_block_states.size()) {
         return true;
+    }
+
+    if (paged_block_states[physical_block] == paged_block_state::INVALID) {
+        set_paged_swap_error(
+                llama_paged_swap_error_reason::PAGED_WRITE_CONTEXT_INVALID,
+                physical_block, phys_cell);
+        return false;
     }
 
     if (paged_block_states[physical_block] == paged_block_state::RELEASED) {
@@ -3312,6 +3371,33 @@ bool llama_kv_cache::paged_check_read_resident_impl(uint32_t phys_cell, bool req
         } else {
             paged_padded_release_violation += 1;
         }
+    } else if (paged_block_states[physical_block] == paged_block_state::PENDING_WRITE) {
+        // PENDING_WRITE cells only have valid backing memory when they belong to
+        // the current write transaction (paged_pending_write_cells flag set).
+        // A stale / non-current-transaction PENDING_WRITE cell was RELEASED then
+        // MADV_DONTNEED'd before the PENDING_WRITE transition and contains
+        // garbage — it must NOT be read as if resident.  Fresh cells of the
+        // current transaction may be read (their backing memory is allocated and
+        // being written this transaction).
+        const bool pending_fresh_cell =
+            paged_write_transaction_owner != nullptr &&
+            phys_cell < paged_pending_write_cells.size() &&
+            paged_pending_write_cells[phys_cell];
+        if (!pending_fresh_cell) {
+            paged_block_ensure_pending_write_rejected += 1;
+            paged_release_violation += 1;
+            if (required_by_active) {
+                paged_active_release_violation += 1;
+                set_paged_swap_error(
+                        llama_paged_swap_error_reason::ACTIVE_READ_RELEASED_BLOCK,
+                        physical_block, phys_cell);
+                return false;
+            } else {
+                paged_padded_release_violation += 1;
+            }
+        }
+        // else: fresh current-transaction cell — readable, fall through to
+        // the resident check below.
     } else if (paged_block_states[physical_block] == paged_block_state::SWAPPED) {
         paged_swap_read_swapped_hits += 1;
         if (paged_swap_in_block(
@@ -3392,6 +3478,7 @@ void llama_kv_cache::paged_swap_out_block_impl(uint32_t physical_block, bool do_
             case paged_block_state::RELEASED: return "RELEASED";
             case paged_block_state::SWAPPED:  return "SWAPPED";
             case paged_block_state::PENDING_WRITE: return "PENDING_WRITE";
+            case paged_block_state::INVALID: return "INVALID";
         }
         return "UNKNOWN";
     };
@@ -3708,6 +3795,7 @@ bool llama_kv_cache::paged_swap_in_block(
             case paged_block_state::RELEASED: return "RELEASED";
             case paged_block_state::SWAPPED:  return "SWAPPED";
             case paged_block_state::PENDING_WRITE: return "PENDING_WRITE";
+            case paged_block_state::INVALID: return "INVALID";
         }
         return "UNKNOWN";
     };
@@ -4299,41 +4387,61 @@ void llama_kv_cache::paged_verify_fresh_writes(const slot_info & sinfo) const {
     }
 }
 
-void llama_kv_cache::paged_finish_write_transaction(bool success, const slot_info & sinfo) {
+void llama_kv_cache::paged_invalidate_write_context(
+        llama_paged_swap_error_reason reason,
+        uint32_t physical_block,
+        uint32_t physical_cell) {
+    paged_write_context_invalid = true;
+    paged_write_context_invalid_cause = reason;
+    paged_swap_error = {};
+    set_paged_swap_error(reason, physical_block, physical_cell);
+}
+
+bool llama_kv_cache::paged_begin_write_transaction(const llama_kv_cache_context * owner) {
     if (!kv_paged_enabled) {
-        return;
+        return true;
+    }
+    if (paged_write_context_invalid) {
+        paged_swap_error = {};
+        set_paged_swap_error(
+                llama_paged_swap_error_reason::PAGED_WRITE_CONTEXT_INVALID,
+                PAGED_BLOCK_INVALID,
+                PAGED_BLOCK_INVALID,
+                static_cast<int>(paged_write_context_invalid_cause));
+        return false;
+    }
+    if (paged_write_transaction_owner && paged_write_transaction_owner != owner) {
+        paged_invalidate_write_context(
+                llama_paged_swap_error_reason::PAGED_WRITE_CONTEXT_INVALID);
+        return false;
+    }
+    paged_write_transaction_owner = owner;
+    return true;
+}
+
+bool llama_kv_cache::paged_finish_write_transaction(
+        llama_paged_kv_write_action action,
+        const slot_info & sinfo,
+        const llama_kv_cache_context * owner) {
+    if (!kv_paged_enabled) {
+        return true;
     }
 
-    if (success && paged_mincore_enabled && !paged_release_post_ranges.empty()) {
-        uint64_t total = 0;
-        paged_release_mincore_post_graph_last = paged_sample_release_ranges(
-                paged_release_post_ranges, &total);
-        paged_release_mincore_total_last = total;
+    if (paged_write_transaction_owner != owner) {
+        paged_invalidate_write_context(
+                llama_paged_swap_error_reason::PAGED_WRITE_CONTEXT_INVALID);
+        return false;
     }
 
-    const uint64_t rollbacks_before = paged_release_write_rollbacks;
-    const bool transaction_open = !paged_pending_write_blocks.empty();
-    if (success) {
+    bool finished = true;
+    if (action == llama_paged_kv_write_action::COMMIT) {
+        if (paged_mincore_enabled && !paged_release_post_ranges.empty()) {
+            uint64_t total = 0;
+            paged_release_mincore_post_graph_last = paged_sample_release_ranges(
+                    paged_release_post_ranges, &total);
+            paged_release_mincore_total_last = total;
+        }
         paged_verify_fresh_writes(sinfo);
-        std::vector<paged_release_range> reaccess_ranges;
-        for (uint32_t block : paged_pending_write_blocks) {
-            if (block < paged_released_ranges_by_block.size()) {
-                const auto & ranges = paged_released_ranges_by_block[block];
-                reaccess_ranges.insert(reaccess_ranges.end(), ranges.begin(), ranges.end());
-            }
-        }
-        if (paged_mincore_enabled && !reaccess_ranges.empty()) {
-            paged_release_mincore_reaccess_last = paged_sample_release_ranges(
-                    reaccess_ranges, &paged_release_mincore_reaccess_total_last);
-        }
-        uint64_t reuse_reaccess_resident = 0;
-        uint64_t reuse_reaccess_total = 0;
-        if (paged_mincore_enabled && paged_release_test_reuse_block != PAGED_BLOCK_INVALID &&
-                paged_release_test_reuse_block < paged_released_ranges_by_block.size()) {
-            reuse_reaccess_resident = paged_sample_release_ranges(
-                    paged_released_ranges_by_block[paged_release_test_reuse_block],
-                    &reuse_reaccess_total);
-        }
         for (uint32_t block : paged_pending_write_blocks) {
             if (block < paged_block_states.size() &&
                     paged_block_states[block] == paged_block_state::PENDING_WRITE) {
@@ -4344,75 +4452,108 @@ void llama_kv_cache::paged_finish_write_transaction(bool success, const slot_inf
                 }
             }
         }
-        if (paged_release_test_reuse && !paged_release_test_reuse_marker_emitted &&
-                paged_release_test_reuse_block != PAGED_BLOCK_INVALID) {
-            const uint64_t fresh_bytes = paged_release_fresh_verify_bytes -
-                paged_release_test_reuse_fresh_bytes_before;
-            const uint32_t block = paged_release_test_reuse_block;
-            const bool committed = block < paged_block_states.size() &&
-                paged_block_states[block] == paged_block_state::RESIDENT;
-            fprintf(stderr,
-                    "KV_PAGED_RELEASE_R3 released_block=%u reused_block=%u state_released=1 "
-                    "pending_write=%d commit=%d fresh_write_bytes=%llu reaccess_resident=%llu "
-                    "reaccess_total=%llu old_backing_metadata_absent=%d stale_content_used=0\n",
-                    block,
-                    block,
-                    paged_release_test_reuse_pending_seen ? 1 : 0,
-                    committed ? 1 : 0,
-                    (unsigned long long) fresh_bytes,
-                    (unsigned long long) reuse_reaccess_resident,
-                    (unsigned long long) reuse_reaccess_total,
-                    paged_release_test_reuse_metadata_absent ? 1 : 0);
-            paged_release_test_reuse_marker_emitted = true;
+    } else if (action == llama_paged_kv_write_action::ROLLBACK_PRE_COMPUTE) {
+        std::vector<uint8_t> rollback_protected(paged_n_blocks, 0);
+        for (uint32_t block = 0; block < paged_n_blocks; ++block) {
+            rollback_protected[block] =
+                paged_block_states[block] != paged_block_state::PENDING_WRITE &&
+                paged_block_states[block] != paged_block_state::RELEASED &&
+                paged_block_states[block] != paged_block_state::SWAPPED;
         }
-    } else {
         for (uint32_t block : paged_pending_write_blocks) {
             if (block >= paged_block_states.size() ||
                     paged_block_states[block] != paged_block_state::PENDING_WRITE) {
                 continue;
             }
+
             uint64_t failures = 0;
             uint64_t skipped = 0;
             uint64_t skip_live = 0;
-            (void) paged_madvise_block(block, nullptr, failures, skipped, skip_live);
+            if (paged_release_bounded_test_fail_rollback_madvise) {
+                paged_release_bounded_test_fail_rollback_madvise = false;
+                paged_release_bounded_test_fail_rollback_madvise_triggers += 1;
+                failures = 1;
+            } else {
+                (void) paged_madvise_block(
+                        block, &rollback_protected, failures, skipped, skip_live);
+            }
+
+            if (failures != 0 || skipped != 0 || skip_live != 0) {
+                paged_block_states[block] = paged_block_state::INVALID;
+                if (block < paged_block_used.size() && !paged_block_used[block]) {
+                    paged_block_used[block] = 1;
+                    paged_blocks_in_use += 1;
+                }
+                paged_free_list.erase(
+                        std::remove(paged_free_list.begin(), paged_free_list.end(), block),
+                        paged_free_list.end());
+                paged_invalidate_write_context(
+                        llama_paged_swap_error_reason::PAGED_WRITE_ROLLBACK_DISCARD_FAILURE,
+                        block,
+                        PAGED_BLOCK_INVALID);
+                finished = false;
+                continue;
+            }
+
             paged_block_states[block] = paged_block_state::RELEASED;
             if (block < paged_block_used.size() && paged_block_used[block]) {
                 paged_block_used[block] = 0;
                 if (paged_blocks_in_use > 0) {
                     paged_blocks_in_use -= 1;
                 }
-                if (std::find(paged_free_list.begin(), paged_free_list.end(), block) == paged_free_list.end()) {
-                    paged_free_list.push_back(block);
-                }
+            }
+            if (std::find(paged_free_list.begin(), paged_free_list.end(), block) ==
+                    paged_free_list.end()) {
+                paged_free_list.push_back(block);
             }
             paged_release_write_rollbacks += 1;
         }
-        if (paged_test_force_active_release_consumed &&
-                !paged_release_test_r5_marker_emitted) {
-            bool rollback_complete = true;
-            for (uint32_t block : paged_pending_write_blocks) {
-                if (block < paged_block_states.size() &&
-                        paged_block_states[block] == paged_block_state::PENDING_WRITE) {
-                    rollback_complete = false;
+    } else {
+        std::vector<uint32_t> write_blocks;
+        for (uint32_t stream = 0; stream < sinfo.n_stream(); ++stream) {
+            for (uint32_t logical_cell : sinfo.idxs[stream]) {
+                const uint32_t logical_block = logical_cell / paged_block_size;
+                if (logical_block >= paged_block_table.size()) {
+                    continue;
+                }
+                const uint32_t block = paged_block_table[logical_block];
+                if (block < paged_block_states.size()) {
+                    write_blocks.push_back(block);
                 }
             }
-            fprintf(stderr,
-                    "KV_PAGED_RELEASE_R5 active_errors=%llu transaction_open=%d "
-                    "rollback_blocks=%llu rollback_complete=%d\n",
-                    (unsigned long long) paged_active_release_violation,
-                    transaction_open ? 1 : 0,
-                    (unsigned long long) (paged_release_write_rollbacks - rollbacks_before),
-                    rollback_complete ? 1 : 0);
-            paged_release_test_r5_marker_emitted = true;
         }
+        std::sort(write_blocks.begin(), write_blocks.end());
+        write_blocks.erase(std::unique(write_blocks.begin(), write_blocks.end()), write_blocks.end());
+        for (uint32_t block : write_blocks) {
+            paged_block_states[block] = paged_block_state::INVALID;
+            if (block < paged_block_used.size() && !paged_block_used[block]) {
+                paged_block_used[block] = 1;
+                paged_blocks_in_use += 1;
+            }
+            paged_free_list.erase(
+                    std::remove(paged_free_list.begin(), paged_free_list.end(), block),
+                    paged_free_list.end());
+        }
+        paged_invalidate_write_context(
+                llama_paged_swap_error_reason::PAGED_WRITE_COMPUTE_FAILURE,
+                write_blocks.empty() ? PAGED_BLOCK_INVALID : write_blocks.front(),
+                PAGED_BLOCK_INVALID);
+        finished = false;
     }
 
     for (uint32_t block : paged_pending_write_blocks) {
         const uint32_t begin = block * paged_block_size;
-        const uint32_t end = std::min<uint32_t>(begin + paged_block_size, paged_pending_write_cells.size());
-        std::fill(paged_pending_write_cells.begin() + begin, paged_pending_write_cells.begin() + end, 0);
+        const uint32_t end = std::min<uint32_t>(
+                begin + paged_block_size, paged_pending_write_cells.size());
+        std::fill(
+                paged_pending_write_cells.begin() + begin,
+                paged_pending_write_cells.begin() + end,
+                0);
     }
     paged_pending_write_blocks.clear();
+    paged_write_transaction_owner = nullptr;
+
+    return finished;
 }
 
 // ===========================================================================================
@@ -5371,10 +5512,14 @@ void llama_kv_cache::paged_log_stats() const {
     fprintf(stderr,
             "KV_PAGED_RELEASE_STATS contract=no_backing_unrecoverable_dead_or_unused_only "
             "release_calls=%llu released_blocks=%llu released_unused=%llu released_dead=%llu "
+            "bounded_release_calls=%llu bounded_release_bytes=%llu bounded_release_blocks=%llu "
             "skip_owned=%llu skip_shared=%llu ownership_invalid=%llu backing_metadata_cleared=%llu "
             "backing_metadata_stale=%llu "
             "idempotent_skips=%llu reuse_allocations=%llu write_commits=%llu write_rollbacks=%llu "
             "released_redirect_rows=%llu released_redirect_blocks=%llu released_redirect_no_dummy=%llu "
+            "released_redirect_no_dummy_pending_write=%llu "
+            "dummy_candidate_resident=%llu dummy_candidate_pending_write_cell=%llu "
+            "ensure_released=%llu ensure_pending_write_rejected=%llu "
             "release_violation=%llu active_release_violation=%llu padded_release_violation=%llu "
             "identity_fail=%llu mapping_oob_fail=%llu logical_mapping_fail=%llu write_resolve_fail=%llu "
             "row_idx_fail=%llu row_mapping_fatal=%llu write_mapping_fatal=%llu "
@@ -5389,6 +5534,9 @@ void llama_kv_cache::paged_log_stats() const {
             (unsigned long long) paged_blocks_released,
             (unsigned long long) paged_blocks_released_unused,
             (unsigned long long) paged_blocks_released_dead,
+            (unsigned long long) paged_bounded_release_calls,
+            (unsigned long long) paged_bounded_release_bytes,
+            (unsigned long long) paged_bounded_release_blocks,
             (unsigned long long) paged_block_release_skip_owned,
             (unsigned long long) paged_block_release_skip_shared,
             (unsigned long long) paged_block_release_ownership_invalid,
@@ -5401,6 +5549,11 @@ void llama_kv_cache::paged_log_stats() const {
             (unsigned long long) paged_released_redirect_rows,
             (unsigned long long) paged_released_redirect_blocks,
             (unsigned long long) paged_released_redirect_no_dummy,
+            (unsigned long long) paged_released_redirect_no_dummy_pending_write,
+            (unsigned long long) paged_dummy_candidate_resident,
+            (unsigned long long) paged_dummy_candidate_pending_write_cell,
+            (unsigned long long) paged_block_ensure_released,
+            (unsigned long long) paged_block_ensure_pending_write_rejected,
             (unsigned long long) paged_release_violation,
             (unsigned long long) paged_active_release_violation,
             (unsigned long long) paged_padded_release_violation,
@@ -6047,6 +6200,14 @@ void llama_kv_cache::paged_release_blocks(uint32_t n_kv) {
         return;
     }
 
+    // Fail-stop guard: if the write context is invalid (compute-started failure
+    // has poisoned the cache), refuse all destructive release until explicit reset.
+    if (paged_write_context_invalid) {
+        LLAMA_LOG_WARN("KV_PAGED_RELEASE_SKIP reason=CONTEXT_INVALID cause=%d\n",
+                static_cast<int>(paged_write_context_invalid_cause));
+        return;
+    }
+
     paged_block_release_calls += 1;
 
     // RELEASED is destructive: it has no backing and is never recoverable. Protect every
@@ -6079,13 +6240,48 @@ void llama_kv_cache::paged_release_blocks(uint32_t n_kv) {
             continue;
         }
 
-        const paged_block_state state = paged_block_states[physical_block];
+        const paged_block_state state =
+            (paged_release_bounded_test_block_state_override.block == physical_block)
+            ? static_cast<paged_block_state>(
+                    paged_release_bounded_test_block_state_override.state)
+            : paged_block_states[physical_block];
+        // Unified safety gate — shares the same state rejection set as the
+        // bounded and dry-run paths:
+        // - RELEASED: already destructively discarded, idempotent skip
+        // - SWAPPED:   recoverable history, must not be destroyed
+        // - PENDING_WRITE: open write transaction, must not madvise mid-tx
+        // - INVALID:   quarantined after compute-started failure, must not touch
         if (state == paged_block_state::RELEASED) {
             paged_block_release_idempotent += 1;
             continue;
         }
         if (state == paged_block_state::SWAPPED) {
             continue;
+        }
+        if (state == paged_block_state::PENDING_WRITE) {
+            continue;
+        }
+        if (state == paged_block_state::INVALID) {
+            continue;
+        }
+
+        // Per-candidate recheck immediately before madvise: re-confirm the
+        // block state hasn't changed since the initial gate check, the write
+        // context is still valid, and quarantine hasn't been set.  This is the
+        // last safety barrier before the destructive MADV_DONTNEED syscall.
+        if (paged_write_context_invalid) {
+            continue;
+        }
+        {
+            const paged_block_state recheck_state =
+                (paged_release_bounded_test_block_state_override.block == physical_block)
+                ? static_cast<paged_block_state>(
+                        paged_release_bounded_test_block_state_override.state)
+                : paged_block_states[physical_block];
+            if (recheck_state != paged_block_state::RESIDENT &&
+                    recheck_state != paged_block_state::UNUSED) {
+                continue;
+            }
         }
 
         std::vector<paged_release_range> advised_ranges;
@@ -6265,18 +6461,93 @@ void llama_kv_cache::paged_release_blocks(uint32_t n_kv) {
         }
         paged_release_test_repeat_marker_emitted = true;
     }
+
+    // Auto-reset test-only state override so fault injections are single-shot
+    // across the legacy path as well (matching the bounded impl's reset pattern).
+    paged_release_bounded_test_block_state_override.block = UINT32_MAX;
 #else
     (void) n_kv;
 #endif
 }
 
+// --- Bounded-release common implementation ------------------------------------
+// Shared by the legacy paged_release_blocks_bounded (gated on
+// LLAMA_KV_PAGED_RELEASE → paged_block_release_enabled, legacy counters) and the
+// server bounded_release path (gated on LLAMA_KV_PRESSURE_BOUNDED_RELEASE,
+// independent counters).  Both paths enforce the identical block of safety gates
+// (layout, ownership, PENDING_WRITE, SWAPPED, RELEASED, madvise result, neighbour
+// page protection) — the only differences are the authorisation source and which
+// counter set to update.
+
 llama_kv_bounded_release_result llama_kv_cache::paged_release_blocks_bounded(
         uint64_t target_bytes,
         uint32_t max_scan_blocks) {
 #if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+    // Legacy gate: must have paged_block_release_enabled (LLAMA_KV_PAGED_RELEASE=1)
+    if (!kv_paged_enabled || !paged_block_release_enabled) {
+        return {};
+    }
+
+    paged_bounded_release_counters cnt;
+    cnt.bytes  = &paged_block_release_bytes;
+    cnt.blocks = &paged_blocks_released;
+    cnt.unused = &paged_blocks_released_unused;
+    cnt.dead   = &paged_blocks_released_dead;
+
+    return paged_release_blocks_bounded_impl(
+            target_bytes, max_scan_blocks, cnt,
+            true /* use_test_seams */);
+#else
+    (void) target_bytes;
+    (void) max_scan_blocks;
+    return {};
+#endif
+}
+
+llama_kv_bounded_release_result llama_kv_cache::bounded_release(
+        uint64_t target_bytes,
+        uint32_t max_scan_blocks) {
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+    // Server gate: must satisfy structural preconditions independently of
+    // LLAMA_KV_PAGED_RELEASE.  The server policy layer gates on
+    // LLAMA_KV_PRESSURE_BOUNDED_RELEASE before calling this.
+    if (!bounded_release_can_enable()) {
+        return {};
+    }
+
+    paged_bounded_release_counters cnt;
+    cnt.calls  = &paged_bounded_release_calls;
+    cnt.bytes  = &paged_bounded_release_bytes;
+    cnt.blocks = &paged_bounded_release_blocks;
+    cnt.unused = &paged_bounded_release_unused;
+    cnt.dead   = &paged_bounded_release_dead;
+
+    llama_kv_bounded_release_result result = paged_release_blocks_bounded_impl(
+            target_bytes, max_scan_blocks, cnt,
+            false /* use_test_seams — server path never accesses test seams */);
+
+    if (cnt.calls) { *cnt.calls += 1; }
+    return result;
+#else
+    (void) target_bytes;
+    (void) max_scan_blocks;
+    return {};
+#endif
+}
+
+llama_kv_bounded_release_result llama_kv_cache::paged_release_blocks_bounded_impl(
+        uint64_t target_bytes,
+        uint32_t max_scan_blocks,
+        const paged_bounded_release_counters & cnt,
+        bool use_test_seams) {
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
     llama_kv_bounded_release_result result;
 
-    if (!kv_paged_enabled || !paged_block_release_enabled) {
+    // Structural safety — enforced equally for both legacy and server paths.
+    // Both callers have already verified their respective authorisation gates
+    // (paged_block_release_enabled for legacy, bounded_release_can_enable()
+    // for server) before entering the impl.
+    if (!kv_paged_enabled) {
         return result;
     }
     if (v_trans || n_stream != 1 || paged_block_size == 0 || paged_n_blocks == 0 ||
@@ -6284,31 +6555,42 @@ llama_kv_bounded_release_result llama_kv_cache::paged_release_blocks_bounded(
         return result;
     }
 
+    // Fail-stop guard: if the write context is invalid (compute-started failure
+    // has poisoned the cache), refuse all destructive release until explicit reset.
+    if (paged_write_context_invalid) {
+        result.ownership_aborted = true;
+        return result;
+    }
+
     // target=0: return immediately — no ownership collection or scan.
-    // Reset test-only seams so fault injections are strictly single-shot.
     if (target_bytes == 0) {
-        paged_release_bounded_test_force_ownership_abort     = false;
-        paged_release_bounded_test_madvise_fail_block        = -1;
-        paged_release_bounded_test_block_state_override.block = UINT32_MAX;
+        if (use_test_seams) {
+            paged_release_bounded_test_force_ownership_abort     = false;
+            paged_release_bounded_test_madvise_fail_block        = -1;
+            paged_release_bounded_test_block_state_override.block = UINT32_MAX;
+        }
         return result;
     }
 
     // scan budget of zero: return immediately without scanning or ownership check.
-    // Reset test-only seams so fault injections are strictly single-shot.
     if (max_scan_blocks == 0) {
         result.block_scan_exhausted = true;
         result.shortfall_bytes      = target_bytes;
-        paged_release_bounded_test_force_ownership_abort     = false;
-        paged_release_bounded_test_madvise_fail_block        = -1;
-        paged_release_bounded_test_block_state_override.block = UINT32_MAX;
+        if (use_test_seams) {
+            paged_release_bounded_test_force_ownership_abort     = false;
+            paged_release_bounded_test_madvise_fail_block        = -1;
+            paged_release_bounded_test_block_state_override.block = UINT32_MAX;
+        }
         return result;
     }
 
-    // Ownership collection — reuse the same intent as paged_release_blocks
+    // Ownership collection
     const auto ownership = llama_kv_release_collect_ownership(
             v_cells, paged_n_blocks, paged_block_size, PAGED_BLOCK_INVALID, LLAMA_MAX_SEQ,
             [&](uint32_t logical_cell) { return paged_resolve(logical_cell); });
-    if (!ownership.valid || paged_release_bounded_test_force_ownership_abort) {
+    const bool force_abort = use_test_seams &&
+        paged_release_bounded_test_force_ownership_abort;
+    if (!ownership.valid || force_abort) {
         result.ownership_aborted = true;
         if (!ownership.valid) {
             paged_block_release_ownership_invalid += ownership.invalid_mappings;
@@ -6316,10 +6598,11 @@ llama_kv_bounded_release_result llama_kv_cache::paged_release_blocks_bounded(
                     "KV_PAGED_RELEASE_BOUNDED_ABORT reason=INVALID_LIVE_MAPPING invalid_mappings=%llu\n",
                     (unsigned long long) ownership.invalid_mappings);
         }
-        // Reset ALL test-only flags immediately (single-shot — no residual across exit paths).
-        paged_release_bounded_test_force_ownership_abort     = false;
-        paged_release_bounded_test_madvise_fail_block        = -1;
-        paged_release_bounded_test_block_state_override.block = UINT32_MAX;
+        if (use_test_seams) {
+            paged_release_bounded_test_force_ownership_abort     = false;
+            paged_release_bounded_test_madvise_fail_block        = -1;
+            paged_release_bounded_test_block_state_override.block = UINT32_MAX;
+        }
         return result;
     }
     const auto & owned = ownership.owned;
@@ -6337,38 +6620,59 @@ llama_kv_bounded_release_result llama_kv_cache::paged_release_blocks_bounded(
         }
 
         const paged_block_state state =
-            (paged_release_bounded_test_block_state_override.block == physical_block)
+            (use_test_seams &&
+             paged_release_bounded_test_block_state_override.block == physical_block)
             ? static_cast<paged_block_state>(
                     paged_release_bounded_test_block_state_override.state)
             : paged_block_states[physical_block];
-        // Explicitly skip PENDING_WRITE, SWAPPED, RELEASED
+        // Unified safety gate — skip PENDING_WRITE, SWAPPED, RELEASED, INVALID.
+        // Same state rejection set as the unbounded legacy path and the dry-run
+        // scanner: quarantined INVALID blocks must never be madvise'd.
         if (state == paged_block_state::PENDING_WRITE ||
                 state == paged_block_state::SWAPPED ||
-                state == paged_block_state::RELEASED) {
+                state == paged_block_state::RELEASED ||
+                state == paged_block_state::INVALID) {
             result.blocks_skipped_state += 1;
             continue;
         }
 
-        // Candidate block: try madvise (skip actual call when test injects failure
-        // on this block — avoids DONTNEED without state-change inconsistency)
+        // Per-candidate recheck: re-confirm safety conditions immediately
+        // before madvise — same barrier as the legacy unbounded path.
+        if (paged_write_context_invalid) {
+            continue;
+        }
+        {
+            const paged_block_state recheck_state = use_test_seams &&
+                paged_release_bounded_test_block_state_override.block == physical_block
+                ? static_cast<paged_block_state>(
+                        paged_release_bounded_test_block_state_override.state)
+                : paged_block_states[physical_block];
+            if (recheck_state != paged_block_state::RESIDENT &&
+                    recheck_state != paged_block_state::UNUSED) {
+                continue;
+            }
+        }
+
+        // Candidate block: try madvise
         uint64_t advised_bytes = 0;
         uint64_t local_failures = 0;
         uint64_t local_skipped = 0;
         uint64_t local_skip_live = 0;
-        if ((int32_t)physical_block != paged_release_bounded_test_madvise_fail_block) {
+        const bool inject_fail = use_test_seams &&
+            (int32_t)physical_block == paged_release_bounded_test_madvise_fail_block;
+        if (!inject_fail) {
             advised_bytes = paged_madvise_block(
                     physical_block, &owned,
                     local_failures, local_skipped, local_skip_live,
                     nullptr);
         } else {
-            // Test-injected failure: simulate a madvise failure.
-            paged_release_bounded_test_madvise_fail_block = -1;
+            if (use_test_seams) {
+                paged_release_bounded_test_madvise_fail_block = -1;
+            }
             local_failures = 1;
         }
 
         if (advised_bytes == 0) {
-            // madvise failed: do not change block state, do not consume release
-            // budget, continue scanning.
             result.madvise_failures += local_failures;
             continue;
         }
@@ -6402,14 +6706,13 @@ llama_kv_bounded_release_result llama_kv_cache::paged_release_blocks_bounded(
             }
         }
 
-        // Update global counters (not the per-call block last fields — those belong to
-        // the unbounded paged_release_blocks)
-        paged_block_release_bytes += advised_bytes;
-        paged_blocks_released += 1;
+        // Update counters (legacy or independent based on caller)
+        if (cnt.bytes)  { *cnt.bytes  += advised_bytes; }
+        if (cnt.blocks) { *cnt.blocks += 1; }
         if (state == paged_block_state::UNUSED) {
-            paged_blocks_released_unused += 1;
+            if (cnt.unused) { *cnt.unused += 1; }
         } else {
-            paged_blocks_released_dead += 1;
+            if (cnt.dead)   { *cnt.dead   += 1; }
         }
 
         // Budget check: stop once target is met (allow one-block overshoot)
@@ -6421,10 +6724,11 @@ llama_kv_bounded_release_result llama_kv_cache::paged_release_blocks_bounded(
     result.blocks_scanned = scanned;
     result.block_scan_exhausted = (scanned >= scan_limit);
 
-    // Reset ALL test-only seams — single-shot across every exit path.
-    paged_release_bounded_test_force_ownership_abort     = false;
-    paged_release_bounded_test_madvise_fail_block        = -1;
-    paged_release_bounded_test_block_state_override.block = UINT32_MAX;
+    if (use_test_seams) {
+        paged_release_bounded_test_force_ownership_abort     = false;
+        paged_release_bounded_test_madvise_fail_block        = -1;
+        paged_release_bounded_test_block_state_override.block = UINT32_MAX;
+    }
 
     if (result.released_bytes < target_bytes) {
         result.shortfall_bytes = target_bytes - result.released_bytes;
@@ -6437,8 +6741,40 @@ llama_kv_bounded_release_result llama_kv_cache::paged_release_blocks_bounded(
 #else
     (void) target_bytes;
     (void) max_scan_blocks;
+    (void) cnt;
+    (void) use_test_seams;
     return {};
 #endif
+}
+
+bool llama_kv_cache::bounded_release_can_enable() const {
+    return bounded_release_can_enable_diagnose().can_enable;
+}
+
+llama_kv_bounded_release_capability llama_kv_cache::bounded_release_can_enable_diagnose() const {
+    // Per-condition decomposition of bounded_release_can_enable() for precise
+    // diagnostic skip-reason attribution.  Server policy can use each field
+    // individually to produce an exact skip_reason instead of a catch-all
+    // "structurally_disabled".
+    llama_kv_bounded_release_capability cap;
+
+    cap.paged = kv_paged_enabled;
+    if (!cap.paged) return cap;
+
+    cap.ingraph = paged_ingraph_enabled;
+    cap.layers_supported = paged_layers_supported;
+    cap.row_idx = paged_row_idx_enabled;
+    cap.swap_disabled = !paged_swap_enabled;
+    cap.layout_supported =
+        !v_trans && n_stream == 1 && paged_block_size > 0 && paged_n_blocks > 0;
+
+    cap.can_enable = cap.paged && cap.ingraph && cap.layers_supported &&
+                     cap.row_idx && cap.swap_disabled && cap.layout_supported;
+    return cap;
+}
+
+uint64_t llama_kv_cache::sample_kv_resident_bytes() const {
+    return paged_sample_mincore();
 }
 
 llama_kv_bounded_release_result llama_kv_cache::paged_release_blocks_bounded_dry_run(
@@ -6455,6 +6791,12 @@ llama_kv_bounded_release_result llama_kv_cache::paged_release_blocks_bounded_dry
     }
     if (v_trans || n_stream != 1 || paged_block_size == 0 || paged_n_blocks == 0 ||
             paged_block_states.size() != paged_n_blocks) {
+        return result;
+    }
+
+    // Fail-stop guard: if the write context is invalid, dry-run has no safe
+    // candidates — all write-transaction blocks are quarantined.
+    if (paged_write_context_invalid) {
         return result;
     }
 
@@ -6495,12 +6837,14 @@ llama_kv_bounded_release_result llama_kv_cache::paged_release_blocks_bounded_dry
             continue;
         }
 
-        // State gate: skip PENDING_WRITE, SWAPPED, RELEASED.
+        // State gate: skip PENDING_WRITE, SWAPPED, RELEASED, INVALID.
         // Does NOT access test-only seams — dry-run is a production path.
+        // Same rejection set as the destructive paths.
         const paged_block_state state = paged_block_states[physical_block];
         if (state == paged_block_state::PENDING_WRITE ||
                 state == paged_block_state::SWAPPED ||
-                state == paged_block_state::RELEASED) {
+                state == paged_block_state::RELEASED ||
+                state == paged_block_state::INVALID) {
             result.blocks_skipped_state += 1;
             continue;
         }
@@ -7481,6 +7825,7 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
             if (block < paged_block_states.size() &&
                     paged_block_states[block] == paged_block_state::RESIDENT) {
                 dummy_phys = phys;
+                paged_dummy_candidate_resident += 1;
                 break;
             }
         }
@@ -7562,7 +7907,64 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
             if (block < paged_block_states.size() &&
                     paged_block_states[block] == paged_block_state::RESIDENT) {
                 dummy_phys = phys;
+                paged_dummy_candidate_resident += 1;
                 break;
+            }
+        }
+
+        // Fallback: if no RESIDENT dummy was found among active-visible cells,
+        // scan fresh PENDING_WRITE cells of the current write transaction.  Such
+        // a cell's physical row is a transaction-local safe dummy.
+        //
+        // Safety basis (do NOT rely on tensor-content or graph-internal data
+        // dependencies):
+        //   1. dummy rows are ONLY ever used to redirect rows that are masked /
+        //      active-invisible — the caller (released/stale-PENDING_WRITE
+        //      redirect below) never substitutes an active-visible row with a
+        //      dummy.  Because the redirected row contributes nothing to the
+        //      attention result (its mask bit clears the read), the actual K/V
+        //      values at the dummy row are irrelevant.
+        //   2. the dummy row only needs an accessible backing address (no
+        //      MADV_DONTNEED, within the allocated KV buffer) so the gather
+        //      does not fault.  A fresh PENDING_WRITE cell's physical backing
+        //      is allocated and has not been MADV_DONTNEED'd, so its address is
+        //      accessible.
+        //   3. the gather that reads through the row index honours the current
+        //      SET_ROWS / GET_ROWS graph expansion ordering already established
+        //      for this context — dummy substitution happens during row-index
+        //      setup, before graph compute; the subsequent GET_ROWS simply reads
+        //      whatever physical row the index points at.
+        //
+        // NOTE: paged_note_cells only updates block/cell *metadata* (state, the
+        // pending_write_cells flag, free list); it does NOT write tensor data.
+        // The freshness signal used here is the per-cell pending_write_cells
+        // flag set by paged_note_cells, which is valid for cells of the
+        // current transaction and is cleared by paged_finish_write_transaction
+        // after this graph completes.  We deliberately do NOT use the post-
+        // graph finish_write_transaction ordering as a proof of gather data
+        // dependency — the redirect safety rests on mask + accessible address
+        // + existing graph expansion order, not on what the gather reads.
+        if (dummy_phys == PAGED_BLOCK_INVALID && paged_pending_write_cells.size() > 0) {
+            const uint64_t t_pending_dummy = base_timing_enabled ? llama_paged_timing_now_us() : 0;
+            for (uint32_t phys = 0; phys < paged_pending_write_cells.size(); ++phys) {
+                if (!paged_pending_write_cells[phys]) {
+                    continue;
+                }
+                if (phys > (uint32_t) std::numeric_limits<int32_t>::max()) {
+                    continue;
+                }
+                const uint32_t block = phys / paged_block_size;
+                if (block >= paged_block_states.size()) {
+                    continue;
+                }
+                if (paged_block_states[block] == paged_block_state::PENDING_WRITE) {
+                    dummy_phys = phys;
+                    paged_dummy_candidate_pending_write_cell += 1;
+                    break;
+                }
+            }
+            if (base_timing_enabled) {
+                paged_base_timing_nonidentity_probe_us += llama_paged_timing_now_us() - t_pending_dummy;
             }
         }
     }
@@ -7742,8 +8144,14 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
         // (no swap-in, stays SWAPPED) and runs independently of the cold/owner.count()==1 path.
         bool swapped_handled = false;
         bool released_handled = false;
-        if (block_state_valid && (state == paged_block_state::RELEASED ||
-                    (state == paged_block_state::PENDING_WRITE && !required_by_active))) {
+        // RELEASED blocks: redirect to dummy row (no valid backing).
+        // PENDING_WRITE blocks: cells that are being freshly written in the
+        // current transaction (paged_pending_write_cells flag set) have valid
+        // backing memory — use real physical row. Other PENDING_WRITE cells
+        // (not in current write transaction) were RELEASED→MADV_DONTNEED'd
+        // before the PENDING_WRITE transition and contain garbage — redirect
+        // to dummy (same as RELEASED).
+        if (block_state_valid && state == paged_block_state::RELEASED) {
             ensure_visibility();
             if (required_by_active) {
                 paged_active_row_dummy_redirect_blocked += 1;
@@ -7762,6 +8170,38 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
             paged_released_redirect_rows += 1;
             released_redirected_blocks.insert(block);
             released_handled = true;
+        } else if (block_state_valid && state == paged_block_state::PENDING_WRITE &&
+                   !required_by_active) {
+            // PENDING_WRITE rows not required by active seq: check whether
+            // this cell is being freshly written in the current transaction.
+            const bool pending_fresh_cell =
+                phys_orig < paged_pending_write_cells.size() &&
+                paged_pending_write_cells[phys_orig];
+            if (!pending_fresh_cell) {
+                // Cell was RELEASED→MADV_DONTNEED'd before PENDING_WRITE
+                // transition and is NOT being rewritten in this transaction.
+                // Must redirect to dummy (content is garbage).
+                ensure_visibility();
+                if (required_by_active) {
+                    paged_active_row_dummy_redirect_blocked += 1;
+                    return fail_row_idx(
+                            llama_paged_swap_error_reason::ACTIVE_READ_RELEASED_BLOCK,
+                            block, phys_orig);
+                }
+                if (dummy_phys == PAGED_BLOCK_INVALID ||
+                        dummy_phys > (uint32_t) std::numeric_limits<int32_t>::max()) {
+                    paged_released_redirect_no_dummy_pending_write += 1;
+                    return fail_row_idx(
+                            llama_paged_swap_error_reason::INPUT_SETUP_FAILURE,
+                            block, phys_orig);
+                }
+                phys = dummy_phys;
+                paged_released_redirect_rows += 1;
+                released_redirected_blocks.insert(block);
+                released_handled = true;
+            }
+            // else: pending_fresh_cell — cell is being written in current
+            // transaction; physical row has valid backing → keep real phys.
         }
         if (!released_handled && swapped_redirect_probe_ready) {
             if (idle_swap_debug_probes) {
@@ -8539,6 +8979,7 @@ void llama_kv_cache::paged_trace_emit_step(
             case paged_block_state::RELEASED: released += 1; break;
             case paged_block_state::UNUSED:   free_b   += 1; break;
             case paged_block_state::PENDING_WRITE: resident += 1; break;
+            case paged_block_state::INVALID: break;
         }
     }
 
@@ -9621,8 +10062,10 @@ llama_kv_cache_context::llama_kv_cache_context(
 }
 
 llama_kv_cache_context::~llama_kv_cache_context() {
-    if (paged_write_transaction_open && kv && i_cur < sinfos.size()) {
-        kv->paged_finish_write_transaction(false, sinfos[i_cur]);
+    if (paged_write_transaction_state_ == paged_write_transaction_state::APPLIED) {
+        finish_paged_kv_write(llama_paged_kv_write_action::ROLLBACK_PRE_COMPUTE);
+    } else if (paged_write_transaction_state_ == paged_write_transaction_state::COMPUTE_STARTED) {
+        finish_paged_kv_write(llama_paged_kv_write_action::INVALIDATE_COMPUTE_STARTED);
     }
 }
 
@@ -9653,6 +10096,16 @@ bool llama_kv_cache_context::apply() {
         return true;
     }
 
+    if (kv->paged_write_context_invalid) {
+        kv->paged_swap_error = {};
+        kv->set_paged_swap_error(
+                llama_paged_swap_error_reason::PAGED_WRITE_CONTEXT_INVALID,
+                llama_kv_cache::PAGED_BLOCK_INVALID,
+                llama_kv_cache::PAGED_BLOCK_INVALID,
+                static_cast<int>(kv->paged_write_context_invalid_cause));
+        return false;
+    }
+
     const bool base_timing_enabled = kv->paged_base_timing_enabled;
     const uint64_t apply_paged_start_us = base_timing_enabled ? llama_paged_timing_now_us() : 0;
     if (base_timing_enabled) {
@@ -9671,13 +10124,100 @@ bool llama_kv_cache_context::apply() {
     }
 
     uint64_t t0 = base_timing_enabled ? llama_paged_timing_now_us() : 0;
+    paged_write_failure_handled = false;
+    paged_write_metadata_deltas.clear();
+    paged_write_block_deltas.clear();
+
+    if (paged_write_transaction_state_ != paged_write_transaction_state::CLOSED ||
+            !kv->paged_begin_write_transaction(this)) {
+        return false;
+    }
+
+    std::vector<std::vector<uint32_t>> transaction_cells(kv->v_cells.size());
+    llama_pos overwritten_max[LLAMA_MAX_SEQ];
+    std::fill(overwritten_max, overwritten_max + LLAMA_MAX_SEQ, -1);
+    std::vector<uint32_t> transaction_blocks;
+
+    for (uint32_t stream = 0; stream < sinfos[i_cur].n_stream(); ++stream) {
+        const uint32_t stream_id = sinfos[i_cur].strm[stream];
+        if (stream_id >= kv->v_cells.size()) {
+            continue;
+        }
+
+        const auto & selected = sinfos[i_cur].idxs[stream];
+        transaction_cells[stream_id].insert(
+                transaction_cells[stream_id].end(), selected.begin(), selected.end());
+
+        for (uint32_t cell : selected) {
+            if (cell < kv->v_cells[stream_id].size() && !kv->v_cells[stream_id].is_empty(cell)) {
+                GGML_ASSERT(kv->v_cells[stream_id].seq_count(cell) == 1);
+                const llama_seq_id old_seq = kv->v_cells[stream_id].seq_get(cell);
+                if (old_seq >= 0 && old_seq < LLAMA_MAX_SEQ) {
+                    overwritten_max[old_seq] = std::max(
+                            overwritten_max[old_seq], kv->v_cells[stream_id].pos_get(cell));
+                }
+            }
+
+            if (kv->kv_paged_enabled && kv->paged_block_size != 0) {
+                const uint32_t logical_block = cell / kv->paged_block_size;
+                if (logical_block < kv->paged_block_table.size()) {
+                    const uint32_t block = kv->paged_block_table[logical_block];
+                    if (block < kv->paged_block_states.size()) {
+                        transaction_blocks.push_back(block);
+                    }
+                }
+            }
+        }
+    }
+
+    for (uint32_t seq_id = 0; seq_id < LLAMA_MAX_SEQ; ++seq_id) {
+        if (overwritten_max[seq_id] < 0 || seq_id >= kv->seq_to_stream.size()) {
+            continue;
+        }
+        const uint32_t stream_id = kv->seq_to_stream[seq_id];
+        if (stream_id >= kv->v_cells.size()) {
+            continue;
+        }
+        const auto & cells = kv->v_cells[stream_id];
+        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+            if (!cells.is_empty(cell) && cells.seq_has(cell, seq_id) &&
+                    cells.pos_get(cell) <= overwritten_max[seq_id]) {
+                transaction_cells[stream_id].push_back(cell);
+            }
+        }
+    }
+
+    for (uint32_t stream_id = 0; stream_id < transaction_cells.size(); ++stream_id) {
+        auto & cells = transaction_cells[stream_id];
+        if (cells.empty() || stream_id >= kv->v_heads.size()) {
+            continue;
+        }
+        std::sort(cells.begin(), cells.end());
+        cells.erase(std::unique(cells.begin(), cells.end()), cells.end());
+        paged_write_metadata_deltas.push_back({
+                stream_id, cells, kv->v_cells[stream_id].cp(cells), kv->v_heads[stream_id] });
+    }
+
+    std::sort(transaction_blocks.begin(), transaction_blocks.end());
+    transaction_blocks.erase(
+            std::unique(transaction_blocks.begin(), transaction_blocks.end()),
+            transaction_blocks.end());
+    for (uint32_t block : transaction_blocks) {
+        paged_write_block_deltas.push_back({
+                block,
+                kv->paged_block_states[block],
+                kv->paged_block_used[block] != 0,
+                std::find(kv->paged_free_list.begin(), kv->paged_free_list.end(), block) !=
+                    kv->paged_free_list.end() });
+    }
+
+    paged_write_transaction_state_ = paged_write_transaction_state::APPLIED;
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     if (base_timing_enabled) {
         kv->paged_base_timing_apply_ubatch_us += llama_paged_timing_now_us() - t0;
     }
     t0 = base_timing_enabled ? llama_paged_timing_now_us() : 0;
     kv->paged_note_cells(sinfos[i_cur]);
-    paged_write_transaction_open = !kv->paged_pending_write_blocks.empty();
     if (base_timing_enabled) {
         kv->paged_base_timing_note_cells_us += llama_paged_timing_now_us() - t0;
     }
@@ -9758,16 +10298,111 @@ llama_paged_swap_error llama_kv_cache_context::get_paged_swap_error() const {
     return kv->get_paged_swap_error();
 }
 
-void llama_kv_cache_context::finish_paged_kv_write(bool success) {
-    if (!kv || i_cur >= sinfos.size()) {
-        return;
+void llama_kv_cache_context::mark_paged_kv_compute_started() {
+    if (paged_write_transaction_state_ == paged_write_transaction_state::APPLIED) {
+        paged_write_transaction_state_ = paged_write_transaction_state::COMPUTE_STARTED;
     }
-    kv->paged_finish_write_transaction(success, sinfos[i_cur]);
-    paged_write_transaction_open = false;
+}
+
+bool llama_kv_cache_context::finish_paged_kv_write(llama_paged_kv_write_action action) {
+    paged_write_failure_handled = false;
+
+    if (!kv || i_cur >= sinfos.size()) {
+        paged_write_transaction_state_ = paged_write_transaction_state::CLOSED;
+        paged_write_metadata_deltas.clear();
+        paged_write_block_deltas.clear();
+        return true;
+    }
+
+    if (paged_write_transaction_state_ == paged_write_transaction_state::CLOSED) {
+        paged_write_failure_handled = action != llama_paged_kv_write_action::COMMIT &&
+            kv->kv_paged_enabled && kv->paged_write_context_invalid;
+        return true;
+    }
+
+    if (paged_write_transaction_state_ == paged_write_transaction_state::COMPUTE_STARTED &&
+            action == llama_paged_kv_write_action::ROLLBACK_PRE_COMPUTE) {
+        action = llama_paged_kv_write_action::INVALIDATE_COMPUTE_STARTED;
+    }
+
+    const bool finished = kv->paged_finish_write_transaction(action, sinfos[i_cur], this);
+
+    if (action == llama_paged_kv_write_action::ROLLBACK_PRE_COMPUTE) {
+        for (const auto & delta : paged_write_metadata_deltas) {
+            if (delta.stream < kv->v_cells.size()) {
+                kv->v_cells[delta.stream].set(delta.cells, delta.cells_before);
+            }
+            if (delta.stream < kv->v_heads.size()) {
+                kv->v_heads[delta.stream] = delta.head_before;
+            }
+        }
+
+        for (const auto & delta : paged_write_block_deltas) {
+            if (delta.block >= kv->paged_block_states.size() ||
+                    kv->paged_block_states[delta.block] == llama_kv_cache::paged_block_state::INVALID) {
+                continue;
+            }
+
+            const bool used_now = kv->paged_block_used[delta.block] != 0;
+            if (used_now != delta.used_before) {
+                if (delta.used_before) {
+                    kv->paged_blocks_in_use += 1;
+                } else if (kv->paged_blocks_in_use > 0) {
+                    kv->paged_blocks_in_use -= 1;
+                }
+            }
+            kv->paged_block_used[delta.block] = delta.used_before ? 1 : 0;
+            kv->paged_block_states[delta.block] = delta.state_before;
+
+            kv->paged_free_list.erase(
+                    std::remove(
+                        kv->paged_free_list.begin(),
+                        kv->paged_free_list.end(),
+                        delta.block),
+                    kv->paged_free_list.end());
+            if (delta.in_free_list_before) {
+                kv->paged_free_list.push_back(delta.block);
+            }
+        }
+    }
+
+    paged_write_failure_handled = action != llama_paged_kv_write_action::COMMIT &&
+        kv->kv_paged_enabled && (finished || kv->paged_write_context_invalid);
+    paged_write_metadata_deltas.clear();
+    paged_write_block_deltas.clear();
+    paged_write_transaction_state_ = paged_write_transaction_state::CLOSED;
+    return finished;
 }
 
 bool llama_kv_cache_context::needs_paged_kv_post_graph_sync() const {
-    return kv && (paged_write_transaction_open || !kv->paged_release_post_ranges.empty());
+    return kv && (paged_write_transaction_state_ != paged_write_transaction_state::CLOSED ||
+            !kv->paged_release_post_ranges.empty());
+}
+
+bool llama_kv_cache_context::paged_kv_failure_handled() const {
+    return paged_write_failure_handled;
+}
+
+bool llama_kv_cache_context::test_paged_kv_fail_graph_alloc() {
+    if (!kv || !kv->paged_release_bounded_test_fail_graph_alloc) {
+        return false;
+    }
+    kv->paged_release_bounded_test_fail_graph_alloc = false;
+    kv->paged_release_bounded_test_fail_graph_alloc_triggers += 1;
+    kv->set_paged_swap_error(
+            llama_paged_swap_error_reason::PAGED_WRITE_GRAPH_ALLOC_FAILURE,
+            llama_kv_cache::PAGED_BLOCK_INVALID,
+            llama_kv_cache::PAGED_BLOCK_INVALID);
+    return true;
+}
+
+bool llama_kv_cache_context::test_paged_kv_fail_after_compute() {
+    if (!kv || !kv->paged_release_bounded_test_fail_after_compute) {
+        return false;
+    }
+    kv->paged_release_bounded_test_fail_after_compute = false;
+    kv->paged_release_bounded_test_fail_after_compute_triggers += 1;
+    return true;
 }
 
 uint32_t llama_kv_cache_context::get_n_kv() const {

@@ -410,31 +410,29 @@ static void test_dry_run_state_transition_resets_cooldown() {
     cfg.backoff_ms = 10000;
     runtime.dry_run_enable(cfg);
 
-    auto t0 = server_kv_pressure_runtime::clock::now();
-
-    // Enter PRESSURE → immediate
+    const auto t0 = server_kv_pressure_runtime::clock::now();
     CHECK(runtime.dry_run_due(t0, kv_pressure_state::PRESSURE, false));
-    runtime.dry_run_record(false, t0);
+    runtime.dry_run_record(true, t0);
+    CHECK(!runtime.dry_run_due(t0, kv_pressure_state::CRITICAL, false));
+    CHECK(!runtime.dry_run_due(t0, kv_pressure_state::RECOVERY, false));
+    CHECK(runtime.dry_run_due(t0, kv_pressure_state::CRITICAL, false));
+}
 
-    // 500ms: within cooldown → blocked
-    auto t1 = t0 + std::chrono::milliseconds(500);
-    CHECK(!runtime.dry_run_due(t1, kv_pressure_state::PRESSURE, false));
 
-    // Transition to CRITICAL (new episode) → immediate (bypass cooldown)
-    auto t2 = t0 + std::chrono::milliseconds(1000);
-    CHECK(runtime.dry_run_due(t2, kv_pressure_state::CRITICAL, false));
-    runtime.dry_run_record(false, t2);
+static void test_dry_run_normal_exit_clears_backoff() {
+    server_kv_pressure_runtime runtime;
+    server_kv_pressure_dry_run_config cfg;
+    cfg.enabled = true;
+    cfg.target_bytes = 4194304;
+    cfg.cooldown_ms = 2000;
+    cfg.backoff_ms = 10000;
+    runtime.dry_run_enable(cfg);
 
-    // 500ms after CRITICAL entry → within cooldown → blocked
-    auto t3 = t2 + std::chrono::milliseconds(500);
-    CHECK(!runtime.dry_run_due(t3, kv_pressure_state::CRITICAL, false));
-
-    // Drop back to RECOVERY → not a trigger state → false
-    CHECK(!runtime.dry_run_due(t3, kv_pressure_state::RECOVERY, false));
-
-    // Back to PRESSURE (new PRESSURE episode) → immediate
-    auto t4 = t3 + std::chrono::milliseconds(1000);
-    CHECK(runtime.dry_run_due(t4, kv_pressure_state::PRESSURE, false));
+    const auto t0 = server_kv_pressure_runtime::clock::now();
+    CHECK(runtime.dry_run_due(t0, kv_pressure_state::PRESSURE, false));
+    runtime.dry_run_record(true, t0);
+    CHECK(!runtime.dry_run_due(t0, kv_pressure_state::NORMAL, false));
+    CHECK(runtime.dry_run_due(t0, kv_pressure_state::PRESSURE, false));
 }
 
 static void test_dry_run_config_disabled() {
@@ -458,6 +456,334 @@ static void test_dry_run_config_disabled() {
     CHECK(!runtime.dry_run_due(t0, kv_pressure_state::CRITICAL, false));
 }
 
+// --- bounded release config tests --------------------------------------------
+
+static void clear_bounded_release_env() {
+    unsetenv("LLAMA_KV_PRESSURE_BOUNDED_RELEASE");
+    unsetenv("LLAMA_KV_PRESSURE_BOUNDED_RELEASE_TARGET_BYTES");
+    unsetenv("LLAMA_KV_PRESSURE_BOUNDED_RELEASE_MAX_SCAN_BLOCKS");
+    unsetenv("LLAMA_KV_PRESSURE_BOUNDED_RELEASE_COOLDOWN_MS");
+    unsetenv("LLAMA_KV_PRESSURE_BOUNDED_RELEASE_BACKOFF_MS");
+}
+
+static void test_bounded_release_config_default_disabled() {
+    clear_bounded_release_env();
+    server_kv_pressure_bounded_release_config cfg;
+    std::string error;
+    CHECK(server_kv_pressure_bounded_release_config_from_env(cfg, error));
+    CHECK(!cfg.enabled);
+    CHECK(cfg.target_bytes == 0);
+}
+
+
+static void test_bounded_release_config_enabled_defaults_preserved() {
+    clear_bounded_release_env();
+    setenv("LLAMA_KV_PRESSURE_BOUNDED_RELEASE", "1", 1);
+    setenv("LLAMA_KV_PRESSURE_BOUNDED_RELEASE_TARGET_BYTES", "1048576", 1);
+
+    server_kv_pressure_bounded_release_config cfg;
+    std::string error;
+    CHECK(server_kv_pressure_bounded_release_config_from_env(cfg, error));
+    CHECK(cfg.enabled);
+    CHECK(cfg.max_scan_blocks == server_kv_pressure_bounded_release_config::DEFAULT_MAX_SCAN_BLOCKS);
+    CHECK(cfg.cooldown_ms == server_kv_pressure_bounded_release_config::DEFAULT_COOLDOWN_MS);
+    CHECK(cfg.backoff_ms == server_kv_pressure_bounded_release_config::DEFAULT_BACKOFF_MS);
+    clear_bounded_release_env();
+}
+
+static void test_bounded_release_config_explicit_boundaries_and_invalid_values() {
+    clear_bounded_release_env();
+    setenv("LLAMA_KV_PRESSURE_BOUNDED_RELEASE", "1", 1);
+    setenv("LLAMA_KV_PRESSURE_BOUNDED_RELEASE_TARGET_BYTES", "1", 1);
+    setenv("LLAMA_KV_PRESSURE_BOUNDED_RELEASE_MAX_SCAN_BLOCKS", "0", 1);
+    setenv("LLAMA_KV_PRESSURE_BOUNDED_RELEASE_COOLDOWN_MS", "0", 1);
+    setenv("LLAMA_KV_PRESSURE_BOUNDED_RELEASE_BACKOFF_MS", "500", 1);
+
+    server_kv_pressure_bounded_release_config cfg;
+    std::string error;
+    CHECK(server_kv_pressure_bounded_release_config_from_env(cfg, error));
+    CHECK(cfg.max_scan_blocks == 1);
+    CHECK(cfg.cooldown_ms == server_kv_pressure_bounded_release_config::MIN_COOLDOWN_MS);
+    CHECK(cfg.backoff_ms == server_kv_pressure_bounded_release_config::MIN_COOLDOWN_MS);
+
+    setenv("LLAMA_KV_PRESSURE_BOUNDED_RELEASE_MAX_SCAN_BLOCKS", "4294967296", 1);
+    error.clear();
+    CHECK(!server_kv_pressure_bounded_release_config_from_env(cfg, error));
+    CHECK(!error.empty());
+    clear_bounded_release_env();
+}
+
+static void test_bounded_release_config_valid() {
+    clear_bounded_release_env();
+    setenv("LLAMA_KV_PRESSURE_BOUNDED_RELEASE", "1", 1);
+    setenv("LLAMA_KV_PRESSURE_BOUNDED_RELEASE_TARGET_BYTES", "33554432", 1);
+    setenv("LLAMA_KV_PRESSURE_BOUNDED_RELEASE_MAX_SCAN_BLOCKS", "128", 1);
+    setenv("LLAMA_KV_PRESSURE_BOUNDED_RELEASE_COOLDOWN_MS", "3000", 1);
+    setenv("LLAMA_KV_PRESSURE_BOUNDED_RELEASE_BACKOFF_MS", "20000", 1);
+
+    server_kv_pressure_bounded_release_config cfg;
+    std::string error;
+    CHECK(server_kv_pressure_bounded_release_config_from_env(cfg, error));
+    CHECK(cfg.enabled);
+    CHECK(cfg.target_bytes == 33554432);
+    CHECK(cfg.max_scan_blocks == 128);
+    CHECK(cfg.cooldown_ms == 3000);
+    CHECK(cfg.backoff_ms == 20000);
+    clear_bounded_release_env();
+}
+
+static void test_bounded_release_config_target_zero_disables() {
+    clear_bounded_release_env();
+    setenv("LLAMA_KV_PRESSURE_BOUNDED_RELEASE", "1", 1);
+    setenv("LLAMA_KV_PRESSURE_BOUNDED_RELEASE_TARGET_BYTES", "0", 1);
+
+    server_kv_pressure_bounded_release_config cfg;
+    std::string error;
+    CHECK(server_kv_pressure_bounded_release_config_from_env(cfg, error));
+    CHECK(!cfg.enabled);  // zero target → effectively disabled
+    clear_bounded_release_env();
+}
+
+static void test_bounded_release_config_invalid_target() {
+    clear_bounded_release_env();
+    setenv("LLAMA_KV_PRESSURE_BOUNDED_RELEASE", "1", 1);
+    setenv("LLAMA_KV_PRESSURE_BOUNDED_RELEASE_TARGET_BYTES", "not_a_number", 1);
+
+    server_kv_pressure_bounded_release_config cfg;
+    std::string error;
+    CHECK(!server_kv_pressure_bounded_release_config_from_env(cfg, error));
+    CHECK(!error.empty());
+    clear_bounded_release_env();
+}
+
+static void test_bounded_release_config_cooldown_min_clamped() {
+    clear_bounded_release_env();
+    setenv("LLAMA_KV_PRESSURE_BOUNDED_RELEASE", "1", 1);
+    setenv("LLAMA_KV_PRESSURE_BOUNDED_RELEASE_TARGET_BYTES", "1048576", 1);
+    setenv("LLAMA_KV_PRESSURE_BOUNDED_RELEASE_COOLDOWN_MS", "100", 1);
+
+    server_kv_pressure_bounded_release_config cfg;
+    std::string error;
+    CHECK(server_kv_pressure_bounded_release_config_from_env(cfg, error));
+    CHECK(cfg.cooldown_ms == 500);  // clamped to MIN_COOLDOWN_MS
+    clear_bounded_release_env();
+}
+
+// --- bounded release cooldown / state-entry tests -----------------------------
+
+static void test_bounded_release_normal_recovery_not_due() {
+    server_kv_pressure_runtime runtime;
+    server_kv_pressure_bounded_release_config cfg;
+    cfg.enabled = true;
+    cfg.target_bytes = 4194304;
+    cfg.cooldown_ms = 2000;
+    cfg.backoff_ms = 10000;
+    runtime.bounded_release_enable(cfg);
+
+    auto t0 = server_kv_pressure_runtime::clock::now();
+    CHECK(!runtime.bounded_release_due(t0, kv_pressure_state::NORMAL, false));
+    CHECK(!runtime.bounded_release_due(t0, kv_pressure_state::RECOVERY, false));
+}
+
+static void test_bounded_release_pressure_critical_entry() {
+    server_kv_pressure_runtime runtime;
+    server_kv_pressure_bounded_release_config cfg;
+    cfg.enabled = true;
+    cfg.target_bytes = 4194304;
+    cfg.cooldown_ms = 2000;
+    cfg.backoff_ms = 10000;
+    runtime.bounded_release_enable(cfg);
+
+    const auto t0 = server_kv_pressure_runtime::clock::now();
+    CHECK(runtime.bounded_release_due(t0, kv_pressure_state::PRESSURE, false));
+    runtime.bounded_release_record(false, t0);
+    CHECK(!runtime.bounded_release_due(t0, kv_pressure_state::CRITICAL, false));
+    CHECK(runtime.bounded_release_due(t0 + std::chrono::milliseconds(2000),
+            kv_pressure_state::CRITICAL, false));
+}
+
+static void test_bounded_release_cooldown_blocking() {
+    server_kv_pressure_runtime runtime;
+    server_kv_pressure_bounded_release_config cfg;
+    cfg.enabled = true;
+    cfg.target_bytes = 4194304;
+    cfg.cooldown_ms = 2000;
+    cfg.backoff_ms = 10000;
+    runtime.bounded_release_enable(cfg);
+
+    auto t0 = server_kv_pressure_runtime::clock::now();
+    CHECK(runtime.bounded_release_due(t0, kv_pressure_state::PRESSURE, false));
+
+    // Record a successful (non-shortfall) evaluation
+    runtime.bounded_release_record(false, t0);
+
+    // Immediately after: blocked by cooldown
+    CHECK(!runtime.bounded_release_due(t0, kv_pressure_state::PRESSURE, false));
+
+    // After cooldown: allows evaluation
+    auto t2 = t0 + std::chrono::milliseconds(2000);
+    CHECK(runtime.bounded_release_due(t2, kv_pressure_state::PRESSURE, false));
+}
+
+static void test_bounded_release_shortfall_backoff() {
+    server_kv_pressure_runtime runtime;
+    server_kv_pressure_bounded_release_config cfg;
+    cfg.enabled = true;
+    cfg.target_bytes = 4194304;
+    cfg.cooldown_ms = 2000;
+    cfg.backoff_ms = 10000;
+    runtime.bounded_release_enable(cfg);
+
+    auto t0 = server_kv_pressure_runtime::clock::now();
+    CHECK(runtime.bounded_release_due(t0, kv_pressure_state::PRESSURE, false));
+
+    // Record a shortfall evaluation
+    runtime.bounded_release_record(true, t0);
+
+    // Immediately after: blocked by backoff (longer than cooldown)
+    CHECK(!runtime.bounded_release_due(t0, kv_pressure_state::PRESSURE, false));
+
+    // After cooldown but before backoff: still blocked
+    auto t2 = t0 + std::chrono::milliseconds(2000);
+    CHECK(!runtime.bounded_release_due(t2, kv_pressure_state::PRESSURE, false));
+
+    // After backoff: allows
+    auto t3 = t0 + std::chrono::milliseconds(10000);
+    CHECK(runtime.bounded_release_due(t3, kv_pressure_state::PRESSURE, false));
+}
+
+static void test_bounded_release_state_transition_resets_cooldown() {
+    server_kv_pressure_runtime runtime;
+    server_kv_pressure_bounded_release_config cfg;
+    cfg.enabled = true;
+    cfg.target_bytes = 4194304;
+    cfg.cooldown_ms = 2000;
+    cfg.backoff_ms = 10000;
+    runtime.bounded_release_enable(cfg);
+
+    const auto t0 = server_kv_pressure_runtime::clock::now();
+    CHECK(runtime.bounded_release_due(t0, kv_pressure_state::PRESSURE, false));
+    runtime.bounded_release_record(true, t0);
+    CHECK(!runtime.bounded_release_due(t0, kv_pressure_state::CRITICAL, false));
+    CHECK(!runtime.bounded_release_due(t0, kv_pressure_state::PRESSURE, false));
+    CHECK(!runtime.bounded_release_due(t0, kv_pressure_state::RECOVERY, false));
+    CHECK(runtime.bounded_release_due(t0, kv_pressure_state::PRESSURE, false));
+}
+
+
+static void test_bounded_release_episode_exit_clears_backoff() {
+    server_kv_pressure_runtime runtime;
+    server_kv_pressure_bounded_release_config cfg;
+    cfg.enabled = true;
+    cfg.target_bytes = 4194304;
+    cfg.cooldown_ms = 2000;
+    cfg.backoff_ms = 10000;
+    runtime.bounded_release_enable(cfg);
+
+    const auto t0 = server_kv_pressure_runtime::clock::now();
+    CHECK(runtime.bounded_release_due(t0, kv_pressure_state::PRESSURE, false));
+    runtime.bounded_release_record(true, t0);
+    CHECK(!runtime.bounded_release_due(t0, kv_pressure_state::PRESSURE, false));
+    CHECK(!runtime.bounded_release_due(t0, kv_pressure_state::NORMAL, false));
+    CHECK(runtime.bounded_release_due(t0, kv_pressure_state::PRESSURE, false));
+
+    runtime.bounded_release_record(true, t0);
+    CHECK(!runtime.bounded_release_due(t0, kv_pressure_state::CRITICAL, false));
+    CHECK(!runtime.bounded_release_due(t0, kv_pressure_state::RECOVERY, false));
+    CHECK(runtime.bounded_release_due(t0, kv_pressure_state::CRITICAL, false));
+}
+
+static void test_bounded_release_same_episode_transition_keeps_backoff() {
+    server_kv_pressure_runtime runtime;
+    server_kv_pressure_bounded_release_config cfg;
+    cfg.enabled = true;
+    cfg.target_bytes = 4194304;
+    cfg.cooldown_ms = 2000;
+    cfg.backoff_ms = 10000;
+    runtime.bounded_release_enable(cfg);
+
+    const auto t0 = server_kv_pressure_runtime::clock::now();
+    CHECK(runtime.bounded_release_due(t0, kv_pressure_state::PRESSURE, false));
+    runtime.bounded_release_record(true, t0);
+    CHECK(!runtime.bounded_release_due(t0, kv_pressure_state::CRITICAL, false));
+    CHECK(!runtime.bounded_release_due(t0 + std::chrono::milliseconds(2000),
+            kv_pressure_state::PRESSURE, false));
+    CHECK(runtime.bounded_release_due(t0 + std::chrono::milliseconds(10000),
+            kv_pressure_state::CRITICAL, false));
+}
+
+static void test_bounded_release_config_disabled() {
+    server_kv_pressure_runtime runtime;
+    server_kv_pressure_bounded_release_config cfg;
+    cfg.enabled = false;
+    cfg.target_bytes = 0;
+    runtime.bounded_release_enable(cfg);
+
+    auto t0 = server_kv_pressure_runtime::clock::now();
+    CHECK(!runtime.bounded_release_due(t0, kv_pressure_state::PRESSURE, false));
+    CHECK(!runtime.bounded_release_due(t0, kv_pressure_state::CRITICAL, false));
+    CHECK(!runtime.bounded_release_due(t0, kv_pressure_state::NORMAL, false));
+
+    cfg.enabled = true;
+    cfg.target_bytes = 0;
+    runtime.bounded_release_enable(cfg);
+    CHECK(!runtime.bounded_release_due(t0, kv_pressure_state::CRITICAL, false));
+}
+
+static void test_bounded_release_stale_rejection() {
+    server_kv_pressure_runtime runtime;
+    server_kv_pressure_bounded_release_config cfg;
+    cfg.enabled = true;
+    cfg.target_bytes = 4194304;
+    cfg.cooldown_ms = 2000;
+    cfg.backoff_ms = 10000;
+    runtime.bounded_release_enable(cfg);
+
+    auto t0 = server_kv_pressure_runtime::clock::now();
+    CHECK(!runtime.bounded_release_due(t0, kv_pressure_state::PRESSURE, true));
+    CHECK(!runtime.bounded_release_due(t0, kv_pressure_state::CRITICAL, true));
+}
+
+static void test_bounded_release_marker_format() {
+    server_kv_pressure_bounded_release_event event;
+    event.pressure_state = kv_pressure_state::CRITICAL;
+    event.pressure_source = kv_pressure_source::RSS_ABSOLUTE;
+    event.result.released_bytes = 1048576;
+    event.result.released_blocks = 4;
+    event.result.blocks_scanned = 10;
+    event.result.blocks_skipped_owned = 3;
+    event.result.blocks_skipped_state = 2;
+    event.result.madvise_failures = 0;
+    event.result.shortfall_bytes = 0;
+    event.result.overshoot_bytes = 512;
+    event.result.block_scan_exhausted = false;
+    event.result.ownership_aborted = false;
+    event.target_bytes = 1048576;
+    event.max_scan_blocks = 64;
+    event.legacy_enabled = false;
+    event.sample_count = 7;
+    event.episode = 2;
+    event.cooldown_ms = 2000;
+    event.skipped_reason = "none";
+    event.idle = false;
+    event.stale = false;
+
+    const std::string marker =
+        server_kv_pressure_bounded_release_format_marker(event);
+    CHECK(marker.find("kv_pressure_bounded_release") != std::string::npos);
+    CHECK(marker.find("state=CRITICAL") != std::string::npos);
+    CHECK(marker.find("released_bytes=1048576") != std::string::npos);
+    CHECK(marker.find("released_blocks=4") != std::string::npos);
+    CHECK(marker.find("blocks_scanned=10") != std::string::npos);
+    CHECK(marker.find("blocks_skipped_owned=3") != std::string::npos);
+    CHECK(marker.find("blocks_skipped_state=2") != std::string::npos);
+    CHECK(marker.find("madvise_failures=0") != std::string::npos);
+    CHECK(marker.find("ownership_aborted=0") != std::string::npos);
+    CHECK(marker.find("legacy_enabled=0") != std::string::npos);
+    CHECK(marker.find("episode=2") != std::string::npos);
+    CHECK(marker.find("skipped_reason=none") != std::string::npos);
+}
+
 int main() {
     test_default_off();
     test_interval_config();
@@ -474,7 +800,25 @@ int main() {
     test_dry_run_cooldown_blocking();
     test_dry_run_shortfall_backoff();
     test_dry_run_state_transition_resets_cooldown();
+    test_dry_run_normal_exit_clears_backoff();
     test_dry_run_config_disabled();
+    test_bounded_release_config_default_disabled();
+    test_bounded_release_config_enabled_defaults_preserved();
+    test_bounded_release_config_explicit_boundaries_and_invalid_values();
+    test_bounded_release_config_valid();
+    test_bounded_release_config_target_zero_disables();
+    test_bounded_release_config_invalid_target();
+    test_bounded_release_config_cooldown_min_clamped();
+    test_bounded_release_normal_recovery_not_due();
+    test_bounded_release_pressure_critical_entry();
+    test_bounded_release_cooldown_blocking();
+    test_bounded_release_shortfall_backoff();
+    test_bounded_release_state_transition_resets_cooldown();
+    test_bounded_release_episode_exit_clears_backoff();
+    test_bounded_release_same_episode_transition_keeps_backoff();
+    test_bounded_release_config_disabled();
+    test_bounded_release_stale_rejection();
+    test_bounded_release_marker_format();
 
     std::printf("server KV pressure tests: %d/%d passed\n", tests_total - tests_failed, tests_total);
     return tests_failed == 0 ? 0 : 1;
