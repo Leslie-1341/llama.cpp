@@ -1,778 +1,288 @@
 #!/usr/bin/env bash
-# run-checks.sh — check dispatch engine
-# Uses DIFF_CLASSES (from diff-analyzer) to determine which checks to run.
-# Each check function records its result via gate_record_check().
+# Diff-selected checks. Expensive commands write full logs to the artifact.
 
 set -euo pipefail
 
 OS_AGENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+declare TARGET_MAPPER_READY=0
 
-# ---- individual checks ----
+affected_paths() {
+    printf '%s\n' "${DIFF_FILES[@]}"
+}
 
 check_git_diff_check() {
-    local name="git-diff-check"
-    gate_log 1 "Running $name..."
-
-    local failed=0
-
-    # Check tracked diff
-    local output
-    if output=$(git diff --check HEAD 2>&1); then
-        gate_log 2 "$name: tracked diff clean"
-    else
-        gate_log 1 "$name: tracked diff FAIL — whitespace errors"
-        printf '%s\n' "$output" >> "$GATE_FULL_LOG"
-        failed=1
-    fi
-
-    # Check untracked text files for trailing whitespace / conflict markers
-    local untracked_text
-    untracked_text=$(git ls-files --others --exclude-standard 2>/dev/null | grep -vE '\.(o|so|a|bin|exe|jpg|png|gif|pdf|gz|zip|tar)$' || true)
-    if [[ -n "$untracked_text" ]]; then
-        while IFS= read -r f; do
-            [[ -z "$f" ]] && continue
-            [[ ! -f "$f" ]] && continue
-            # Check only text files (avoid binary)
-            if file "$f" 2>/dev/null | grep -q 'text'; then
-                # Create a diff of the file against /dev/null and check it
-                if git diff --check /dev/null "$f" 2>&1 | grep -q .; then
-                    gate_log 1 "$name: $f has whitespace issues"
-                    git diff --check /dev/null "$f" 2>&1 >> "$GATE_FULL_LOG"
-                    failed=1
-                fi
-            fi
-        done <<< "$untracked_text"
-    fi
-
-    if (( failed > 0 )); then
-        gate_record_check "$name" "FAIL" "whitespace errors detected"
-    else
-        gate_record_check "$name" "PASS" ""
-    fi
+    local name=git-diff-check log="$GATE_ARTIFACT_DIR/logs/git-diff-check.log" failed=0 f
+    : > "$log"
+    if ! git diff --check HEAD >>"$log" 2>&1; then failed=1; fi
+    while IFS= read -r f; do
+        [[ -n "$f" && -f "$f" ]] || continue
+        if file "$f" 2>/dev/null | grep -q text; then
+            if grep -nE '[[:blank:]]+$|^(<<<<<<<|=======|>>>>>>>)' "$f" >>"$log" 2>&1; then failed=1; fi
+        fi
+    done < <(git ls-files --others --exclude-standard)
+    if (( failed )); then gate_failure_excerpt "$log"; gate_record_check "$name" FAIL "whitespace/conflict-marker errors"; else gate_record_check "$name" PASS; fi
 }
 
 check_python_syntax() {
-    local name="python-syntax"
-    gate_log 1 "Running $name..."
-    local py_files
-    py_files="$(printf '%s\n' "${DIFF_CLASSES[py]:-}" | sed '/^$/d' || true)"
-    if [[ -z "$py_files" ]]; then
-        gate_record_check "$name" "SKIP" "no Python changes"
-        return
-    fi
-
-    local failed=0 total=0
+    local name=python-syntax f failed=0 total=0 log="$GATE_ARTIFACT_DIR/logs/python-syntax.log"
+    : > "$log"
     while IFS= read -r f; do
-        [[ -z "$f" ]] && continue
+        [[ -n "$f" && -f "$f" ]] || continue
         total=$((total + 1))
-        if python3 -m py_compile "$f" 2>&1; then
-            gate_log 2 "$name: $f OK"
-        else
-            gate_log 1 "$name: $f FAIL"
-            failed=$((failed + 1))
-        fi
-    done <<< "$py_files"
-
-    if (( failed > 0 )); then
-        gate_record_check "$name" "FAIL" "$failed/$total files failed"
-    else
-        gate_record_check "$name" "PASS" "$total files OK"
-    fi
+        python3 -m py_compile "$f" >>"$log" 2>&1 || failed=$((failed + 1))
+    done < <(diff_paths_for py)
+    if (( total == 0 )); then gate_record_check "$name" SKIP "no changed Python files"
+    elif (( failed )); then gate_failure_excerpt "$log"; gate_record_check "$name" FAIL "$failed/$total files failed"
+    else gate_record_check "$name" PASS "$total files"; fi
 }
 
 check_shell_syntax() {
-    local name="shell-syntax"
-    gate_log 1 "Running $name..."
-    local sh_files
-    sh_files="$(printf '%s\n' "${DIFF_CLASSES[sh]:-}" | sed '/^$/d' || true)"
-    if [[ -z "$sh_files" ]]; then
-        gate_record_check "$name" "SKIP" "no shell changes"
-        return
-    fi
-
-    local failed=0 total=0
+    local name=shell-syntax f failed=0 total=0 log="$GATE_ARTIFACT_DIR/logs/shell-syntax.log"
+    : > "$log"
     while IFS= read -r f; do
-        [[ -z "$f" ]] && continue
+        [[ -n "$f" && -f "$f" ]] || continue
         total=$((total + 1))
-        if bash -n "$f" 2>&1; then
-            gate_log 2 "$name: $f OK"
-        else
-            gate_log 1 "$name: $f FAIL (bash -n)"
-            failed=$((failed + 1))
-        fi
-    done <<< "$sh_files"
-
-    if (( failed > 0 )); then
-        gate_record_check "$name" "FAIL" "$failed/$total files failed"
-    else
-        gate_record_check "$name" "PASS" "$total files OK"
-    fi
+        bash -n "$f" >>"$log" 2>&1 || failed=$((failed + 1))
+    done < <(diff_paths_for sh)
+    if (( total == 0 )); then gate_record_check "$name" SKIP "no changed shell files"
+    elif (( failed )); then gate_failure_excerpt "$log"; gate_record_check "$name" FAIL "$failed/$total files failed"
+    else gate_record_check "$name" PASS "$total files"; fi
 }
 
 check_cmake_configure() {
-    local name="cmake-configure"
-    gate_log 1 "Running $name..."
+    local name=cmake-configure repo_root build_dir cc
+    repo_root="$(gate_repo_root)"; build_dir="${GATE_BUILD_DIR:-build}"; cc="$repo_root/$build_dir/compile_commands.json"
+    if (( ! HAS_CMAKE )) && [[ -f "$cc" ]]; then gate_record_check "$name" SKIP "configuration unchanged"; return; fi
+    if gate_run_logged "$GATE_ARTIFACT_DIR/logs/cmake-configure.log" cmake -S "$repo_root" -B "$repo_root/$build_dir" -DCMAKE_EXPORT_COMPILE_COMMANDS=ON; then
+        gate_record_check "$name" PASS
+    else gate_record_check "$name" FAIL "see logs/cmake-configure.log"; fi
+}
 
-    local cmake_files
-    cmake_files="$(printf '%s\n' "${DIFF_CLASSES[cmake]:-}" | sed '/^$/d' || true)"
-    if [[ -z "$cmake_files" ]]; then
-        gate_record_check "$name" "SKIP" "no CMake changes"
-        return
-    fi
+ensure_target_mapper() {
+    (( TARGET_MAPPER_READY )) && return 0
+    target_mapper_init "${GATE_BUILD_DIR:-build}" "${TARGET_MAPPER_READ_ONLY:-0}"
+    TARGET_MAPPER_READY=1
+}
 
-    local build_dir="${GATE_BUILD_DIR:-build}"
-    local repo_root
-    repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-
-    local log_file="$GATE_ARTIFACT_DIR/cmake-configure.log"
-    # Reconfigure: cmake automatically detects if nothing has changed and is a no-op
-    if cmake -S "$repo_root" -B "$repo_root/$build_dir" 2>&1 | tee "$log_file"; then
-        gate_record_check "$name" "PASS" "configure OK"
-    else
-        gate_record_check "$name" "FAIL" "cmake configure failed"
-    fi
+cpp_changed_files() {
+    printf '%s\n' "$(diff_paths_for cpp)" "$(diff_paths_for c)" "$(diff_paths_for h)" | sed '/^$/d' | sort -u
 }
 
 check_compile_commands() {
-    local name="compile-commands"
-    gate_log 1 "Running $name..."
-
-    local build_dir="${GATE_BUILD_DIR:-build}"
-    local repo_root
-    repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-    local cc_json="$repo_root/$build_dir/compile_commands.json"
-
-    if [[ ! -f "$cc_json" ]]; then
-        gate_record_check "$name" "FAIL" "compile_commands.json missing"
-        return
-    fi
-
-    local entries
-    entries=$(python3 -c "import json; data=json.load(open('$cc_json')); print(len(data))" 2>&1)
-    if [[ "$entries" =~ ^[0-9]+$ ]] && (( entries > 0 )); then
-        local cpp_files
-        cpp_files="$(printf '%s\n' "${DIFF_CLASSES[cpp]:-}" | sed '/^$/d' || true)"
-        local unresolved=0 total=0
-
-        if [[ -n "$cpp_files" ]]; then
-            while IFS= read -r f; do
-                [[ -z "$f" ]] && continue
-                total=$((total + 1))
-                local abs="$f"
-                [[ "$abs" = /* ]] || abs="$repo_root/$f"
-                if ! python3 -c "
-import json
-with open('$cc_json') as fh:
-    data = json.load(fh)
-found = any(e.get('file','') == '$abs' for e in data)
-exit(0 if found else 1)
-" 2>/dev/null; then
-                    gate_log 1 "$name: $f not in compile_commands.json"
-                    unresolved=$((unresolved + 1))
-                fi
-            done <<< "$cpp_files"
-        fi
-
-        if (( unresolved > 0 )); then
-            gate_record_check "$name" "FAIL" "$unresolved/$total C++ files not in compile_commands.json"
-        else
-            gate_record_check "$name" "PASS" "$entries entries, $total changed C++ files all present"
-        fi
-    else
-        gate_record_check "$name" "FAIL" "invalid compile_commands.json"
-    fi
+    local name=compile-commands f unresolved=0 total=0
+    if (( !(HAS_CPP || HAS_C || HAS_H) )); then gate_record_check "$name" SKIP "no C/C++ changes"; return; fi
+    ensure_target_mapper
+    if (( TARGET_MAP_FAILED )); then gate_record_check "$name" FAIL "$TARGET_MAP_ERROR"; return; fi
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        total=$((total + 1))
+        target_for_file "$f" >/dev/null 2>&1 || unresolved=$((unresolved + 1))
+    done < <(cpp_changed_files)
+    if (( unresolved )); then gate_record_check "$name" UNRESOLVED "$unresolved/$total files lack a verified target"
+    else gate_record_check "$name" PASS "$TARGET_MAP_ENTRIES entries; $total changed files mapped"; fi
 }
 
 check_incremental_build() {
-    local name="incremental-build"
-    gate_log 1 "Running $name..."
-
-    local cpp_files h_files
-    cpp_files="$(printf '%s\n' "${DIFF_CLASSES[cpp]:-}" | sed '/^$/d' || true)"
-    h_files="$(printf '%s\n' "${DIFF_CLASSES[cpp_headers]:-}" | sed '/^$/d' || true)"
-    local all_cpp="$cpp_files"$'\n'"$h_files"
-
-    if [[ -z "$(echo "$all_cpp" | sed '/^$/d' || true)" ]]; then
-        gate_record_check "$name" "SKIP" "no C/C++ changes"
-        return
-    fi
-
-    local repo_root
-    repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-    local build_dir="${GATE_BUILD_DIR:-build}"
-
-    # Resolve targets using verified CMake target names
-    local resolved
-    if ! resolved=$(targets_for_files 1 $cpp_files $h_files 2>/dev/null); then
-        gate_record_check "$name" "UNRESOLVED" "some C/C++ files have no verified build target"
-        return
-    fi
-
-    local -a targets
-    mapfile -t targets <<< "$resolved"
-
-    if (( ${#targets[@]} == 0 )); then
-        gate_record_check "$name" "UNRESOLVED" "no build targets resolved"
-        return
-    fi
-
-    gate_log 1 "$name: building targets: ${targets[*]}"
-
-    local failed=0 built=0
-    local log_file="$GATE_ARTIFACT_DIR/build.log"
+    local name=incremental-build repo_root build_dir resolved target failed=0 built=0
+    if (( !(HAS_CPP || HAS_C || HAS_H) )); then gate_record_check "$name" SKIP "no C/C++ changes"; return; fi
+    ensure_target_mapper
+    if (( TARGET_MAP_FAILED )); then gate_record_check "$name" FAIL "$TARGET_MAP_ERROR"; return; fi
+    if ! resolved="$(targets_for_files 1 $(cpp_changed_files) 2>/dev/null)"; then gate_record_check "$name" UNRESOLVED "target mapping incomplete"; return; fi
+    local -a targets=(); mapfile -t targets <<< "$resolved"
+    if (( ${#targets[@]} == 0 )); then gate_record_check "$name" UNRESOLVED "no build targets"; return; fi
+    local component_fp cached_artifact=""
+    component_fp="$(fingerprint_build_surface)"
+    if (( ${GATE_COMPONENT_REUSE:-1} )); then cached_artifact="$(component_cache_find build "$component_fp" 2>/dev/null || true)"; fi
+    if [[ -n "$cached_artifact" ]]; then gate_record_check "$name" PASS "reused unchanged C/C++ surface from $cached_artifact"; return; fi
+    repo_root="$(gate_repo_root)"; build_dir="${GATE_BUILD_DIR:-build}"
+    : > "$GATE_ARTIFACT_DIR/logs/build.log"
     for target in "${targets[@]}"; do
-        gate_log 1 "$name: cmake --build $build_dir --target $target"
-        if cmake --build "$repo_root/$build_dir" --target "$target" -j"$(nproc)" 2>&1 | tee -a "$log_file"; then
-            gate_log 2 "$name: $target OK"
+        if gate_run_logged "$GATE_ARTIFACT_DIR/logs/build-${target//\//_}.log" cmake --build "$repo_root/$build_dir" --target "$target" -j"$(nproc)"; then
             built=$((built + 1))
-        else
-            gate_log 1 "$name: $target FAIL"
-            failed=$((failed + 1))
-        fi
+        else failed=$((failed + 1)); fi
     done
-
-    if (( failed > 0 )); then
-        gate_record_check "$name" "FAIL" "$failed/${#targets[@]} targets failed ($built built)"
-    else
-        gate_record_check "$name" "PASS" "${#targets[@]} targets built OK"
-    fi
+    if (( failed )); then gate_record_check "$name" FAIL "$failed/${#targets[@]} targets failed"
+    else component_cache_save build "$component_fp"; gate_record_check "$name" PASS "$built targets"; fi
 }
 
 check_clang_tidy() {
-    local name="clang-tidy"
-    gate_log 1 "Running $name..."
-
-    if ! command -v clang-tidy &> /dev/null; then
-        gate_record_check "$name" "SKIP" "clang-tidy not found"
-        return
-    fi
-
-    local cpp_files
-    cpp_files="$(printf '%s\n' "${DIFF_CLASSES[cpp]:-}" | sed '/^$/d' || true)"
-    if [[ -z "$cpp_files" ]]; then
-        gate_record_check "$name" "SKIP" "no C++ changes"
-        return
-    fi
-
-    local repo_root
-    repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-    local build_dir="${GATE_BUILD_DIR:-build}"
-    local cc_json="$repo_root/$build_dir/compile_commands.json"
-
-    if [[ ! -f "$cc_json" ]]; then
-        gate_record_check "$name" "SKIP" "no compile_commands.json"
-        return
-    fi
-
-    # Only analyze changed TRANSLATION UNITS (.cpp/.cc/.cxx), not standalone headers
-    local -a tu_files=()
+    local name=clang-tidy repo_root build_dir f rc failed=0 advisory=0 total=0
+    if ! command -v clang-tidy >/dev/null 2>&1; then gate_record_check "$name" SKIP "clang-tidy unavailable"; return; fi
+    repo_root="$(gate_repo_root)"; build_dir="${GATE_BUILD_DIR:-build}"
+    local component_fp cached_artifact=""
+    component_fp="$(fingerprint_tidy_surface)"
+    if (( ${GATE_COMPONENT_REUSE:-1} )); then cached_artifact="$(component_cache_find tidy "$component_fp" 2>/dev/null || true)"; fi
+    if [[ -n "$cached_artifact" ]]; then gate_record_check "$name" PASS "reused unchanged tidy surface from $cached_artifact"; return; fi
     while IFS= read -r f; do
-        [[ -z "$f" ]] && continue
-        case "${f##*.}" in
-            cpp|cc|cxx|C|c) tu_files+=("$f") ;;
-            *) continue ;;
-        esac
-    done <<< "$cpp_files"
-
-    if (( ${#tu_files[@]} == 0 )); then
-        gate_record_check "$name" "SKIP" "no changed translation units (headers only)"
-        return
-    fi
-
-    local failed=0 warnings=0 passed=0 total=${#tu_files[@]}
-    local tidylog_dir="$GATE_ARTIFACT_DIR/clang-tidy"
-    mkdir -p "$tidylog_dir"
-
-    for f in "${tu_files[@]}"; do
-        local abs="$f"
-        [[ "$abs" = /* ]] || abs="$repo_root/$f"
-        local bn; bn="$(basename "$f")"
-        local tu_log="$tidylog_dir/${bn}.log"
-
-        gate_log 2 "$name: analyzing $f"
-
-        # Per-file independent log; use compile_commands.json for flags + explicit C++17
-        local rc=0
-        clang-tidy -p "$repo_root/$build_dir" "$abs" --quiet --extra-arg=-std=c++17 > "$tu_log" 2>&1 || rc=$?
-
-        if (( rc == 0 )); then
-            passed=$((passed + 1))
-            gate_log 2 "$name: $f OK"
-        else
-            # Check THIS file's log only (NOT cumulative log) for error/fatal error
-            if grep -qE 'error:|fatal error:' "$tu_log" 2>/dev/null; then
-                gate_log 1 "$name: $f FAIL (compiler error)"
-                failed=$((failed + 1))
-            else
-                gate_log 1 "$name: $f advisory warnings (exit=$rc)"
-                warnings=$((warnings + 1))
-            fi
+        [[ -n "$f" && -f "$f" ]] || continue
+        case "$f" in *.cpp|*.cc|*.cxx|*.c|*.C) ;; *) continue ;; esac
+        total=$((total + 1)); rc=0
+        gate_run_logged "$GATE_ARTIFACT_DIR/logs/clang-tidy-$(basename "$f").log" clang-tidy -p "$repo_root/$build_dir" "$repo_root/$f" --quiet --extra-arg=-std=c++17 || rc=$?
+        if (( rc != 0 )); then
+            if grep -qE 'error:|fatal error:' "$GATE_ARTIFACT_DIR/logs/clang-tidy-$(basename "$f").log"; then failed=$((failed + 1)); else advisory=$((advisory + 1)); fi
         fi
-    done
-
-    if (( failed > 0 )); then
-        gate_record_check "$name" "FAIL" "$failed/$total TUs have errors ($warnings warnings advisory, $passed clean)"
-    elif (( warnings > 0 )); then
-        gate_record_check "$name" "PASS" "$total TUs OK ($warnings warnings advisory, $passed clean)"
-    else
-        gate_record_check "$name" "PASS" "$total TUs clean"
-    fi
+    done < <(printf '%s\n' "$(diff_paths_for cpp)" "$(diff_paths_for c)" | sed '/^$/d' | sort -u)
+    if (( total == 0 )); then gate_record_check "$name" SKIP "no changed translation units"
+    elif (( failed )); then gate_record_check "$name" FAIL "$failed/$total translation units"
+    else component_cache_save tidy "$component_fp"; gate_record_check "$name" PASS "$total translation units; $advisory advisory"; fi
 }
 
-# ---- parser test check: explicit registration, no heuristic filtering ----
+# ---------- parser registry ----------
+declare -a PARSER_NAMES=()
+declare -A PARSER_TEST=() PARSER_BINDING=() PARSER_SELECTORS=() PARSER_TAGS=()
 
-# Registry: "name|path|flags|binding"
-# Each entry is a parser test that can run without external artifacts.
-# Flags: selfcontained (runs without models/artifacts)
-#        knownfail (pre-existing failure — see below)
-# Binding: documents and machine-checks how the parser test reaches the real
-# parser/producer schema.
-#   module:<path>   — module exists; test references it and contains an import/execution path
-#   fixture:<path>  — fixture exists and the test source references its basename
-#   inline:<desc>   — human-only claim; recorded UNVERIFIED, never PASS
-#   none            — binding undocumented; recorded UNVERIFIED
-#
-# knownfail handling:
-#   A knownfail entry is a parser test that fails for reasons the operator has
-#   confirmed are PRE-EXISTING and unrelated to the current diff/stage.  The
-#   gate distinguishes two cases:
-#
-#     knownfail;unrelated — baseline evidence says the failure is pre-existing.
-#       It is non-blocking only while neither the test nor its bound module/fixture
-#       is changed by the current diff.
-#     knownfail;selected  — explicitly relevant to the current stage → UNRESOLVED.
-#       A current diff touching the test or bound path overrides unrelated and
-#       dynamically promotes the entry to selected.
-#
-#   Design intent (validation-policy): a newly-broken parser may NEVER disguise
-#   itself as a pre-existing knownfail.  An unregistered new test resolves to
-#   `unregistered` → UNRESOLVED.  A registered, non-knownfail test that fails
-#   → FAIL. A knownfail can be non-blocking only with prior baseline evidence
-#   and while its test/bound producer paths are unchanged in the current diff.
-declare -a PARSER_TEST_REGISTRY=(
-    "test-kv-paged-identity-e2i-parser|tests/test-kv-paged-identity-e2i-parser.py|selfcontained|module:scripts/parse-kv-paged-identity-e2i.py"
-    "test-kv-e0-e2-e5-single-turn-parser|tests/test-kv-e0-e2-e5-single-turn-parser.py|selfcontained|module:scripts/parse-kv-e0-e2-e5-single-turn.py"
-    "test-kv-paged-release-correctness-parser|tests/test-kv-paged-release-correctness-parser.py|selfcontained|module:scripts/parse-kv-paged-release-correctness.py"
-    "test-kv-dry-run-stage3a-2b-parser|tests/test-kv-dry-run-stage3a-2b-parser.py|selfcontained|module:scripts/parse-kv-dry-run-stage3a-2b.py"
-    "test-kv-final-controlled-e0-e5-parser|tests/test-kv-final-controlled-e0-e5-parser.py|selfcontained|module:scripts/parse-kv-final-controlled-e0-e5.py"
-    "test-kv-bounded-release-stage3a-2c-parser|tests/test-kv-bounded-release-stage3a-2c-parser.py|selfcontained|module:scripts/parse-kv-bounded-release-stage3a-2c.py"
-    # knownfail — pre-existing failures unrelated to Stage 3A-2C bounded-release diff
-    # (baseline-vs-worktree failure-signature comparison confirms both fail identically
-    # at HEAD=a2da80f52 without the working-tree diff; neither test file is in the diff.)
-    "test-server-kv-pressure-stage3a-1c-parser|tests/test-server-kv-pressure-stage3a-1c-parser.py|knownfail;unrelated|module:scripts/parse-server-kv-pressure-stage3a-1c.py"
-    "test-kv-paged-identity-controlled-ab-parser|tests/test-kv-paged-identity-controlled-ab-parser.py|knownfail;unrelated|module:scripts/parse-kv-paged-identity-controlled-ab.py"
-)
-
-
-_repo_path_changed() {
-    local repo_root="$1"
-    local rel_path="$2"
-    [[ -n "$rel_path" ]] || return 1
-
-    if git -C "$repo_root" diff --name-only --diff-filter=ACDMRTUXB HEAD -- "$rel_path" 2>/dev/null | grep -q .; then
-        return 0
-    fi
-    if git -C "$repo_root" ls-files --others --exclude-standard -- "$rel_path" 2>/dev/null | grep -q .; then
-        return 0
-    fi
-    return 1
+load_parser_registry() {
+    ((${#PARSER_NAMES[@]} > 0)) && return 0
+    local cfg="$OS_AGENT_DIR/config/parser-tests.tsv" name test binding selectors tags extra
+    [[ -f "$cfg" ]] || return 1
+    while IFS=$'\t' read -r name test binding selectors tags extra; do
+        [[ -n "$name" && "$name" != \#* ]] || continue
+        [[ -z "$extra" ]] || { gate_log 1 "malformed parser registry row: $name"; return 1; }
+        [[ -n "$test" && -n "$binding" && -n "$selectors" ]] || return 1
+        [[ -z "${PARSER_TEST[$name]+present}" ]] || return 1
+        PARSER_NAMES+=("$name"); PARSER_TEST["$name"]="$test"; PARSER_BINDING["$name"]="$binding"; PARSER_SELECTORS["$name"]="$selectors"; PARSER_TAGS["$name"]="$tags"
+    done < "$cfg"
+    ((${#PARSER_NAMES[@]} > 0))
 }
 
-_binding_path() {
-    local binding="${1:-}"
-    case "$binding" in
-        module:*|fixture:*) printf '%s' "${binding#*:}" ;;
-        *) return 1 ;;
-    esac
-}
+binding_path() { case "$1" in module:*|fixture:*) printf '%s' "${1#*:}" ;; *) return 1 ;; esac; }
 
-_parser_entry_selected_by_diff() {
-    local repo_root="$1"
-    local test_path="$2"
-    local binding="${3:-}"
-
-    _repo_path_changed "$repo_root" "$test_path" && return 0
-
-    local bound_path=""
-    if bound_path="$(_binding_path "$binding" 2>/dev/null)"; then
-        _repo_path_changed "$repo_root" "$bound_path" && return 0
-    fi
-    return 1
-}
-
-_parser_checks_relevant_to_diff() {
-    # C/C++ runtime changes can alter producer output. Python/shell changes are
-    # relevant only when they touch parsers, runners, parser tests, or Harness.
-    if (( HAS_CPP || HAS_C || HAS_H || HAS_DELETED_CPP || HAS_DELETED_C || HAS_DELETED_H )); then
-        return 0
-    fi
-
-    local path
-    for key in py sh deleted_py deleted_sh; do
-        while IFS= read -r path; do
-            [[ -n "$path" ]] || continue
-            case "$path" in
-                scripts/parse-*.py|scripts/run-*.py|scripts/run-*.sh|scripts/*kv*.sh|scripts/*protocol*.sh|tests/*parser*.py|scripts/os-agent/*)
-                    return 0
-                    ;;
-            esac
-        done <<< "${DIFF_CLASSES[$key]:-}"
+parser_selected() {
+    local name="$1" full="${2:-0}" path pattern selectors
+    (( full )) && return 0
+    diff_path_changed "${PARSER_TEST[$name]}" && return 0
+    path="$(binding_path "${PARSER_BINDING[$name]}" 2>/dev/null || true)"
+    [[ -n "$path" ]] && diff_path_changed "$path" && return 0
+    selectors="${PARSER_SELECTORS[$name]}"
+    local IFS=';'; read -ra pats <<< "$selectors"
+    for path in "${DIFF_FILES[@]}"; do
+        for pattern in "${pats[@]}"; do
+            [[ -n "$pattern" ]] || continue
+            [[ "$pattern" == @all || "$path" == $pattern ]] && return 0
+        done
     done
     return 1
+}
+
+parser_registry_validate() {
+    local full="${1:-0}" repo_root name test binding path base unregistered=0 malformed=0
+    repo_root="$(gate_repo_root)"
+    if ! load_parser_registry; then gate_record_check parser-registry INCOMPLETE "missing or malformed config/parser-tests.tsv"; return 1; fi
+    for name in "${PARSER_NAMES[@]}"; do
+        test="${PARSER_TEST[$name]}"; binding="${PARSER_BINDING[$name]}"; path="$(binding_path "$binding" 2>/dev/null || true)"
+        [[ -f "$repo_root/$test" && -n "$path" && -f "$repo_root/$path" ]] || malformed=$((malformed + 1))
+    done
+    local f bn registered
+    while IFS= read -r -d '' f; do
+        bn="${f#$repo_root/}"; registered=0
+        for name in "${PARSER_NAMES[@]}"; do [[ "${PARSER_TEST[$name]}" == "$bn" ]] && { registered=1; break; }; done
+        if (( ! registered )) && { (( full )) || diff_path_changed "$bn"; }; then unregistered=$((unregistered + 1)); fi
+    done < <(find "$repo_root/tests" -maxdepth 1 -type f -name '*parser*.py' -print0 2>/dev/null || true)
+    if (( malformed )); then gate_record_check parser-registry FAIL "$malformed missing test/binding paths"; return 1
+    elif (( unregistered )); then gate_record_check parser-registry UNRESOLVED "$unregistered changed/full parser tests unregistered"; return 1
+    else gate_record_check parser-registry PASS "${#PARSER_NAMES[@]} registered"; fi
+}
+
+parser_waiver_valid() {
+    local name="$1" test="$2" binding="$3" log="$4" repo_root cfg row_name baseline test_sha bind_sha fail_sha expires reason path
+    repo_root="$(gate_repo_root)"; cfg="$OS_AGENT_DIR/config/parser-waivers.tsv"
+    [[ -f "$cfg" ]] || return 1
+    path="$(binding_path "$binding" 2>/dev/null)" || return 1
+    diff_path_changed "$test" && return 1
+    diff_path_changed "$path" && return 1
+    while IFS=$'\t' read -r row_name baseline test_sha bind_sha fail_sha expires reason; do
+        [[ -n "$row_name" && "$row_name" != \#* ]] || continue
+        [[ "$row_name" == "$name" ]] || continue
+        [[ "$(sha256sum "$repo_root/$test" | awk '{print $1}')" == "$test_sha" ]] || return 1
+        [[ "$(sha256sum "$repo_root/$path" | awk '{print $1}')" == "$bind_sha" ]] || return 1
+        [[ "$(sha256sum "$log" | awk '{print $1}')" == "$fail_sha" ]] || return 1
+        [[ $(date -u +%s) -lt $(date -u -d "$expires" +%s 2>/dev/null || echo 0) ]] || return 1
+        gate_log 1 "parser waiver accepted: $name baseline=$baseline expires=$expires"
+        return 0
+    done < "$cfg"
+    return 1
+}
+
+check_parser_plan() {
+    local full="${1:-0}" selected=0 name
+    parser_registry_validate "$full" || return 0
+    for name in "${PARSER_NAMES[@]}"; do parser_selected "$name" "$full" && selected=$((selected + 1)); done
+    if (( selected )); then gate_record_check parser-plan PASS "$selected selected; execution omitted in audit"
+    else gate_record_check parser-plan SKIP "no parser tests selected"; fi
 }
 
 check_parser_test() {
-    local name="parser-test"
-    gate_log 1 "Running $name..."
-
-    local repo_root
-    repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-
-    # Phase 1: discover all parser test candidates on disk
-    local -a candidates=()
-    while IFS= read -r -d '' f; do
-        candidates+=("$f")
-    done < <(find "$repo_root/tests" -maxdepth 1 -name '*parser*.py' -print0 2>/dev/null || true)
-
-    if (( ${#candidates[@]} == 0 )); then
-        gate_record_check "$name" "SKIP" "no parser tests found on disk"
-        return
-    fi
-
-    # Phase 2: match candidates against registry
-    local -a run_list=()
-    local -a knownfail_selected=()
-    local -a knownfail_unrelated=()
-    local -a unregistered=()
-    local -a excluded_reasons=()
-
-    for candidate in "${candidates[@]}"; do
-        local bn; bn="$(basename "$candidate")"
-        local matched=0
-        for entry in "${PARSER_TEST_REGISTRY[@]}"; do
-            IFS='|' read -r reg_name reg_path reg_flags reg_binding <<< "$entry"
-            if [[ "$bn" == "$(basename "$reg_path")" ]]; then
-                matched=1
-                if [[ "$reg_flags" == *"knownfail"* ]]; then
-                    if [[ "$reg_flags" == *"selected"* ]] || \
-                       _parser_entry_selected_by_diff "$repo_root" "$reg_path" "$reg_binding"; then
-                        knownfail_selected+=("$bn")
-                        excluded_reasons+=("$bn: knownfail selected — current diff touches the test or bound producer/fixture")
-                    else
-                        knownfail_unrelated+=("$bn")
-                        excluded_reasons+=("$bn: knownfail unrelated — baseline evidence retained and bound paths unchanged")
-                    fi
-                else
-                    run_list+=("$candidate")
-                fi
-                break
-            fi
-        done
-        if (( matched == 0 )); then
-            unregistered+=("$bn")
-            excluded_reasons+=("$bn: not registered — add to PARSER_TEST_REGISTRY in run-checks.sh if self-contained")
-        fi
+    local full="${1:-0}" repo_root name test log failed=0 passed=0 waived=0 selected=0 component_fp cached_artifact=""
+    parser_registry_validate "$full" || return 0
+    repo_root="$(gate_repo_root)"
+    local -a selected_names=()
+    for name in "${PARSER_NAMES[@]}"; do parser_selected "$name" "$full" && selected_names+=("$name"); done
+    selected=${#selected_names[@]}
+    if (( selected == 0 )); then gate_record_check parser-test SKIP "no tests selected by diff"; return; fi
+    component_fp="$(fingerprint_parser_surface "${selected_names[@]}")"
+    if (( ${GATE_COMPONENT_REUSE:-1} && ! full )); then cached_artifact="$(component_cache_find parser "$component_fp" 2>/dev/null || true)"; fi
+    if [[ -n "$cached_artifact" ]]; then gate_record_check parser-test PASS "reused $selected selected tests from $cached_artifact"; return; fi
+    for name in "${selected_names[@]}"; do
+        test="${PARSER_TEST[$name]}"; log="$GATE_ARTIFACT_DIR/logs/parser-$name.log"
+        if gate_run_logged "$log" python3 "$repo_root/$test"; then passed=$((passed + 1))
+        elif (( ! full )) && parser_waiver_valid "$name" "$test" "${PARSER_BINDING[$name]}" "$log"; then waived=$((waived + 1))
+        else failed=$((failed + 1)); fi
     done
-
-    # Phase 3a: selected knownfail — BLOCKING UNRESOLVED.
-    # These are knownfail tests explicitly marked as relevant to the current
-    # diff/stage.  The operator must resolve them before the gate can PASS.
-    if (( ${#knownfail_selected[@]} > 0 )); then
-        gate_log 1 "$name: UNRESOLVED — ${#knownfail_selected[@]} selected knownfail tests"
-        for reason in "${excluded_reasons[@]}"; do
-            if [[ "$reason" == *"knownfail selected"* ]]; then
-                gate_log 2 "$name: selected: $reason"
-            fi
-        done
-        gate_record_check "$name" "UNRESOLVED" \
-            "${#knownfail_selected[@]} selected knownfail tests: ${knownfail_selected[*]}"
-        return
-    fi
-
-    # Phase 3b: unrelated knownfail — NON-BLOCKING record.
-    # These are pre-existing failures confirmed (via baseline-vs-worktree
-    # failure-signature comparison) to be unrelated to the current diff.
-    # They are LOGGED but do NOT block the gate verdict.
-    if (( ${#knownfail_unrelated[@]} > 0 )); then
-        gate_log 1 "$name: NOTED — ${#knownfail_unrelated[@]} unrelated knownfail tests (non-blocking)"
-        for reason in "${excluded_reasons[@]}"; do
-            if [[ "$reason" == *"knownfail unrelated"* ]]; then
-                gate_log 2 "$name: unrelated: $reason"
-            fi
-        done
-        # Do NOT return — continue through remaining phases.
-    fi
-
-    # Phase 4: if unregistered files exist, we have an UNRESOLVED situation
-    if (( ${#unregistered[@]} > 0 )); then
-        gate_log 1 "$name: UNRESOLVED — ${#unregistered[@]} parser tests not in registry"
-        for reason in "${excluded_reasons[@]}"; do
-            gate_log 2 "$name: excluded: $reason"
-        done
-        gate_record_check "$name" "UNRESOLVED" \
-            "${#unregistered[@]} unregistered parser tests: ${unregistered[*]}"
-        return
-    fi
-
-    # Phase 5: neutral when the diff cannot affect a runtime producer,
-    # runner, parser, parser test, or Harness. This is SKIP, not UNVERIFIED,
-    # because the check is genuinely not applicable.
-    if ! _parser_checks_relevant_to_diff; then
-        gate_record_check "$name" "SKIP" "no parser/runtime/Harness-relevant changes"
-        return
-    fi
-
-    # Phase 6: run registered (non-knownfail) tests
-    local kf_note=""
-    if (( ${#knownfail_unrelated[@]} > 0 )); then
-        kf_note="; ${#knownfail_unrelated[@]} unrelated knownfail noted (non-blocking): ${knownfail_unrelated[*]}"
-    fi
-    local failed=0 passed=0 total=${#run_list[@]}
-    local log_file="$GATE_ARTIFACT_DIR/parser-test.log"
-
-    if (( total == 0 )); then
-        # All matched tests are unrelated knownfail — run nothing, note them.
-        gate_record_check "$name" "PASS" "no runnable tests (all unrelated knownfail)${kf_note}"
-        return
-    fi
-
-    for pt in "${run_list[@]}"; do
-        gate_log 2 "$name: $(basename "$pt")"
-        if python3 "$pt" >> "$log_file" 2>&1; then
-            passed=$((passed + 1))
-        else
-            gate_log 1 "$name: $(basename "$pt") FAIL"
-            failed=$((failed + 1))
-        fi
-    done
-
-    if (( failed > 0 )); then
-        gate_record_check "$name" "FAIL" "$failed/$total parser tests failed${kf_note}"
-    else
-        gate_record_check "$name" "PASS" "$total parser tests OK${kf_note}"
-    fi
+    if (( failed )); then gate_record_check parser-test FAIL "$failed/$selected failed; $passed passed; $waived waived"
+    else component_cache_save parser "$component_fp"; gate_record_check parser-test PASS "$passed passed; $waived identity-bound waivers"; fi
 }
 
-# ---- fixture binding check: verify parser tests reach their declared schema authority ----
-#
-# This is stronger than checking that a parser module merely exists. The
-# registry entry, test file, and bound module/fixture must all exist, and the
-# test source must reference the bound basename. Inline claims are human-only
-# and therefore UNVERIFIED, never PASS.
 check_fixture_binding() {
-    local name="fixture-binding"
-    gate_log 1 "Running $name..."
-
-    local repo_root
-    repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-
-    local missing_tests=0 missing_targets=0 unbound=0 undocumented=0 malformed=0 verified=0 duplicates=0
-    local total=${#PARSER_TEST_REGISTRY[@]}
-    local -A seen_names=() seen_paths=()
-
-    local entry reg_name reg_path reg_flags reg_binding test_file target_path target_file target_base
-    for entry in "${PARSER_TEST_REGISTRY[@]}"; do
-        IFS='|' read -r reg_name reg_path reg_flags reg_binding <<< "$entry"
-
-        if [[ -z "$reg_name" || -z "$reg_path" || -z "$reg_flags" ]]; then
-            gate_log 1 "$name: malformed registry entry: $entry"
-            malformed=$((malformed + 1))
-            continue
-        fi
-
-        if [[ -n "${seen_names[$reg_name]+present}" || -n "${seen_paths[$reg_path]+present}" ]]; then
-            gate_log 1 "$name: duplicate registry name/path: $reg_name | $reg_path"
-            duplicates=$((duplicates + 1))
-            continue
-        fi
-        seen_names["$reg_name"]=1
-        seen_paths["$reg_path"]=1
-
-        test_file="$repo_root/$reg_path"
-        if [[ ! -f "$test_file" ]]; then
-            gate_log 1 "$name: $reg_name → test file missing: $reg_path"
-            missing_tests=$((missing_tests + 1))
-            continue
-        fi
-
-        if [[ -z "$reg_binding" || "$reg_binding" == "none" ]]; then
-            gate_log 2 "$name: $reg_name → binding undocumented"
-            undocumented=$((undocumented + 1))
-            continue
-        fi
-
-        case "$reg_binding" in
-            module:*)
-                target_path="${reg_binding#module:}"
-                target_file="$repo_root/$target_path"
-                if [[ -z "$target_path" || ! -f "$target_file" ]]; then
-                    gate_log 1 "$name: $reg_name → bound module missing: $target_path"
-                    missing_targets=$((missing_targets + 1))
-                    continue
-                fi
-
-                target_base="$(basename "$target_path")"
-                if grep -Fq "$target_base" "$test_file" &&                    grep -Eq 'subprocess|importlib|runpy' "$test_file"; then
-                    gate_log 2 "$name: $reg_name → module:$target_path referenced through an execution/import path"
-                    verified=$((verified + 1))
-                else
-                    gate_log 1 "$name: $reg_name → test does not execute/import bound module: $target_base"
-                    unbound=$((unbound + 1))
-                fi
-                ;;
-            fixture:*)
-                target_path="${reg_binding#fixture:}"
-                target_file="$repo_root/$target_path"
-                if [[ -z "$target_path" || ! -f "$target_file" ]]; then
-                    gate_log 1 "$name: $reg_name → bound fixture missing: $target_path"
-                    missing_targets=$((missing_targets + 1))
-                    continue
-                fi
-
-                target_base="$(basename "$target_path")"
-                if grep -Fq "$target_base" "$test_file"; then
-                    gate_log 2 "$name: $reg_name → fixture:$target_path referenced by test"
-                    verified=$((verified + 1))
-                else
-                    gate_log 1 "$name: $reg_name → test does not reference bound fixture: $target_base"
-                    unbound=$((unbound + 1))
-                fi
-                ;;
-            inline:*)
-                gate_log 2 "$name: $reg_name → inline claim is not machine-verifiable"
-                undocumented=$((undocumented + 1))
-                ;;
-            *)
-                gate_log 1 "$name: $reg_name → unknown binding type: $reg_binding"
-                malformed=$((malformed + 1))
-                ;;
+    local full="${1:-0}" repo_root name test binding path base selected=0 failed=0
+    load_parser_registry || { gate_record_check fixture-binding INCOMPLETE "registry unavailable"; return; }
+    repo_root="$(gate_repo_root)"
+    for name in "${PARSER_NAMES[@]}"; do
+        parser_selected "$name" "$full" || continue
+        selected=$((selected + 1)); test="${PARSER_TEST[$name]}"; binding="${PARSER_BINDING[$name]}"; path="$(binding_path "$binding" 2>/dev/null || true)"; base="$(basename "$path")"
+        case "$binding" in
+            module:*) grep -Fq "$base" "$repo_root/$test" && grep -Eq 'subprocess|importlib|runpy' "$repo_root/$test" || failed=$((failed + 1)) ;;
+            fixture:*) grep -Fq "$base" "$repo_root/$test" || failed=$((failed + 1)) ;;
+            *) failed=$((failed + 1)) ;;
         esac
     done
-
-    local detail="$verified verified, $missing_tests test missing, $missing_targets target missing, $unbound unbound, $undocumented unverified, $malformed malformed, $duplicates duplicate of $total entries"
-
-    if (( missing_tests > 0 || missing_targets > 0 || unbound > 0 || malformed > 0 || duplicates > 0 )); then
-        gate_record_check "$name" "FAIL" "$detail"
-        return
-    fi
-
-    if (( undocumented > 0 )); then
-        gate_record_check "$name" "UNVERIFIED" "$detail"
-        return
-    fi
-
-    gate_record_check "$name" "PASS" "$detail"
+    if (( selected == 0 )); then gate_record_check fixture-binding SKIP "no parser tests selected"
+    elif (( failed )); then gate_record_check fixture-binding FAIL "$failed/$selected bindings unproven"
+    else gate_record_check fixture-binding PASS "$selected bindings"; fi
 }
 
 check_skill_validation() {
-    local name="skill-validation"
-    gate_log 1 "Running $name..."
-
-    local skill_files
-    skill_files="$(printf '%s\n' "${DIFF_CLASSES[skill]:-}" | sed '/^$/d' || true)"
-
-    local repo_root
-    repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-
-    # Determine if we should run: always if skill files changed; also if gate harness changed
-    local should_run=0
-    if [[ -n "$skill_files" ]]; then
-        should_run=1
-    else
-        local gate_files
-        gate_files=$(printf '%s\n' "${DIFF_CLASSES[sh]:-}" | sed '/^$/d' | { grep 'scripts/os-agent/' || true; })
-        [[ -n "$gate_files" ]] && should_run=1
-    fi
-
-    if (( ! should_run )); then
-        gate_record_check "$name" "SKIP" "no skill changes"
-        return
-    fi
-
-    local failed=0
-    for skill_dir in "$repo_root/.claude/skills/os-agent-task" "$repo_root/.agents/skills/os-agent-task"; do
-        if [[ -f "$skill_dir/scripts/validate-skill.sh" ]]; then
-            gate_log 2 "$name: validating $skill_dir"
-            if bash "$skill_dir/scripts/validate-skill.sh" 2>&1 | tee -a "$GATE_FULL_LOG"; then
-                :
-            else
-                gate_log 1 "$name: $skill_dir FAIL"
-                failed=$((failed + 1))
-            fi
-        fi
-    done
-
-    # bash -n on all gate harness scripts
-    if [[ -d "$repo_root/scripts/os-agent" ]]; then
-        while IFS= read -r -d '' script; do
-            local first_line
-            first_line=$(head -1 "$script" 2>/dev/null || true)
-            if [[ "$first_line" == '#!/usr/bin/env bash' ]] || [[ "$first_line" == '#!/bin/bash' ]]; then
-                bash -n "$script" 2>&1 || failed=$((failed + 1))
-            fi
-        done < <(find "$repo_root/scripts/os-agent" -type f -print0 2>/dev/null)
-    fi
-
-    if (( failed > 0 )); then
-        gate_record_check "$name" "FAIL" "$failed validations failed"
-    else
-        gate_record_check "$name" "PASS" "all skill validations OK"
-    fi
+    local full="${1:-0}" repo_root a b validator
+    if (( ! full && ! HAS_SKILL && ! HAS_HARNESS )); then gate_record_check skill-validation SKIP "skill/Harness unchanged"; return; fi
+    repo_root="$(gate_repo_root)"; a="$repo_root/.claude/skills/os-agent-task"; b="$repo_root/.agents/skills/os-agent-task"
+    [[ -d "$a" && -d "$b" ]] || { gate_record_check skill-validation FAIL "both Skill mirrors are required"; return; }
+    if ! diff -qr "$a" "$b" >"$GATE_ARTIFACT_DIR/logs/skill-parity.log" 2>&1; then gate_failure_excerpt "$GATE_ARTIFACT_DIR/logs/skill-parity.log"; gate_record_check skill-validation FAIL "Skill mirrors differ"; return; fi
+    validator="$a/scripts/validate-skill.sh"
+    [[ -x "$validator" || -f "$validator" ]] || { gate_record_check skill-validation FAIL "canonical validator missing"; return; }
+    if gate_run_logged "$GATE_ARTIFACT_DIR/logs/skill-validation.log" bash "$validator"; then gate_record_check skill-validation PASS "parity + canonical validation"
+    else gate_record_check skill-validation FAIL "canonical validation failed"; fi
 }
 
 check_memory_check() {
-    local name="memory-check"
-    gate_log 1 "Running $name..."
-
-    local ledger_files
-    ledger_files="$(printf '%s\n' "${DIFF_CLASSES[ledger]:-}" | sed '/^$/d' || true)"
-
-    if [[ -z "$ledger_files" ]]; then
-        gate_record_check "$name" "SKIP" "no ledger changes"
-        return
-    fi
-
-    local repo_root
-    repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-
-    local checker="$repo_root/.claude/skills/os-agent-task/scripts/init-project-ledger.sh"
-    if [[ -f "$checker" ]]; then
-        if bash "$checker" check 2>&1 | tee -a "$GATE_FULL_LOG"; then
-            gate_record_check "$name" "PASS" "ledgers present"
-        else
-            gate_record_check "$name" "FAIL" "ledger check failed"
-        fi
-    else
-        gate_record_check "$name" "SKIP" "no ledger checker"
-    fi
+    local full="${1:-0}" repo_root checker
+    if (( ! full && ! HAS_LEDGER )); then gate_record_check memory-check SKIP "ledgers unchanged"; return; fi
+    repo_root="$(gate_repo_root)"; checker="$repo_root/.claude/skills/os-agent-task/scripts/init-project-ledger.sh"
+    [[ -f "$checker" ]] || { gate_record_check memory-check UNVERIFIED "ledger checker missing"; return; }
+    if gate_run_logged "$GATE_ARTIFACT_DIR/logs/memory-check.log" bash "$checker" check; then gate_record_check memory-check PASS
+    else gate_record_check memory-check FAIL "ledger check failed"; fi
 }
 
-# ---- main dispatch ----
+check_harness_selftest() {
+    local full="${1:-0}" test="$OS_AGENT_DIR/tests/test-harness.sh"
+    if [[ "${GATE_SKIP_HARNESS_SELFTEST:-0}" == 1 ]]; then gate_record_check harness-selftest SKIP "disabled by environment"; return; fi
+    if (( ! HAS_HARNESS )) && [[ "${GATE_FULL_HARNESS:-0}" != 1 ]]; then gate_record_check harness-selftest SKIP "Harness unchanged"; return; fi
+    [[ -f "$test" ]] || { gate_record_check harness-selftest FAIL "test-harness.sh missing"; return; }
+    local -a args=(--fast); (( full )) && args=(--full)
+    if gate_run_logged "$GATE_ARTIFACT_DIR/logs/harness-selftest.log" bash "$test" "${args[@]}"; then gate_record_check harness-selftest PASS "isolated ${args[*]}"
+    else gate_record_check harness-selftest FAIL "isolated self-test failed"; fi
+}
 
-run_checks_for_mode() {
-    local mode="$1"
-
-    case "$mode" in
-        implement|review|review-fix|audit)
-            ;;
-        *)
-            gate_log 0 "Unknown mode: $mode"
-            return 1
-            ;;
-    esac
-
-    local gate_script="$OS_AGENT_DIR/gates/define-gates.sh"
-    if [[ -f "$gate_script" ]]; then
-        source "$gate_script"
-    else
-        gate_log 0 "Gate definitions not found: $gate_script"
-        return 1
-    fi
-
-    case "$mode" in
-        implement)  gate_implement ;;
-        review)     gate_review ;;
-        review-fix) gate_review_fix ;;
-        audit)      gate_audit ;;
-    esac
+check_reused_validation() {
+    local src="${GATE_REUSED_FROM:-}"
+    if [[ -n "$src" && -f "$src/summary.txt" ]] && grep -q '^verdict=PASS$' "$src/summary.txt"; then gate_record_check reused-validation PASS "$src"
+    else gate_record_check reused-validation INCOMPLETE "cache record invalid"; fi
 }

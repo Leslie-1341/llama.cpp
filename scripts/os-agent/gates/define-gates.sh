@@ -1,130 +1,96 @@
 #!/usr/bin/env bash
-# define-gates.sh — gate definitions per mode
-# Each gate_* function runs the appropriate checks in order.
+# Mode/profile composition. Expensive checks are not repeated after compatible PASS reuse.
 
 set -euo pipefail
 
-# --- implement gate: full checks ---
-gate_implement() {
-    gate_log 1 "Gate IMPLEMENT: running full check suite"
-
+gate_static_checks() {
     check_git_diff_check
+    check_shell_syntax
+    check_python_syntax
+}
 
-    if (( HAS_CPP || HAS_C || HAS_H )); then
-        target_mapper_init "${GATE_BUILD_DIR:-build}"
+gate_build_checks() {
+    if (( HAS_CPP || HAS_C || HAS_H || HAS_CMAKE )); then
         check_cmake_configure
         check_compile_commands
-        check_clang_tidy
         check_incremental_build
     else
-        gate_record_check "cmake-configure" "SKIP" "no C/C++ changes"
-        gate_record_check "compile-commands" "SKIP" "no C/C++ changes"
-        gate_record_check "clang-tidy" "SKIP" "no C/C++ changes"
-        gate_record_check "incremental-build" "SKIP" "no C/C++ changes"
-    fi
-
-    # If C++ files were deleted, flag it (but don't block — deletion may be intentional)
-    if (( HAS_DELETED_CPP || HAS_DELETED_C || HAS_DELETED_H )); then
-        local deleted_count
-        deleted_count=$(printf '%s\n' "${DIFF_CLASSES[deleted_cpp]:-}${DIFF_CLASSES[deleted_c]:-}${DIFF_CLASSES[deleted_h]:-}" | sed '/^$/d' | wc -l)
-        gate_record_check "deleted-cpp-files" "PASS" "$deleted_count C/C++ files deleted — verify dependencies"
-    fi
-
-    check_shell_syntax
-    check_python_syntax
-    check_parser_test
-    check_fixture_binding
-    check_skill_validation
-    check_memory_check
-}
-
-# --- review gate: diff-focused checks ---
-gate_review() {
-    gate_log 1 "Gate REVIEW: running review checks"
-
-    check_git_diff_check
-    check_shell_syntax
-    check_python_syntax
-
-    if (( HAS_CPP || HAS_C || HAS_H )); then
-        target_mapper_init "${GATE_BUILD_DIR:-build}"
-        check_compile_commands
-        check_clang_tidy
-        check_incremental_build
-    else
-        gate_record_check "compile-commands" "SKIP" "no C/C++ changes"
-        gate_record_check "clang-tidy" "SKIP" "no C/C++ changes"
-        gate_record_check "incremental-build" "SKIP" "no C/C++ changes"
-    fi
-
-    check_cmake_configure
-    check_parser_test
-    check_fixture_binding
-    check_skill_validation
-
-    if (( HAS_DELETED_ANY )); then
-        gate_record_check "deleted-files" "PASS" "deleted files noted — review impact"
+        gate_record_check cmake-configure SKIP "no C/C++ or CMake changes"
+        gate_record_check compile-commands SKIP "no C/C++ changes"
+        gate_record_check incremental-build SKIP "no C/C++ changes"
     fi
 }
 
-# --- review-fix gate: targeted fix verification ---
-gate_review_fix() {
-    gate_log 1 "Gate REVIEW-FIX: running fix verification"
-
-    check_git_diff_check
-    check_shell_syntax
-    check_python_syntax
-
-    if (( HAS_CPP || HAS_C || HAS_H )); then
-        target_mapper_init "${GATE_BUILD_DIR:-build}"
-        check_compile_commands
-        check_incremental_build
-    else
-        gate_record_check "compile-commands" "SKIP" "no C/C++ changes"
-        gate_record_check "incremental-build" "SKIP" "no C/C++ changes"
-    fi
-
-    check_parser_test
-    check_fixture_binding
-    check_skill_validation
+gate_quick() {
+    gate_static_checks
+    gate_build_checks
+    check_parser_test 0
+    check_fixture_binding 0
+    check_skill_validation 0
+    check_memory_check 0
+    check_harness_selftest 0
 }
 
-# --- audit gate: classification and read-only checks only ---
-gate_audit() {
-    gate_log 1 "Gate AUDIT: read-only classification"
-
-    check_git_diff_check
-    check_shell_syntax
-    check_python_syntax
-
-    if (( HAS_CPP || HAS_C || HAS_H )); then
-        target_mapper_init "${GATE_BUILD_DIR:-build}"
-        check_compile_commands
-
-        # Audit: only check mapping, don't build
-        local cpp_files
-        cpp_files="$(printf '%s\n' "${DIFF_CLASSES[cpp]:-}" | sed '/^$/d' || true)"
-        if [[ -n "$cpp_files" ]]; then
-            local resolved
-            if resolved=$(targets_for_files 0 $cpp_files 2>/dev/null); then
-                gate_record_check "target-resolution" "PASS" "all C++ files mapped to verified targets"
-            else
-                gate_record_check "target-resolution" "UNRESOLVED" "some C++ files have no verified target"
-            fi
-        else
-            gate_record_check "target-resolution" "SKIP" "no C++ files"
-        fi
+gate_verify() {
+    gate_static_checks
+    if [[ -n "${GATE_REUSED_FROM:-}" ]]; then
+        check_reused_validation
+        gate_record_check cmake-configure SKIP "reused unchanged fingerprint"
+        gate_record_check compile-commands SKIP "reused unchanged fingerprint"
+        gate_record_check incremental-build SKIP "reused unchanged fingerprint"
+        gate_record_check parser-registry SKIP "reused unchanged fingerprint"
+        gate_record_check parser-test SKIP "reused unchanged fingerprint"
+        gate_record_check fixture-binding SKIP "reused unchanged fingerprint"
     else
-        gate_record_check "compile-commands" "SKIP" "no C/C++ changes"
-        gate_record_check "target-resolution" "SKIP" "no C++ files"
+        gate_build_checks
+        check_parser_test 0
+        check_fixture_binding 0
     fi
+    if (( HAS_CPP || HAS_C )); then check_clang_tidy; else gate_record_check clang-tidy SKIP "no changed translation units"; fi
+    check_skill_validation 0
+    check_memory_check 0
+    check_harness_selftest 0
+}
 
-    if (( HAS_DELETED_ANY )); then
-        gate_record_check "deleted-files" "PASS" "deleted files noted"
+gate_full() {
+    gate_static_checks
+    gate_build_checks
+    check_clang_tidy
+    check_parser_test 1
+    check_fixture_binding 1
+    check_skill_validation 1
+    check_memory_check 1
+    check_harness_selftest 1
+}
+
+gate_audit_profile() {
+    TARGET_MAPPER_READ_ONLY=1
+    gate_static_checks
+    if (( HAS_CMAKE )); then
+        gate_record_check cmake-configure UNVERIFIED "audit is read-only; CMake changes require implement/verify"
+    else
+        gate_record_check cmake-configure SKIP "audit is read-only"
     fi
+    if (( HAS_CPP || HAS_C || HAS_H )); then
+        check_compile_commands
+    else
+        gate_record_check compile-commands SKIP "no C/C++ changes"
+    fi
+    check_parser_plan 0
+    check_fixture_binding 0
+    check_skill_validation 0
+    check_memory_check 0
+    gate_record_check incremental-build SKIP "audit is read-only"
+    gate_record_check clang-tidy SKIP "audit is read-only"
+    gate_record_check harness-selftest SKIP "audit is read-only"
+}
 
-    check_parser_test
-    check_fixture_binding
-    check_skill_validation
-    check_memory_check
+run_gate_profile() {
+    case "$GATE_PROFILE" in
+        audit) gate_audit_profile ;;
+        quick) gate_quick ;;
+        verify) gate_verify ;;
+        full) gate_full ;;
+        *) gate_record_check harness-profile INCOMPLETE "unknown profile: $GATE_PROFILE" ;;
+    esac
 }

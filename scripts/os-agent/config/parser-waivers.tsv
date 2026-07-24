@@ -1,0 +1,4 @@
+# Temporary parser failure waivers. Empty by default.
+# name<TAB>baseline_head<TAB>test_sha256<TAB>binding_sha256<TAB>failure_sha256<TAB>expires_utc<TAB>reason
+# A waiver is valid only when test/binding paths are unchanged in the current diff,
+# all hashes match, the failure signature matches, and expires_utc is in the future.

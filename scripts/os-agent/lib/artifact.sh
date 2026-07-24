@@ -1,60 +1,43 @@
 #!/usr/bin/env bash
-# artifact.sh — artifact directory creation and management
-# Default artifact root: /tmp/os-agent-gate/ (outside repo to prevent self-contamination)
-# Customizable via GATE_ARTIFACT_PREFIX env var.
+# Artifact lifecycle. Full command logs stay outside the repository.
 
 set -euo pipefail
 
-# After artifact_init, this variable contains the actual artifact prefix
-# so diff-analyzer can exclude it.
 declare GATE_ARTIFACT_PREFIX_USED=""
 
+artifact_prune() {
+    local prefix="$1" keep="${GATE_ARTIFACT_KEEP:-24}"
+    [[ "$keep" =~ ^[0-9]+$ ]] || keep=24
+    (( keep > 0 )) || return 0
+    mapfile -t old < <(find "$prefix" -mindepth 1 -maxdepth 1 -type d -name 'gate-*' -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk 'NR>'"$keep"'{print $2}')
+    ((${#old[@]} == 0)) || rm -rf -- "${old[@]}"
+}
+
 artifact_init() {
-    local repo_root
+    local repo_root timestamp prefix
     repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-    local timestamp
     timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-
-    # Default to outside-repo path to avoid self-contamination
-    local prefix="${GATE_ARTIFACT_PREFIX:-/tmp/os-agent-gate}"
+    prefix="${GATE_ARTIFACT_PREFIX:-/tmp/os-agent-gate}"
     GATE_ARTIFACT_PREFIX_USED="$prefix"
-    GATE_ARTIFACT_DIR="${prefix}/gate-${GATE_MODE}-${timestamp}"
-    mkdir -p "$GATE_ARTIFACT_DIR"
-
+    mkdir -p "$prefix"
+    GATE_ARTIFACT_DIR="$prefix/gate-${GATE_MODE}-${timestamp}-$$"
+    mkdir -p "$GATE_ARTIFACT_DIR/logs"
     GATE_FULL_LOG="$GATE_ARTIFACT_DIR/full.log"
     GATE_SUMMARY_FILE="$GATE_ARTIFACT_DIR/summary.txt"
-    GATE_START_TIME="$timestamp"
+    GATE_START_EPOCH=$(date +%s)
 
-    # Start the full log
-    cat > "$GATE_FULL_LOG" <<EOF
-# OS Agent Gate — full log
-# mode=${GATE_MODE}
-# artifact_dir=${GATE_ARTIFACT_DIR}
-# timestamp=${timestamp}
-# repo=${repo_root}
-# head=$(git rev-parse HEAD 2>/dev/null || echo unknown)
-# branch=$(git branch --show-current 2>/dev/null || echo unknown)
-# worktree_status=$(git status --porcelain 2>/dev/null | wc -l) untracked/working items
+    cat > "$GATE_FULL_LOG" <<LOG
+# OS Agent Gate compact execution log
+mode=${GATE_MODE}
+profile=${GATE_PROFILE}
+repo=${repo_root}
+head=$(git rev-parse HEAD 2>/dev/null || echo unknown)
+branch=$(git branch --show-current 2>/dev/null || echo unknown)
+started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 ---
-EOF
-
-    gate_log 1 "artifact_init: $GATE_ARTIFACT_DIR"
+LOG
+    artifact_prune "$prefix"
+    gate_log 1 "artifact=$GATE_ARTIFACT_DIR"
 }
 
-artifact_save_file() {
-    local src="$1"
-    local name="${2:-$(basename "$src")}"
-    if [[ -f "$src" ]]; then
-        cp "$src" "$GATE_ARTIFACT_DIR/$name"
-    fi
-}
-
-artifact_dir() {
-    printf '%s' "$GATE_ARTIFACT_DIR"
-}
-
-# Returns a grep -E compatible pattern for paths to exclude from diff analysis
-artifact_exclude_pattern() {
-    # Always exclude the actual artifact directory being used
-    printf '%s' "${GATE_ARTIFACT_PREFIX_USED:-/tmp/os-agent-gate}"
-}
+artifact_dir() { printf '%s' "$GATE_ARTIFACT_DIR"; }
