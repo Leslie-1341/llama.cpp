@@ -44,6 +44,13 @@ disable-model-invocation: true
 
 高风险或连续失败任务读取 [references/systemic-workflow.md](references/systemic-workflow.md)；`contract` 或需要推荐模型时读取 [references/model-selection.md](references/model-selection.md)。
 
+### 任务粒度与阻塞项规则
+
+- 任务保持中等粒度：一个任务对应一个可独立验收的目标结果。不把多个不相关的小修复合并为一个任务，也不把一个需要多轮 audit→implement→review 的复杂问题压缩为单轮。
+- **新增阻塞项必须先证明**：源码可达性（真实调用链可达，非推测）、阶段范围（在当前阶段目标范围内）、真实风险（会产生可观测错误行为或假通过）。纯理论风险、未经证实的“可能存在问题”或 agent 输出未提及某路径，本身不构成阻塞项。
+- **禁止将 agent 输出遗漏当作源码缺陷**：agent 未提及某调用链 ≠ 该调用链缺失；parser/Harness 未覆盖字段 ≠ core 未输出字段。覆盖缺口只有在当前协议明确要求该字段，且能够证明会造成假通过、错误归因或漏报时，才作为 tooling 阻塞项；否则记录为非阻塞建议。
+- 同一问题连续两轮未关闭时，必须停止局部修补，重新执行系统级 audit。
+
 以下任一情况视为**高风险系统任务**，必须使用完整状态/生命周期契约：
 
 - destructive release/reclaim/swap、持久化或 backing store；

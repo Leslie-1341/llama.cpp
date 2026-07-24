@@ -321,43 +321,105 @@ check_clang_tidy() {
 
 # ---- parser test check: explicit registration, no heuristic filtering ----
 
-# Registry: "name|path|flags"
+# Registry: "name|path|flags|binding"
 # Each entry is a parser test that can run without external artifacts.
 # Flags: selfcontained (runs without models/artifacts)
 #        knownfail (pre-existing failure — see below)
+# Binding: documents and machine-checks how the parser test reaches the real
+# parser/producer schema.
+#   module:<path>   — module exists; test references it and contains an import/execution path
+#   fixture:<path>  — fixture exists and the test source references its basename
+#   inline:<desc>   — human-only claim; recorded UNVERIFIED, never PASS
+#   none            — binding undocumented; recorded UNVERIFIED
 #
 # knownfail handling:
 #   A knownfail entry is a parser test that fails for reasons the operator has
 #   confirmed are PRE-EXISTING and unrelated to the current diff/stage.  The
 #   gate distinguishes two cases:
 #
-#     knownfail;unrelated (default)  — failure is NOT selected by the current
-#       diff/stage: RECORD it (logged + emitted in marker unresolved tally
-#       NOTE) but do NOT block the verdict.  A separate baseline-vs-worktree
-#       failure-signature comparison (see PROJECT_STATE / EXPERIMENTS) is the
-#       evidence that the failure is pre-existing.
-#     knownfail;selected             — failure IS selected by the current
-#       diff/stage (e.g. the stage explicitly targets this module) → UNRESOLVED
-#       and blocks until the operator resolves it.
+#     knownfail;unrelated — baseline evidence says the failure is pre-existing.
+#       It is non-blocking only while neither the test nor its bound module/fixture
+#       is changed by the current diff.
+#     knownfail;selected  — explicitly relevant to the current stage → UNRESOLVED.
+#       A current diff touching the test or bound path overrides unrelated and
+#       dynamically promotes the entry to selected.
 #
 #   Design intent (validation-policy): a newly-broken parser may NEVER disguise
 #   itself as a pre-existing knownfail.  An unregistered new test resolves to
 #   `unregistered` → UNRESOLVED.  A registered, non-knownfail test that fails
-#   → FAIL.  Only an entry EXPLICITLY marked knownfail;unrelated can be a
-#   non-blocking record, and that marking is human-curated against the diff.
+#   → FAIL. A knownfail can be non-blocking only with prior baseline evidence
+#   and while its test/bound producer paths are unchanged in the current diff.
 declare -a PARSER_TEST_REGISTRY=(
-    "test-kv-paged-identity-e2i-parser|tests/test-kv-paged-identity-e2i-parser.py|selfcontained"
-    "test-kv-e0-e2-e5-single-turn-parser|tests/test-kv-e0-e2-e5-single-turn-parser.py|selfcontained"
-    "test-kv-paged-release-correctness-parser|tests/test-kv-paged-release-correctness-parser.py|selfcontained"
-    "test-kv-dry-run-stage3a-2b-parser|tests/test-kv-dry-run-stage3a-2b-parser.py|selfcontained"
-    "test-kv-final-controlled-e0-e5-parser|tests/test-kv-final-controlled-e0-e5-parser.py|selfcontained"
-    "test-kv-bounded-release-stage3a-2c-parser|tests/test-kv-bounded-release-stage3a-2c-parser.py|selfcontained"
+    "test-kv-paged-identity-e2i-parser|tests/test-kv-paged-identity-e2i-parser.py|selfcontained|module:scripts/parse-kv-paged-identity-e2i.py"
+    "test-kv-e0-e2-e5-single-turn-parser|tests/test-kv-e0-e2-e5-single-turn-parser.py|selfcontained|module:scripts/parse-kv-e0-e2-e5-single-turn.py"
+    "test-kv-paged-release-correctness-parser|tests/test-kv-paged-release-correctness-parser.py|selfcontained|module:scripts/parse-kv-paged-release-correctness.py"
+    "test-kv-dry-run-stage3a-2b-parser|tests/test-kv-dry-run-stage3a-2b-parser.py|selfcontained|module:scripts/parse-kv-dry-run-stage3a-2b.py"
+    "test-kv-final-controlled-e0-e5-parser|tests/test-kv-final-controlled-e0-e5-parser.py|selfcontained|module:scripts/parse-kv-final-controlled-e0-e5.py"
+    "test-kv-bounded-release-stage3a-2c-parser|tests/test-kv-bounded-release-stage3a-2c-parser.py|selfcontained|module:scripts/parse-kv-bounded-release-stage3a-2c.py"
     # knownfail — pre-existing failures unrelated to Stage 3A-2C bounded-release diff
     # (baseline-vs-worktree failure-signature comparison confirms both fail identically
     # at HEAD=a2da80f52 without the working-tree diff; neither test file is in the diff.)
-    "test-server-kv-pressure-stage3a-1c-parser|tests/test-server-kv-pressure-stage3a-1c-parser.py|knownfail;unrelated"
-    "test-kv-paged-identity-controlled-ab-parser|tests/test-kv-paged-identity-controlled-ab-parser.py|knownfail;unrelated"
+    "test-server-kv-pressure-stage3a-1c-parser|tests/test-server-kv-pressure-stage3a-1c-parser.py|knownfail;unrelated|module:scripts/parse-server-kv-pressure-stage3a-1c.py"
+    "test-kv-paged-identity-controlled-ab-parser|tests/test-kv-paged-identity-controlled-ab-parser.py|knownfail;unrelated|module:scripts/parse-kv-paged-identity-controlled-ab.py"
 )
+
+
+_repo_path_changed() {
+    local repo_root="$1"
+    local rel_path="$2"
+    [[ -n "$rel_path" ]] || return 1
+
+    if git -C "$repo_root" diff --name-only --diff-filter=ACDMRTUXB HEAD -- "$rel_path" 2>/dev/null | grep -q .; then
+        return 0
+    fi
+    if git -C "$repo_root" ls-files --others --exclude-standard -- "$rel_path" 2>/dev/null | grep -q .; then
+        return 0
+    fi
+    return 1
+}
+
+_binding_path() {
+    local binding="${1:-}"
+    case "$binding" in
+        module:*|fixture:*) printf '%s' "${binding#*:}" ;;
+        *) return 1 ;;
+    esac
+}
+
+_parser_entry_selected_by_diff() {
+    local repo_root="$1"
+    local test_path="$2"
+    local binding="${3:-}"
+
+    _repo_path_changed "$repo_root" "$test_path" && return 0
+
+    local bound_path=""
+    if bound_path="$(_binding_path "$binding" 2>/dev/null)"; then
+        _repo_path_changed "$repo_root" "$bound_path" && return 0
+    fi
+    return 1
+}
+
+_parser_checks_relevant_to_diff() {
+    # C/C++ runtime changes can alter producer output. Python/shell changes are
+    # relevant only when they touch parsers, runners, parser tests, or Harness.
+    if (( HAS_CPP || HAS_C || HAS_H || HAS_DELETED_CPP || HAS_DELETED_C || HAS_DELETED_H )); then
+        return 0
+    fi
+
+    local path
+    for key in py sh deleted_py deleted_sh; do
+        while IFS= read -r path; do
+            [[ -n "$path" ]] || continue
+            case "$path" in
+                scripts/parse-*.py|scripts/run-*.py|scripts/run-*.sh|scripts/*kv*.sh|scripts/*protocol*.sh|tests/*parser*.py|scripts/os-agent/*)
+                    return 0
+                    ;;
+            esac
+        done <<< "${DIFF_CLASSES[$key]:-}"
+    done
+    return 1
+}
 
 check_parser_test() {
     local name="parser-test"
@@ -388,16 +450,17 @@ check_parser_test() {
         local bn; bn="$(basename "$candidate")"
         local matched=0
         for entry in "${PARSER_TEST_REGISTRY[@]}"; do
-            IFS='|' read -r reg_name reg_path reg_flags <<< "$entry"
+            IFS='|' read -r reg_name reg_path reg_flags reg_binding <<< "$entry"
             if [[ "$bn" == "$(basename "$reg_path")" ]]; then
                 matched=1
                 if [[ "$reg_flags" == *"knownfail"* ]]; then
-                    if [[ "$reg_flags" == *"selected"* ]]; then
+                    if [[ "$reg_flags" == *"selected"* ]] || \
+                       _parser_entry_selected_by_diff "$repo_root" "$reg_path" "$reg_binding"; then
                         knownfail_selected+=("$bn")
-                        excluded_reasons+=("$bn: knownfail;selected — this stage explicitly targets its module")
+                        excluded_reasons+=("$bn: knownfail selected — current diff touches the test or bound producer/fixture")
                     else
                         knownfail_unrelated+=("$bn")
-                        excluded_reasons+=("$bn: knownfail;unrelated — pre-existing failure, baseline-vs-worktree confirmed unrelated")
+                        excluded_reasons+=("$bn: knownfail unrelated — baseline evidence retained and bound paths unchanged")
                     fi
                 else
                     run_list+=("$candidate")
@@ -417,7 +480,7 @@ check_parser_test() {
     if (( ${#knownfail_selected[@]} > 0 )); then
         gate_log 1 "$name: UNRESOLVED — ${#knownfail_selected[@]} selected knownfail tests"
         for reason in "${excluded_reasons[@]}"; do
-            if [[ "$reason" == *"knownfail;selected"* ]]; then
+            if [[ "$reason" == *"knownfail selected"* ]]; then
                 gate_log 2 "$name: selected: $reason"
             fi
         done
@@ -433,7 +496,7 @@ check_parser_test() {
     if (( ${#knownfail_unrelated[@]} > 0 )); then
         gate_log 1 "$name: NOTED — ${#knownfail_unrelated[@]} unrelated knownfail tests (non-blocking)"
         for reason in "${excluded_reasons[@]}"; do
-            if [[ "$reason" == *"knownfail;unrelated"* ]]; then
+            if [[ "$reason" == *"knownfail unrelated"* ]]; then
                 gate_log 2 "$name: unrelated: $reason"
             fi
         done
@@ -451,11 +514,11 @@ check_parser_test() {
         return
     fi
 
-    # Phase 5: skip if no relevant changes — but mark as UNVERIFIED
-    # (not SKIP) since registered parser tests could validate the diff.
-    if [[ -z "${DIFF_CLASSES[py]:-}" ]] && [[ -z "${DIFF_CLASSES[cpp]:-}" ]] && [[ -z "${DIFF_CLASSES[sh]:-}" ]]; then
-        gate_record_check "$name" "UNVERIFIED" \
-            "no relevant py/cpp/sh changes — cannot verify parser tests are unrelated"
+    # Phase 5: neutral when the diff cannot affect a runtime producer,
+    # runner, parser, parser test, or Harness. This is SKIP, not UNVERIFIED,
+    # because the check is genuinely not applicable.
+    if ! _parser_checks_relevant_to_diff; then
+        gate_record_check "$name" "SKIP" "no parser/runtime/Harness-relevant changes"
         return
     fi
 
@@ -488,6 +551,117 @@ check_parser_test() {
     else
         gate_record_check "$name" "PASS" "$total parser tests OK${kf_note}"
     fi
+}
+
+# ---- fixture binding check: verify parser tests reach their declared schema authority ----
+#
+# This is stronger than checking that a parser module merely exists. The
+# registry entry, test file, and bound module/fixture must all exist, and the
+# test source must reference the bound basename. Inline claims are human-only
+# and therefore UNVERIFIED, never PASS.
+check_fixture_binding() {
+    local name="fixture-binding"
+    gate_log 1 "Running $name..."
+
+    local repo_root
+    repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+
+    local missing_tests=0 missing_targets=0 unbound=0 undocumented=0 malformed=0 verified=0 duplicates=0
+    local total=${#PARSER_TEST_REGISTRY[@]}
+    local -A seen_names=() seen_paths=()
+
+    local entry reg_name reg_path reg_flags reg_binding test_file target_path target_file target_base
+    for entry in "${PARSER_TEST_REGISTRY[@]}"; do
+        IFS='|' read -r reg_name reg_path reg_flags reg_binding <<< "$entry"
+
+        if [[ -z "$reg_name" || -z "$reg_path" || -z "$reg_flags" ]]; then
+            gate_log 1 "$name: malformed registry entry: $entry"
+            malformed=$((malformed + 1))
+            continue
+        fi
+
+        if [[ -n "${seen_names[$reg_name]+present}" || -n "${seen_paths[$reg_path]+present}" ]]; then
+            gate_log 1 "$name: duplicate registry name/path: $reg_name | $reg_path"
+            duplicates=$((duplicates + 1))
+            continue
+        fi
+        seen_names["$reg_name"]=1
+        seen_paths["$reg_path"]=1
+
+        test_file="$repo_root/$reg_path"
+        if [[ ! -f "$test_file" ]]; then
+            gate_log 1 "$name: $reg_name → test file missing: $reg_path"
+            missing_tests=$((missing_tests + 1))
+            continue
+        fi
+
+        if [[ -z "$reg_binding" || "$reg_binding" == "none" ]]; then
+            gate_log 2 "$name: $reg_name → binding undocumented"
+            undocumented=$((undocumented + 1))
+            continue
+        fi
+
+        case "$reg_binding" in
+            module:*)
+                target_path="${reg_binding#module:}"
+                target_file="$repo_root/$target_path"
+                if [[ -z "$target_path" || ! -f "$target_file" ]]; then
+                    gate_log 1 "$name: $reg_name → bound module missing: $target_path"
+                    missing_targets=$((missing_targets + 1))
+                    continue
+                fi
+
+                target_base="$(basename "$target_path")"
+                if grep -Fq "$target_base" "$test_file" &&                    grep -Eq 'subprocess|importlib|runpy' "$test_file"; then
+                    gate_log 2 "$name: $reg_name → module:$target_path referenced through an execution/import path"
+                    verified=$((verified + 1))
+                else
+                    gate_log 1 "$name: $reg_name → test does not execute/import bound module: $target_base"
+                    unbound=$((unbound + 1))
+                fi
+                ;;
+            fixture:*)
+                target_path="${reg_binding#fixture:}"
+                target_file="$repo_root/$target_path"
+                if [[ -z "$target_path" || ! -f "$target_file" ]]; then
+                    gate_log 1 "$name: $reg_name → bound fixture missing: $target_path"
+                    missing_targets=$((missing_targets + 1))
+                    continue
+                fi
+
+                target_base="$(basename "$target_path")"
+                if grep -Fq "$target_base" "$test_file"; then
+                    gate_log 2 "$name: $reg_name → fixture:$target_path referenced by test"
+                    verified=$((verified + 1))
+                else
+                    gate_log 1 "$name: $reg_name → test does not reference bound fixture: $target_base"
+                    unbound=$((unbound + 1))
+                fi
+                ;;
+            inline:*)
+                gate_log 2 "$name: $reg_name → inline claim is not machine-verifiable"
+                undocumented=$((undocumented + 1))
+                ;;
+            *)
+                gate_log 1 "$name: $reg_name → unknown binding type: $reg_binding"
+                malformed=$((malformed + 1))
+                ;;
+        esac
+    done
+
+    local detail="$verified verified, $missing_tests test missing, $missing_targets target missing, $unbound unbound, $undocumented unverified, $malformed malformed, $duplicates duplicate of $total entries"
+
+    if (( missing_tests > 0 || missing_targets > 0 || unbound > 0 || malformed > 0 || duplicates > 0 )); then
+        gate_record_check "$name" "FAIL" "$detail"
+        return
+    fi
+
+    if (( undocumented > 0 )); then
+        gate_record_check "$name" "UNVERIFIED" "$detail"
+        return
+    fi
+
+    gate_record_check "$name" "PASS" "$detail"
 }
 
 check_skill_validation() {

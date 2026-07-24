@@ -33,6 +33,7 @@ gate_implement() {
     check_shell_syntax
     check_python_syntax
     check_parser_test
+    check_fixture_binding
     check_skill_validation
     check_memory_check
 }
@@ -58,6 +59,7 @@ gate_review() {
 
     check_cmake_configure
     check_parser_test
+    check_fixture_binding
     check_skill_validation
 
     if (( HAS_DELETED_ANY )); then
@@ -83,6 +85,7 @@ gate_review_fix() {
     fi
 
     check_parser_test
+    check_fixture_binding
     check_skill_validation
 }
 
@@ -121,6 +124,7 @@ gate_audit() {
     fi
 
     check_parser_test
+    check_fixture_binding
     check_skill_validation
     check_memory_check
 }

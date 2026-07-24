@@ -2,59 +2,148 @@
 
 > 追加式实验索引。只记录可追溯协议与证据入口，不复制大日志，不用未运行或失败结果支撑正式结论。
 
-## E-0001 — 当前 HEAD 的 KV controlled E0-E5
+## E-0001 — 当前 HEAD 的 KV controlled E0–E5
 
 - Status: planned
-- Date: 2026-07-15
-- Commit/worktree: 目标 commit `d9d2e3b80acff27b3ff793003bb1f47ee212613b`；当前 HEAD `adfe67136` 包含 release correctness 基础设施，E0-E5 正式模型矩阵尚未运行
+- Date: 2026-07-15 首次入账；截至 2026-07-24 正式矩阵仍未运行
+- Protocol/parser evidence commit: `d9d2e3b80acff27b3ff793003bb1f47ee212613b`
 - Runner/protocol: `scripts/kv-final-controlled-e0-e5.sh`；`docs/kv_final_controlled_e0_e5_protocol.md`
 - Parser: `scripts/parse-kv-final-controlled-e0-e5.py`
 - Raw artifacts: 尚未生成
 
-_(remaining content unchanged — refer to previous version of this experiment ledger)_
+**Question**
 
+在固定 idle/resume workload 下，lazy、paged gather、swap、madvise、prefetch/defer 是否正确触发，并如何影响 current RSS、active-token latency、TPS、wall time 和 backing I/O？
+
+**Variants**
+
+- E0: experimental KV mechanisms off
+- E1: lazy clear/tail
+- E2: paged row-index + in-graph gather
+- E3: E2 + paged idle swap, no madvise
+- E4: E3 + madvise
+- E5: E4 + active delayed prefetch/defer
+
+**Protocol**
+
+Driver `llama-kv-idle-swap-resume`；ctx 2048、n-predict 128、batch/ubatch 128、parallel 4、seed 1、temp 0、K/V F32、unified KV。Functional smoke uses RUNS=1；formal mode uses RUNS=3 with interleaved order。Warmup 256 tokens、idle seqs 2、resume pending 96。
+
+Correctness requires exit 0、same-round Seq0/Seq1 text and SHA256 equal to E0、all required safety/backend/I/O fields zero、case mechanism actually triggered。Missing mandatory data is UNVERIFIED；identity/order/case errors fail closed。
+
+**Result and limits**
+
+尚未运行，不能支持当前 HEAD 的 E0–E5 correctness 或 performance 结论。固定 example workload 也不等同于 HTTP server、ShareGPT 或 production continuous batching。
 ## E-0002 — Stage 12-C ShareGPT-backed historical report
 
-- Status: historical-unverified
+- Status: historical-unverified（不能作为当前 HEAD 正式证据）
+- Date: historical docs 2026-06-23 to 2026-06-24；2026-07-15 入账
+- Commit/worktree: 无法确认
+- Runner/report: `docs/reproduce_kv_cache_optimization.md`、`examples/kv-trace-replay/`、`scripts/kv_trace_from_sharegpt.py`、`docs/kv_trace_replay_stage12c_real_sharegpt_results.md`
+- Raw artifacts/hash index: 仓库内缺失
 
-_(remaining content unchanged — refer to previous version of this experiment ledger)_
+**Question and workload**
 
+在 ShareGPT-backed synthetic multi-session idle/resume trace 下，fast-maintenance Paged-KV 是否降低 current RSS，并控制 TPS 与 resume first-token 回退？ShareGPT 只提供文本/多轮结构，arrival、idle 和 concurrency 为合成。
+
+**Historical report**
+
+文档报告 Ubuntu 22.04、Linux 5.15、x86-64 8 cores/23 GB、SSD、Llama-3-8B Q4_K_M、K/V F32，并给出 baseline、aggressive S5、fast-maintenance V4/V5、ctx8192、mincore diagnostic 和组件消融。
+
+Reported values: V5 ctx4096 RSS drop 611.883 MiB、TPS delta -3.007%；ctx8192 RSS drop 1619.195 MiB、TPS delta -1.006%。
+
+**Supported conclusion and limits**
+
+只能证明仓库历史文档曾报告这些口径和值。缺少 raw logs、binary/model hashes、run commit/worktree 和完整 run order，不能用于当前 HEAD 正式正确性、性能或可复现性结论。
 ## E-0003 — 仓库内 ctx512 单次 baseline
 
-- Status: historical-single-run
+- Status: historical-single-run / invalid for comparison
+- Date: 无法确认；2026-07-15 入账
+- Commit/worktree: 无法确认
+- Raw files: `results/kv_baseline/ctx512_run1.log`、`ctx512_run1.time`、`baseline_summary.csv`、`run_meta.txt`
 
-_(remaining content unchanged — refer to previous version of this experiment ledger)_
+**Workload**
 
+Llama-3-8B-Instruct Q4_K_M、CPU、threads 12、ngl 0、ctx 512、n_predict 16、seed 42、prompt `Hello, how are you?`。OS、CPU、compiler/build、model/binary hash 和 commit 缺失。
+
+**Observed single-run result**
+
+- max RSS: 8,192,968 KiB
+- prompt throughput: 42.90 tokens/s
+- decode throughput: 15.37 tokens/s
+- total: 1,145.84 ms
+
+**Supported conclusion and limits**
+
+只能证明一次未绑定 commit 的 baseline invocation 成功。单次运行、无 variant、无 correctness comparison，不能支持性能比较或回归。
 ## Unconfirmed Claims Not Registered as Valid Experiments
 
-- `README.md` 中 Dense Flex、MoE-Buffer、CLG、极端内存和"KV + flex auto"组合表缺少仓库内 raw logs、hash、运行 commit/worktree 与完整协议，目前无法确认。
-- `README_KV_OPT.md` 与归档 stage docs 可作为历史设计和结果入口，但不能覆盖当前源码或替代 E-0001 的当前 HEAD 受控验证。
+- `README.md` 中 Dense Flex、MoE-Buffer、CLG、极端内存和“KV + flex auto”组合表缺少当前仓库可核对的 raw logs、hash、run commit/worktree 和完整协议，不能覆盖正式受控实验。
+- `README_KV_OPT.md` 与归档 stage docs 可作为历史设计/结果入口，但不能替代当前 HEAD artifact。
+- 理论估计、单次最好结果、exit 0、marker 出现、内部 counter 下降或 gate PASS 均不能单独成为正式性能结论。
+## E-0004 — Stage 1 E0/E2/E5 single-turn diagnostic
 
-## E-0004 — Stage 1 E0/E2/E5 单 token 诊断框架
+- Status: diagnostic-valid for bottleneck localization；invalid for formal performance
+- Date: 2026-07-15 to 2026-07-16
+- Artifact: `/root/oscomp/kv_logs/kv_e0_e2_e5_single_turn_20260715T165518Z_104953`
+- Runner/parser: `scripts/kv-e0-e2-e5-single-turn-diagnose.sh` / `scripts/parse-kv-e0-e2-e5-single-turn.py`
 
-- Status: invalid（不能作为当前 HEAD 的有效模型实验或性能结论）
+**Question**
 
-_(remaining content unchanged — refer to previous version of this experiment ledger)_
+定位 E2 paged gather 和 E5 active prefetch 的主要成本，不修改 scheduler 或 CPU kernel hot path。
 
-## E-0005 — clean-HEAD paged identity E2I 功能门禁
+**Result**
+
+- E0/E2 correctness and mechanism checks passed, but performance attribution was explicitly disabled/unavailable and remained UNRESOLVED.
+- E5 token→prefetch call→physical block→phase correlation passed.
+- 17 active-token prefetch calls corresponded to 17 restored physical blocks.
+- Within the measured block restore phases: unpack/tensor write-back about 70.76%, backing read about 29.20%, validate about 0.035%, commit about 0.004%.
+- Diagnostic exit was nonzero because unresolved performance attribution was not converted into PASS.
+
+**Supported conclusion and limits**
+
+The evidence supports a Stage 1 diagnostic direction: E5 cost was dominated by unpack/write-back, then backing read; metadata commit was negligible in that run. It does not provide formal E0/E2/E5 performance comparison or p95/p99 conclusion.
+## E-0005 — clean-HEAD paged identity E2I functional gate
 
 - Status: valid
 - Date: 2026-07-16
-- Commit/worktree: `a744830e90969a2298785cdd994901f8f448995a`；manifest 记录 clean worktree
+- Commit/worktree: `a744830e90969a2298785cdd994901f8f448995a`；manifest clean
 - Runner/parser: `scripts/kv-paged-identity-e2i.sh` / `scripts/parse-kv-paged-identity-e2i.py`
-- Raw artifact: `/root/oscomp/kv_logs/kv_paged_identity_e2i_smoke_20260716T135342Z`
+- Artifact: `/root/oscomp/kv_logs/kv_paged_identity_e2i_smoke_20260716T135342Z`
+- Manifest SHA256: `feee0b1f8951a35b597ce9ccbbe82dd0fe492bb67f90d897352bd80c90d51c82`
+- Summary SHA256: `ad4276ec29f62a92d8b323892d29a889912c6285a59d9aa1f17c6890a55e8d`
 
-_(remaining content unchanged — refer to previous version of this experiment ledger)_
+**Question**
 
-## E-0006 — static identity E2G/E2I 三轮 controlled A/B
+Static identity context 是否能省略 paged row-index/gather，同时保证 graph topology、mechanism activation 和 output correctness？
 
-- Status: valid
+**Result**
+
+Parser exit 0；functional artifact valid。Eligible E2I context 使用 continuous K/V view；不合格或动态配置保持 E2G gather。Graph reuse topology mismatch 时拒绝复用。
+
+**Supported conclusion and limits**
+
+支持保留 fast path 的功能正确性，不单独支持性能收益。适用范围限定为 context-lifetime static identity、supported CPU layout 和无动态 residency/mapping mutation。
+## E-0006 — static identity E2G/E2I three-round controlled A/B
+
+- Status: valid artifact；performance judgment `MIXED`
 - Date: 2026-07-16
-- Commit/worktree: `a744830e90969a2298785cdd994901f8f448995a`；manifest 记录 clean worktree
-- Raw artifact: `/root/oscomp/kv_logs/kv_paged_identity_controlled_ab_20260716T142722Z`
+- Commit/worktree: `a744830e90969a2298785cdd994901f8f448995a`；manifest clean
+- Artifact: `/root/oscomp/kv_logs/kv_paged_identity_controlled_ab_20260716T142722Z`
+- Manifest SHA256: `46dff8b8f42d87435e6a9bdab3b44600cdbc0cbb1d4509a6d2ad4ad8939372bf`
 
-_(remaining content unchanged — refer to previous version of this experiment ledger)_
+**Question and protocol**
 
+Compare paged gather E2G with static identity E2I using three paired/interleaved rounds, while requiring output correctness and actual mechanism selection.
+
+**Result**
+
+- TPOT, TPS and wall time were favorable to E2I in 3/3 rounds.
+- p95 was favorable in 2/3 rounds.
+- Strict aggregate judgment remained `MIXED`.
+
+**Supported conclusion and limits**
+
+The result is sufficient for the engineering decision to retain the fast path, but not for a final competition performance claim. It covers one model/workload/machine and does not establish server continuous-batching, long-context or multi-model benefit.
 ## E-0007 — Stage 3A-0 RELEASED 生命周期 R0–R5/N0–N2 长门禁
 
 - Status: valid
@@ -133,7 +222,6 @@ R1 mincore: `mincore_before_last=243,793,920` bytes (~232 MiB) 在 madvise 前 r
 - 固定 example workload（ctx 1024、n-predict 16、parallel 4、idle seqs 2）不等同于 server continuous batching 或生产 ShareGPT trace。
 - 不覆盖 GPU/device memory、multi-stream、v_trans、不同 block_size 或非 Llama 模型。
 - 62 个 released block 全部是 UNUSED block（无 live owner），符合 destructive release 仅回收 no-backing dead/unused block 的契约；released_dead 在本 workload 中为 0，不表示 dead block release 路径异常——该路径的单元测试覆盖由 `tests/test-kv-paged-release-ownership.cpp` 提供。
-
 ## E-0008 — Stage 3A-1B pressure sampler-only 单元、sanitizer 与严格 warning 验证
 
 - Status: valid（仅限 sampler-only 正确性/构建门禁）
@@ -163,7 +251,6 @@ R1 mincore: `mincore_before_last=243,793,920` bytes (~232 MiB) 在 madvise 前 r
 - **尚未验证真实模型状态转换。** 当前状态转换证据来自 synthetic/fixture，不代表真实 RSS/cgroup/PSI 序列。
 - **尚未验证 server 时延。** 未测 TTFT、TPOT、吞吐、p50/p95/p99 或不同采样频率的累计开销。
 - **尚未验证 bounded reclaim。** sampler 与 `paged_release_blocks()` 无运行时连接，未验证回收预算、RSS 降幅、并发干扰或 live/shared block 安全性。
-
 ## E-0009 — Stage 3A-1C server pressure telemetry 集成与验证协议
 
 - Status: **valid**（真实 server + Meta-Llama-3-8B Q4_K_M，10/10 cases PASS）
@@ -234,7 +321,6 @@ R1 mincore: `mincore_before_last=243,793,920` bytes (~232 MiB) 在 madvise 前 r
 - **性能结论为 EXPLORATORY_ONLY**（n=3，单模型、单提示、无并发请求、ctx 1024、32 token 输出）。不构成正式 TTFT/TPOT/吞吐收益或退化声明。
 - Pressure thresholds 1/2/3 KiB 为 forced lifecycle validation，非部署推荐值。
 - 不覆盖：并发请求、长上下文、真实内存压力下的 CRITICAL 状态转换、不同模型/quantization、GPU/device memory。
-
 ## E-0010 — Stage 3A-2A bounded release 原语正确性测试
 
 - Status: **registered**（test binary build 通过、CTest 注册、Part A 无需模型可运行；Part B 因环境缺少 `LLAMACPP_TEST_MODELFILE` 而 SKIP）
@@ -295,6 +381,9 @@ Test config: `LLAMA_KV_PAGED=1 LLAMA_KV_PAGED_RELEASE=1 LLAMA_KV_PAGED_BLOCK_SIZ
 - 证据限制：Part B 正式 run 因缺少模型而 SKIP——本条目为 `registered` 状态，不得升级为 `valid` 直至提供模型运行并通过全部 B1–B11 assertions。
 - **不覆盖**：并发 request、server scheduler 集成、pressure-driven 触发、RSS 降幅、TTFT/TPOT/吞吐影响、长上下文、不同模型/quantization/block_size。
 
+**Later status addendum — Stage 3A-2C (2026-07-23)**
+
+Stage 3A-2C 的定向短验证已运行当前扩展后的 WT0–WT23 并全部通过，同时 server integration/static tests 通过。E-0010 仍保留 `registered`，因为它记录的是 `949fbd0c8` 当时的独立 Part B 归档状态；后续短验证不能反向伪造该旧 artifact。端到端 server 证据见 E-0012。
 ## E-0011 — Stage 3A-2B pressure-driven KV reclaim dry-run OFF/ON controlled A/B
 
 - Status: **valid**（真实 server + Meta-Llama-3-8B Q4_K_M，OFF/ON controlled A/B，parser exit 0、verdict PASS）
@@ -357,10 +446,96 @@ Timeout: 60s, non-dry-run（runner 参数命名；server 行为是 dry-run）。
 - Dry-run 的 `const` 零 mutation 属性在 C++ 类型系统和源码审计层面成立；strace 的零 MADV_DONTNEED 确认了 syscall 层面的零 destructive 行为。但尚未验证 `const_cast` 绕过或其他 indirect mutation 路径是否存在。
 - 本实验固定使用 32 MiB target_bytes 和 64 max_scan_blocks——这些值与 dry-run 的 would-release 预测相关，但当前 artifact 的 would-release 字节/block 计数的绝对值不构成正式容量或回收率结论。
 
-**Relation to next gate**
+**Relation to later gate**
 
-本实验完成 dry-run 控制链路验证后，下道门禁 Stage 3A-2C 将 dry-run scanner 替换为真实 destructive `paged_release_blocks_bounded()`，在相同 OFF/ON controlled A/B 协议下验证：
-- ON strace 确认 MADV_DONTNEED 发生且计数与 release marker 一致；
-- 响应仍 byte-identical（release 不误伤 active-owned block）；
-- ownership ABORT 零发生；
-- 使用固定 target_bytes（非动态阈值）以便与 dry-run 的 would-release 预测对比。
+Stage 3A-2C subsequently completed the destructive server path and is recorded in E-0012. E-0011 remains the independent evidence that the policy control chain could first be exercised read-only, with would-release output and no target destructive action.
+
+## E-0012 — Stage 3A-2C bounded destructive release OFF/DRY/BOUNDED controlled validation
+
+- Status: **valid diagnostic**（dirty-tree real-model PASS）
+- Date: 2026-07-23
+- Runtime base: `cffe4f5ae`
+- Parser fix in working tree was later committed as `0fe0aed12`
+- Capture mode: `diagnostic_dirty`；not clean-HEAD archival
+- Runner: `scripts/run-kv-bounded-release-stage3a-2c.py`
+- Parser: `scripts/parse-kv-bounded-release-stage3a-2c.py`
+- Parser tests: `tests/test-kv-bounded-release-stage3a-2c-parser.py`（35/35 after trigger fix）
+- Runner tests: 8/8
+- Artifact: `/root/oscomp/kv_logs/kv_bounded_release_stage3a_2c_20260723T161538Z_cffe4f5aea_ba3095de5079`
+- Console log: `/root/oscomp/kv_logs/stage3a_2c_console_20260723T161538Z.log`
+
+**Question**
+
+在 forced CRITICAL 下，server Phase C 是否能按固定 budget 安全执行 destructive bounded release，产生真实 KV resident-page drop，并保持与 OFF/DRY 相同的模型输出？
+
+**Environment and workload**
+
+- Meta-Llama-3-8B-Instruct Q4_K_M
+- Linux CPU；runtime log: Intel Xeon Silver 4316
+- single slot / single request
+- ctx 1024、13-token prompt、32 generated tokens、seed 1、K/V F32
+- prompt: `In one short sentence, explain why deterministic tests are useful.`
+- forced RSS thresholds 1/2/3 KiB, only to force CRITICAL
+- target 33,554,432 bytes、max_scan_blocks 64
+- timeout 60 s per variant
+
+**Variants and gates**
+
+| Variant | Target action | Required evidence |
+|---|---|---|
+| OFF | bounded release disabled | zero bounded marker/counter; response baseline |
+| DRY | read-only candidate evaluation | would-release marker; zero bounded destructive result/counter |
+| BOUNDED | real bounded release | released bytes/blocks > 0; counter delta match; mincore physical observation; zero safety errors |
+
+Process-wide strace is reported for all variants but is not used to attribute target bytes because llama.cpp performs background `MADV_DONTNEED` outside bounded release.
+
+**Key result**
+
+| Metric | OFF | DRY | BOUNDED |
+|---|---:|---:|---:|
+| response length | 183 | 183 | 183 |
+| response identity | baseline | byte-equal | byte-equal |
+| bounded release calls | 0 | 0 | 1 |
+| released bytes | 0 | would-release > 0 | **35,389,440** |
+| released blocks | 0 | would-release > 0 | **9** |
+| ownership_aborted | — | 0 | **0** |
+| madvise_failures | — | — | **0** |
+| bounded counter bytes delta | 0 | 0 | **35,389,440** |
+| bounded counter blocks delta | 0 | 0 | **9** |
+| mincore before | — | — | 268,173,312 |
+| mincore after | — | — | 232,783,872 |
+| observed mincore drop | — | — | **35,389,440** |
+| process cleanup | PASS | PASS | PASS |
+
+Budget result: target 32 MiB, actual 33.75 MiB, overshoot 1,835,008 bytes due to whole-block granularity.
+
+Process-wide strace report from the successful run:
+
+- OFF: 50,085,888 bytes / 6 `MADV_DONTNEED` calls
+- DRY: 41,738,240 bytes / 5 calls
+- BOUNDED: 85,475,328 bytes / 582 calls
+
+These values include background operations and are not bounded-release byte attribution.
+
+**Parser verdict**
+
+- Configuration isolation PASS
+- Server topology/capability PASS
+- OFF, DRY and BOUNDED case gates PASS
+- Core result == independent bounded counter delta
+- mincore directional/plausibility gate PASS; exact equality happened in this run but is not a universal requirement
+- response identity PASS
+- process cleanup PASS
+- parser exit 0; runner exit 0
+
+**Supported conclusion**
+
+Stage 3A-2C endpoint is feasible and correct in the stated controlled boundary: pressure state can drive bounded release, 9 safe blocks were physically de-residented, no ownership abort or madvise failure occurred, and output remained byte-identical.
+
+**Limits**
+
+- Not real deployment pressure: CRITICAL was forced with 1/2/3 KiB thresholds.
+- Not a formal performance or total-RSS result.
+- Single run, single model, single request, ctx 1024, fixed target.
+- Does not cover concurrency, long context, repeated episodes, dynamic target, different page/block sizes, different models, GPU, or release/offload/prefetch arbitration.
+- Dirty-tree diagnostic evidence is not clean archival evidence.

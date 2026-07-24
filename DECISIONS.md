@@ -33,7 +33,6 @@ Dense 使用 layer-level Flex ring；MoE 使用 expert-level anonymous buffer、
 - `README.md` 2.2.2、2.6.1-2.6.3。
 - `src/llama-model.cpp` 的 `use_flex` / `use_moe_buffer_pre` gate 与 CLG 初始化。
 - `src/llama-flex.h`、`src/llama-moe-buffer.h`、`src/llama-window.cpp`。
-
 ## D-0002 — 实验内存机制保持 opt-in，默认路径不启用
 
 - Date: 2026-07-15（首次入账；实现早于本日期）
@@ -64,7 +63,6 @@ Flex/MoE streaming 与 paged KV 依赖模型形状、CPU host memory 和操作�
 
 - `docs/final_technical_report.md` 8.2、8.3。
 - `src/llama-model.cpp` 权重 gate；`src/llama-kv-cache.cpp` paged/swap gate。
-
 ## D-0003 — core 提供 KV 机制，上层 driver/scheduler 提供生命周期策略
 
 - Date: 2026-07-15（首次入账；实现早于本日期）
@@ -96,7 +94,6 @@ core 维护 block state、swap/madvise/restore/prefetch 与错误；example/trac
 - `docs/final_technical_report.md` 8.4、9.1。
 - `docs/kv_trace_replay_stage12c_real_sharegpt_results.md` 4。
 - `src/llama-memory.h` 与 `examples/kv-*`。
-
 ## D-0004 — backing store 固定槽位、block I/O 原子发布并传播 active 恢复错误
 
 - Date: 2026-07-15
@@ -130,7 +127,6 @@ append 式 backing file 会随重复 swap 周期增长；逐 cell 直接发布�
 - `src/llama-kv-cache.cpp` 的 `write_cells()`/`read_cells()`、全有或全无 metadata publication。
 - `src/llama-memory.h`、`src/llama-context.cpp`、`src/llama-graph.cpp` 的错误传播。
 - `tests/test-kv-backing-store.cpp` 与三个 `scripts/run-kv-p0-*.sh`。
-
 ## D-0005 — 当前正式 KV 对比采用固定 E0-E5 协议
 
 - Date: 2026-07-15
@@ -165,12 +161,13 @@ append 式 backing file 会随重复 swap 周期增长；逐 cell 直接发布�
 
 **Historical static audit addendum — protocol requirement vs parser capability before `d9d2e3b80` (2026-07-15)**
 
-_(content unchanged — refer to previous version of this decision log)_
+A static audit found that the formal protocol already required fail-closed handling for `UNVERIFIED`, missing/duplicate cases, missing mandatory metrics and order/identity drift, while the parser implementation at that point did not enforce every requirement consistently. Therefore no E0–E5 run from that parser version could be promoted solely because the runner completed or produced a summary.
+
+This addendum records a historical gap between the protocol document and parser capability. It does not claim that a formal current-HEAD E0–E5 matrix was run.
 
 **Resolution addendum — parser fail-closed gate completed (2026-07-15)**
 
-_(content unchanged)_
-
+Commit `d9d2e3b80` completed the parser-side fail-closed gate and added synthetic negative coverage for `UNVERIFIED`, missing/duplicate cases, order errors, missing mandatory fields, duplicate telemetry markers/keys and malformed input. The resolution makes the protocol executable, but it still does not create a valid model artifact: the formal RUNS=3 E0–E5 matrix remains planned until a clean, identity-bound run is performed.
 ## D-0006 — 撤销 CPU backend GET_ROWS 内层计时，采用最小 identity fast path 的未插桩 A/B
 
 - Date: 2026-07-16
@@ -203,7 +200,6 @@ Stage 1 需要区分 E2 paged gather 的调度/图构造开销与 E5 active pref
 
 - `a9faa532`：`examples/kv-idle-swap-resume/idle-swap-resume.cpp`、`src/llama-kv-cache.*`、`scripts/kv-e0-e2-e5-single-turn-diagnose.sh`、`scripts/parse-kv-e0-e2-e5-single-turn.py`。
 - 当前 HEAD：`tests/test-kv-e0-e2-e5-single-turn-parser.py` 11 tests 通过；runner `bash -n` 通过；未运行 build、模型或新的 dry-run。
-
 ## D-0007 — 保留 context-lifetime static paged identity fast path
 
 - Date: 2026-07-16
@@ -240,7 +236,6 @@ E2 paged gather 在 logical-to-physical mapping 始终为 identity 时仍为每�
 - Functional artifact: `/root/oscomp/kv_logs/kv_paged_identity_e2i_smoke_20260716T135342Z`；manifest SHA256 `feee0b1f8951a35b597ce9ccbbe82dd0fe492bb67f90d897352bd80c90d51c82`；summary SHA256 `ad4276ec29f62a92d0d8b323892d29a889912c6285a59d9aa1f17c6890a55e8d`；parser exit 0。
 - Controlled A/B artifact: `/root/oscomp/kv_logs/kv_paged_identity_controlled_ab_20260716T142722Z`；manifest SHA256 `46dff8b8f42d87435e6a9bdab3b44600cdbc0cbb1d4509a6d2ad4ad8939372bf`；summary SHA256 `5eb66dc2d48cc40924170ba3763ce0bd4c31e2344c7ce157fecc318f88bcbabe`；parser exit 0、artifact `VALID`、performance judgment `MIXED`。
 - Source: `src/llama-kv-cache-identity.h`、`src/llama-kv-cache.cpp`、`src/llama-graph.cpp`；unit coverage: `tests/test-kv-paged-identity-fast-path.cpp`。
-
 ## D-0008 — Destructive release 仅允许 no-backing dead/unused block；可恢复历史必须经 SWAPPED
 
 - Date: 2026-07-17
@@ -290,7 +285,6 @@ idle/resume workload 中，不再被任何 sequence 引用的 block（dead）或
 - `scripts/run-kv-paged-release-correctness.sh`：R0–R5/N0–N2 完整矩阵 runner。
 - `scripts/parse-kv-paged-release-correctness.py`：fail-closed parser。
 - Artifact `/root/oscomp/kv_logs/kv_paged_release_20260717T134951Z_6071`：parser exit 0、overall PASS、全部 passing case seq0/seq1 hash 一致、R5 EXPECTED_FAILURE 正确触发。
-
 ## D-0009 — 压力采样与 reclaim 解耦，先做单 owner 限频只读 server 集成
 
 - Date: 2026-07-18（决策入账）；2026-07-19（server 集成与验证协议提交；真实模型 VALID artifact 通过）
@@ -338,14 +332,13 @@ Stage 3A-0 已验证 destructive release 的 ownership、事务和 fail-closed �
 - `scripts/run-server-kv-pressure-stage3a-1c.py`、`scripts/parse-server-kv-pressure-stage3a-1c.py`、`tests/test-server-kv-pressure-stage3a-1c-parser.py`：9 合成负例通过、py_compile 通过。
 - **Stage 3A-1C VALID artifact**: `/root/oscomp/kv_logs/server_kv_pressure_stage3a_1c_20260719T134156Z_726d977b26bb` — parser exit 0、artifact status VALID、10/10 cases PASS。Strace ON 归因 6 条 sampler procfs/cgroup 路径、OFF 零路径；lifecycle post-resume sample_count 独立重置；idle 1.5s 窗口零 periodic marker。
 - 此前失败 artifacts 保留为 INVALID 诊断证据：`…073412Z_4ac1919ec2ed`（strace ON 无法观测 procfs 路径）、`…082058Z_31e81656d1e6`（pre-request marker 缺失）、`…125819Z_ad92e603f7b8`（ON strace lacks required sampler procfs reads；strace 在首次采样后 attach，60000ms 采样周期导致 completion 结束前无后续采样，trace 文件全空；与 lifecycle post-resume marker 无关）；均 runner 10/10 cases 完成但 parser 拒绝。
-
 ## D-0010 — Bounded release 作为 per-call budget 控制原语，先入 core 再连 pressure policy
 
 - Date: 2026-07-20
 - Status: accepted
 - Evidence commit/worktree: `949fbd0c850b7413302907df20cc4022f623d8db`（clean）；CTest #29 `test-kv-paged-release-bounded` 注册并 build 通过
 - Supersedes: D-0009 中"bounded reclaim 尚未实现"的阶段描述——本决策提交 core 原语，server 接入留待下道门禁
-- Superseded by: none
+- Superseded by: D-0018（当前 release safety 与 server 接入状态）
 
 **Context**
 
@@ -382,14 +375,13 @@ Stage 3A-0 的 `paged_release_blocks()` 是全量扫描、无 budget 控制—�
 - `tests/CMakeLists.txt`：注册 test #29 `test-kv-paged-release-bounded`。
 - Build artifact: `build/bin/test-kv-paged-release-bounded` 存在，CTest 可在有模型时运行 Part B。
 - `git diff --check`：通过（无 whitespace 错误）。
-
 ## D-0011 — Dry-run bounded release 先于 destructive release 接入 server scheduler，通过只读控制链路验证调度时序与压力状态一致性
 
 - Date: 2026-07-20
 - Status: accepted
 - Evidence commit/worktree: `02f8cd5ed33a13ffac3cce444d6d3ea7eb987650`（clean）；VALID artifact `/root/oscomp/kv_logs/kv_dry_run_stage3a_2b_20260720T161209Z_02f8cd5ed3`
 - Supersedes: D-0010 中"bounded release 先入 core，不连 pressure"的阶段描述——本决策提交 server scheduler 的 dry-run 连接，destructive 接入留待 Stage 3A-2C
-- Superseded by: none
+- Superseded by: D-0018（destructive server 接入完成）
 
 **Context**
 
@@ -457,7 +449,6 @@ D-0010 提交的 `paged_release_blocks_bounded()` 是 per-call budget 控制的 
 - `tests/test-server-kv-pressure.cpp`：dry-run config 解析、cooldown/backoff、state-entry、skip-reason 路径。
 - `tests/test-server-kv-pressure-static.py`：dry-run decoupling、marker field schema、config isolation 静态检查。
 - **Stage 3A-2B VALID artifact**：`/root/oscomp/kv_logs/kv_dry_run_stage3a_2b_20260720T161209Z_02f8cd5ed3`——parser exit 0、verdict PASS、OFF=0 ON=7 dry_run markers、response byte-identical、zero destructive release、zero MADV_DONTNEED (strace)。
-
 ## D-0012 — Diff-aware validation harness 作为 implement/review/review-fix/audit 的强制门禁
 
 - Date: 2026-07-21
@@ -506,7 +497,6 @@ D-0010 提交的 `paged_release_blocks_bounded()` 是 per-call budget 控制的 
 - `scripts/os-agent/checks/run-checks.sh`：534 行，10 个 check 函数。
 - `scripts/os-agent/tests/test-harness.sh`：526 行，15 E2E 合成测试——**15/15 PASS**。
 - Audit gate 实际运行：`bash scripts/os-agent/gate-runner audit` → `OS_AGENT_GATE_RESULT mode=audit verdict=PASS code=0 checks=8 pass=5 fail=0 skip=3 unresolved=0`。
-
 ## D-0013 — 冻结 KV 三轴生命周期目标状态机，runtime 改造以 overlay 与唯一 commit visibility 为准
 
 - Date: 2026-07-23
@@ -535,7 +525,6 @@ D-0010 提交的 `paged_release_blocks_bounded()` 是 per-call budget 控制的 
 **Evidence**
 
 - `docs/kv_block_lifecycle_contract.md` §1–§10，尤其 §9 当前实现差距矩阵与 §10 完成判定。
-
 ## D-0014 — 冻结 server 策略与 lifecycle core 状态 authority 的分层及动作优先级
 
 - Date: 2026-07-23
@@ -564,7 +553,6 @@ D-0010 提交的 `paged_release_blocks_bounded()` 是 per-call budget 控制的 
 **Evidence**
 
 - `docs/kv_pressure_scheduler_contract.md` §1–§11，尤其 §10 当前实现差距与 §11 完成判定。
-
 ## D-0015 — 冻结统一 lifecycle 证据协议，parser fail-closed 且不以系统观测冒充状态 truth
 
 - Date: 2026-07-23
@@ -593,3 +581,110 @@ D-0010 提交的 `paged_release_blocks_bounded()` 是 per-call budget 控制的 
 **Evidence**
 
 - `docs/kv_lifecycle_evidence_protocol.md` §1–§16，尤其 §15 当前协议差距与 §16 完成判定。
+## D-0016 — Stage 3A-2C v4 将 core counter 作为主归因、mincore 作为独立物理观测
+
+- Date: 2026-07-23
+- Status: accepted
+- Evidence commit/worktree: runtime `cffe4f5ae`；parser fix later committed as `0fe0aed12`；artifact capture mode `diagnostic_dirty`
+- Supersedes: none
+- Superseded by: none
+
+**Context**
+
+Bounded release 的 server marker 同时包含 core result、全局 bounded counter delta、KV resident mincore before/after 和 process-wide strace。旧 parser 曾无条件要求 `mincore_drop == counter_delta`，但 mincore 是系统页驻留观测，不能在所有内核、页粒度、refault 或后台活动下保证与逻辑 release 字节精确相等。Process-wide strace 还会捕获 llama.cpp 其他 `MADV_DONTNEED`，不能直接归因目标 action。
+
+**Decision**
+
+1. `released_bytes/released_blocks` 是本次 core call result。
+2. `bounded_cnt_bytes_delta/blocks_delta` 是 server 在调用前后读取独立 core bounded counters 得到的 delta，作为目标 bounded action 的主归因；必须与 core call result 一致。
+3. `mincore_before/after` 是独立 KV resident-page 物理观测。Parser 验证数据存在、方向合理和不出现明显不可信范围；不把普遍精确相等作为协议要求。
+4. Process-wide strace 只报告 `MADV_DONTNEED` syscall 活动，不把全部 bytes/calls 归因给 bounded release。
+5. Runner 只记录事实；parser 独占 PASS/FAIL。
+
+**Alternatives rejected**
+
+- 仅使用 `released_bytes`：缺少独立 counter 对账。
+- 无条件要求 mincore 精确相等：会把合法系统观测波动变成假失败。
+- 用 process-wide strace 字节数作为目标 release 字节：包含背景 `MADV_DONTNEED`，归因错误。
+- 用 mincore/RSS 反推 lifecycle transition：系统观测不是 core state truth。
+
+**Consequences and limits**
+
+- 当前 v4 能证明本阶段的受控 bounded-release action、物理下降方向和 response correctness，但不是完整 lifecycle protocol。
+- Stage 3A-2C 单次运行恰好满足 `released_bytes == counter_delta == mincore observed drop == 35,389,440`；这是该 artifact 的观测结果，不是普遍协议假设。
+- 未测量 mincore 诊断本身的 TTFT/TPOT 开销；正式性能矩阵必须关闭或单独消融诊断。
+
+**Evidence**
+
+- `tools/server/server-context.cpp`：调用前后读取 `bounded_release_counter_*()`，形成 independent delta。
+- `tools/server/server-kv-pressure.*`：32-field bounded marker。
+- `scripts/parse-kv-bounded-release-stage3a-2c.py`：PRIMARY counter / OBSERVATIONAL mincore 分层。
+- Artifact `/root/oscomp/kv_logs/kv_bounded_release_stage3a_2c_20260723T161538Z_cffe4f5aea_ba3095de5079`。
+## D-0017 — `kv_pressure_telemetry trigger` 使用逗号分隔的 token 集合
+
+- Date: 2026-07-23
+- Status: accepted
+- Evidence commit/worktree: `0fe0aed12e7f324d3959c40e6c04985a4e2af31e`
+- Supersedes: none
+- Superseded by: none
+
+**Context**
+
+Server 的 `event_trigger()` 可在一次采样中同时产生多个原因，真实日志会输出 `trigger=first,state,source`。原 v4 parser 将 `trigger` 当作单值枚举，对完整字符串做集合成员检查，因此误拒绝了已经成功完成 OFF/DRY/BOUNDED 的真实 artifact。
+
+**Decision**
+
+`trigger` 按逗号拆分并验证 token 集合。允许 token 为 `first/state/source/stale/periodic/wake_completion`；空值、空组件、重复 token 和未知 token 全部 fail-closed。该修改只改变 trigger 字段语法，不放宽其他 marker、identity、release、mincore 或 verdict 门禁。
+
+**Alternatives rejected**
+
+- 把合法组合逐个写成完整字符串枚举：组合数量随 producer 扩展，不可维护。
+- 直接允许任意逗号字符串：会放过拼写错误和未知 trigger。
+- 引入 event-stream ID：超出本次字段语法修复范围，属于未来 v5 协议。
+
+**Consequences and limits**
+
+Parser 能接受真实 producer 输出，同时继续拒绝非法格式。本决策不等于完整 marker grouping 或 lifecycle event-stream 协议。
+
+**Evidence**
+
+- `scripts/parse-kv-bounded-release-stage3a-2c.py`
+- `tests/test-kv-bounded-release-stage3a-2c-parser.py`：35/35 PASS
+- Stage 3A-2C artifact：parser exit 0、verdict PASS
+## D-0018 — Stage 3A-2C 将 bounded destructive release 接入 server，但结论限定为受控正确性
+
+- Date: 2026-07-24（完成状态入账）
+- Status: accepted
+- Evidence commit/worktree: runtime `cffe4f5ae`；parser `0fe0aed12`；dirty-tree real-model artifact
+- Supersedes: D-0010 中“仅 core 原语”、D-0011 中“仅 dry-run 接入”的阶段状态
+- Superseded by: none
+
+**Context**
+
+Stage 3A-2A/2B 已分别提供 bounded core primitive 和只读 pressure-driven dry-run，但没有真实 server destructive action。直接接入必须同时关闭 PENDING_WRITE、INVALID/quarantine、fail-stop、ownership、unsupported wrapper 和证据归因问题。
+
+**Decision**
+
+1. 在 `maybe_sample_kv_pressure()` Phase C 通过独立 config、capability、stale/state/cooldown gates 调用 memory-level `bounded_release()`。
+2. Legacy bounded 与 server bounded 共享 core implementation；unbounded、bounded 和 dry-run 统一拒绝 `RELEASED/SWAPPED/PENDING_WRITE/INVALID`，fail-stop context 拒绝执行。
+3. Server 只使用公开 capability/result/counter API，不访问 private block/free-list/backing metadata。
+4. 当前单 scheduler owner 保证一次调用内 ownership bitmap 稳定；destructive path 在 madvise 前仍重读 context/state 作为防御加固。
+5. Stage 3A-2C 完成判定只要求受控 OFF/DRY/BOUNDED 正确性、物理观测和 response identity；不把 forced threshold、35.4 MB 单次下降或一次 timing 包装成正式性能收益。
+
+**Alternatives rejected**
+
+- 在 server 直接选择 physical block：破坏 core state authority。
+- 首次接入同时实现完整三轴 lifecycle、统一五动作 scheduler 和 v5：范围过大，无法关闭本阶段门禁。
+- 仅以 HTTP 200、exit 0、marker 或 RSS 下降判 PASS：不能证明 action 实际执行且未误伤 active KV。
+
+**Consequences and limits**
+
+- 当前可证明真实 server 上 bounded action 可安全执行并产生 KV resident-page 下降。
+- 适用边界为 Linux CPU、plain paged KV、single owner、single request、forced CRITICAL、fixed target、swap disabled。
+- 并发、长上下文、真实阈值、动态 target、性能和 release/offload/prefetch 仲裁进入 Stage 3B。
+
+**Evidence**
+
+- F1 short tests: WT0–WT23、server 183/183、static 36/36、review PASS。
+- F2 parser 35/35、runner 8/8、review PASS。
+- Artifact `/root/oscomp/kv_logs/kv_bounded_release_stage3a_2c_20260723T161538Z_cffe4f5aea_ba3095de5079`：released 35,389,440 bytes / 9 blocks，response identity，zero ownership abort/madvise failure。

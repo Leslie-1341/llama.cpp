@@ -19,10 +19,28 @@ fail_test() { FAIL_COUNT=$((FAIL_COUNT + 1)); TOTAL=$((TOTAL + 1)); printf '  FA
 
 cleanup_all() {
     rm -rf "$FIXTURE_ROOT" 2>/dev/null || true
-    # Restore any modified repo files
     cd "$REPO_ROOT"
-    git checkout -- tests/test-kv-backing-store.cpp 2>/dev/null || true
+
+    # Recover production files even if a self-test is interrupted between
+    # registry injection and its normal restore step.
+    local reg_file="$REPO_ROOT/scripts/os-agent/checks/run-checks.sh"
+    local bak
+    for bak in "$reg_file".bak-*; do
+        [[ -f "$bak" ]] || continue
+        cp "$bak" "$reg_file" 2>/dev/null || true
+        rm -f "$bak"
+    done
+
+    if [[ -f /tmp/test-kv-backing-store.cpp.bak ]]; then
+        cp /tmp/test-kv-backing-store.cpp.bak "$REPO_ROOT/tests/test-kv-backing-store.cpp" 2>/dev/null || true
+        rm -f /tmp/test-kv-backing-store.cpp.bak
+    else
+        git checkout -- tests/test-kv-backing-store.cpp 2>/dev/null || true
+    fi
+
+    rm -f "$REPO_ROOT"/tests/test-gate-* "$REPO_ROOT"/scripts/test-gate-* 2>/dev/null || true
 }
+
 trap cleanup_all EXIT
 
 setup_fixture_repo() {
@@ -331,9 +349,7 @@ test_e2e_cpp_build() {
     if [[ "$build_verdict" == "PASS" ]]; then
         pass_test "$name"
     elif [[ "$build_verdict" == "FAIL" ]]; then
-        # Build failed — this is acceptable if it's a pre-existing issue, not gate-related
-        printf '  [info] incremental-build FAIL (possibly pre-existing)\n' >&2
-        pass_test "$name"
+        fail_test "$name" "real incremental-build failed; self-test must not convert it to PASS"
     else
         fail_test "$name" "incremental-build not found in summary (got: $build_verdict)"
     fi
@@ -493,22 +509,24 @@ test_e2e_knownfail_selected_blocks() {
 
     cd "$REPO_ROOT"
 
-    # Create a dummy parser test file whose name we'll inject as knownfail;selected
     local dummy="$REPO_ROOT/tests/test-gate-harness-knownfail-sel-parser.py"
+    local producer="$REPO_ROOT/scripts/test-gate-harness-knownfail-sel-producer.py"
+    cat > "$producer" << 'PYEOF'
+#!/usr/bin/env python3
+print("producer")
+PYEOF
     cat > "$dummy" << 'PYEOF'
 #!/usr/bin/env python3
-"""Dummy parser — knownfail;selected."""
-print("this would fail in real life")
-import sys; sys.exit(0)
+"""Dummy knownfail selected parser test."""
+import subprocess
+PRODUCER = "test-gate-harness-knownfail-sel-producer.py"
+print(PRODUCER, subprocess.__name__)
 PYEOF
 
-    # Inject a knownfail;selected entry into the registry
     local reg_file="$REPO_ROOT/scripts/os-agent/checks/run-checks.sh"
     local bak="$reg_file.bak-$$"
     cp "$reg_file" "$bak"
-
-    # Insert the selected knownfail entry before the closing ")" of the array
-    sed -i '/^)$/i\    "test-gate-harness-knownfail-sel|tests/test-gate-harness-knownfail-sel-parser.py|knownfail;selected"' "$reg_file"
+    sed -i '/^)$/i\    "test-gate-harness-knownfail-sel|tests/test-gate-harness-knownfail-sel-parser.py|knownfail;selected|module:scripts/test-gate-harness-knownfail-sel-producer.py"' "$reg_file"
 
     local output rc=0
     set +e
@@ -516,9 +534,8 @@ PYEOF
     rc=$?
     set -e
 
-    # Restore immediately
     mv "$bak" "$reg_file"
-    rm -f "$dummy"
+    rm -f "$dummy" "$producer"
 
     local marker
     marker=$(echo "$output" | grep 'OS_AGENT_GATE_RESULT' | head -1)
@@ -532,27 +549,32 @@ PYEOF
 }
 
 # ============================================================
-# E2E-17: knownfail;unrelated → non-blocking (gate PASS)
+# E2E-17: current diff overrides knownfail;unrelated
 # ============================================================
-test_e2e_knownfail_unrelated_nonblocking() {
-    local name="E2E_knownfail_unrelated_nonblocking"
+test_e2e_knownfail_unrelated_selected_by_diff() {
+    local name="E2E_knownfail_unrelated_selected_by_diff"
     printf '\n[TEST %d] %s\n' "$((TOTAL + 1))" "$name"
 
     cd "$REPO_ROOT"
 
     local dummy="$REPO_ROOT/tests/test-gate-harness-knownfail-unrel-parser.py"
+    local producer="$REPO_ROOT/scripts/test-gate-harness-knownfail-unrel-producer.py"
+    cat > "$producer" << 'PYEOF'
+#!/usr/bin/env python3
+print("producer")
+PYEOF
     cat > "$dummy" << 'PYEOF'
 #!/usr/bin/env python3
-"""Dummy parser — knownfail;unrelated."""
-print("pre-existing, unrelated failure")
-import sys; sys.exit(0)
+"""A changed knownfail cannot remain unrelated."""
+import subprocess
+PRODUCER = "test-gate-harness-knownfail-unrel-producer.py"
+print(PRODUCER, subprocess.__name__)
 PYEOF
 
     local reg_file="$REPO_ROOT/scripts/os-agent/checks/run-checks.sh"
     local bak="$reg_file.bak-$$"
     cp "$reg_file" "$bak"
-
-    sed -i '/^)$/i\    "test-gate-harness-knownfail-unrel|tests/test-gate-harness-knownfail-unrel-parser.py|knownfail;unrelated"' "$reg_file"
+    sed -i '/^)$/i\    "test-gate-harness-knownfail-unrel|tests/test-gate-harness-knownfail-unrel-parser.py|knownfail;unrelated|module:scripts/test-gate-harness-knownfail-unrel-producer.py"' "$reg_file"
 
     local output rc=0
     set +e
@@ -561,16 +583,16 @@ PYEOF
     set -e
 
     mv "$bak" "$reg_file"
-    rm -f "$dummy"
+    rm -f "$dummy" "$producer"
 
     local marker
     marker=$(echo "$output" | grep 'OS_AGENT_GATE_RESULT' | head -1)
     if [[ -z "$marker" ]]; then
         fail_test "$name" "no marker (rc=$rc)"
-    elif echo "$marker" | grep -qE 'unresolved=0' && echo "$marker" | grep -qE 'verdict=PASS'; then
+    elif echo "$marker" | grep -qE 'unresolved=[1-9]'; then
         pass_test "$name"
     else
-        fail_test "$name" "expected unresolved=0 verdict=PASS for unrelated knownfail, got: $marker"
+        fail_test "$name" "changed knownfail;unrelated must be promoted to selected: $marker"
     fi
 }
 
@@ -627,6 +649,443 @@ PYEOF
 }
 
 # ============================================================
+# E2E-19: SKIP does NOT produce UNVERIFIED verdict
+# ============================================================
+test_e2e_skip_not_unverified() {
+    local name="E2E_SKIP_not_UNVERIFIED"
+    printf '\n[TEST %d] %s\n' "$((TOTAL + 1))" "$name"
+
+    cd "$REPO_ROOT"
+
+    # Simulate: all checks SKIP (no changes to trigger them) — verdict should
+    # be NO_CHANGES or PASS, NOT UNVERIFIED.  SKIP means "not applicable",
+    # which is distinct from UNVERIFIED ("should have been checked but wasn't").
+    local output rc=0
+    set +e
+    output=$(bash -c "
+        source $REPO_ROOT/scripts/os-agent/lib/common.sh
+        gate_record_check 'git-diff-check' 'SKIP' 'no changes'
+        gate_record_check 'shell-syntax' 'SKIP' 'no shell files'
+        gate_record_check 'python-syntax' 'SKIP' 'no python files'
+        gate_final_verdict
+        rc=\$?
+        gate_verdict_name \$rc
+    " 2>&1)
+    rc=$?
+    set -e
+
+    # All SKIP with no real checks → no changes to evaluate → should be
+    # NO_CHANGES (4), not UNVERIFIED (5).
+    if [[ "$rc" -eq 4 ]]; then
+        pass_test "$name"
+    elif [[ "$rc" -eq 5 ]]; then
+        fail_test "$name" "SKIP-only checks produced UNVERIFIED — SKIP must be neutral"
+    else
+        fail_test "$name" "expected NO_CHANGES(4) for all-SKIP, got rc=$rc: $output"
+    fi
+}
+
+# ============================================================
+# E2E-20: INCOMPLETE takes priority over UNVERIFIED
+# ============================================================
+test_e2e_incomplete_over_unverified() {
+    local name="E2E_INCOMPLETE_over_UNVERIFIED"
+    printf '\n[TEST %d] %s\n' "$((TOTAL + 1))" "$name"
+
+    cd "$REPO_ROOT"
+
+    # Simulate: one check UNVERIFIED, another INCOMPLETE.  INCOMPLETE
+    # (harness structural problem) should take priority over UNVERIFIED
+    # (coverage gap).
+    local output rc=0
+    set +e
+    output=$(bash -c "
+        source $REPO_ROOT/scripts/os-agent/lib/common.sh
+        gate_record_check 'parser-test' 'UNVERIFIED' 'no relevant changes'
+        gate_record_check 'incremental-build' 'INCOMPLETE' 'build chain broken'
+        gate_final_verdict
+        rc=\$?
+        gate_verdict_name \$rc
+    " 2>&1)
+    rc=$?
+    set -e
+
+    if [[ "$rc" -eq 3 ]]; then
+        pass_test "$name"
+    elif [[ "$rc" -eq 5 ]]; then
+        fail_test "$name" "UNVERIFIED(5) overrode INCOMPLETE(3) — INCOMPLETE must take priority"
+    else
+        fail_test "$name" "expected INCOMPLETE(3), got rc=$rc: $output"
+    fi
+}
+
+# ============================================================
+# E2E-21: UNVERIFIED correctly promoted when nothing worse
+# ============================================================
+test_e2e_unverified_promotion() {
+    local name="E2E_UNVERIFIED_promotion"
+    printf '\n[TEST %d] %s\n' "$((TOTAL + 1))" "$name"
+
+    cd "$REPO_ROOT"
+
+    # Simulate: one check PASS, one check UNVERIFIED.  With no FAIL/UNRESOLVED/
+    # INCOMPLETE, the verdict should be UNVERIFIED.
+    local output rc=0
+    set +e
+    output=$(bash -c "
+        source $REPO_ROOT/scripts/os-agent/lib/common.sh
+        gate_record_check 'git-diff-check' 'PASS' ''
+        gate_record_check 'parser-test' 'UNVERIFIED' 'no relevant py/cpp/sh changes'
+        gate_final_verdict
+        rc=\$?
+        gate_verdict_name \$rc
+    " 2>&1)
+    rc=$?
+    set -e
+
+    if [[ "$rc" -eq 5 ]]; then
+        pass_test "$name"
+    elif [[ "$rc" -eq 0 ]]; then
+        fail_test "$name" "UNVERIFIED was silently absorbed into PASS — must surface as UNVERIFIED"
+    else
+        fail_test "$name" "expected UNVERIFIED(5), got rc=$rc: $output"
+    fi
+}
+
+# ============================================================
+# E2E-22: Fixture binding check — all registered parsers have binding
+# ============================================================
+test_e2e_fixture_binding_pass() {
+    local name="E2E_fixture_binding_PASS"
+    printf '\n[TEST %d] %s\n' "$((TOTAL + 1))" "$name"
+
+    cd "$REPO_ROOT"
+
+    # Run check_fixture_binding directly. All entries in the current
+    # PARSER_TEST_REGISTRY should have valid module: bindings.
+    local output rc=0
+    set +e
+    output=$(GATE_ARTIFACT_PREFIX="$TEST_ARTIFACT_PREFIX" bash -c "
+        source $REPO_ROOT/scripts/os-agent/lib/common.sh
+        source $REPO_ROOT/scripts/os-agent/lib/artifact.sh
+        GATE_MODE=implement
+        artifact_init
+        source $REPO_ROOT/scripts/os-agent/checks/run-checks.sh
+        check_fixture_binding
+        printf 'VERDICT=%s\n' \"\${CHECK_RESULTS[fixture-binding]:-UNKNOWN}\"
+    " 2>&1)
+    rc=$?
+    set -e
+
+    if echo "$output" | grep -q 'VERDICT=PASS'; then
+        pass_test "$name"
+    elif echo "$output" | grep -q 'VERDICT=UNVERIFIED'; then
+        fail_test "$name" "fixture-binding UNVERIFIED — check for legacy/undocumented entries: $output"
+    else
+        fail_test "$name" "unexpected verdict: $output"
+    fi
+}
+
+# ============================================================
+# E2E-23: Fixture binding — detects missing module
+# ============================================================
+test_e2e_fixture_binding_missing_module() {
+    local name="E2E_fixture_binding_missing_module"
+    printf '\n[TEST %d] %s\n' "$((TOTAL + 1))" "$name"
+
+    cd "$REPO_ROOT"
+
+    local dummy="$REPO_ROOT/tests/test-gate-missing-module.py"
+    cat > "$dummy" << 'PYEOF'
+#!/usr/bin/env python3
+PARSER = "nonexistent-parser.py"
+print(PARSER)
+PYEOF
+
+    local reg_file="$REPO_ROOT/scripts/os-agent/checks/run-checks.sh"
+    local bak="$reg_file.bak-$$"
+    cp "$reg_file" "$bak"
+    sed -i '/^)$/i\    "test-gate-missing-module|tests/test-gate-missing-module.py|selfcontained|module:scripts/nonexistent-parser.py"' "$reg_file"
+
+    local output rc=0
+    set +e
+    output=$(GATE_ARTIFACT_PREFIX="$TEST_ARTIFACT_PREFIX" bash -c "
+        source $REPO_ROOT/scripts/os-agent/lib/common.sh
+        source $REPO_ROOT/scripts/os-agent/lib/artifact.sh
+        GATE_MODE=implement
+        artifact_init
+        source $REPO_ROOT/scripts/os-agent/checks/run-checks.sh
+        check_fixture_binding
+        printf 'VERDICT=%s\\n' \"\${CHECK_RESULTS[fixture-binding]:-UNKNOWN}\"
+    " 2>&1)
+    rc=$?
+    set -e
+
+    mv "$bak" "$reg_file"
+    rm -f "$dummy"
+
+    if echo "$output" | grep -q 'VERDICT=FAIL'; then
+        pass_test "$name"
+    else
+        fail_test "$name" "expected FAIL for missing module, got: $output"
+    fi
+}
+
+# ============================================================
+# E2E-24: SKILL.md anti-pattern rules are present
+# ============================================================
+test_e2e_skill_anti_pattern_rules() {
+    local name="E2E_skill_anti_pattern_rules"
+    printf '\n[TEST %d] %s\n' "$((TOTAL + 1))" "$name"
+
+    local skill_file="$REPO_ROOT/.claude/skills/os-agent-task/SKILL.md"
+    local modes_file="$REPO_ROOT/.claude/skills/os-agent-task/references/modes.md"
+
+    local failed=0
+
+    # SKILL.md must have the anti-omission-as-defect rule
+    if grep -q '禁止将 agent 输出遗漏当作源码缺陷' "$skill_file"; then
+        :
+    else
+        printf '  [FAIL] SKILL.md: missing anti-omission-as-defect rule\n' >&2
+        failed=1
+    fi
+
+    # SKILL.md must have the blocking-item reachability rule
+    if grep -q '源码可达性' "$skill_file"; then
+        :
+    else
+        printf '  [FAIL] SKILL.md: missing reachability rule\n' >&2
+        failed=1
+    fi
+
+    # A proven parser/Harness false-pass path remains a valid tooling blocker.
+    if grep -q '假通过、错误归因或漏报' "$skill_file"; then
+        :
+    else
+        printf '  [FAIL] SKILL.md: missing tooling false-pass exception\n' >&2
+        failed=1
+    fi
+
+    # modes.md must have the blocking-item admission gate
+    if grep -q '阻塞项准入门禁' "$modes_file"; then
+        :
+    else
+        printf '  [FAIL] modes.md: missing blocking-item admission gate\n' >&2
+        failed=1
+    fi
+
+    # modes.md must have the anti-pattern section
+    if grep -q '反模式' "$modes_file"; then
+        :
+    else
+        printf '  [FAIL] modes.md: missing anti-pattern section\n' >&2
+        failed=1
+    fi
+
+    if (( failed == 0 )); then
+        pass_test "$name"
+    else
+        fail_test "$name" "$failed rule(s) missing"
+    fi
+}
+
+# ============================================================
+# E2E-25: Gate runner handles --help for all modes
+# ============================================================
+test_e2e_help_all_modes() {
+    local name="E2E_help_all_modes"
+    printf '\n[TEST %d] %s\n' "$((TOTAL + 1))" "$name"
+
+    cd "$REPO_ROOT"
+
+    local output
+    output=$(bash "$GATE_RUNNER" --help 2>&1) || true
+
+    local failed=0
+    for mode in implement review review-fix audit; do
+        if echo "$output" | grep -q "$mode"; then
+            :
+        else
+            printf '  [FAIL] help: mode %s not documented\n' "$mode" >&2
+            failed=1
+        fi
+    done
+
+    if ! echo "$output" | grep -q '5 UNVERIFIED'; then
+        printf '  [FAIL] help: UNVERIFIED exit code not documented\n' >&2
+        failed=1
+    fi
+
+    if (( failed == 0 )); then
+        pass_test "$name"
+    else
+        fail_test "$name" "one or more modes missing from --help"
+    fi
+}
+
+# ============================================================
+# E2E-26: Existing unrelated knownfail remains non-selected
+# ============================================================
+test_e2e_knownfail_unchanged_nonselected() {
+    local name="E2E_knownfail_unchanged_nonselected"
+    printf '\n[TEST %d] %s\n' "$((TOTAL + 1))" "$name"
+
+    cd "$REPO_ROOT"
+    local output rc=0
+    set +e
+    output=$(bash -c "
+        source $REPO_ROOT/scripts/os-agent/lib/common.sh
+        source $REPO_ROOT/scripts/os-agent/lib/diff-analyzer.sh
+        diff_analyze
+        source $REPO_ROOT/scripts/os-agent/checks/run-checks.sh
+        if _parser_entry_selected_by_diff '$REPO_ROOT' \\
+            'tests/test-server-kv-pressure-stage3a-1c-parser.py' \\
+            'module:scripts/parse-server-kv-pressure-stage3a-1c.py'; then
+            exit 1
+        fi
+        exit 0
+    " 2>&1)
+    rc=$?
+    set -e
+
+    if [[ "$rc" -eq 0 ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "unchanged knownfail was incorrectly selected: $output"
+    fi
+}
+
+# ============================================================
+# E2E-27: Existing module is not enough — test must reference it
+# ============================================================
+test_e2e_fixture_binding_unbound_module() {
+    local name="E2E_fixture_binding_unbound_module"
+    printf '\n[TEST %d] %s\n' "$((TOTAL + 1))" "$name"
+
+    cd "$REPO_ROOT"
+    local dummy="$REPO_ROOT/tests/test-gate-unbound-module.py"
+    cat > "$dummy" << 'PYEOF'
+#!/usr/bin/env python3
+print("does not reference the declared parser")
+PYEOF
+
+    local reg_file="$REPO_ROOT/scripts/os-agent/checks/run-checks.sh"
+    local bak="$reg_file.bak-$$"
+    cp "$reg_file" "$bak"
+    sed -i '/^)$/i\    "test-gate-unbound-module|tests/test-gate-unbound-module.py|selfcontained|module:scripts/parse-kv-bounded-release-stage3a-2c.py"' "$reg_file"
+
+    local output
+    output=$(GATE_ARTIFACT_PREFIX="$TEST_ARTIFACT_PREFIX" bash -c "
+        source $REPO_ROOT/scripts/os-agent/lib/common.sh
+        source $REPO_ROOT/scripts/os-agent/lib/artifact.sh
+        GATE_MODE=implement
+        artifact_init
+        source $REPO_ROOT/scripts/os-agent/checks/run-checks.sh
+        check_fixture_binding
+        printf 'VERDICT=%s\\n' \"\${CHECK_RESULTS[fixture-binding]:-UNKNOWN}\"
+    " 2>&1) || true
+
+    mv "$bak" "$reg_file"
+    rm -f "$dummy"
+
+    if echo "$output" | grep -q 'VERDICT=FAIL'; then
+        pass_test "$name"
+    else
+        fail_test "$name" "declared module existence produced a false binding PASS: $output"
+    fi
+}
+
+# ============================================================
+# E2E-28: Inline binding is UNVERIFIED, never PASS
+# ============================================================
+test_e2e_fixture_binding_inline_unverified() {
+    local name="E2E_fixture_binding_inline_UNVERIFIED"
+    printf '\n[TEST %d] %s\n' "$((TOTAL + 1))" "$name"
+
+    cd "$REPO_ROOT"
+    local dummy="$REPO_ROOT/tests/test-gate-inline-binding.py"
+    cat > "$dummy" << 'PYEOF'
+#!/usr/bin/env python3
+print("inline fixture")
+PYEOF
+
+    local reg_file="$REPO_ROOT/scripts/os-agent/checks/run-checks.sh"
+    local bak="$reg_file.bak-$$"
+    cp "$reg_file" "$bak"
+    sed -i '/^)$/i\    "test-gate-inline-binding|tests/test-gate-inline-binding.py|selfcontained|inline:human-claim"' "$reg_file"
+
+    local output
+    output=$(GATE_ARTIFACT_PREFIX="$TEST_ARTIFACT_PREFIX" bash -c "
+        source $REPO_ROOT/scripts/os-agent/lib/common.sh
+        source $REPO_ROOT/scripts/os-agent/lib/artifact.sh
+        GATE_MODE=implement
+        artifact_init
+        source $REPO_ROOT/scripts/os-agent/checks/run-checks.sh
+        check_fixture_binding
+        printf 'VERDICT=%s\\n' \"\${CHECK_RESULTS[fixture-binding]:-UNKNOWN}\"
+    " 2>&1) || true
+
+    mv "$bak" "$reg_file"
+    rm -f "$dummy"
+
+    if echo "$output" | grep -q 'VERDICT=UNVERIFIED'; then
+        pass_test "$name"
+    else
+        fail_test "$name" "inline binding must not be machine-PASS: $output"
+    fi
+}
+
+# ============================================================
+# E2E-29: Invalid check verdict fails closed as INCOMPLETE
+# ============================================================
+test_e2e_invalid_verdict_incomplete() {
+    local name="E2E_invalid_verdict_INCOMPLETE"
+    printf '\n[TEST %d] %s\n' "$((TOTAL + 1))" "$name"
+
+    local rc=0
+    set +e
+    bash -c "
+        source $REPO_ROOT/scripts/os-agent/lib/common.sh
+        gate_record_check 'bad-check' 'MAYBE' 'invalid verdict'
+        gate_final_verdict
+    " >/dev/null 2>&1
+    rc=$?
+    set -e
+
+    if [[ "$rc" -eq 3 ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "invalid verdict must yield INCOMPLETE(3), got $rc"
+    fi
+}
+
+# ============================================================
+# E2E-30: Duplicate check names fail closed as INCOMPLETE
+# ============================================================
+test_e2e_duplicate_check_incomplete() {
+    local name="E2E_duplicate_check_INCOMPLETE"
+    printf '\n[TEST %d] %s\n' "$((TOTAL + 1))" "$name"
+
+    local rc=0
+    set +e
+    bash -c "
+        source $REPO_ROOT/scripts/os-agent/lib/common.sh
+        gate_record_check 'same-check' 'PASS' ''
+        gate_record_check 'same-check' 'PASS' ''
+        gate_final_verdict
+    " >/dev/null 2>&1
+    rc=$?
+    set -e
+
+    if [[ "$rc" -eq 3 ]]; then
+        pass_test "$name"
+    else
+        fail_test "$name" "duplicate check names must yield INCOMPLETE(3), got $rc"
+    fi
+}
+
+# ============================================================
 # Main
 # ============================================================
 main() {
@@ -653,8 +1112,20 @@ main() {
     test_e2e_mode_dispatch
     test_e2e_build_dir_flag
     test_e2e_knownfail_selected_blocks
-    test_e2e_knownfail_unrelated_nonblocking
+    test_e2e_knownfail_unrelated_selected_by_diff
     test_e2e_new_failure_not_disguised
+    test_e2e_skip_not_unverified
+    test_e2e_incomplete_over_unverified
+    test_e2e_unverified_promotion
+    test_e2e_fixture_binding_pass
+    test_e2e_fixture_binding_missing_module
+    test_e2e_skill_anti_pattern_rules
+    test_e2e_help_all_modes
+    test_e2e_knownfail_unchanged_nonselected
+    test_e2e_fixture_binding_unbound_module
+    test_e2e_fixture_binding_inline_unverified
+    test_e2e_invalid_verdict_incomplete
+    test_e2e_duplicate_check_incomplete
 
     printf '\n========================================\n'
     printf 'Results: %d/%d passed\n' "$PASS_COUNT" "$TOTAL"

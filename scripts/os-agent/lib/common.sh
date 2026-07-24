@@ -10,7 +10,7 @@ readonly EXIT_FAIL=1
 readonly EXIT_UNRESOLVED=2
 readonly EXIT_INCOMPLETE=3
 readonly EXIT_NO_CHANGES=4
-readonly EXIT_UNVERIFIED=5  # necessary check was skipped — cannot determine PASS/FAIL
+readonly EXIT_UNVERIFIED=5
 
 # --- log level ---
 declare GATE_LOG_LEVEL="${GATE_LOG_LEVEL:-1}"  # 0=quiet 1=normal 2=verbose
@@ -38,12 +38,44 @@ gate_log() {
 }
 
 gate_record_check() {
-    local name="$1"
-    local verdict="$2"   # PASS | FAIL | SKIP | UNRESOLVED
+    local name="${1:-}"
+    local verdict="${2:-}"
     local detail="${3:-}"
+
+    if [[ -z "$name" ]]; then
+        name="harness-invalid-check-$(( ${#CHECK_ORDER[@]} + 1 ))"
+        verdict="INCOMPLETE"
+        detail="check recorded without a name${detail:+; $detail}"
+    fi
+
+    case "$verdict" in
+        PASS|FAIL|SKIP|UNRESOLVED|UNVERIFIED|INCOMPLETE|NO_CHANGES) ;;
+        *)
+            detail="invalid check verdict '${verdict:-<empty>}'${detail:+; $detail}"
+            verdict="INCOMPLETE"
+            ;;
+    esac
+
+    # Duplicate names make counts and authority ambiguous. Fail closed without
+    # overwriting an earlier FAIL.
+    if [[ -n "${CHECK_RESULTS[$name]+present}" ]]; then
+        local previous="${CHECK_RESULTS[$name]}"
+        case "$previous" in
+            FAIL|UNRESOLVED|INCOMPLETE) ;;
+            *) CHECK_RESULTS["$name"]="INCOMPLETE" ;;
+        esac
+        if [[ -n "${GATE_FULL_LOG:-}" ]] && [[ -f "$GATE_FULL_LOG" ]]; then
+            printf '[%s] %s: %s — duplicate check record (previous=%s, new=%s)\n' \
+                "$(date +%H:%M:%S)" "$name" "${CHECK_RESULTS[$name]}" "$previous" "$verdict" >> "$GATE_FULL_LOG"
+        fi
+        return 0
+    fi
+
     CHECK_RESULTS["$name"]="$verdict"
     CHECK_ORDER+=("$name")
-    printf '[%s] %s: %s%s\n' "$(date +%H:%M:%S)" "$name" "$verdict" "${detail:+ — $detail}" >> "$GATE_FULL_LOG"
+    if [[ -n "${GATE_FULL_LOG:-}" ]] && [[ -f "$GATE_FULL_LOG" ]]; then
+        printf '[%s] %s: %s%s\n' "$(date +%H:%M:%S)" "$name" "$verdict" "${detail:+ — $detail}" >> "$GATE_FULL_LOG"
+    fi
 }
 
 gate_verdict_name() {
@@ -59,44 +91,60 @@ gate_verdict_name() {
     esac
 }
 
-# Summarize all check results and determine final exit code.
-# Priority: FAIL > UNRESOLVED > UNVERIFIED > INCOMPLETE > PASS > NO_CHANGES
-# UNVERIFIED triggers when a necessary check was SKIPped — cannot determine
-# PASS/FAIL without running the check.  Also triggers when knownfail tests
-# were excluded without confirmation they're unrelated to current diff.
+# Priority: FAIL > UNRESOLVED > INCOMPLETE > UNVERIFIED > PASS > NO_CHANGES.
+# SKIP means not applicable and is neutral. UNVERIFIED means a required
+# evidence layer was not executed or could not be established.
 gate_final_verdict() {
-    local worst=4  # start at NO_CHANGES
-    local has_unverified=0
+    local has_pass=0 has_fail=0 has_unresolved=0 has_incomplete=0 has_unverified=0 has_any=0
+    local name verdict
+
     for name in "${CHECK_ORDER[@]}"; do
-        local v="${CHECK_RESULTS[$name]}"
-        case "$v" in
-            FAIL)        worst=1 ;;  # FAIL beats everything, unconditionally
-            UNRESOLVED)  [[ $worst -gt 2 || $worst -eq 0 ]] && worst=2 ;;  # overrides PASS/UNVERIFIED/INCOMPLETE/NO_CHANGES
-            UNVERIFIED)  has_unverified=1
-                         [[ $worst -gt 3 ]] && worst=5 ;;  # overrides PASS/NO_CHANGES only
-            INCOMPLETE)  [[ $worst -gt 3 ]] && worst=3 ;;  # only overrides NO_CHANGES
-            PASS)        [[ $worst -eq 4 ]] && worst=0 ;;  # only if nothing worse (was NO_CHANGES)
-            SKIP)        ;;
-            NO_CHANGES)  ;;
+        has_any=1
+        verdict="${CHECK_RESULTS[$name]:-INCOMPLETE}"
+        case "$verdict" in
+            FAIL)        has_fail=1 ;;
+            UNRESOLVED)  has_unresolved=1 ;;
+            INCOMPLETE)  has_incomplete=1 ;;
+            UNVERIFIED)  has_unverified=1 ;;
+            PASS)        has_pass=1 ;;
+            SKIP|NO_CHANGES) ;;
+            *)           has_incomplete=1 ;;
         esac
     done
-    # If a necessary check was SKIPped with an UNVERIFIED record, and
-    # nothing worse than INCOMPLETE happened, the verdict is UNVERIFIED.
-    if [[ $has_unverified -eq 1 ]] && [[ $worst -eq 0 || $worst -eq 3 || $worst -eq 4 ]]; then
-        worst=5
-    fi
-    return $worst
+
+    if (( has_fail )); then return "$EXIT_FAIL"; fi
+    if (( has_unresolved )); then return "$EXIT_UNRESOLVED"; fi
+    if (( has_incomplete )); then return "$EXIT_INCOMPLETE"; fi
+    if (( has_unverified )); then return "$EXIT_UNVERIFIED"; fi
+    if (( has_pass )); then return "$EXIT_PASS"; fi
+    if (( has_any )); then return "$EXIT_NO_CHANGES"; fi
+    return "$EXIT_NO_CHANGES"
 }
 
-# Single source of truth: writes summary file AND outputs compact marker to stdout.
-# The caller (gate-runner) should NOT emit a second marker.
+gate_count_result() {
+    local target="$1"
+    local count=0 name
+    for name in "${CHECK_ORDER[@]}"; do
+        [[ "${CHECK_RESULTS[$name]:-}" == "$target" ]] && count=$((count + 1))
+    done
+    printf '%d' "$count"
+}
+
+# Single source of truth: writes summary file and emits the only compact marker.
 gate_emit_summary() {
     local final_code="$1"
     local final_name
     final_name="$(gate_verdict_name "$final_code")"
 
-    # Write summary file
-    cat > "$GATE_SUMMARY_FILE" <<EOF
+    local count_pass count_fail count_skip count_unresolved count_incomplete count_unverified
+    count_pass="$(gate_count_result PASS)"
+    count_fail="$(gate_count_result FAIL)"
+    count_skip="$(gate_count_result SKIP)"
+    count_unresolved="$(gate_count_result UNRESOLVED)"
+    count_incomplete="$(gate_count_result INCOMPLETE)"
+    count_unverified="$(gate_count_result UNVERIFIED)"
+
+    cat > "$GATE_SUMMARY_FILE" <<SUMMARY
 OS_AGENT_GATE_SUMMARY
 mode=${GATE_MODE}
 verdict=${final_name}
@@ -106,27 +154,24 @@ timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 head=$(git rev-parse HEAD 2>/dev/null || echo unknown)
 branch=$(git branch --show-current 2>/dev/null || echo unknown)
 checks_total=${#CHECK_ORDER[@]}
-checks_pass=$(for n in "${CHECK_ORDER[@]}"; do [[ "${CHECK_RESULTS[$n]:-}" == "PASS" ]] && echo x; done | wc -l)
-checks_fail=$(for n in "${CHECK_ORDER[@]}"; do [[ "${CHECK_RESULTS[$n]:-}" == "FAIL" ]] && echo x; done | wc -l)
-checks_skip=$(for n in "${CHECK_ORDER[@]}"; do [[ "${CHECK_RESULTS[$n]:-}" == "SKIP" ]] && echo x; done | wc -l)
-checks_unresolved=$(for n in "${CHECK_ORDER[@]}"; do [[ "${CHECK_RESULTS[$n]:-}" == "UNRESOLVED" ]] && echo x; done | wc -l)
-checks_unverified=$(for n in "${CHECK_ORDER[@]}"; do [[ "${CHECK_RESULTS[$n]:-}" == "UNVERIFIED" ]] && echo x; done | wc -l)
+checks_pass=${count_pass}
+checks_fail=${count_fail}
+checks_skip=${count_skip}
+checks_unresolved=${count_unresolved}
+checks_incomplete=${count_incomplete}
+checks_unverified=${count_unverified}
 ---
-EOF
+SUMMARY
+
+    local name
     for name in "${CHECK_ORDER[@]}"; do
         printf '%-30s %s\n' "$name" "${CHECK_RESULTS[$name]}" >> "$GATE_SUMMARY_FILE"
     done
 
-    # Single compact summary marker to stdout — this is the ONLY place it's emitted
-    printf 'OS_AGENT_GATE_RESULT mode=%s verdict=%s code=%d checks=%d pass=%d fail=%d skip=%d unresolved=%d unverified=%d artifact=%s\n' \
-        "$GATE_MODE" "$final_name" "$final_code" \
-        "${#CHECK_ORDER[@]}" \
-        "$(for n in "${CHECK_ORDER[@]}"; do [[ "${CHECK_RESULTS[$n]:-}" == "PASS" ]] && echo x; done | wc -l)" \
-        "$(for n in "${CHECK_ORDER[@]}"; do [[ "${CHECK_RESULTS[$n]:-}" == "FAIL" ]] && echo x; done | wc -l)" \
-        "$(for n in "${CHECK_ORDER[@]}"; do [[ "${CHECK_RESULTS[$n]:-}" == "SKIP" ]] && echo x; done | wc -l)" \
-        "$(for n in "${CHECK_ORDER[@]}"; do [[ "${CHECK_RESULTS[$n]:-}" == "UNRESOLVED" ]] && echo x; done | wc -l)" \
-        "$(for n in "${CHECK_ORDER[@]}"; do [[ "${CHECK_RESULTS[$n]:-}" == "UNVERIFIED" ]] && echo x; done | wc -l)" \
-        "$GATE_ARTIFACT_DIR"
+    printf 'OS_AGENT_GATE_RESULT mode=%s verdict=%s code=%d checks=%d pass=%d fail=%d skip=%d unresolved=%d incomplete=%d unverified=%d artifact=%s\n' \
+        "$GATE_MODE" "$final_name" "$final_code" "${#CHECK_ORDER[@]}" \
+        "$count_pass" "$count_fail" "$count_skip" "$count_unresolved" \
+        "$count_incomplete" "$count_unverified" "$GATE_ARTIFACT_DIR"
 }
 
 gate_repo_root() {

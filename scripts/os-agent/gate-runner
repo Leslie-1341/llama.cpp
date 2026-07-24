@@ -5,7 +5,7 @@
 # Usage: gate-runner <mode> [--build-dir <dir>] [--quiet] [--verbose]
 #   mode: implement | review | review-fix | audit
 #
-# Exit codes: 0=PASS 1=FAIL 2=UNRESOLVED 3=INCOMPLETE 4=NO_CHANGES
+# Exit codes: 0=PASS 1=FAIL 2=UNRESOLVED 3=INCOMPLETE 4=NO_CHANGES 5=UNVERIFIED
 
 set -euo pipefail
 
@@ -52,9 +52,10 @@ Options:
 Exit codes:
   0 PASS             All checks passed
   1 FAIL             One or more checks failed
-  2 UNRESOLVED       C/C++ target mapping failed
-  3 INCOMPLETE       Required checks were skipped
+  2 UNRESOLVED       Relevant target, test, or evidence relation is unresolved
+  3 INCOMPLETE       Check chain did not finish or harness structure is invalid
   4 NO_CHANGES       No changes detected
+  5 UNVERIFIED       Required evidence could not be established
 HELP
             exit 0 ;;
         *)
