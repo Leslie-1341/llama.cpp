@@ -5,7 +5,7 @@ argument-hint: "<contract|audit|implement|review|review-fix|script|memory> <目�
 disable-model-invocation: true
 ---
 
-# OS Agent Task v3 — 轻量上下文版
+# OS Agent Task
 
 把用户目标收敛为一次可独立验收的任务。优先当前源码、diff 和运行证据；不把局部报错、代理摘要遗漏或未来理论风险直接升级为阻塞项。
 
