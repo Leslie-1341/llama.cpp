@@ -181,6 +181,10 @@ std::string server_kv_pressure_format_marker(const server_kv_pressure_event & ev
         << " cgroup_high_kb=" << telemetry.cgroup_high_kb
         << " psi_some_avg10=" << telemetry.psi_some_avg10
         << " psi_full_avg10=" << telemetry.psi_full_avg10
+        << " pressure_basis_valid=" << (telemetry.pressure_basis_valid ? 1 : 0)
+        << " pressure_current_bytes=" << telemetry.pressure_current_bytes
+        << " pressure_low_water_bytes=" << telemetry.pressure_low_water_bytes
+        << " pressure_basis_generation=" << telemetry.pressure_basis_generation
         << " sample_latency_ns=" << telemetry.sample_latency_ns
         << " sample_count=" << event.sample_count
         << " skip_count=" << event.skip_count
@@ -359,6 +363,7 @@ bool server_kv_pressure_bounded_release_config_from_env(
     error.clear();
 
     parsed.enabled = parse_bool_env("LLAMA_KV_PRESSURE_BOUNDED_RELEASE");
+    parsed.dynamic_target = parse_bool_env("LLAMA_KV_PRESSURE_BOUNDED_RELEASE_DYNAMIC_TARGET");
 
     if (!parse_uint64_env("LLAMA_KV_PRESSURE_BOUNDED_RELEASE_TARGET_BYTES",
                           parsed.target_bytes, error)) {
@@ -391,9 +396,52 @@ bool server_kv_pressure_bounded_release_config_from_env(
     return true;
 }
 
+server_kv_pressure_dynamic_target server_kv_pressure_compute_dynamic_target(
+        const kv_pressure_telemetry & telemetry,
+        const llama_kv_release_budget_snapshot & budget,
+        uint64_t max_release_bytes) {
+    server_kv_pressure_dynamic_target result;
+    if (!telemetry.sample_valid || telemetry.stale || !telemetry.pressure_basis_valid) {
+        result.decision_reason = "invalid_pressure_basis";
+        return result;
+    }
+    if (telemetry.state != kv_pressure_state::PRESSURE &&
+            telemetry.state != kv_pressure_state::CRITICAL) {
+        result.decision_reason = "not_pressure";
+        return result;
+    }
+    if (!budget.valid || budget.ownership_aborted) {
+        result.decision_reason = budget.ownership_aborted ? "ownership_aborted" : "invalid_kv_budget";
+        return result;
+    }
+    if (max_release_bytes == 0) {
+        result.decision_reason = "no_budget";
+        return result;
+    }
+
+    result.water_excess_bytes = telemetry.pressure_current_bytes > telemetry.pressure_low_water_bytes ?
+        telemetry.pressure_current_bytes - telemetry.pressure_low_water_bytes : 0;
+    result.effective_target_bytes = result.water_excess_bytes;
+    if (max_release_bytes < result.effective_target_bytes) {
+        result.effective_target_bytes = max_release_bytes;
+        result.clamp_reason = "max_release";
+    }
+    if (budget.resident_bytes < result.effective_target_bytes) {
+        result.effective_target_bytes = budget.resident_bytes;
+        result.clamp_reason = "resident";
+    }
+    if (budget.reclaimable_resident_bytes < result.effective_target_bytes) {
+        result.effective_target_bytes = budget.reclaimable_resident_bytes;
+        result.clamp_reason = "reclaimable";
+    }
+    result.valid = true;
+    result.decision_reason = result.effective_target_bytes == 0 ? "no_excess_or_candidate" : "dynamic";
+    return result;
+}
+
 bool server_kv_pressure_runtime::bounded_release_due(
         time_point now, kv_pressure_state state,
-        bool stale) {
+        bool stale, uint64_t basis_generation) {
     if (!bounded_release_config_.enabled || bounded_release_config_.target_bytes == 0 || stale) {
         return false;
     }
@@ -407,11 +455,18 @@ bool server_kv_pressure_runtime::bounded_release_due(
         return false;
     }
 
+    if (bounded_release_episode_active_ && basis_generation != bounded_release_basis_generation_) {
+        bounded_release_episode_active_ = false;
+        last_bounded_release_ = time_point {};
+        bounded_release_current_cooldown_ms_ = bounded_release_config_.cooldown_ms;
+    }
+
     if (!bounded_release_episode_active_) {
         bounded_release_episode_active_ = true;
         last_bounded_release_state_ = state;
         last_bounded_release_ = time_point {};
         bounded_release_current_cooldown_ms_ = bounded_release_config_.cooldown_ms;
+        bounded_release_basis_generation_ = basis_generation;
         return true;
     }
 
@@ -458,6 +513,21 @@ std::string server_kv_pressure_bounded_release_format_marker(
         << " overshoot_bytes=" << r.overshoot_bytes
         << " block_scan_exhausted=" << (r.block_scan_exhausted ? 1 : 0)
         << " ownership_aborted=" << (r.ownership_aborted ? 1 : 0)
+        << " target_mode=" << (event.dynamic_target ? "dynamic" : "fixed")
+        << " pressure_basis_valid=" << (event.pressure_basis_valid ? 1 : 0)
+        << " pressure_current_bytes=" << event.pressure_current_bytes
+        << " pressure_low_water_bytes=" << event.pressure_low_water_bytes
+        << " pressure_basis_generation=" << event.pressure_basis_generation
+        << " kv_budget_valid=" << (event.kv_budget_valid ? 1 : 0)
+        << " kv_budget_ownership_aborted=" << (event.kv_budget_ownership_aborted ? 1 : 0)
+        << " kv_resident_bytes=" << event.kv_resident_bytes
+        << " kv_reclaimable_resident_bytes=" << event.kv_reclaimable_resident_bytes
+        << " water_excess_bytes=" << event.water_excess_bytes
+        << " water_shortfall_bytes=" << event.water_shortfall_bytes
+        << " water_overshoot_bytes=" << event.water_overshoot_bytes
+        << " max_release_bytes=" << event.max_release_bytes
+        << " target_clamp=" << event.target_clamp
+        << " decision_reason=" << event.decision_reason
         << " target_bytes=" << event.target_bytes
         << " max_scan_blocks=" << event.max_scan_blocks
         << " legacy_enabled=" << (event.legacy_enabled ? 1 : 0)

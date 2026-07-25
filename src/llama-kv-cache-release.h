@@ -30,6 +30,15 @@ struct llama_kv_bounded_release_result {
     bool     ownership_aborted    = false;
 };
 
+// One read-only residency snapshot used to bound a dynamic release decision.
+// valid distinguishes a real zero from an unavailable or failed mincore probe.
+struct llama_kv_release_budget_snapshot {
+    bool     valid = false;
+    bool     ownership_aborted = false;
+    uint64_t resident_bytes = 0;
+    uint64_t reclaimable_resident_bytes = 0;
+};
+
 // Per-condition decomposition of bounded_release_can_enable() for diagnostic use.
 // Each field reports whether the corresponding structural precondition is met.
 // can_enable is true iff all fields are true.

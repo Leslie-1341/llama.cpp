@@ -460,6 +460,7 @@ static void test_dry_run_config_disabled() {
 
 static void clear_bounded_release_env() {
     unsetenv("LLAMA_KV_PRESSURE_BOUNDED_RELEASE");
+    unsetenv("LLAMA_KV_PRESSURE_BOUNDED_RELEASE_DYNAMIC_TARGET");
     unsetenv("LLAMA_KV_PRESSURE_BOUNDED_RELEASE_TARGET_BYTES");
     unsetenv("LLAMA_KV_PRESSURE_BOUNDED_RELEASE_MAX_SCAN_BLOCKS");
     unsetenv("LLAMA_KV_PRESSURE_BOUNDED_RELEASE_COOLDOWN_MS");
@@ -479,12 +480,14 @@ static void test_bounded_release_config_default_disabled() {
 static void test_bounded_release_config_enabled_defaults_preserved() {
     clear_bounded_release_env();
     setenv("LLAMA_KV_PRESSURE_BOUNDED_RELEASE", "1", 1);
+    setenv("LLAMA_KV_PRESSURE_BOUNDED_RELEASE_DYNAMIC_TARGET", "1", 1);
     setenv("LLAMA_KV_PRESSURE_BOUNDED_RELEASE_TARGET_BYTES", "1048576", 1);
 
     server_kv_pressure_bounded_release_config cfg;
     std::string error;
     CHECK(server_kv_pressure_bounded_release_config_from_env(cfg, error));
     CHECK(cfg.enabled);
+    CHECK(cfg.dynamic_target);
     CHECK(cfg.max_scan_blocks == server_kv_pressure_bounded_release_config::DEFAULT_MAX_SCAN_BLOCKS);
     CHECK(cfg.cooldown_ms == server_kv_pressure_bounded_release_config::DEFAULT_COOLDOWN_MS);
     CHECK(cfg.backoff_ms == server_kv_pressure_bounded_release_config::DEFAULT_BACKOFF_MS);
@@ -784,6 +787,38 @@ static void test_bounded_release_marker_format() {
     CHECK(marker.find("skipped_reason=none") != std::string::npos);
 }
 
+static void test_dynamic_target_formula_and_fail_closed() {
+    kv_pressure_telemetry telemetry = make_telemetry(
+            kv_pressure_state::PRESSURE, kv_pressure_source::CGROUP_RATIO, false);
+    telemetry.pressure_basis_valid = true;
+    telemetry.pressure_current_bytes = 900;
+    telemetry.pressure_low_water_bytes = 500;
+    llama_kv_release_budget_snapshot budget;
+    budget.valid = true;
+    budget.resident_bytes = 350;
+    budget.reclaimable_resident_bytes = 300;
+
+    auto result = server_kv_pressure_compute_dynamic_target(telemetry, budget, 325);
+    CHECK(result.valid);
+    CHECK(result.water_excess_bytes == 400);
+    CHECK(result.effective_target_bytes == 300);
+    CHECK(std::string(result.clamp_reason) == "reclaimable");
+
+    budget.reclaimable_resident_bytes = 500;
+    result = server_kv_pressure_compute_dynamic_target(telemetry, budget, 325);
+    CHECK(result.effective_target_bytes == 325);
+    CHECK(std::string(result.clamp_reason) == "max_release");
+
+    telemetry.stale = true;
+    CHECK(!server_kv_pressure_compute_dynamic_target(telemetry, budget, 325).valid);
+    telemetry.stale = false;
+    telemetry.state = kv_pressure_state::NORMAL;
+    CHECK(!server_kv_pressure_compute_dynamic_target(telemetry, budget, 325).valid);
+    telemetry.state = kv_pressure_state::CRITICAL;
+    budget.valid = false;
+    CHECK(!server_kv_pressure_compute_dynamic_target(telemetry, budget, 325).valid);
+}
+
 int main() {
     test_default_off();
     test_interval_config();
@@ -819,6 +854,7 @@ int main() {
     test_bounded_release_config_disabled();
     test_bounded_release_stale_rejection();
     test_bounded_release_marker_format();
+    test_dynamic_target_formula_and_fail_closed();
 
     std::printf("server KV pressure tests: %d/%d passed\n", tests_total - tests_failed, tests_total);
     return tests_failed == 0 ? 0 : 1;

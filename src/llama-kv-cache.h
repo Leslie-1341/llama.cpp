@@ -386,6 +386,7 @@ public:
     bool bounded_release_can_enable() const override;
     llama_kv_bounded_release_capability bounded_release_can_enable_diagnose() const override;
     uint64_t sample_kv_resident_bytes() const override;
+    llama_kv_release_budget_snapshot sample_kv_release_budget() const override;
     uint64_t bounded_release_counter_bytes() const override {
         return paged_bounded_release_bytes;
     }

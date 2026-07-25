@@ -63,6 +63,11 @@ BOUNDED_REQUIRED_KEYS = {
     "blocks_scanned", "blocks_skipped_owned", "blocks_skipped_state",
     "madvise_failures", "shortfall_bytes", "overshoot_bytes",
     "block_scan_exhausted", "ownership_aborted",
+    "target_mode", "pressure_basis_valid", "pressure_current_bytes",
+    "pressure_low_water_bytes", "pressure_basis_generation",
+    "kv_budget_valid", "kv_budget_ownership_aborted", "kv_resident_bytes",
+    "kv_reclaimable_resident_bytes", "water_excess_bytes", "water_shortfall_bytes",
+    "water_overshoot_bytes", "max_release_bytes", "target_clamp", "decision_reason",
     "target_bytes", "max_scan_blocks",
     "legacy_enabled", "sample_count", "episode",
     "cooldown_ms", "skipped_reason", "idle",
@@ -119,6 +124,8 @@ TELEMETRY_REQUIRED_KEYS = {
     "state", "previous_state", "source", "sample_valid", "stale", "config_valid",
     "rss_kb", "cgroup_current_bytes", "cgroup_max_bytes", "cgroup_current_kb",
     "cgroup_max_kb", "cgroup_high_kb", "psi_some_avg10", "psi_full_avg10",
+    "pressure_basis_valid", "pressure_current_bytes", "pressure_low_water_bytes",
+    "pressure_basis_generation",
     "sample_latency_ns", "sample_count", "skip_count", "idle", "trigger",
 }
 MARKER_SCHEMAS = {
@@ -129,15 +136,21 @@ MARKER_SCHEMAS = {
 BOOL_FIELDS = {"stale", "release_enabled", "block_scan_exhausted", "ownership_aborted",
                "legacy_enabled", "idle", "can_enable", "cap_paged", "cap_ingraph",
                "cap_layers", "cap_row_idx", "cap_swap_disabled", "cap_layout",
-               "sample_valid", "config_valid"}
+               "sample_valid", "config_valid", "pressure_basis_valid", "kv_budget_valid",
+               "kv_budget_ownership_aborted"}
 ENUMS = {
     "state": {"NORMAL", "PRESSURE", "CRITICAL", "RECOVERY"},
     "previous_state": {"NORMAL", "PRESSURE", "CRITICAL", "RECOVERY"},
-    "source": {"NONE", "RSS_ABSOLUTE", "CGROUP_RATIO", "PSI"},
+    "source": {"NONE", "RSS_ABSOLUTE", "CGROUP_RATIO", "CGROUP_ABSOLUTE"},
     "skipped_reason": {"none", "dry_run_active", "no_memory", "not_paged",
         "layout_unsupported", "swap_enabled", "not_ingraph", "no_layers", "no_row_idx",
         "legacy_active", "stale", "not_pressure", "cooldown",
-        "structurally_disabled", "ownership_aborted"},
+        "structurally_disabled", "ownership_aborted", "invalid_pressure_basis",
+        "invalid_kv_budget", "no_budget", "no_excess_or_candidate"},
+    "target_mode": {"fixed", "dynamic"},
+    "target_clamp": {"none", "max_release", "resident", "reclaimable"},
+    "decision_reason": {"fixed", "dynamic", "invalid_pressure_basis", "not_pressure",
+        "ownership_aborted", "invalid_kv_budget", "no_budget", "no_excess_or_candidate"},
 }
 TRIGGERS = {"first", "state", "source", "stale", "periodic", "wake_completion"}
 
@@ -211,6 +224,7 @@ BOUNDED_ONLY_KEYS = {
     "LLAMA_KV_PRESSURE_BOUNDED_RELEASE_MAX_SCAN_BLOCKS",
     "LLAMA_KV_PRESSURE_BOUNDED_RELEASE_COOLDOWN_MS",
     "LLAMA_KV_PRESSURE_BOUNDED_RELEASE_BACKOFF_MS",
+    "LLAMA_KV_PRESSURE_BOUNDED_RELEASE_DYNAMIC_TARGET",
 }
 
 DRY_RUN_ONLY_KEYS = {

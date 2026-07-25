@@ -220,6 +220,10 @@ struct llama_memory_i {
         return 0;
     }
 
+    virtual llama_kv_release_budget_snapshot sample_kv_release_budget() const {
+        return {};
+    }
+
     // Structural capability query for bounded destructive release,
     // independent of LLAMA_KV_PAGED_RELEASE or any legacy policy state.
     // Returns true when paged KV is active with a valid layout, in-graph

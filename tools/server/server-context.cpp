@@ -1171,9 +1171,10 @@ private:
                     kv_pressure_bounded_release_config = bounded_cfg;
                     kv_pressure_runtime.bounded_release_enable(bounded_cfg);
                     kv_pressure_bounded_release_episode = 0;
-                    SRV_INF("KV pressure bounded release enabled: target_bytes=%"
+                    SRV_INF("KV pressure bounded release enabled: target_mode=%s max_release_bytes=%"
                             PRIu64 " max_scan_blocks=%" PRIu32 " cooldown_ms=%"
                             PRIu32 " backoff_ms=%" PRIu32 "\n",
+                            bounded_cfg.dynamic_target ? "dynamic" : "fixed",
                             bounded_cfg.target_bytes,
                             bounded_cfg.max_scan_blocks,
                             bounded_cfg.cooldown_ms,
@@ -1352,7 +1353,13 @@ private:
             bounded_event.sample_count     = kv_pressure_runtime.sample_count();
             bounded_event.episode          = kv_pressure_bounded_release_episode;
             bounded_event.target_bytes     = kv_pressure_bounded_release_config.target_bytes;
+            bounded_event.dynamic_target   = kv_pressure_bounded_release_config.dynamic_target;
+            bounded_event.max_release_bytes = kv_pressure_bounded_release_config.target_bytes;
             bounded_event.max_scan_blocks  = kv_pressure_bounded_release_config.max_scan_blocks;
+            bounded_event.pressure_basis_valid = telemetry.pressure_basis_valid;
+            bounded_event.pressure_current_bytes = telemetry.pressure_current_bytes;
+            bounded_event.pressure_low_water_bytes = telemetry.pressure_low_water_bytes;
+            bounded_event.pressure_basis_generation = telemetry.pressure_basis_generation;
 
             const auto now2 = server_kv_pressure_runtime::clock::now();
 
@@ -1439,7 +1446,33 @@ private:
                 } else if (!bounded_skip_reason) {
                     should_evaluate_bounded =
                         kv_pressure_runtime.bounded_release_due(
-                                now2, telemetry.state, telemetry.stale);
+                                now2, telemetry.state, telemetry.stale,
+                                telemetry.pressure_basis_generation);
+                }
+            }
+
+            if (should_evaluate_bounded) {
+                auto * mem = llama_get_memory(ctx_tgt);
+                if (kv_pressure_bounded_release_config.dynamic_target) {
+                    const auto budget = mem->sample_kv_release_budget();
+                    bounded_event.kv_budget_valid = budget.valid;
+                    bounded_event.kv_budget_ownership_aborted = budget.ownership_aborted;
+                    bounded_event.kv_resident_bytes = budget.resident_bytes;
+                    bounded_event.kv_reclaimable_resident_bytes = budget.reclaimable_resident_bytes;
+                    const auto target = server_kv_pressure_compute_dynamic_target(
+                            telemetry, budget, kv_pressure_bounded_release_config.target_bytes);
+                    bounded_event.water_excess_bytes = target.water_excess_bytes;
+                    bounded_event.target_bytes = target.effective_target_bytes;
+                    bounded_event.target_clamp = target.clamp_reason;
+                    bounded_event.decision_reason = target.decision_reason;
+                    if (!target.valid || target.effective_target_bytes == 0) {
+                        bounded_skip_reason = target.decision_reason;
+                        kv_pressure_runtime.bounded_release_record(
+                                !target.valid || budget.ownership_aborted, now2);
+                        bounded_event.cooldown_ms =
+                            kv_pressure_runtime.bounded_release_current_cooldown_ms();
+                        should_evaluate_bounded = false;
+                    }
                 }
             }
 
@@ -1453,7 +1486,7 @@ private:
                 // Sample KV resident pages before release (mincore hard gate)
                 bounded_event.mincore_before_bytes = mem->sample_kv_resident_bytes();
                 bounded_event.result = mem->bounded_release(
-                        kv_pressure_bounded_release_config.target_bytes,
+                        bounded_event.target_bytes,
                         kv_pressure_bounded_release_config.max_scan_blocks);
                 // Sample KV resident pages after release
                 bounded_event.mincore_after_bytes = mem->sample_kv_resident_bytes();
@@ -1461,12 +1494,21 @@ private:
                 const uint64_t cnt_blocks_after = mem->bounded_release_counter_blocks();
                 bounded_event.bounded_cnt_bytes_delta  = cnt_bytes_after - cnt_bytes_before;
                 bounded_event.bounded_cnt_blocks_delta = cnt_blocks_after - cnt_blocks_before;
-                const bool had_shortfall =
-                    bounded_event.result.shortfall_bytes > 0 &&
-                    bounded_event.result.block_scan_exhausted;
+                const bool had_shortfall = bounded_event.result.ownership_aborted ||
+                    bounded_event.result.madvise_failures > 0 ||
+                    (bounded_event.result.shortfall_bytes > 0 &&
+                     bounded_event.result.block_scan_exhausted);
                 kv_pressure_runtime.bounded_release_record(had_shortfall, now2);
                 bounded_event.cooldown_ms =
-                    kv_pressure_bounded_release_config.cooldown_ms;
+                    kv_pressure_runtime.bounded_release_current_cooldown_ms();
+                if (bounded_event.dynamic_target) {
+                    bounded_event.water_shortfall_bytes =
+                        bounded_event.water_excess_bytes > bounded_event.result.released_bytes ?
+                        bounded_event.water_excess_bytes - bounded_event.result.released_bytes : 0;
+                    bounded_event.water_overshoot_bytes =
+                        bounded_event.result.released_bytes > bounded_event.water_excess_bytes ?
+                        bounded_event.result.released_bytes - bounded_event.water_excess_bytes : 0;
+                }
                 bounded_skip_reason = "none";
                 // Advance episode counter on successful evaluation
                 kv_pressure_bounded_release_episode += 1;

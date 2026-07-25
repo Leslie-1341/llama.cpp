@@ -41,6 +41,8 @@ class ParserArtifactTest(unittest.TestCase):
                 "source=RSS_ABSOLUTE sample_valid=1 stale=0 config_valid=1 rss_kb=1000 "
                 "cgroup_current_bytes=0 cgroup_max_bytes=0 cgroup_current_kb=0 "
                 "cgroup_max_kb=0 cgroup_high_kb=0 psi_some_avg10=0 psi_full_avg10=0 "
+                "pressure_basis_valid=1 pressure_current_bytes=1024000 "
+                "pressure_low_water_bytes=1024 pressure_basis_generation=1 "
                 "sample_latency_ns=1 sample_count=1 skip_count=0 idle=0 "
                 "trigger=first,state,source\n")
 
@@ -59,7 +61,12 @@ class ParserArtifactTest(unittest.TestCase):
                 "released_bytes=4096 released_blocks=1 blocks_scanned=1 "
                 "blocks_skipped_owned=0 blocks_skipped_state=0 madvise_failures=0 "
                 "shortfall_bytes=0 overshoot_bytes=0 block_scan_exhausted=0 "
-                "ownership_aborted=0 target_bytes=4096 max_scan_blocks=1 legacy_enabled=0 "
+                "ownership_aborted=0 target_mode=fixed pressure_basis_valid=1 "
+                "pressure_current_bytes=1024000 pressure_low_water_bytes=1024 "
+                "pressure_basis_generation=1 kv_budget_valid=0 kv_budget_ownership_aborted=0 "
+                "kv_resident_bytes=0 kv_reclaimable_resident_bytes=0 water_excess_bytes=0 "
+                "water_shortfall_bytes=0 water_overshoot_bytes=0 max_release_bytes=4096 "
+                "target_clamp=none decision_reason=fixed target_bytes=4096 max_scan_blocks=1 legacy_enabled=0 "
                 "sample_count=1 episode=1 cooldown_ms=60000 skipped_reason=none idle=0 "
                 "mincore_before_bytes=8192 mincore_after_bytes=4096 "
                 "bounded_cnt_bytes_delta=4096 bounded_cnt_blocks_delta=1 "
@@ -349,7 +356,12 @@ class ParserArtifactTest(unittest.TestCase):
                     "released_bytes=0 released_blocks=0 blocks_scanned=0 "
                     "blocks_skipped_owned=0 blocks_skipped_state=0 madvise_failures=0 "
                     "shortfall_bytes=4096 overshoot_bytes=0 block_scan_exhausted=1 "
-                    "ownership_aborted=0 target_bytes=4096 max_scan_blocks=1 legacy_enabled=0 "
+                    "ownership_aborted=0 target_mode=fixed pressure_basis_valid=1 "
+                    "pressure_current_bytes=1024000 pressure_low_water_bytes=1024 "
+                    "pressure_basis_generation=1 kv_budget_valid=0 kv_budget_ownership_aborted=0 "
+                    "kv_resident_bytes=0 kv_reclaimable_resident_bytes=0 water_excess_bytes=0 "
+                    "water_shortfall_bytes=0 water_overshoot_bytes=0 max_release_bytes=4096 "
+                    "target_clamp=none decision_reason=fixed target_bytes=4096 max_scan_blocks=1 legacy_enabled=0 "
                     "sample_count=1 episode=0 cooldown_ms=60000 skipped_reason=not_paged idle=0 "
                     "mincore_before_bytes=0 mincore_after_bytes=0 "
                     "bounded_cnt_bytes_delta=0 bounded_cnt_blocks_delta=0 "
@@ -370,7 +382,12 @@ class ParserArtifactTest(unittest.TestCase):
             "released_bytes=0 released_blocks=0 blocks_scanned=0 "
             "blocks_skipped_owned=0 blocks_skipped_state=0 madvise_failures=0 "
             "shortfall_bytes=4096 overshoot_bytes=0 block_scan_exhausted=1 "
-            "ownership_aborted=0 target_bytes=4096 max_scan_blocks=1 legacy_enabled=0 "
+            "ownership_aborted=0 target_mode=fixed pressure_basis_valid=1 "
+            "pressure_current_bytes=1024000 pressure_low_water_bytes=1024 "
+            "pressure_basis_generation=1 kv_budget_valid=0 kv_budget_ownership_aborted=0 "
+            "kv_resident_bytes=0 kv_reclaimable_resident_bytes=0 water_excess_bytes=0 "
+            "water_shortfall_bytes=0 water_overshoot_bytes=0 max_release_bytes=4096 "
+            "target_clamp=none decision_reason=fixed target_bytes=4096 max_scan_blocks=1 legacy_enabled=0 "
             "sample_count=1 episode=0 cooldown_ms=60000 skipped_reason=no_row_idx idle=0 "
             "mincore_before_bytes=0 mincore_after_bytes=0 "
             "bounded_cnt_bytes_delta=0 bounded_cnt_blocks_delta=0 "
@@ -471,6 +488,45 @@ class ParserArtifactTest(unittest.TestCase):
         path.write_text(path.read_text().replace(
             "trigger=first,state,source", "trigger="))
         self.assert_failure("malformed field 'trigger='")
+
+
+    # --- Stage 3B-1 dynamic target env isolation (review-fix) ---
+
+    _DYNAMIC_ENV = {"LLAMA_KV_PRESSURE_BOUNDED_RELEASE_DYNAMIC_TARGET": "1"}
+
+    def _add_dynamic_target_to_case(self, case_dir: str, label: str) -> None:
+        """Add DYNAMIC_TARGET=1 to all env records for a case (environment.json,
+        execution.json, and both manifest locations)."""
+        self.mutate_json(f"{case_dir}/environment.json",
+                         lambda e: e.update(self._DYNAMIC_ENV))
+        self.mutate_json(f"{case_dir}/execution.json",
+                         lambda v: v["environment"].update(self._DYNAMIC_ENV))
+        # manifest.json stores the environment in two places:
+        #   case_configs[label].environment (top-level env identity)
+        #   case_configs[label].execution.environment (nested inside execution identity)
+        self.mutate_json("manifest.json",
+                         lambda v: v["case_configs"][label]["environment"].update(
+                             self._DYNAMIC_ENV))
+        self.mutate_json("manifest.json",
+                         lambda v: v["case_configs"][label]["execution"]["environment"].update(
+                             self._DYNAMIC_ENV))
+
+    def test_bounded_dynamic_target_accepted(self) -> None:
+        """BOUNDED variant with DYNAMIC_TARGET=1 must pass env isolation."""
+        self._add_dynamic_target_to_case("bounded_on", "BOUNDED")
+        result = self.run_parser()
+        self.assertEqual(result.returncode, 0,
+                         f"BOUNDED+DYNAMIC_TARGET should pass; got: {result.stderr}")
+
+    def test_off_dynamic_target_rejected(self) -> None:
+        """OFF variant with DYNAMIC_TARGET=1 must be rejected as bounded key leakage."""
+        self._add_dynamic_target_to_case("bounded_off", "OFF")
+        self.assert_failure("OFF env has bounded-release keys")
+
+    def test_dry_dynamic_target_rejected(self) -> None:
+        """DRY variant with DYNAMIC_TARGET=1 must be rejected as bounded key leakage."""
+        self._add_dynamic_target_to_case("dry_run_off", "DRY")
+        self.assert_failure("DRY env has")
 
 
 if __name__ == "__main__":

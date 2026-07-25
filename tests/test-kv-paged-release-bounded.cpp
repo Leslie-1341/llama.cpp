@@ -299,6 +299,18 @@ int main(int /*argc*/, char ** /*argv*/) {
             CHECK(rc == 0, "SETUP: decode ok");
             uint8_t s0 = g.kv->paged_release_bounded_test_read_block_state(0);
             CHECK(s0 == 1, "SETUP: block 0 RESIDENT after decode");
+            const auto owned_budget = g.kv->sample_kv_release_budget();
+            CHECK(owned_budget.valid, "SETUP: release budget snapshot valid");
+            CHECK(owned_budget.resident_bytes > 0, "SETUP: resident bytes observed");
+            CHECK(owned_budget.reclaimable_resident_bytes == 0,
+                    "SETUP: active-owned block is not reclaimable");
+            llama_memory_seq_rm(g.mem, 0, -1, -1);
+            const auto idle_budget = g.kv->sample_kv_release_budget();
+            CHECK(idle_budget.valid, "SETUP: idle release budget snapshot valid");
+            CHECK(idle_budget.reclaimable_resident_bytes > 0,
+                    "SETUP: unowned resident block is reclaimable");
+            CHECK(idle_budget.reclaimable_resident_bytes <= idle_budget.resident_bytes,
+                    "SETUP: reclaimable resident bytes bounded by resident bytes");
             std::fprintf(stderr, "SETUP synthetic-model paged: rc=%d block0=%u OK\n", rc, s0);
         }
     }
@@ -1078,6 +1090,8 @@ int main(int /*argc*/, char ** /*argv*/) {
                     "WT15: cap_layers is false (no paged)");
             CHECK(cap.row_idx == false,
                     "WT15: cap_row_idx is false (no paged)");
+            CHECK(!g.mem->sample_kv_release_budget().valid,
+                    "WT15: unsupported wrapper reports invalid release budget");
 
             // Each field independently reported for attribution.
             std::fprintf(stderr, "WT15 unsupported wrapper diagnose: paged=%d"
@@ -1117,6 +1131,10 @@ int main(int /*argc*/, char ** /*argv*/) {
             const auto r1 = g.kv->bounded_release(UINT64_MAX, UINT32_MAX);
             CHECK(!r1.ownership_aborted, "WT16: round1 ownership valid");
             CHECK(r1.released_blocks >= 1, "WT16: round1 released some blocks");
+            const auto released_budget = g.kv->sample_kv_release_budget();
+            CHECK(released_budget.valid, "WT16: zero-candidate snapshot remains valid");
+            CHECK(released_budget.reclaimable_resident_bytes == 0,
+                    "WT16: RELEASED blocks are not reclaimable candidates");
 
             // Round 2 — all candidates already RELEASED, idempotent
             const auto r2 = g.kv->bounded_release(UINT64_MAX, UINT32_MAX);

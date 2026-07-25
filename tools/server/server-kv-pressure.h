@@ -83,11 +83,25 @@ struct server_kv_pressure_bounded_release_config {
     static constexpr uint32_t MIN_COOLDOWN_MS         = 500;
 
     bool     enabled         = false;   // LLAMA_KV_PRESSURE_BOUNDED_RELEASE=1
+    bool     dynamic_target  = false;   // LLAMA_KV_PRESSURE_BOUNDED_RELEASE_DYNAMIC_TARGET=1
     uint64_t target_bytes    = 0;       // LLAMA_KV_PRESSURE_BOUNDED_RELEASE_TARGET_BYTES
     uint32_t max_scan_blocks = DEFAULT_MAX_SCAN_BLOCKS;
     uint32_t cooldown_ms     = DEFAULT_COOLDOWN_MS;
     uint32_t backoff_ms      = DEFAULT_BACKOFF_MS;
 };
+
+struct server_kv_pressure_dynamic_target {
+    bool valid = false;
+    uint64_t water_excess_bytes = 0;
+    uint64_t effective_target_bytes = 0;
+    const char * clamp_reason = "none";
+    const char * decision_reason = "fixed";
+};
+
+server_kv_pressure_dynamic_target server_kv_pressure_compute_dynamic_target(
+        const kv_pressure_telemetry & telemetry,
+        const llama_kv_release_budget_snapshot & budget,
+        uint64_t max_release_bytes);
 
 struct server_kv_pressure_bounded_release_event {
     llama_kv_bounded_release_result result;
@@ -99,6 +113,21 @@ struct server_kv_pressure_bounded_release_event {
     uint64_t sample_count    = 0;
     uint64_t episode         = 0;      // pressure-episode counter
     uint64_t target_bytes    = 0;
+    bool     dynamic_target  = false;
+    bool     pressure_basis_valid = false;
+    uint64_t pressure_current_bytes = 0;
+    uint64_t pressure_low_water_bytes = 0;
+    uint64_t pressure_basis_generation = 0;
+    bool     kv_budget_valid = false;
+    bool     kv_budget_ownership_aborted = false;
+    uint64_t kv_resident_bytes = 0;
+    uint64_t kv_reclaimable_resident_bytes = 0;
+    uint64_t water_excess_bytes = 0;
+    uint64_t water_shortfall_bytes = 0;
+    uint64_t water_overshoot_bytes = 0;
+    uint64_t max_release_bytes = 0;
+    const char * target_clamp = "none";
+    const char * decision_reason = "fixed";
     uint32_t max_scan_blocks = 0;
     uint32_t cooldown_ms     = 0;
     uint64_t mincore_before_bytes = 0; // KV resident bytes before release (mincore)
@@ -224,6 +253,7 @@ public:
         last_bounded_release_state_ = kv_pressure_state::NORMAL;
         bounded_release_episode_active_ = false;
         bounded_release_current_cooldown_ms_ = cfg.cooldown_ms;
+        bounded_release_basis_generation_ = 0;
     }
 
     void bounded_release_disable() {
@@ -232,18 +262,23 @@ public:
         last_bounded_release_state_ = kv_pressure_state::NORMAL;
         bounded_release_episode_active_ = false;
         bounded_release_current_cooldown_ms_ = 0;
+        bounded_release_basis_generation_ = 0;
     }
 
     // Returns true when a bounded destructive release should be evaluated.
     // Same episode reset, cooldown, state-entry, and backoff semantics as dry_run_due().
     bool bounded_release_due(time_point now, kv_pressure_state state,
-                             bool stale);
+                             bool stale, uint64_t basis_generation = 0);
 
     // Advance cooldown after a completed bounded release call.
     void bounded_release_record(bool had_shortfall, time_point now = clock::now());
 
     const server_kv_pressure_bounded_release_config & bounded_release_config() const {
         return bounded_release_config_;
+    }
+
+    uint32_t bounded_release_current_cooldown_ms() const {
+        return bounded_release_current_cooldown_ms_;
     }
 
 private:
@@ -274,4 +309,5 @@ private:
     kv_pressure_state last_bounded_release_state_ = kv_pressure_state::NORMAL;
     bool bounded_release_episode_active_ = false;
     uint32_t bounded_release_current_cooldown_ms_ = 0;
+    uint64_t bounded_release_basis_generation_ = 0;
 };

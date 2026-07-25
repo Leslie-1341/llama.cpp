@@ -87,6 +87,10 @@ struct kv_pressure_telemetry {
     uint64_t            cgroup_high_kb   = 0;
     uint32_t            psi_some_avg10   = 0;
     uint32_t            psi_full_avg10   = 0;
+    bool                pressure_basis_valid = false;
+    uint64_t            pressure_current_bytes = 0;
+    uint64_t            pressure_low_water_bytes = 0;
+    uint64_t            pressure_basis_generation = 0;
     uint64_t            sample_latency_ns = 0;
     char                transition_reason[128] = {};
     char                disabled_reason[160] = {};
@@ -202,6 +206,7 @@ private:
     };
 
     transition_basis transition_basis_;
+    uint64_t pressure_basis_generation_ = 0;
 
     // Resolved cgroup state
     std::string cgroup_mem_path_;

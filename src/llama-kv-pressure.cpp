@@ -922,7 +922,54 @@ void kv_pressure_sampler::refresh_transition_basis(const kv_pressure_telemetry &
     if (changed) {
         reset_transition_counters();
     }
+    if (!transition_basis_.initialized || changed) {
+        if (pressure_basis_generation_ != UINT64_MAX) {
+            pressure_basis_generation_ += 1;
+        }
+    }
     transition_basis_ = next;
+
+    telemetry_.pressure_basis_valid = false;
+    telemetry_.pressure_current_bytes = 0;
+    telemetry_.pressure_low_water_bytes = 0;
+    telemetry_.pressure_basis_generation = pressure_basis_generation_;
+    uint64_t low_bytes = 0;
+    switch (sample.source) {
+        case kv_pressure_source::RSS_ABSOLUTE:
+            if (checked_mul(sample.rss_kb, 1024, telemetry_.pressure_current_bytes) &&
+                    checked_mul(config_.low_water_rss_kb, 1024, low_bytes)) {
+                telemetry_.pressure_low_water_bytes = low_bytes;
+                telemetry_.pressure_basis_valid = true;
+            }
+            break;
+        case kv_pressure_source::CGROUP_ABSOLUTE:
+            if (checked_mul(config_.low_water_cgroup_kb, 1024, low_bytes)) {
+                telemetry_.pressure_current_bytes = sample.cgroup_current_bytes;
+                telemetry_.pressure_low_water_bytes = low_bytes;
+                telemetry_.pressure_basis_valid = true;
+            }
+            break;
+        case kv_pressure_source::CGROUP_RATIO: {
+            const uint64_t maximum = sample.cgroup_max_bytes;
+            const uint64_t quotient = maximum / 10000;
+            const uint64_t remainder = maximum % 10000;
+            uint64_t whole = 0;
+            uint64_t numerator = 0;
+            uint64_t fractional = 0;
+            if (maximum > 0 && checked_mul(quotient, config_.low_water_ratio, whole) &&
+                    checked_mul(remainder, config_.low_water_ratio, numerator)) {
+                fractional = numerator / 10000 + (numerator % 10000 != 0 ? 1 : 0);
+                if (checked_add(whole, fractional, low_bytes)) {
+                    telemetry_.pressure_current_bytes = sample.cgroup_current_bytes;
+                    telemetry_.pressure_low_water_bytes = low_bytes;
+                    telemetry_.pressure_basis_valid = true;
+                }
+            }
+            break;
+        }
+        case kv_pressure_source::NONE:
+            break;
+    }
 }
 
 // ── state machine evaluation ────────────────────────────────────────────────
@@ -938,6 +985,7 @@ void kv_pressure_sampler::evaluate_transition() {
         consecutive_psi_pressure_     = 0;
 
         telemetry_.stale = true;
+        telemetry_.pressure_basis_valid = false;
         set_state(t.state, "sample failure: stale (no auto-demotion)");
         return;
     }

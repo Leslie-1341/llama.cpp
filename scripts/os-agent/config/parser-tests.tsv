@@ -12,6 +12,8 @@ test-kv-final-controlled-e0-e5-parser	tests/test-kv-final-controlled-e0-e5-parse
 
 test-kv-bounded-release-stage3a-2c-parser	tests/test-kv-bounded-release-stage3a-2c-parser.py	module:scripts/parse-kv-bounded-release-stage3a-2c.py	tests/test-kv-bounded-release-stage3a-2c-parser.py;scripts/parse-kv-bounded-release-stage3a-2c.py;scripts/*bounded-release-stage3a-2c*	bounded
 
+test-kv-bounded-release-stage3b-1-parser	tests/test-kv-bounded-release-stage3b-1-parser.py	module:scripts/parse-kv-bounded-release-stage3b-1.py	tests/test-kv-bounded-release-stage3b-1-parser.py;scripts/parse-kv-bounded-release-stage3b-1.py;scripts/*bounded-release-stage3b-1*	bounded
+
 test-server-kv-pressure-stage3a-1c-parser	tests/test-server-kv-pressure-stage3a-1c-parser.py	module:scripts/parse-server-kv-pressure-stage3a-1c.py	tests/test-server-kv-pressure-stage3a-1c-parser.py;scripts/parse-server-kv-pressure-stage3a-1c.py;scripts/*server-kv-pressure-stage3a-1c*	pressure
 
 test-kv-paged-identity-controlled-ab-parser	tests/test-kv-paged-identity-controlled-ab-parser.py	module:scripts/parse-kv-paged-identity-controlled-ab.py	tests/test-kv-paged-identity-controlled-ab-parser.py;scripts/parse-kv-paged-identity-controlled-ab.py;scripts/*paged-identity-controlled-ab*	identity

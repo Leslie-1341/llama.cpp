@@ -88,6 +88,8 @@ class ServerKvPressureStaticTest(unittest.TestCase):
             "state=", "previous_state=", "source=", "sample_valid=", "stale=",
             "rss_kb=", "cgroup_current_bytes=", "cgroup_max_bytes=",
             "psi_some_avg10=", "psi_full_avg10=", "sample_latency_ns=",
+            "pressure_basis_valid=", "pressure_current_bytes=",
+            "pressure_low_water_bytes=", "pressure_basis_generation=",
             "sample_count=", "skip_count=",
         )
         for field in required:
@@ -216,6 +218,10 @@ class ServerKvPressureStaticTest(unittest.TestCase):
             "legacy_enabled=", "sample_count=", "episode=",
             "cooldown_ms=", "skipped_reason=",
             "mincore_before_bytes=", "mincore_after_bytes=",
+            "target_mode=", "kv_budget_valid=", "kv_budget_ownership_aborted=", "kv_resident_bytes=",
+            "kv_reclaimable_resident_bytes=", "water_excess_bytes=",
+            "water_shortfall_bytes=", "water_overshoot_bytes=",
+            "max_release_bytes=", "target_clamp=", "decision_reason=",
             "bounded_cnt_bytes_delta=", "bounded_cnt_blocks_delta=",
             "can_enable=", "cap_paged=", "cap_ingraph=", "cap_layers=",
             "cap_row_idx=", "cap_swap_disabled=", "cap_layout=",

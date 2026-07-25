@@ -63,6 +63,10 @@ static kv_pressure_telemetry make_telemetry(
     t.rss_kb            = rss_kb;
     t.cgroup_current_kb = cg_current_kb;
     t.cgroup_max_kb     = cg_max_kb;
+    if (cg_current_kb <= UINT64_MAX / 1024 && cg_max_kb <= UINT64_MAX / 1024) {
+        t.cgroup_current_bytes = cg_current_kb * 1024;
+        t.cgroup_max_bytes     = cg_max_kb * 1024;
+    }
     t.psi_some_avg10    = psi_some_avg10;
     t.psi_full_avg10    = psi_full_avg10;
     t.sample_latency_ns = 1000;
@@ -269,6 +273,9 @@ static void test_full_cycle_cgroup_ratio() {
     st = s.sample_synthetic(t_pressure);
     CHECK_STATE(st, kv_pressure_state::PRESSURE);
     CHECK(s.telemetry().state == kv_pressure_state::PRESSURE);
+    CHECK(s.telemetry().pressure_basis_valid);
+    CHECK(s.telemetry().pressure_current_bytes == 8500 * 1024);
+    CHECK(s.telemetry().pressure_low_water_bytes == 7000 * 1024);
 
     // --- Phase 2: PRESSURE → CRITICAL (critical_ratio=95%, immediate entry) ---
     // cgroup: 96% usage
@@ -494,6 +501,9 @@ static void test_rss_absolute_thresholds() {
 
     auto st = s.sample_synthetic(t);
     CHECK_STATE(st, kv_pressure_state::PRESSURE);
+    CHECK(s.telemetry().pressure_basis_valid);
+    CHECK(s.telemetry().pressure_current_bytes == 1500000 * 1024);
+    CHECK(s.telemetry().pressure_low_water_bytes == 800000 * 1024);
 
     // Critical threshold
     t.rss_kb = 2500000;  // 2.5 GB RSS (> 2 GB critical)
@@ -796,6 +806,9 @@ static void test_cgroup_absolute_thresholds() {
 
     auto st = s.sample_synthetic(t);
     CHECK_STATE(st, kv_pressure_state::PRESSURE);
+    CHECK(s.telemetry().pressure_basis_valid);
+    CHECK(s.telemetry().pressure_current_bytes == 600000 * 1024);
+    CHECK(s.telemetry().pressure_low_water_bytes == 400000 * 1024);
 
     // Critical
     t.cgroup_current_kb = 1000000; // 1 GB

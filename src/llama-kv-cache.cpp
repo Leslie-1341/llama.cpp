@@ -6777,6 +6777,104 @@ uint64_t llama_kv_cache::sample_kv_resident_bytes() const {
     return paged_sample_mincore();
 }
 
+llama_kv_release_budget_snapshot llama_kv_cache::sample_kv_release_budget() const {
+    llama_kv_release_budget_snapshot result;
+#if defined(__linux__)
+    if (!bounded_release_can_enable() || paged_write_context_invalid ||
+            paged_block_states.size() != paged_n_blocks) {
+        return result;
+    }
+
+    const auto ownership = llama_kv_release_collect_ownership(
+            v_cells, paged_n_blocks, paged_block_size, PAGED_BLOCK_INVALID, LLAMA_MAX_SEQ,
+            [&](uint32_t logical_cell) { return paged_resolve(logical_cell); });
+    if (!ownership.valid) {
+        result.ownership_aborted = true;
+        return result;
+    }
+
+    const long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) {
+        return result;
+    }
+    const uintptr_t pg = (uintptr_t) page;
+    std::vector<paged_release_range> resident_ranges;
+    std::vector<paged_release_range> reclaimable_ranges;
+    for (const auto & layer : layers) {
+        auto add_tensor = [&](ggml_tensor * tensor) {
+            if (!tensor || !tensor->data) {
+                return;
+            }
+            const uintptr_t lo = (uintptr_t) tensor->data;
+            const uintptr_t hi = lo + (uintptr_t) ggml_nbytes(tensor);
+            const uintptr_t begin = (lo + pg - 1) & ~(pg - 1);
+            const uintptr_t end = hi & ~(pg - 1);
+            if (end > begin) {
+                resident_ranges.push_back({ (void *) begin, (size_t) (end - begin), 0, UINT32_MAX });
+            }
+        };
+        add_tensor(layer.k_stream.empty() ? nullptr : layer.k_stream[0]);
+        add_tensor(layer.v_stream.empty() ? nullptr : layer.v_stream[0]);
+    }
+    for (uint32_t block = 0; block < paged_n_blocks; ++block) {
+        if (ownership.owned[block]) {
+            continue;
+        }
+        const paged_block_state state = paged_block_states[block];
+        if (state != paged_block_state::RESIDENT && state != paged_block_state::UNUSED) {
+            continue;
+        }
+
+        for (const auto & layer : layers) {
+            auto add_tensor = [&](ggml_tensor * tensor, uint64_t row) {
+                if (!tensor || !tensor->data || row == 0) {
+                    return;
+                }
+                const uint64_t lo_cell = (uint64_t) block * paged_block_size;
+                const uint64_t hi_cell = std::min<uint64_t>(lo_cell + paged_block_size, paged_kv_size);
+                const uintptr_t lo = (uintptr_t) tensor->data + (uintptr_t) lo_cell * row;
+                const uintptr_t hi = (uintptr_t) tensor->data + (uintptr_t) hi_cell * row;
+                const uintptr_t begin = (lo + pg - 1) & ~(pg - 1);
+                const uintptr_t end = hi & ~(pg - 1);
+                if (end > begin) {
+                    reclaimable_ranges.push_back({ (void *) begin, (size_t) (end - begin), 0, block });
+                }
+            };
+            ggml_tensor * k = layer.k_stream.empty() ? nullptr : layer.k_stream[0];
+            ggml_tensor * v = layer.v_stream.empty() ? nullptr : layer.v_stream[0];
+            add_tensor(k, k ? ggml_row_size(k->type, hparams.n_embd_k_gqa(layer.il)) : 0);
+            add_tensor(v, v ? ggml_row_size(v->type, hparams.n_embd_v_gqa(layer.il)) : 0);
+        }
+    }
+
+    const auto sample_ranges = [&](const std::vector<paged_release_range> & ranges,
+                                   uint64_t & resident_bytes) {
+        resident_bytes = 0;
+        for (const auto & range : ranges) {
+            std::vector<unsigned char> vec(range.len / pg);
+            if (mincore(range.addr, range.len, vec.data()) != 0) {
+                paged_mincore_failures += 1;
+                return false;
+            }
+            for (unsigned char value : vec) {
+                if (value & 1u) {
+                    resident_bytes += pg;
+                }
+            }
+        }
+        return true;
+    };
+    if (!sample_ranges(resident_ranges, result.resident_bytes) ||
+            !sample_ranges(reclaimable_ranges, result.reclaimable_resident_bytes)) {
+        result.resident_bytes = 0;
+        result.reclaimable_resident_bytes = 0;
+        return result;
+    }
+    result.valid = true;
+#endif
+    return result;
+}
+
 llama_kv_bounded_release_result llama_kv_cache::paged_release_blocks_bounded_dry_run(
         uint64_t target_bytes,
         uint32_t max_scan_blocks) const {
