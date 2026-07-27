@@ -688,3 +688,41 @@ Stage 3A-2A/2B 已分别提供 bounded core primitive 和只读 pressure-driven 
 - F1 short tests: WT0–WT23、server 183/183、static 36/36、review PASS。
 - F2 parser 35/35、runner 8/8、review PASS。
 - Artifact `/root/oscomp/kv_logs/kv_bounded_release_stage3a_2c_20260723T161538Z_cffe4f5aea_ba3095de5079`：released 35,389,440 bytes / 9 blocks，response identity，zero ownership abort/madvise failure。
+
+## D-0019 — Stage 3B-2A 动态 target、正释放与 clean-HEAD 归档边界
+
+- Date: 2026-07-27
+- Status: accepted
+- Evidence commit: `a94381a31ea7f127352d996861355559aac2b469`；clean worktree
+- Supersedes: D-0018 的 Stage 3B“尚待验证”状态；不改变 D-0016 的 attribution 分层
+- Superseded by: none
+
+**Context**
+
+Stage 3A-2C 已证明固定 target 的受控 destructive action，但未形成 clean-HEAD 的 long-context 动态 target 协议。Stage 3B-2A 需要避免把请求的 nominal context 当成实际可用上下文，也不能把“无可安全回收候选”误判为 action 失败或成功释放。
+
+**Decision**
+
+1. 先 probe 真实 server effective context，再为每个合法档位独立完成 exact-token 与真实 server PID/RSS calibration；OFF/DYNAMIC ladder 只能运行在 effective context 内。
+2. DYNAMIC target 以有效 water excess 为起点，并受 hard cap、KV resident bytes 和 KV reclaimable resident bytes 共同约束：`min(water_excess, max_release, kv_resident, kv_reclaimable_resident)`；target clamp/reason 必须进入 marker 并由 parser 验证。
+3. `released_bytes > 0` 的正释放必须同时满足核心/counter 对账和有效、方向正确的 KV `mincore` resident drop；不要求跨运行或跨平台的精确字节相等。
+4. 若候选在判定时均为 owned/shared/active-visible，或没有有效可回收 resident bytes，则允许 `released_bytes=0` 的 safe no-op；parser 必须把它与正 action 分开，不得伪造 release 成功。
+5. 可登记为正式验证的 artifact 必须绑定 clean committed HEAD、空 tracked diff、runner 完整结束和同一 artifact 的 parser PASS；dirty-tree diagnostic 不得升级为 archival 结论。
+
+**Alternatives rejected**
+
+- 用请求 `--ctx-size` 或 nominal token 直接声明长上下文覆盖：可能在模型/slot cap 后越界或假通过。
+- 仅按 water excess 决定 target：可能超过实际 resident 或安全可回收量。
+- 只以 HTTP 200、RSS 变化或 marker 存在判断正释放：不能证明目标 action 和物理 resident 下降。
+- 将 owned-only zero release 视为失败或视为已释放：前者破坏安全语义，后者污染证据。
+- 将 dirty worktree 的真实结果与 clean commit 混同：无法形成可复现归档。
+
+**Consequences and limits**
+
+- D-0019 关闭的是单模型、单次完整协议的正确性与有限连续稳定性，不是正式性能、总 RSS 收益、多模型、并发或长期稳定性结论。
+- PID/RSS 仍是进程观测；core/counter 与 mincore 的角色不变，不能反推完整 lifecycle state。
+
+**Evidence**
+
+- `scripts/run-kv-bounded-release-stage3b-2a.py` 与 `scripts/parse-kv-bounded-release-stage3b-2a.py`。
+- `/root/oscomp/kv_logs/kv_bounded_release_stage3b_2a_20260727T115210Z_a94381a31e_d82cf2a44751`：`RUN_RC=0`、`PARSER_RC=0`、parser `PASS`。

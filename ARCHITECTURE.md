@@ -2,9 +2,9 @@
 
 > 记录当前源码和运行证据可验证的稳定结构。目标契约、计划和未验证机制必须明确标记，不能混入当前 runtime。
 
-- Last verified: 2026-07-24
-- Runtime evidence commits: `cffe4f5ae`、`0fe0aed12`
-- Evidence scope: Stage 3A-2C source/review/short tests + dirty-tree real-model OFF/DRY/BOUNDED artifact
+- Last verified: 2026-07-27
+- Runtime evidence commits: `cffe4f5ae`、`0fe0aed12`、`a94381a31`
+- Evidence scope: Stage 3A-2C historical diagnostic + Stage 3B-2A clean-HEAD long-context correctness and limited-stability artifact
 
 ## 1. Authority and Scope
 
@@ -291,6 +291,25 @@ The uploaded source snapshot additionally contains:
 
 These are visible in source, but the supplied ledgers do not contain a commit-bound full Harness result for that newer state. Until the planned Skill/Harness task completes review and self-tests, they remain **implemented but evidence insufficient**, not a stable Harness v2 claim.
 
+## 8.3 Stage 3B-2A clean-HEAD long-context evidence lifecycle
+
+`run-kv-bounded-release-stage3b-2a.py` 将正式验证固定为 fail-closed 的四段生命周期：
+
+```text
+effective-context probe (server stderr effective n_ctx)
+  -> exact token calibration (each legal tier)
+  -> independent RSS calibration (fresh real llama-server PID/RSS per tier)
+  -> OFF/DYNAMIC_RELEASE ladder + continuous DYNAMIC_RELEASE requests
+  -> runner artifact facts / parser schema, identity, action, response and cleanup verdict
+```
+
+- Probe 从 server 实际 slot `n_ctx` 推导可发送 prompt 上限；请求档位必须 clamp 到有效档位，不能以 context overflow 得到假 PASS。
+- Token calibration 与 RSS calibration 独立：前者通过 `/tokenize` 记录 exact prompt count，后者为每个有效档位启动真实 `llama-server`、记录 `(pid, starttime, cmdline)` 与 RSS 后再派生该档阈值/timeout。
+- Ladder 的 `OFF` 使用安全阈值且不配置 bounded action；`DYNAMIC_RELEASE` 使用动态 target 与触发阈值。每档均要求 HTTP 200 和与该档 OFF baseline 的 response identity。
+- `DYNAMIC_RELEASE` marker 的 action 与 safe zero-release no-op 分开：有正 `released_bytes` 时须有有效、方向正确的 KV `mincore` drop；若候选均 owned/shared/active-visible，则 `released_bytes=0` 是允许的安全 no-op，不得伪报 action。
+- RSS 只能从真实 `llama-server` PID 采样，不能取 `strace` wrapper；连续请求还要求跨 round PID identity 一致、20 个 HTTP 200、零累计错误和 response identity。
+- Runner 只持久化输入、身份、原始事实和首个失败 phase/target/reason；任一必需目录、文件、身份、上下文、action/no-op、PID/RSS、响应或 cleanup 不满足，parser 以 fail-closed 方式拒绝 artifact。仅 parser 写 PASS/FAIL。
+
 ## 9. Module Responsibilities
 
 - `src/llama-flex.*` / weight-stream files: Dense layer registration, bounded buffers, prefetch and compute callback.
@@ -328,11 +347,11 @@ These are visible in source, but the supplied ledgers do not contain a commit-bo
 - No complete PagedAttention block-table design; current implementation is lightweight paged row mapping for edge CPU runtime.
 - No unified weight/KV memory budget or I/O arbiter.
 - No active-access/resume asynchronous prefetch thread in server scheduler.
-- No current proof for concurrent requests, long contexts, multiple models, different block sizes/page sizes or sustained repeated release.
-- Stage 3A-2C uses forced CRITICAL and fixed target; not production policy.
-- `mincore` and strace diagnostics add overhead and must be disabled in formal performance comparisons unless explicitly measured.
+- Stage 3B-2A 已在单模型、单次协议中覆盖有效 8064-token 档位与同一 server 的 20 次连续请求；仍无并发、多模型/quantization、不同 block/page size、长期重复 release/refault 的证明。
+- DYNAMIC target 与 per-tier calibrated RSS 的正确性证据不等于生产阈值或性能策略；Stage 3A-2C 的 forced CRITICAL/fixed target 仅保留为历史 diagnostic。
+- `mincore`、RSS 和 strace 是诊断/正确性观测；它们会带来开销，正式性能比较必须关闭或单独测量。
 - Current target contracts for three-axis lifecycle, unified five-action scheduler and v5 evidence remain unimplemented.
 
 ## 12. Next Architecture Gate
 
-First close Skill/Harness correctness and workflow efficiency. Then Stage 3B should add real-threshold experiments, dynamic reclaim budget, concurrent/long-context validation and release/offload/prefetch arbitration. Weight–KV shared budget and I/O arbitration follow only after those KV correctness and evidence gates remain stable.
+Stage 3B-2A 已关闭单模型、单次 long-context/repeated-request correctness 门禁。下一架构门禁是以 clean-HEAD artifacts 扩展到真实压力、并发、多模型/quantization 和重复 release/refault，并在每个正释放 case 维持 mincore drop、在 owned-only case 维持安全 no-op。仅在这些 KV 正确性和性能矩阵稳定后，再接入 release/offload/prefetch 与权重的共享预算和 I/O 仲裁。

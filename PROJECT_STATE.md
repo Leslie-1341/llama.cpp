@@ -2,11 +2,11 @@
 
 > 当前项目快照。只记录可验证事实；历史决策和实验索引分别进入 `DECISIONS.md` 与 `EXPERIMENTS.md`。
 
-- Last updated: 2026-07-24
-- Evidence commit: `0fe0aed12e7f324d3959c40e6c04985a4e2af31e`（composite pressure trigger parser 修复）
-- Runtime implementation commit: `cffe4f5ae`（Stage 3A-2C bounded destructive release）
+- Last updated: 2026-07-27
+- Evidence commit: `a94381a31ea7f127352d996861355559aac2b469`（Stage 3B-2A clean-HEAD formal validation）
+- Runtime implementation commit: `a94381a31`（Stage 3B-2A long-context release-only protocol）
 - Branch: `fix/kv-p0-b1-bounded-store`
-- Worktree: 本文件生成时无法读取服务器当前 Git 状态；提交前必须由用户执行 `git status --short` 确认
+- Worktree: clean；`git status --short` 为空，artifact 中 `tracked.diff` SHA-256 为空 diff
 - Upstream relation: 目前无法确认
 
 ## Goal
@@ -15,9 +15,9 @@
 
 ## Current Stage
 
-**Stage 3A-2C 已完成。** 当前结论限定为：在单机 CPU、单 slot、单请求、forced CRITICAL、固定 32 MiB target 的受控场景中，server 能安全执行 bounded destructive release，真实降低 KV resident pages，并保持 OFF/DRY/BOUNDED 三路响应字节一致。
+**Stage 3B-2A 已实现并完成单模型、单次完整协议验证。** 在 clean committed HEAD `a94381a31` 上，Meta-Llama-3-8B-Instruct Q4_K_M 的 effective-context probe、独立 token/RSS calibration、OFF/DYNAMIC long-context ladder 和 20 次连续请求均完成；有效档位为 `1024/2048/4096/8064`，OFF/DYNAMIC 全部 HTTP 200，连续请求 20/20，`RUN_RC=0`、`PARSER_RC=0`。
 
-该结论是 **dirty-tree real-model diagnostic PASS**，不是 clean-HEAD archival 证据，也不是正式内存或性能收益结论。
+该结论是 **clean-HEAD archival correctness and limited-stability PASS**。它不构成正式性能、总 RSS 收益、多模型或长期稳定性结论。
 
 ## Stage 3A-2C Verified Result
 
@@ -38,6 +38,15 @@
 - Capture mode: `diagnostic_dirty`
 
 ## Implemented and Verified
+
+### Stage 3B-2A — clean-HEAD long-context release-only validation
+
+- 正式 artifact：`/root/oscomp/kv_logs/kv_bounded_release_stage3b_2a_20260727T115210Z_a94381a31e_d82cf2a44751`；`capture_mode=archival_clean`，HEAD 为 `a94381a31ea7f127352d996861355559aac2b469`，source snapshot 的 tracked diff 为空。
+- effective-context probe 将请求档位 `1024/2048/4096/8192` 收敛为有效档位 `1024/2048/4096/8064`；最大 prompt 为 8064 tokens，`n_predict=32`。
+- token calibration 四档均为 exact token count（delta 0）；RSS calibration 每档独立启动真实 `llama-server`、记录 PID identity/RSS，并均完成 HTTP 200。
+- OFF 与 DYNAMIC_RELEASE 在四个有效档位均 HTTP 200，响应分别与该档 OFF baseline 一致；DYNAMIC 的 release action 与“all candidates owned”导致的 safe zero-release no-op 由 parser 分开验证。
+- 连续 DYNAMIC_RELEASE 20/20 请求全部 HTTP 200、与 OFF baseline 一致、`cumulative_error_count=0`；runner `run_complete`、`RUN_RC=0`、parser `PASS`、`PARSER_RC=0`。
+- 当前证据只关闭该单模型、单次完整协议的正确性和有限稳定性门禁。
 
 ### Stage 3A-2C — pressure-driven bounded destructive release
 
@@ -64,16 +73,11 @@
 
 ## Implemented but Evidence Insufficient
 
-- Stage 3A-2C 只覆盖单模型、单请求、forced threshold、ctx 1024、固定 target；不代表真实压力、长上下文或并发场景。
-- 本次约 33.75 MiB 下降证明 KV resident pages 可按预算真实回收；不等同于整体 RSS 大幅下降。该值约占本次 mincore 可观测 KV resident 的 13%，只占约 8.4 GiB server RSS 的约 0.4%。
-- 未形成正式 TTFT、TPOT、TPS、吞吐、p95/p99 或长期稳定性对照；单次 timing 不能用于性能结论。
-- `mincore` 本次恰好与 core result 精确一致，但 v4 协议只把它作为独立物理观测，不要求普遍精确相等。
-- Process-wide strace 包含 llama.cpp 其他后台 `MADV_DONTNEED`；只能证明 syscall 存在，不能按字节归因 bounded release。
-- Bounded release cooldown/backoff、真实 pressure thresholds、dynamic target 尚未调优。
-- 多请求并发下 ownership、安全性、scheduler latency 和 release/refault 代价尚未验证。
-- 与 swap/offload/prefetch 的统一互斥和优先级只存在目标契约，尚未形成统一 runtime scheduler。
-- 当前 HEAD 的正式 E0–E5 三轮模型矩阵仍未运行。
-- Stage 3A-2A 原始 E-0010 的模型 Part B 当时因环境变量缺失而 SKIP；当前 WT0–WT23 短验证已通过，但没有为原 E-0010 另建 clean archival artifact。
+- Stage 3B-2A 虽覆盖至有效 8064-token 档位和一次 20-request 连续序列，但仍只是一台 Linux CPU、单 slot、单模型、单次运行；未覆盖并发、多模型/quantization、不同 block/page size 或长期重复 episode。
+- DYNAMIC target 的机制与 marker 已受 parser 验证，但本 artifact 不得用于声称正式总 RSS 收益、回收率、TTFT/TPOT/TPS、吞吐或 p95/p99 改善。
+- RSS 是独立真实 server PID 的进程观测；它不替代 KV resident/mincore 或 lifecycle state truth。正释放的 mincore 下降是本协议的正确性证据，非性能指标。
+- release、swap/offload、prefetch 的统一互斥/优先级、与权重共享预算/I/O 仲裁尚未实现或验证。
+- Stage 3A-2C 的 dirty-tree 单次固定-target 结论保留为历史 diagnostic；新 clean-HEAD artifact 不自动将其推广为生产策略。
 
 ## In Progress
 
@@ -83,22 +87,13 @@
 
 ## Blocked
 
-无 Stage 3A-2C runtime 阻塞项。
+无已确认的 Stage 3B-2A runtime 阻塞项。
 
 ## Next Gate
 
-### Immediate gate — Skill + Harness
+### Stage 3B 后续覆盖与性能门禁
 
-1. Skill 强制任务先定义阶段目标、支持边界和真实触发路径，再产生 implement/review-fix。
-2. 提示词只保留目标、验收和特殊边界，不重复 Skill 已承担的固定规则。
-3. Harness 区分 PASS、FAIL、UNRESOLVED、UNVERIFIED、INCOMPLETE、NO_CHANGES；必要检查被跳过时不能返回 PASS。
-4. Fixture 必须覆盖真实 producer 日志形态，包括组合 trigger。
-5. 完成短验证后形成独立 infra commit 并 push。
-
-### Following gate — Stage 3B
-
-1. 用真实内存上限和真实 workload 替代 forced 1/2/3 KiB thresholds。
-2. 根据当前压力、目标水位和可回收量计算 dynamic target。
-3. 调优 cooldown/backoff，量化 scheduler scan 与 mincore 开销。
-4. 验证多请求、长上下文下 ownership、安全性、RSS/KV resident、TTFT/TPOT/TPS 和恢复代价。
-5. 建立 release、swap/offload、prefetch 的统一互斥和优先级，再进入权重–KV 共享预算与 I/O 仲裁。
+1. 在固定 baseline、KV-only、weight-only、combined 四组下，执行多轮交错的性能协议；明确 TTFT、TPOT、TPS、吞吐和分位数定义，并将诊断开销单独消融。
+2. 扩展到至少多模型/quantization、真实内存/cgroup 压力、并发请求和重复 release/refault episode；每项均保留 clean-HEAD artifact 与 fail-closed parser verdict。
+3. 验证 DYNAMIC release 的正释放 mincore drop、all-candidates-owned 安全 no-op、PID/RSS identity 与 response correctness 在上述矩阵中仍成立。
+4. 在独立 KV 门禁稳定后，再建立 release、swap/offload、prefetch 与权重侧之间的共享预算和 I/O 仲裁；融合验证必须具备 baseline、KV-only、weight-only、combined 对照。

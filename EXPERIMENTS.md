@@ -539,3 +539,42 @@ Stage 3A-2C endpoint is feasible and correct in the stated controlled boundary: 
 - Single run, single model, single request, ctx 1024, fixed target.
 - Does not cover concurrency, long context, repeated episodes, dynamic target, different page/block sizes, different models, GPU, or release/offload/prefetch arbitration.
 - Dirty-tree diagnostic evidence is not clean archival evidence.
+
+## E-0013 — Stage 3B-2A clean-HEAD long-context OFF/DYNAMIC release-only validation
+
+- Status: **valid clean-HEAD archival correctness and limited-stability evidence**
+- Date: 2026-07-27
+- Commit: `a94381a31ea7f127352d996861355559aac2b469` (`test: add Stage 3B-2A long-context release validation`)
+- Capture mode: `archival_clean`；worktree clean，artifact `tracked.diff` 为空
+- Model: `Meta-Llama-3-8B-Instruct-Q4_K_M.gguf`（Meta-Llama-3-8B-Instruct，Q4_K_M；模型 SHA-256 见 manifest）
+- Runner / parser: `scripts/run-kv-bounded-release-stage3b-2a.py` / `scripts/parse-kv-bounded-release-stage3b-2a.py`
+- Command entry: `python3 scripts/run-kv-bounded-release-stage3b-2a.py --binary build/bin/llama-server --model /root/models/Meta-Llama-3-8B-Instruct/Meta-Llama-3-8B-Instruct-Q4_K_M.gguf --output-dir <artifact>`；随后对同一 artifact 运行 parser。
+- Artifact: `/root/oscomp/kv_logs/kv_bounded_release_stage3b_2a_20260727T115210Z_a94381a31e_d82cf2a44751`
+
+**Question**
+
+在 clean committed HEAD 上，动态 bounded release 是否能在真实 effective context 内通过四档 OFF/DYNAMIC ladder 与一次 20-request 连续序列，保持输出正确、action/no-op 语义、真实 server PID/RSS 采样和 fail-closed artifact 闭包？
+
+**Protocol and calibration**
+
+- effective-context probe：请求 `1024/2048/4096/8192`，实际 `n_ctx=8192`，使用 `n_predict=32`、special overhead 1、safety 95、32-token align，得到有效档位 **`1024/2048/4096/8064`**，最大 prompt 8064。
+- token calibration：四档实际 token count 分别为 `1024/2048/4096/8064`，均 `delta=0`。
+- RSS calibration：每档独立启动真实 `llama-server`，记录 PID identity 与 idle/peak RSS；四档 calibration completion 均 HTTP 200。对应 `ctx_size` 为 `1280/2304/4352/8320`，RSS delta 分别为 `23416/25456/41276/76688 KiB`。
+- Ladder：每个有效档位执行 OFF 与 DYNAMIC_RELEASE；DYNAMIC hard cap 为 1 GiB、`max_scan_blocks=256`。连续阶段以最小合法档位的 DYNAMIC_RELEASE server 发送 20 个相同请求。
+
+**Key result**
+
+- 四个有效档位的 OFF/DYNAMIC_RELEASE 均 HTTP 200；每个 DYNAMIC 响应与同档 OFF baseline byte-identical。
+- 20 次连续 DYNAMIC_RELEASE 请求：**20/20** completed，全部 HTTP 200、全部匹配 OFF baseline，`cumulative_error_count=0`，且每轮记录真实 `llama-server` PID/starttime/cmdline 与 RSS。
+- parser 对 dynamic target、正 action 的 core/counter 与 mincore drop、以及 owned-only safe zero-release no-op 分别 fail-closed 验证；没有把 no-op 当作 release action。
+- Runner status `run_complete`，**`RUN_RC=0`**；parser status `PASS`，**`PARSER_RC=0`**；failure phase/reason/target 均为空。
+
+**Supported conclusion**
+
+本 artifact 证明 Stage 3B-2A 已在所述单模型、单次完整协议边界内实现并验证：有效 context 探测、独立 token/RSS calibration、OFF/DYNAMIC ladder、20-request 连续正确性、真实 server PID/RSS 以及完整 artifact/parser fail-closed 生命周期。
+
+**Limits**
+
+- 这是正确性与有限稳定性验证，**不得**用于正式性能、总 RSS 收益、TTFT/TPOT/TPS/吞吐、多模型/quantization、并发请求或长期稳定性结论。
+- 仅一次 clean-HEAD 运行；未覆盖不同 block/page size、真实生产阈值、多轮 release/refault 或 release/swap/offload/prefetch 与权重侧仲裁。
+- RSS/mincore 为观测/正确性证据，不是完整 lifecycle state truth；诊断开销必须在性能协议中关闭或单独测量。
