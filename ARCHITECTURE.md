@@ -159,6 +159,7 @@ resume/active requires block
 - Swap-out 先完成整块 I/O 再发布 metadata；部分写失败不能成为可见 SWAPPED block。
 - Swap-in 先读 staging，再提交 tensor/state；active-required restore failure 通过 context-local error 在 graph compute 前失败传播。
 - Destructive release 与 swap 在当前 capability 上互斥；SWAPPED block 永不进入 RELEASED。
+- 固定槽位 offload、`SWAPPED`、restore/prefetch 与 active restore error propagation 是底层已有路径；它们尚未作为统一 server policy 的动作接入当前 pressure scheduler。
 - Current transaction states are `CLOSED/APPLIED/COMPUTE_STARTED` plus block `PENDING_WRITE/INVALID` behavior；这不是冻结目标契约中的完整 PREPARED/per-cell overlay 实现。
 
 ## 5. Static Paged Identity Fast Path
@@ -207,10 +208,10 @@ State invariants:
 ```text
 Phase A: sample/log telemetry
 Phase B: optional bounded dry-run
-Phase C: optional bounded destructive release
+Phase C: optional dynamic bounded destructive release
 ```
 
-Dry-run and bounded release use independent config and cooldown/backoff state. They **can be enabled together**; Phase B runs before Phase C in the same scheduler call. Stage 3A-2C runner separates DRY and BOUNDED variants to obtain a clear controlled comparison.
+当前已接入 server policy 的 state-changing 动作只有 Phase C 的 dynamic bounded destructive release；dry-run 是只读预测。它们使用独立 config 与 cooldown/backoff，且可在同一 scheduler call 中按 Phase B 再 Phase C 运行。固定槽位 offload、`SWAPPED`、restore/prefetch 与其错误传播仍由底层 KV 路径提供，尚未与 release 组成统一的 server policy 仲裁。Stage 3A-2C runner 分离 DRY/BOUNDED variants 以获得受控比较。
 
 ### 6.3 Phase C gates
 
@@ -350,8 +351,9 @@ effective-context probe (server stderr effective n_ctx)
 - Stage 3B-2A 已在单模型、单次协议中覆盖有效 8064-token 档位与同一 server 的 20 次连续请求；仍无并发、多模型/quantization、不同 block/page size、长期重复 release/refault 的证明。
 - DYNAMIC target 与 per-tier calibrated RSS 的正确性证据不等于生产阈值或性能策略；Stage 3A-2C 的 forced CRITICAL/fixed target 仅保留为历史 diagnostic。
 - `mincore`、RSS 和 strace 是诊断/正确性观测；它们会带来开销，正式性能比较必须关闭或单独测量。
+- 固定槽位 offload、`SWAPPED`、restore/prefetch 和 active restore error propagation 已存在于底层 KV 路径，但尚未统一接入 server policy；当前 server 的 state-changing policy 仍是 dynamic bounded destructive release。
 - Current target contracts for three-axis lifecycle, unified five-action scheduler and v5 evidence remain unimplemented.
 
 ## 12. Next Architecture Gate
 
-Stage 3B-2A 已关闭单模型、单次 long-context/repeated-request correctness 门禁。下一架构门禁是以 clean-HEAD artifacts 扩展到真实压力、并发、多模型/quantization 和重复 release/refault，并在每个正释放 case 维持 mincore drop、在 owned-only case 维持安全 no-op。仅在这些 KV 正确性和性能矩阵稳定后，再接入 release/offload/prefetch 与权重的共享预算和 I/O 仲裁。
+Stage 3C-1 的下一架构门禁是单 owner、单 slot 的最小统一 KV 动作仲裁：沿用 D-0014 authority，在每个 decision 中按 fail-stop → correctness-required restore/prefetch → release → offload → noop 选择动作，并且至多提交一个 state-changing transaction。当前只定义该最小闭环的实现门禁；它不表示完整五动作 scheduler、三轴 lifecycle、异步 prefetch、权重–KV 协同、持续压力、多 slot、并发或正式性能矩阵已经实现。release shortfall 由后续 decision 再进入 offload；上述扩展验证合并至 Stage 3C-2。

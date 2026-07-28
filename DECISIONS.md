@@ -726,3 +726,41 @@ Stage 3A-2C 已证明固定 target 的受控 destructive action，但未形成 c
 
 - `scripts/run-kv-bounded-release-stage3b-2a.py` 与 `scripts/parse-kv-bounded-release-stage3b-2a.py`。
 - `/root/oscomp/kv_logs/kv_bounded_release_stage3b_2a_20260727T115210Z_a94381a31e_d82cf2a44751`：`RUN_RC=0`、`PARSER_RC=0`、parser `PASS`。
+
+## D-0020 — Stage 3C-1 从 release-only 稳定节点转向最小统一 KV 动作仲裁
+
+- Date: 2026-07-28
+- Status: accepted（**路线决策**；Stage 3C-1 runtime 尚未实现）
+- Evidence basis: D-0014 authority/priority；Stage 3B-2A clean-HEAD evidence `a94381a31ea7f127352d996861355559aac2b469`
+- Supersedes: Stage 3B-2A 后将 release-only 容量上限、持续压力和正式性能作为独立下一阶段的路线；不改变 D-0014 的 authority 或 D-0019 的证据边界
+- Superseded by: none
+
+**Context**
+
+Stage 3B-2A 已作为 release-only 的稳定节点关闭，但仅证明单模型、单次完整协议内的 dynamic bounded destructive release 正确性与有限连续稳定性。底层已有固定槽位 offload、`SWAPPED`、restore/prefetch 与错误传播路径，却尚未与已接入 server 的 release policy 统一仲裁。继续先扩展 release-only 容量上限、持续压力或性能矩阵，不能关闭该动作边界。
+
+**Decision**
+
+1. Stage 3C-1 沿用 D-0014 的 server/core authority 与优先级，在单 owner、单 slot 的最小路径按 fail-stop → correctness-required restore/prefetch → release → offload → noop 仲裁。
+2. 每个 decision 最多执行一个 state-changing transaction；server 只提交策略意图，core 继续独占候选解析、ownership/recheck、状态与事务变更。
+3. release shortfall 不在同一 decision 中继续 mutation；由后续 decision 重新评估后才可转入 offload。
+4. 本阶段不增加异步线程，不接入权重模块；不将最小闭环描述为完整五动作 scheduler、完整三轴 lifecycle 或权重–KV 协同。
+5. 原 Stage 3B-2B/2C 的持续压力、重复 episode、多 slot、并发与正式 KV-only 性能矩阵合并为 Stage 3C-2；正式性能矩阵后移，Stage 3C-1 不单独开展 release-only 容量上限、持续压力或正式性能阶段。
+
+**Alternatives rejected**
+
+- 先扩展 release-only 压力/容量和性能矩阵：会继续验证单一动作，无法证明 release/offload/restore/prefetch 的优先级与互斥边界。
+- 在一个 decision 中把 release shortfall 立即追加 offload：会产生多个 state-changing transaction，削弱 decision 到 core mutation 的归因与重检边界。
+- 为预取或调度新增异步线程：超出单 owner、单 slot 最小闭环，先引入并发正确性变量。
+- 同步接入权重模块：尚无已验证的共享预算或 I/O 仲裁，不能构成可信协同。
+
+**Consequences and limits**
+
+- Stage 3B-2A 的 clean-HEAD 结论保留，未被性能或多会话结论升级。
+- Stage 3C-1 是路线与实现门禁，不产生新的 runtime、性能、多 slot 或并发验证结论。
+- Stage 3C-2 的扩展验证仍须保留 clean-HEAD artifact 与 fail-closed parser，并在正式性能时按协议建立对照。
+
+**Evidence**
+
+- D-0014、D-0019。
+- E-0013 的 Stage 3B-2A clean-HEAD artifact 与离线定量摘要。

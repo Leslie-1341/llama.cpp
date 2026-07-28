@@ -578,3 +578,17 @@ Stage 3A-2C endpoint is feasible and correct in the stated controlled boundary: 
 - 这是正确性与有限稳定性验证，**不得**用于正式性能、总 RSS 收益、TTFT/TPOT/TPS/吞吐、多模型/quantization、并发请求或长期稳定性结论。
 - 仅一次 clean-HEAD 运行；未覆盖不同 block/page size、真实生产阈值、多轮 release/refault 或 release/swap/offload/prefetch 与权重侧仲裁。
 - RSS/mincore 为观测/正确性证据，不是完整 lifecycle state truth；诊断开销必须在性能协议中关闭或单独测量。
+
+**离线定量摘要（同一 E-0013 artifact，非新增运行）**
+
+- 四档 OFF/DYNAMIC ladder 共记录 **82** 个正 action、**20** 个 safe no-op、**628** 个 blocks；cumulative release traffic 为 **2355 MiB**，**82/82** 正 action 均匹配有效、方向正确的 `mincore` physical-drop 观测。
+- 连续请求阶段为 **20/20** completed；其中 action/no-op 为 **24/2**，reuse/commit/rollback 为 **81/81/0**。
+- cumulative release traffic 是本协议下累计 destructive release 字节流量，**不是**净 RSS 收益、回收率或内存节省；E-0013 不支持正式性能结论。
+
+## E-0014 — Stage 3C-1 最小统一 KV 动作仲裁
+
+- Status: **planned**
+- Scope: 单 owner、单 slot 下的最小统一 KV 动作仲裁，沿用 D-0014/D-0020 的 authority、优先级与“每个 decision 至多一个 state-changing transaction”边界。
+- Required evidence: correctness-required restore/prefetch、release、offload 与 noop 的决策边界、response correctness、错误传播和 safe no-op；不把底层已有路径或目标契约提前登记为已验证 scheduler/lifecycle。
+- Excluded: 异步线程、权重模块接入、持续压力、重复 episode、多 slot、并发与正式性能矩阵；这些扩展属于 Stage 3C-2。
+- Runner / command / artifact / result: 尚未登记。

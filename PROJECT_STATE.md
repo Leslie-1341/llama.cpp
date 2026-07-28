@@ -2,7 +2,7 @@
 
 > 当前项目快照。只记录可验证事实；历史决策和实验索引分别进入 `DECISIONS.md` 与 `EXPERIMENTS.md`。
 
-- Last updated: 2026-07-27
+- Last updated: 2026-07-28
 - Evidence commit: `a94381a31ea7f127352d996861355559aac2b469`（Stage 3B-2A clean-HEAD formal validation）
 - Runtime implementation commit: `a94381a31`（Stage 3B-2A long-context release-only protocol）
 - Branch: `fix/kv-p0-b1-bounded-store`
@@ -15,9 +15,9 @@
 
 ## Current Stage
 
-**Stage 3B-2A 已实现并完成单模型、单次完整协议验证。** 在 clean committed HEAD `a94381a31` 上，Meta-Llama-3-8B-Instruct Q4_K_M 的 effective-context probe、独立 token/RSS calibration、OFF/DYNAMIC long-context ladder 和 20 次连续请求均完成；有效档位为 `1024/2048/4096/8064`，OFF/DYNAMIC 全部 HTTP 200，连续请求 20/20，`RUN_RC=0`、`PARSER_RC=0`。
+**Current Stage：Stage 3C-1 — 统一 KV 动作仲裁（最小闭环）。** Stage 3B-2A 已作为 release-only 稳定节点关闭：在 clean committed HEAD `a94381a31` 上，Meta-Llama-3-8B-Instruct Q4_K_M 的 effective-context probe、独立 token/RSS calibration、OFF/DYNAMIC long-context ladder 和 20 次连续请求均完成；有效档位为 `1024/2048/4096/8064`，OFF/DYNAMIC 全部 HTTP 200，连续请求 20/20，`RUN_RC=0`、`PARSER_RC=0`。
 
-该结论是 **clean-HEAD archival correctness and limited-stability PASS**。它不构成正式性能、总 RSS 收益、多模型或长期稳定性结论。
+该结论是 **clean-HEAD archival correctness and limited-stability PASS**，只覆盖 release-only 的单模型、单次完整协议边界。Stage 3C-1 转向单 owner、单 slot 的最小统一 KV 动作仲裁；不再单独开展 release-only 的容量上限、持续压力或正式性能阶段。它不构成正式性能、总 RSS 收益、多模型或长期稳定性结论。
 
 ## Stage 3A-2C Verified Result
 
@@ -81,19 +81,18 @@
 
 ## In Progress
 
-**Agent Skill 与 Harness 收敛准备。** 目标是减少局部反复 review-fix、先证明问题真实可达、保持任务提示词精简，并让真实 producer 输出进入 fixture 回归。
-
-仓库快照中可见 `UNVERIFIED`、known-fail 分类和更多 Harness E2E 代码，但目前缺少绑定当前 HEAD 的完整审查与测试输出，因此不能先记为稳定完成。
+**Stage 3C-1 路线同步，尚未开始 runtime 实现。** 目标是在既有单 owner、单 slot server 路径上，以 D-0014 authority 实现最小统一 KV 动作仲裁；当前不新增异步线程，也不接入权重模块。
 
 ## Blocked
 
-无已确认的 Stage 3B-2A runtime 阻塞项。
+无已确认的 Stage 3C-1 runtime 阻塞项；Stage 3C-1 尚未开始实现。
 
 ## Next Gate
 
-### Stage 3B 后续覆盖与性能门禁
+### Stage 3C-1 — 单 owner、单 slot 的最小统一 KV 动作仲裁
 
-1. 在固定 baseline、KV-only、weight-only、combined 四组下，执行多轮交错的性能协议；明确 TTFT、TPOT、TPS、吞吐和分位数定义，并将诊断开销单独消融。
-2. 扩展到至少多模型/quantization、真实内存/cgroup 压力、并发请求和重复 release/refault episode；每项均保留 clean-HEAD artifact 与 fail-closed parser verdict。
-3. 验证 DYNAMIC release 的正释放 mincore drop、all-candidates-owned 安全 no-op、PID/RSS identity 与 response correctness 在上述矩阵中仍成立。
-4. 在独立 KV 门禁稳定后，再建立 release、swap/offload、prefetch 与权重侧之间的共享预算和 I/O 仲裁；融合验证必须具备 baseline、KV-only、weight-only、combined 对照。
+1. 沿用 D-0014 的 server/core authority 和优先级，在已有 server 路径将 fail-stop、correctness-required restore/prefetch、release、offload、noop 纳入一个 decision；每个 decision 至多提交一个 state-changing transaction。
+2. 保持 core 独占候选解析、ownership/recheck、状态与事务变更；server 不读取或改写 private block state。release 未满足目标时只记录 shortfall，由后续 decision 再进入 offload。
+3. 验证单 owner、单 slot 闭环的 response correctness、错误传播和 safe no-op；本阶段不新增异步线程、不接入权重模块，也不声称完整三轴 lifecycle 或五动作 scheduler 已实现。
+
+原定 release-only 的持续压力、重复 episode、多 slot、并发及正式 KV-only 性能矩阵合并后移至 **Stage 3C-2**；Stage 3C-2 之前不再单独开展 release-only 容量上限、持续压力或正式性能阶段。
