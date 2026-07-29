@@ -2,9 +2,9 @@
 
 > 记录当前源码和运行证据可验证的稳定结构。目标契约、计划和未验证机制必须明确标记，不能混入当前 runtime。
 
-- Last verified: 2026-07-27
-- Runtime evidence commits: `cffe4f5ae`、`0fe0aed12`、`a94381a31`
-- Evidence scope: Stage 3A-2C historical diagnostic + Stage 3B-2A clean-HEAD long-context correctness and limited-stability artifact
+- Last verified: 2026-07-29
+- Runtime evidence commits: `cffe4f5ae`、`0fe0aed12`、`a94381a31`、`64301af3d`、`ca4c95210`
+- Evidence scope: Stage 3A-2C historical diagnostic、Stage 3B-2A clean-HEAD artifact，以及 Stage 3C-1C-2A unified pressure code-level short verification
 
 ## 1. Authority and Scope
 
@@ -169,7 +169,7 @@ resume/active requires block
 - core 独占从 logical sequence/budget 到 physical candidate 的解析、候选 ownership/recheck、physical block state transition、free-list/transaction 更新，以及 backing-store read/write 的提交 authority；server 不得枚举或改写 private physical block state。
 - `EVALUATE` 只报告 capability，不创建 transaction。每次 `execute_action()` 调用只执行其 request 指定的一个 action，且只在实际 state transition 后发布一个 core transaction ID；无候选或零预算为 no-op，不隐式串接另一 action。
 - `OFFLOAD` 仅在 backing write 完成后发布 `SWAPPED`；`PREFETCH` 仅在 staging read/validate/unpack 完成后发布 `RESIDENT`。partial PREFETCH backing read failure 保留已恢复 block 的 `RESIDENT` 与失败 block 的 `SWAPPED`，result 返回 `partial_failure`、完成量和 shortfall；correctness-required request 同时置 fail-stop。
-- 当前 core 边界与定向单测已实现并验证。Stage 3C-1C-1 已接入一个独立的 server request-resume PREFETCH 调用边界；更广义的 pressure action arbitration 尚未接入。server 只能从不可变快照形成 logical intent 并提交一次 request，不能替代 core candidate/state/backing authority。
+- 当前 core 边界与定向单测已实现并验证。Stage 3C-1C-1 的 request-resume PREFETCH 与 Stage 3C-1C-2A 的 unified pressure action 是两个独立 server 调用边界；后者只从不可变 pressure/slot 观测形成 logical request，不能替代 core 的 candidate/state/backing authority。
 
 ### 4.2 Stage 3C-1C-1 server request-resume PREFETCH boundary
 
@@ -186,6 +186,23 @@ server::update_slots()
 - gate 位于 `n_past` 确定之后、batch setup/graph compute 前；其只传递 sequence、decision ID 与 correctness-required/all-required logical intent。physical candidate、state、backing I/O 与 transaction authority 仍在 core。
 - 只有 matching decision ID、`completed`/`no_op` outcome、无 I/O failure/fail-stop/context-invalid 且零 shortfall 才允许后续 graph。失败、partial failure 或 nonzero shortfall 均阻止本轮 graph/decode。
 - sequence protection 在 gate 调用前设定，跨成功 graph 生命周期保持；仅在 prompt clear 或 slot release 时清除。该 request-resume boundary 不依赖 pressure state。
+
+### 4.3 Stage 3C-1C-2A unified pressure action boundary
+
+`server_kv_pressure_unified_action_startup_decide_from_env()` 将 unified action 保持为显式 opt-in：仅 `LLAMA_KV_PRESSURE_UNIFIED_ACTION=1` 且 required target/max-blocks 有效、非零时启用；任何 legacy release、dry-run 或 bounded-release opt-in 冲突，或解析/范围错误，都返回 disabled/invalid/conflict，server 不提交 action。
+
+```text
+server::maybe_sample_kv_pressure()
+  -> immutable pressure/idle observation + one server decision ID
+  -> server_kv_pressure_execute_unified_action()
+  -> core execute_action(EVALUATE, same decision ID)
+  -> permitted effective pressure only: core execute_action(RELEASE, same decision ID)
+  -> observation reason=release_submitted; core result remains authoritative
+```
+
+- 只有有效且非 stale 的 `PRESSURE/CRITICAL` 观测会尝试 `EVALUATE`。decision mismatch、context-invalid、open write transaction、fail-stop、cannot-release 或 evaluation rejection 全部在 release 前结束；一个 invocation 至多提交一次 `RELEASE`，不链式 OFFLOAD。
+- server 只保存 observation、logical budgets 和 stable submission reason；core 仍独占 physical candidate selection、ownership/recheck、state transition、backing I/O、outcome/reason 与 transaction ID。`EVALUATE` 不改变状态；`RELEASE` 是否产生状态变化及原因由 core result 决定。
+- 这是源码和短验证可确认的结构，非真实压力或真实 HTTP 行为证明。
 
 ## 5. Static Paged Identity Fast Path
 
@@ -236,7 +253,7 @@ Phase B: optional bounded dry-run
 Phase C: optional dynamic bounded destructive release
 ```
 
-当前已接入 server policy 的 state-changing 动作只有 Phase C 的 dynamic bounded destructive release；dry-run 是只读预测。它们使用独立 config 与 cooldown/backoff，且可在同一 scheduler call 中按 Phase B 再 Phase C 运行。固定槽位 offload、`SWAPPED`、restore/prefetch 与其错误传播仍由底层 KV 路径提供，尚未与 release 组成统一的 server policy 仲裁。Stage 3A-2C runner 分离 DRY/BOUNDED variants 以获得受控比较。
+历史 Phase B/Phase C dry-run 与 dynamic bounded-release 保持独立路径。Stage 3C-1C-2A 另有显式 opt-in 的 unified branch：它在有效压力下只提交同一 decision ID 的 `EVALUATE`，并在允许时至多提交一次 `RELEASE`；它不与 legacy/dry-run/bounded opt-in 混用。固定槽位 offload、`SWAPPED`、restore/prefetch 与其错误传播仍由底层 KV 路径提供；2A 未把它们接成 Governor 或完整五动作 policy。
 
 ### 6.3 Phase C gates
 
@@ -382,4 +399,4 @@ effective-context probe (server stderr effective n_ctx)
 
 ## 12. Next Architecture Gate
 
-Stage 3C-1C 的下一架构门禁是单 owner、单 slot 的 server arbitration：沿用 D-0014 authority，server 从不可变快照在每个 decision 中按 fail-stop → correctness-required restore/prefetch → release → offload → noop 选择一个 logical action，并向 core 提交一次 `execute_action()` request。core 保持唯一的 physical candidate、state transition、backing-store 与 transaction authority；server 不读取或改写 private block state。该门禁不表示完整五动作 scheduler、三轴 lifecycle、异步 prefetch、权重–KV 协同、真实模型、持续压力、多 slot、并发或正式性能矩阵已经实现。release shortfall 由后续 decision 再进入 offload；上述扩展验证合并至 Stage 3C-2。
+Stage 3C-1C-2B-0 的下一架构门禁是 **EdgeKV Governor v1 architecture audit 与 implementation-contract freeze**：审计 pressure debt/高低水位、slot 生命周期与复用信号、backing I/O 的拆分点、预测性 `PREFETCH` logical 接口，以及可供未来 Dense/MoE 共用的 memory claimant、I/O priority 和 byte budget 接口；同时明确 server/core authority、回退路径和线程风险。此项仅是待审计计划，不是现有 runtime、Governor 实现或收益结论；不得在冻结前选定简单 round-robin `OFFLOAD` 策略。

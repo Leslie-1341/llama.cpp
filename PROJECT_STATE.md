@@ -2,12 +2,12 @@
 
 > 当前项目快照。只记录可验证事实；历史决策和实验索引分别进入 `DECISIONS.md` 与 `EXPERIMENTS.md`。
 
-- Last updated: 2026-07-28
-- Evidence commit: `a94381a31ea7f127352d996861355559aac2b469`（Stage 3B-2A clean-HEAD formal validation）
-- Runtime implementation commit: `a94381a31`（Stage 3B-2A long-context release-only protocol）
+- Last updated: 2026-07-29
+- Evidence commit: `ca4c952101656b078d1d1169efb781e3aa8981b1`（Stage 3C-1C-2A static-test synchronization）
+- Runtime implementation commit: `64301af3db0a33974269a9fb30760ca22fb9f1ac`（Stage 3C-1C-2A unified pressure action）；`ca4c95210` 补齐静态测试接口
 - Branch: `fix/kv-p0-b1-bounded-store`
-- Worktree: clean；`git status --short` 为空，artifact 中 `tracked.diff` SHA-256 为空 diff
-- Upstream relation: 目前无法确认
+- Source-validation worktree: clean；`git status --short` 为空，`git diff --check` 通过
+- Upstream relation: `HEAD...origin/fix/kv-p0-b1-bounded-store = 0 0`；当前 HEAD 已推送且与远端同一提交
 
 ## Goal
 
@@ -15,9 +15,7 @@
 
 ## Current Stage
 
-**Current Stage：Stage 3C-1 — 统一 KV 动作仲裁（最小闭环）。** Stage 3B-2A 已作为 release-only 稳定节点关闭：在 clean committed HEAD `a94381a31` 上，Meta-Llama-3-8B-Instruct Q4_K_M 的 effective-context probe、独立 token/RSS calibration、OFF/DYNAMIC long-context ladder 和 20 次连续请求均完成；有效档位为 `1024/2048/4096/8064`，OFF/DYNAMIC 全部 HTTP 200，连续请求 20/20，`RUN_RC=0`、`PARSER_RC=0`。
-
-该结论是 **clean-HEAD archival correctness and limited-stability PASS**，只覆盖 release-only 的单模型、单次完整协议边界。Stage 3C-1 转向单 owner、单 slot 的最小统一 KV 动作仲裁；不再单独开展 release-only 的容量上限、持续压力或正式性能阶段。它不构成正式性能、总 RSS 收益、多模型或长期稳定性结论。
+**Current Stage：Stage 3C-1C-2A — unified pressure `EVALUATE→RELEASE` code-level stable node 已关闭；下一门禁为 Stage 3C-1C-2B-0 EdgeKV Governor v1 architecture audit 与 implementation-contract freeze。** Stage 3B-2A 的 release-only clean-HEAD archival correctness and limited-stability 结论保持不变；2A 只关闭单 owner、单 slot、显式 opt-in 的 server/core unified pressure action 结构与短验证，不构成真实模型 HTTP、真实压力、多 slot、长周期或性能结论。
 
 ## Stage 3A-2C Verified Result
 
@@ -63,6 +61,13 @@
 - 仅当 decision ID 匹配、outcome 为 `completed` 或 `no_op`、无 I/O failure/fail-stop/context-invalid 且 `shortfall_bytes==0` 时允许 graph；其余情形释放 slot 并跳过本轮 graph/decode。sequence protection 在 gate 前设定，且只由 prompt clear 或 slot release 生命周期清除，不受 pressure gate 控制。
 - Release 构建成功；定向 CTest 3/3 PASS：`test-kv-paged-release-bounded`、`test-server-kv-resume`、`test-server-kv-resume-static`。这是 clean-HEAD 的构建与定向单测证据，不是 HTTP 或真实模型验证。
 
+### Stage 3C-1C-2A — unified pressure `EVALUATE→RELEASE` code-level stable node
+
+- Git identity：runtime implementation 为 `64301af3db0a33974269a9fb30760ca22fb9f1ac`，静态测试同步为当前 clean committed HEAD `ca4c952101656b078d1d1169efb781e3aa8981b1`；branch 为 `fix/kv-p0-b1-bounded-store`，与 `origin/fix/kv-p0-b1-bounded-store` ahead/behind 均为 0。验证开始时工作树 clean，`git diff --check` 通过。
+- unified 路径默认关闭，必须显式 `LLAMA_KV_PRESSURE_UNIFIED_ACTION=1`，并要求非零的 target/max-blocks；与 `LLAMA_KV_PAGED_RELEASE`、`LLAMA_KV_PRESSURE_DRY_RUN` 或 `LLAMA_KV_PRESSURE_BOUNDED_RELEASE` 同时请求时，以及解析、范围或缺失配置无效时，startup decision 以 disabled/invalid/conflict fail-closed，不进入 action。
+- 有效、非 stale 的 `PRESSURE/CRITICAL` 采样仅在 server 提交同一 decision ID 的只读 `EVALUATE` 后，且 core capability/结果允许时，至多提交一次 `RELEASE`；decision mismatch、context-invalid、write-transaction-open、fail-stop、unsupported 或 evaluation rejection 均不 release。server 的稳定提交原因是 `release_submitted`，physical candidate、ownership/recheck、state transition、backing I/O、core reason 与 transaction ID 仍由 core 权威返回。
+- 短验证入口：`python3 tests/test-server-kv-pressure-static.py` 为 37/37 PASS；定向 `ctest --test-dir build --output-on-failure -R '^(test-kv-paged-release-bounded|test-server-kv-pressure|test-server-kv-resume|test-server-kv-pressure-action|test-server-kv-pressure-static|test-server-kv-resume-static|test-server-kv-pressure-action-static)$'` 为 7/7 PASS、0 failed。账本同步 review Gate artifact 为 `/tmp/os-agent-gate/gate-review-20260729T105915Z-6555`（`OS_AGENT_GATE_RESULT ... verdict=PASS`；仅覆盖四份账本 diff，不替代 source/test evidence）。
+
 ### Stage 3A-2C — pressure-driven bounded destructive release
 
 - Server `maybe_sample_kv_pressure()` 已形成三阶段：Phase A telemetry、Phase B dry-run、Phase C bounded release。
@@ -91,24 +96,25 @@
 - Stage 3B-2A 虽覆盖至有效 8064-token 档位和一次 20-request 连续序列，但仍只是一台 Linux CPU、单 slot、单模型、单次运行；未覆盖并发、多模型/quantization、不同 block/page size 或长期重复 episode。
 - DYNAMIC target 的机制与 marker 已受 parser 验证，但本 artifact 不得用于声称正式总 RSS 收益、回收率、TTFT/TPOT/TPS、吞吐或 p95/p99 改善。
 - RSS 是独立真实 server PID 的进程观测；它不替代 KV resident/mincore 或 lifecycle state truth。正释放的 mincore 下降是本协议的正确性证据，非性能指标。
-- Stage 3C-1C-1 已验证 server request resume 的 correctness-required PREFETCH 调用边界、严格失败门禁和 sequence protection 生命周期；server pressure 动作仲裁、五类 action 的互斥/优先级和真实路径错误传播仍尚未实现或验证。`all_required` 可能多恢复 tail block，是 P1 性能边界，尚无性能证据。权重–KV 共享预算/I/O 仲裁也尚未实现或验证。
-- 真实模型 HTTP 恢复、OFFLOAD→PREFETCH 的 server 真实路径、长上下文、多 slot、长周期和性能均尚未验证；本节点的定向 CTest 不得推广为上述结论。
+- Stage 3C-1C-2A 已实现并通过 code-level 短验证，但真实模型 HTTP、真实压力触发、多 slot、长周期/重复 episode、并发、真实 server OFFLOAD→PREFETCH、长上下文、性能与权重–KV 融合仍未验证；本节点的静态/定向 CTest 不得推广为这些结论。`all_required` 可能多恢复 tail block，仍是未量化的 P1 性能边界。
+- EdgeKV Governor v1 尚未实现，也没有收益证据；其 pressure debt/水位、slot 生命周期与复用信号、backing I/O 拆分、预测 PREFETCH、共享 memory claimant/I/O priority/byte budget 和线程边界仅是下一 architecture audit 的审计对象。
 - Stage 3A-2C 的 dirty-tree 单次固定-target 结论保留为历史 diagnostic；新 clean-HEAD artifact 不自动将其推广为生产策略。
 
 ## In Progress
 
-**Stage 3C-1C-1 server request resume gate 已关闭；进入 Stage 3C-1C-2 server 压力动作仲裁。** 下一节点仍限既有单 owner、单 slot server 路径，按 D-0014 authority 基于不可变 pressure/slot 快照只提交 logical intent 给 core；不新增异步线程，不接入权重模块。
+**Stage 3C-1C-2A 已关闭；进入 Stage 3C-1C-2B-0 EdgeKV Governor v1 architecture audit 与 implementation-contract freeze。** 本阶段仅审计并冻结可实现边界，不实现 Governor，也不声称收益。
 
 ## Blocked
 
-无已确认的 Stage 3C-1C-2 server 压力动作仲裁 runtime 阻塞项。Stage 3C-1C-1 的定向构建/CTest 已验证，但不能推广为真实模型 HTTP、OFFLOAD→PREFETCH、长上下文、多 slot、长周期或性能证据。
+无已确认的 2A runtime 阻塞项。Governor 设计尚未审计，故不存在可宣称已关闭的 Governor 实现/性能结论。
 
 ## Next Gate
 
-### Stage 3C-1C-2 — 单 owner、单 slot 的 server 压力动作仲裁
+### Stage 3C-1C-2B-0 — EdgeKV Governor v1 architecture audit 与 implementation-contract freeze
 
-1. 在既有 pressure scheduler 中仅基于不可变 pressure/slot 快照选择并提交一次 `NOOP/EVALUATE/PREFETCH/RELEASE/OFFLOAD` logical intent；server 不读取或改写 private physical KV state。不得把已独立实现的 request resume gate 改为 pressure-gated。
-2. 保持 core 独占 physical candidate 解析、ownership/recheck、state transition、backing-store authority 与 transaction ID；同一 decision 不得组合多个 state-changing action，release shortfall 仅交由后续 decision 重新评估。
-3. 验证单 owner、单 slot 的 pressure action decision/result correlation、互斥/优先级、safe no-op、error propagation 与 fail-stop；`all_required` 的可能 tail-block 额外恢复只作为 P1 性能边界记录，不在本正确性节点声称性能收益。
+1. 审计 pressure debt 与 high/low-water 的可观测来源、更新时机、饱和/复位语义，并与现有 pressure telemetry、decision ID 和 fail-stop 语义对齐。
+2. 审计 slot 生命周期、prompt clear/release/复用信号，定位 backing I/O 的可拆分点，并冻结预测性 `PREFETCH` 的 logical request/result 接口，不把 physical block authority 上移到 server。
+3. 定义未来 Dense/MoE 可复用的 memory claimant、I/O priority 与 byte-budget 接口边界，明确现有 KV core/server 的所有权、可回退路径和线程/锁风险。
+4. 产出 architecture audit 与 implementation contract；不得实现 Governor、不得冻结简单 round-robin `OFFLOAD`，也不得以此阶段声称真实压力、性能或融合收益。
 
-原定 release-only 的持续压力、重复 episode、多 slot、并发及正式 KV-only 性能矩阵合并后移至 **Stage 3C-2**；Stage 3C-2 之前不再单独开展 release-only 容量上限、持续压力或正式性能阶段。
+原定持续压力、重复 episode、多 slot、并发与正式 KV-only/combined 性能矩阵继续后移至后续验证阶段，需另有模型/服务器 artifact。

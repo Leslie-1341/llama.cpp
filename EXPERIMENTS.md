@@ -602,3 +602,19 @@ Stage 3A-2C endpoint is feasible and correct in the stated controlled boundary: 
 - Test entry: `ctest --test-dir build --output-on-failure -R '^(test-kv-paged-release-bounded|test-server-kv-resume|test-server-kv-resume-static)$'`；3/3 PASS，0 failed。`test-server-kv-resume` 覆盖 no-op/success、first/partial PREFETCH failure、shortfall/fail-stop/context-invalid；静态测试覆盖 `n_past` 后、graph/decode 前的 gate 顺序、strict failure 与 protection 生命周期。
 - Scope: 本条仅登记短验证入口；不记录性能数值或性能结论。
 - Not covered: 真实模型 HTTP 恢复、server 真实 OFFLOAD→PREFETCH、长上下文、多 slot、长周期/重复 episode、并发、性能和权重–KV 融合均尚未验证。`all_required` 可能多恢复 tail block，仅为 P1 性能边界，尚未量化。
+
+## E-0016 — Stage 3C-1C-2A unified pressure action short verification
+
+- Status: **code-level short verification PASS；非真实 server/model artifact**
+- Identity: branch `fix/kv-p0-b1-bounded-store`；runtime `64301af3db0a33974269a9fb30760ca22fb9f1ac`，static-test synchronization/current HEAD `ca4c952101656b078d1d1169efb781e3aa8981b1`。验证前 worktree clean；当前 HEAD 与 `origin/fix/kv-p0-b1-bounded-store` ahead/behind 均为 0。
+- Static entry: `python3 tests/test-server-kv-pressure-static.py`；**37/37 PASS**。
+- Directed CTest entry: `ctest --test-dir build --output-on-failure -R '^(test-kv-paged-release-bounded|test-server-kv-pressure|test-server-kv-resume|test-server-kv-pressure-action|test-server-kv-pressure-static|test-server-kv-resume-static|test-server-kv-pressure-action-static)$'`；**7/7 PASS，0 failed**。
+- Hygiene entry: `git diff --check`；PASS。账本同步 review Gate artifact：`/tmp/os-agent-gate/gate-review-20260729T105915Z-6555`，`OS_AGENT_GATE_RESULT mode=review profile=verify verdict=PASS code=0 checks=13 pass=3 fail=0 skip=10 unresolved=0 incomplete=0 unverified=0`；其 scope 仅为四份账本 diff（artifact 指针追加前生成），不替代上述 source/test evidence。
+
+**Supported conclusion**
+
+短验证支持以下代码级结论：unified path 需要显式 opt-in；invalid/conflicting configuration fail-closed；有效压力下 server 复用一个 decision ID 提交只读 EVALUATE，并且最多提交一次 RELEASE；server observation 的 `release_submitted` 与 core authoritative outcome/reason/transaction 分离。static/CTest 覆盖相关 API、配置和调用顺序约束。
+
+**Evidence boundary**
+
+本条不包含真实模型 HTTP、真实 pressure 触发、实际 KV resident/release 物理观测、多 slot、长周期/重复 episode、并发、server OFFLOAD→PREFETCH、性能或 Dense/MoE 融合实验；因而不支持上述正确性、稳定性或性能主张。EdgeKV Governor v1 仅为下一 architecture audit/implementation-contract 的计划，未实现且无收益证据。

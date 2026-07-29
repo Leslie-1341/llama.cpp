@@ -836,3 +836,39 @@ D-0021 已给出 core `PREFETCH` 的 structured result、partial failure 与 fai
 - Release build: `cmake --build build --config Release --target test-kv-paged-release-bounded test-server-kv-resume`。
 - `ctest --test-dir build --output-on-failure -R '^(test-kv-paged-release-bounded|test-server-kv-resume|test-server-kv-resume-static)$'`：3/3 PASS。
 - E-0015。
+
+## D-0023 — Stage 3C-1C-2A unified pressure `EVALUATE→RELEASE` 单动作与 fail-closed 配置边界
+
+- Date: 2026-07-29
+- Status: accepted（**已提交、已推送；code-level short verification，非真实 HTTP/压力/性能验证**）
+- Evidence commits/worktree: runtime `64301af3db0a33974269a9fb30760ca22fb9f1ac`，static-test synchronization `ca4c952101656b078d1d1169efb781e3aa8981b1`；branch `fix/kv-p0-b1-bounded-store`，source-validation worktree clean，当前与 `origin/fix/kv-p0-b1-bounded-store` ahead/behind 均为 0。
+- Supersedes: D-0022/D-0021 中“server pressure action arbitration 尚未实现或验证”的描述；保留 request-resume PREFETCH 与 core action authority 的独立边界。
+
+**Context**
+
+D-0021 已冻结 core single-action transaction，D-0022 已关闭 request-resume 的 correctness-required PREFETCH；但 server 仍缺少一个不访问 private physical KV state、能将有效 pressure 先能力评估再提交 destructive release 的统一最小闭环。
+
+**Decision**
+
+1. unified action 默认关闭，只能由 `LLAMA_KV_PRESSURE_UNIFIED_ACTION=1` 显式请求；required target/max-blocks 缺失、非法、溢出或为零时 fail-closed。它与 `LLAMA_KV_PAGED_RELEASE`、`LLAMA_KV_PRESSURE_DRY_RUN`、`LLAMA_KV_PRESSURE_BOUNDED_RELEASE` 冲突时同样 fail-closed，禁止混合 policy。
+2. 对有效、非 stale 的 `PRESSURE/CRITICAL` 观测，server 用一个 decision ID 先提交只读 `EVALUATE`；仅当返回同一 decision ID 且未出现 context-invalid、write-transaction-open、fail-stop、unsupported/rejection，并声明可 release 时，才以该 decision ID 至多提交一次 `RELEASE`。任何终止结果均不隐式串接 OFFLOAD 或第二次动作。
+3. server 的 `release_submitted` 仅表示 logical RELEASE 已提交；physical candidate、ownership/recheck、state change、backing I/O、core outcome/reason 和 transaction ID 均由 core 权威决定。一个 decision 最多一个 state-changing core action，不把 observation reason 伪装为 core release reason。
+4. 不在本节点冻结简单 round-robin `OFFLOAD`。OFFLOAD 的公平性、slot/reuse 信号、I/O 竞争与 byte budget 必须留给 EdgeKV Governor v1 architecture audit/contract，不能由 2A 的 RELEASE 闭环外推。
+
+**Alternatives rejected**
+
+- 由 server 从 private physical block state 决定候选或直接 mutation：破坏 core authority 与 mutation 前 recheck。
+- 将 EVALUATE、RELEASE、OFFLOAD 在一个 decision 内链式执行：破坏单动作归因，并使短fall/终止原因不可审计。
+- 允许 invalid/conflicting opt-in 静默回退到另一 destructive path：配置意图不明确，不能 fail-closed。
+- 现在即固化轮询式 OFFLOAD：缺少 debt、水位、slot 生命周期、backing I/O 和共享 claimant 的架构证据。
+
+**Consequences and limits**
+
+- 已关闭的是 explicit opt-in、same-decision `EVALUATE→最多一次 RELEASE`、server/core authority、配置 fail-closed 和 stable submission reason 的代码级节点。
+- 真实模型 HTTP、真实压力触发、多 slot、长周期/并发、server OFFLOAD→PREFETCH、性能和权重–KV 协同均未验证；不得由本决策声称收益。
+
+**Evidence**
+
+- `python3 tests/test-server-kv-pressure-static.py`：37/37 PASS。
+- 定向 CTest：`test-kv-paged-release-bounded`、`test-server-kv-pressure`、`test-server-kv-resume`、`test-server-kv-pressure-action` 及三个 static tests，7/7 PASS。
+- `git diff --check`：PASS；E-0016。
