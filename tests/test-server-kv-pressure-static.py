@@ -169,7 +169,7 @@ class ServerKvPressureStaticTest(unittest.TestCase):
         self.assertIn("target_bytes    = 0", self.runtime)
 
     def test_dry_run_lifecycle_in_init(self):
-        init_body = function_body(self.context, "void init_kv_pressure_sampler()")
+        init_body = function_body(self.context, "bool init_kv_pressure_sampler()")
         self.assertIn("kv_pressure_runtime.dry_run_disable()", init_body)
         self.assertIn("server_kv_pressure_dry_run_config_from_env", init_body)
 
@@ -178,18 +178,35 @@ class ServerKvPressureStaticTest(unittest.TestCase):
         self.assertIn("kv_pressure_runtime.dry_run_disable();", lifecycle)
 
     def test_master_switch_preflight_precedes_sampler_init(self):
-        init_body = function_body(self.context, "void init_kv_pressure_sampler()")
+        init_body = function_body(self.context, "bool init_kv_pressure_sampler()")
         self.assertLess(
             init_body.index("kv_pressure_sampler_environment_enablement()"),
             init_body.index("std::make_unique<kv_pressure_sampler>()"),
         )
-        self.assertRegex(init_body, re.compile(r"DISABLED\) \{\s*return;", re.MULTILINE))
+        self.assertRegex(
+            init_body,
+            re.compile(r"KV_PRESSURE_ENABLEMENT_DISABLED\) \{\s*return true;", re.MULTILINE),
+        )
 
     def test_sleep_resume_resets_sampler_lifecycle(self):
         lifecycle = function_body(self.context, "void handle_sleeping_state(bool new_state)")
         self.assertIn("kv_pressure_sampler_owner.reset();", lifecycle)
         self.assertIn("kv_pressure_runtime.disable();", lifecycle)
-        self.assertIn("init_kv_pressure_sampler();", lifecycle)
+        self.assertIn("if (!init_kv_pressure_sampler())", lifecycle)
+        self.assertIn(
+            'GGML_ABORT("invalid KV pressure action configuration after sleeping")',
+            lifecycle,
+        )
+
+    def test_main_init_rejects_sampler_failure(self):
+        main_init = function_body(self.context, "bool init()")
+        self.assertRegex(
+            main_init,
+            re.compile(
+                r"if \(!init_kv_pressure_sampler\(\)\) \{\s*return false;",
+                re.MULTILINE,
+            ),
+        )
 
     def test_result_struct_in_shared_header(self):
         """llama_kv_bounded_release_result must live in the shared release header."""
@@ -245,7 +262,7 @@ class ServerKvPressureStaticTest(unittest.TestCase):
         self.assertIn("enabled         = false", self.runtime)
 
     def test_bounded_release_lifecycle_in_init(self):
-        init_body = function_body(self.context, "void init_kv_pressure_sampler()")
+        init_body = function_body(self.context, "bool init_kv_pressure_sampler()")
         self.assertIn("kv_pressure_runtime.bounded_release_disable()", init_body)
         self.assertIn("server_kv_pressure_bounded_release_config_from_env", init_body)
 
@@ -254,7 +271,7 @@ class ServerKvPressureStaticTest(unittest.TestCase):
         self.assertIn("kv_pressure_runtime.bounded_release_disable();", lifecycle)
 
     def test_legacy_mutual_exclusion_check(self):
-        init_body = function_body(self.context, "void init_kv_pressure_sampler()")
+        init_body = function_body(self.context, "bool init_kv_pressure_sampler()")
         self.assertIn("LLAMA_KV_PAGED_RELEASE=1 and", init_body)
         self.assertIn("LLAMA_KV_PRESSURE_BOUNDED_RELEASE=1 are mutually", init_body)
 
@@ -297,7 +314,7 @@ class ServerKvPressureStaticTest(unittest.TestCase):
 
     def test_capability_startup_marker(self):
         """Startup capability diagnostic must emit kv_pressure_bounded_release_capability."""
-        init_body = function_body(self.context, "void init_kv_pressure_sampler()")
+        init_body = function_body(self.context, "bool init_kv_pressure_sampler()")
         self.assertIn("kv_pressure_bounded_release_capability", init_body)
         self.assertIn("can_enable=", init_body)
 
