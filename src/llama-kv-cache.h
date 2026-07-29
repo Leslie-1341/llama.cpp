@@ -379,7 +379,7 @@ public:
     int32_t prefetch_seq(llama_seq_id seq_id) override;
     int32_t prefetch_seq_step(llama_seq_id seq_id, uint32_t max_blocks) override;
     void set_seq_prefetch_protected(llama_seq_id seq_id, bool enabled) override;
-    llama_kv_action_result execute_action(const llama_kv_action_request & request);
+    llama_kv_action_result execute_action(const llama_kv_action_request & request) override;
     llama_kv_bounded_release_result bounded_release_dry_run(
             uint64_t target_bytes, uint32_t max_scan_blocks) override;
     llama_kv_release_status paged_release_status() const override;
@@ -852,7 +852,8 @@ private:
         uint64_t restored_bytes = 0;
         bool failed = false;
     };
-    paged_prefetch_step_result prefetch_seq_step_impl(llama_seq_id seq_id, uint32_t max_blocks);
+    paged_prefetch_step_result prefetch_seq_step_impl(
+            llama_seq_id seq_id, uint32_t max_blocks, bool all_required = false);
     struct paged_release_range {
         void * addr = nullptr;
         size_t len = 0;

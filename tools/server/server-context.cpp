@@ -3,6 +3,7 @@
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
+#include "server-kv-resume.h"
 #if defined(__linux__)
 #include "server-kv-pressure.h"
 #endif
@@ -88,6 +89,7 @@ struct server_slot {
 
     int32_t n_prompt_tokens_cache     = 0;
     int32_t n_prompt_tokens_processed = 0;
+    bool kv_resume_protected = false;
 
     size_t last_nl_pos = 0;
 
@@ -141,6 +143,14 @@ struct server_slot {
         return res;
     }
 
+    void clear_kv_resume_protection() {
+        if (!kv_resume_protected) {
+            return;
+        }
+        llama_memory_set_seq_prefetch_protected(llama_get_memory(ctx_tgt), id, false);
+        kv_resume_protected = false;
+    }
+
     void prompt_clear(bool allow_processing) {
         if (!allow_processing) {
             GGML_ASSERT(!is_processing());
@@ -148,6 +158,7 @@ struct server_slot {
 
         SLT_INF(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
+        clear_kv_resume_protection();
         common_context_seq_rm(ctx_tgt, id, -1, -1);
         if (ctx_dft) {
             common_context_seq_rm(ctx_dft, id, -1, -1);
@@ -366,6 +377,7 @@ struct server_slot {
             t_token_generation = (ggml_time_us() - t_start_generation) / 1e3;
 
             state = SLOT_STATE_IDLE;
+            clear_kv_resume_protection();
 
             // do not keep context of the child slots - the parent's context is enough
             if (task->is_child()) {
@@ -721,6 +733,7 @@ private:
     std::set<std::string> model_tags;    // informational tags
 
     bool sleeping = false;
+    uint64_t kv_resume_decision_next = 0;
 
     void destroy() {
         spec.reset();
@@ -3226,6 +3239,28 @@ private:
                         slot.n_prompt_tokens_processed = 0;
 
                         slot.prompt.tokens.keep_first(n_past);
+
+                        if (n_past > 0) {
+                            auto * mem = llama_get_memory(ctx_tgt);
+                            const auto result = server_kv_resume_gate(
+                                    mem ? server_kv_resume_ops {
+                                        [&slot, mem](llama_seq_id seq_id, bool enabled) {
+                                            llama_memory_set_seq_prefetch_protected(mem, seq_id, enabled);
+                                            slot.kv_resume_protected = enabled;
+                                        },
+                                        [mem](const llama_kv_action_request & request) {
+                                            return mem->execute_action(request);
+                                        },
+                                    } : server_kv_resume_ops {},
+                                    server_kv_resume_trigger::active_access,
+                                    slot.id,
+                                    ++kv_resume_decision_next);
+                            if (!result.graph_allowed) {
+                                send_error(slot, server_kv_resume_failure_message(result), ERROR_TYPE_SERVER);
+                                slot.release();
+                                continue;
+                            }
+                        }
 
                         // send initial 0% progress update if needed
                         // this is to signal the client that the request has started processing

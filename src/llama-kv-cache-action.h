@@ -44,6 +44,9 @@ struct llama_kv_action_request {
     uint64_t target_bytes = 0;
     uint32_t max_blocks = 0;
     bool correctness_required = false;
+    // Restore every currently SWAPPED block owned by seq_id; max_blocks is
+    // intentionally ignored for this explicit correctness path.
+    bool all_required = false;
 };
 
 struct llama_kv_action_capability {

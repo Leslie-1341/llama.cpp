@@ -1956,7 +1956,8 @@ int32_t llama_kv_cache::prefetch_seq(llama_seq_id seq_id) {
 
 llama_kv_cache::paged_prefetch_step_result llama_kv_cache::prefetch_seq_step_impl(
         llama_seq_id seq_id,
-        uint32_t max_blocks) {
+        uint32_t max_blocks,
+        bool all_required) {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
     paged_prefetch_step_result result;
@@ -2027,13 +2028,14 @@ llama_kv_cache::paged_prefetch_step_result llama_kv_cache::prefetch_seq_step_imp
         }
     }
 
-    if (max_blocks == 0) {
+    if (max_blocks == 0 && !all_required) {
         return result;
     }
 
     std::vector<uint32_t> candidates;
     for (const uint32_t physical_block : blocks) {
-        if (candidates.size() >= max_blocks || paged_block_states[physical_block] != paged_block_state::SWAPPED) {
+        if ((!all_required && candidates.size() >= max_blocks) ||
+                paged_block_states[physical_block] != paged_block_state::SWAPPED) {
             continue;
         }
         const uint32_t begin = physical_block * paged_block_size;
@@ -2241,22 +2243,28 @@ llama_kv_action_result llama_kv_cache::execute_action(
     };
 
     if (request.action == llama_kv_action::prefetch) {
-        if (request.max_blocks == 0) {
+        if (request.max_blocks == 0 && !request.all_required) {
             result.reason = llama_kv_action_reason::zero_budget;
             return result;
         }
-        if (!result.capability.can_prefetch || request.seq_id < 0 ||
-                (size_t) request.seq_id >= seq_to_stream.size()) {
-            result.outcome = request.seq_id < 0 || (size_t) request.seq_id >= seq_to_stream.size()
-                ? llama_kv_action_outcome::rejected
-                : llama_kv_action_outcome::unsupported;
-            result.reason = request.seq_id < 0 || (size_t) request.seq_id >= seq_to_stream.size()
-                ? llama_kv_action_reason::invalid_sequence
-                : llama_kv_action_reason::unsupported;
+        if (request.seq_id < 0 || (size_t) request.seq_id >= seq_to_stream.size()) {
+            result.outcome = llama_kv_action_outcome::rejected;
+            result.reason = llama_kv_action_reason::invalid_sequence;
+            return result;
+        }
+        if (!result.capability.can_prefetch) {
+            // With swap disabled, no sequence can own a SWAPPED block. This is
+            // a successful no-op that preserves legacy cache-reuse behavior.
+            if (!paged_swap_enabled) {
+                return result;
+            }
+            result.outcome = llama_kv_action_outcome::unsupported;
+            result.reason = llama_kv_action_reason::unsupported;
             return result;
         }
 
-        const auto prefetch = prefetch_seq_step_impl(request.seq_id, request.max_blocks);
+        const auto prefetch = prefetch_seq_step_impl(
+                request.seq_id, request.max_blocks, request.all_required);
         result.blocks = prefetch.restored_blocks;
         result.bytes = prefetch.restored_bytes;
         result.shortfall_bytes = prefetch.candidate_bytes - prefetch.restored_bytes;

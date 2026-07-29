@@ -2,6 +2,7 @@
 
 #include "llama.h"
 #include "llama-graph.h"
+#include "llama-kv-cache-action.h"
 #include "llama-kv-cache-release.h"
 
 #include <cstdint>
@@ -179,6 +180,12 @@ struct llama_memory_i {
     virtual void set_seq_prefetch_protected(llama_seq_id seq_id, bool enabled) {
         GGML_UNUSED(seq_id);
         GGML_UNUSED(enabled);
+    }
+    virtual llama_kv_action_result execute_action(const llama_kv_action_request & request) {
+        llama_kv_action_result result;
+        result.action = request.action;
+        result.decision_id = request.decision_id;
+        return result;
     }
 
     // Dry-run bounded release: read-only evaluation of would-be release candidates

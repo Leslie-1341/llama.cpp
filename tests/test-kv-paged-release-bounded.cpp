@@ -1553,6 +1553,13 @@ int main(int /*argc*/, char ** /*argv*/) {
                     !zero.state_changed && zero.core_transaction_id == 0,
                     "WT24: zero release budget is a no-op");
 
+            const auto no_swap_prefetch = g.kv->execute_action({
+                llama_kv_action::prefetch, 7005, 0, 0, 0, true, true });
+            CHECK(no_swap_prefetch.outcome == llama_kv_action_outcome::no_op &&
+                    !no_swap_prefetch.io_failure && !no_swap_prefetch.fail_stop &&
+                    no_swap_prefetch.shortfall_bytes == 0,
+                    "WT24: all-required prefetch without swap is a safe no-op");
+
             const auto release = g.kv->execute_action({
                 llama_kv_action::release, 7003, -1, UINT64_MAX, UINT32_MAX, false });
             CHECK(release.decision_id == 7003 && release.state_changed &&
@@ -1703,7 +1710,7 @@ int main(int /*argc*/, char ** /*argv*/) {
             const auto fault_before = p.kv->paged_unified_action_test_read_io_fault();
 
             const auto failed = p.kv->execute_action({
-                llama_kv_action::prefetch, 7203, 0, 0, 2, true });
+                llama_kv_action::prefetch, 7203, 0, 0, 0, true, true });
             CHECK(failed.outcome == llama_kv_action_outcome::partial_failure && failed.io_failure &&
                     failed.fail_stop && failed.state_changed && failed.core_transaction_id > offload.core_transaction_id,
                     "WT26b: partial prefetch failure has one transaction and fail-stop");
