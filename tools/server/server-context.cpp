@@ -90,6 +90,7 @@ struct server_slot {
 
     int32_t n_prompt_tokens_cache     = 0;
     int32_t n_prompt_tokens_processed = 0;
+    int32_t kv_reuse_hint_tokens      = 0;
     bool kv_resume_protected = false;
 
     size_t last_nl_pos = 0;
@@ -136,6 +137,9 @@ struct server_slot {
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
+        if (callback_on_claimant_epoch_invalidate) {
+            callback_on_claimant_epoch_invalidate(id);
+        }
         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
@@ -159,7 +163,11 @@ struct server_slot {
 
         SLT_INF(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
+        if (callback_on_claimant_epoch_invalidate) {
+            callback_on_claimant_epoch_invalidate(id);
+        }
         clear_kv_resume_protection();
+        kv_reuse_hint_tokens = 0;
         common_context_seq_rm(ctx_tgt, id, -1, -1);
         if (ctx_dft) {
             common_context_seq_rm(ctx_dft, id, -1, -1);
@@ -189,6 +197,7 @@ struct server_slot {
     double t_token_generation = 0.0;  // ms
 
     std::function<void(int /* id_slot */)> callback_on_release;
+    std::function<void(int /* id_slot */)> callback_on_claimant_epoch_invalidate;
 
     // Speculative decoding stats
     int32_t n_draft_total = 0;      // Total draft tokens generated
@@ -197,6 +206,9 @@ struct server_slot {
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
+        if (callback_on_claimant_epoch_invalidate) {
+            callback_on_claimant_epoch_invalidate(id);
+        }
         n_prompt_tokens_cache = 0;
 
         last_nl_pos    = 0;
@@ -563,6 +575,7 @@ struct server_slot {
         other.t_prompt_processing       = t_prompt_processing;
         other.n_prompt_tokens_cache     = n_prompt_tokens_cache;
         other.n_prompt_tokens_processed = n_prompt_tokens_processed;
+        other.kv_reuse_hint_tokens      = kv_reuse_hint_tokens;
 
         other.prompt = prompt.clone();
         other.init_sampler();
@@ -723,6 +736,7 @@ private:
     // Unified pressure actions are an independent opt-in path. They only submit
     // logical EVALUATE/RELEASE requests to core and never inspect KV internals.
     server_kv_pressure_unified_action_config kv_pressure_unified_action_config;
+    server_kv_governor_state kv_governor_state;
 #endif
 
     server_metrics metrics;
@@ -780,6 +794,7 @@ private:
             kv_pressure_bounded_release_config = server_kv_pressure_bounded_release_config{};
             kv_pressure_bounded_release_episode = 0;
             kv_pressure_unified_action_config = server_kv_pressure_unified_action_config{};
+            kv_governor_state.reset();
 #endif
             destroy();
         } else {
@@ -1037,6 +1052,9 @@ private:
             slot.callback_on_release = [this](int id_slot) {
                 queue_tasks.pop_deferred_task(id_slot);
             };
+            slot.callback_on_claimant_epoch_invalidate = [this](int id_slot) {
+                kv_governor_state.invalidate_claimant(id_slot);
+            };
 
             slot.reset();
         }
@@ -1114,6 +1132,7 @@ private:
         kv_pressure_bounded_release_config = server_kv_pressure_bounded_release_config{};
         kv_pressure_bounded_release_episode = 0;
         kv_pressure_unified_action_config = server_kv_pressure_unified_action_config{};
+        kv_governor_state.reset();
 
         const auto unified_decision =
                 server_kv_pressure_unified_action_startup_decide_from_env();
@@ -1373,31 +1392,78 @@ private:
             }
         }
 
-        // --- Unified pressure action (EVALUATE then at most one RELEASE) ---
+        // --- EdgeKV Governor: RELEASE first, scored OFFLOAD only after a
+        // prior core no_candidate result arms a later decision. ---
         {
-            const auto & telemetry = kv_pressure_sampler_owner->telemetry();
+            const auto telemetry = kv_pressure_sampler_owner->telemetry();
             if (kv_pressure_unified_action_config.enabled) {
                 auto * mem = ctx_tgt ? llama_get_memory(ctx_tgt) : nullptr;
-                const auto result = server_kv_pressure_execute_unified_action(
+                const uint64_t decision_id = ++kv_decision_next;
+                const server_kv_pressure_snapshot pressure_snapshot {
+                    telemetry.state,
+                    telemetry.source,
+                    telemetry.sample_valid,
+                    telemetry.stale,
+                    telemetry.pressure_basis_valid,
+                    telemetry.pressure_current_bytes,
+                    telemetry.pressure_low_water_bytes,
+                    telemetry.pressure_basis_generation,
+                    kv_pressure_runtime.sample_count(),
+                    decision_id,
+                };
+
+                std::vector<server_kv_claimant_snapshot> claimant_snapshots;
+                claimant_snapshots.reserve(slots.size());
+                const int64_t now_us = ggml_time_us();
+                for (const auto & slot : slots) {
+                    const bool active = slot.is_processing() || slot.task != nullptr;
+                    const bool shared = slot.task && (slot.task->is_parent() || slot.task->is_child());
+                    const uint64_t idle_age_us = !active && slot.t_last_used >= 0 && now_us > slot.t_last_used
+                        ? (uint64_t) (now_us - slot.t_last_used)
+                        : 0;
+                    const uint64_t logical_tokens = slot.prompt.n_tokens() > 0
+                        ? (uint64_t) slot.prompt.n_tokens()
+                        : 0;
+                    const uint64_t reclaimable_bytes = mem && !active && logical_tokens > 0
+                        ? (uint64_t) llama_state_seq_get_size_ext(
+                                ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE)
+                        : 0;
+                    claimant_snapshots.push_back({
+                            llama_kv_memory_claimant::kv,
+                            slot.id,
+                            kv_governor_state.claimant_epoch(slot.id),
+                            active,
+                            slot.kv_resume_protected,
+                            shared,
+                            idle_age_us,
+                            logical_tokens,
+                            reclaimable_bytes,
+                            slot.kv_reuse_hint_tokens > 0
+                                ? (uint64_t) slot.kv_reuse_hint_tokens
+                                : 0,
+                            reclaimable_bytes,
+                    });
+                }
+
+                auto result = server_kv_pressure_execute_governor(
                         kv_pressure_unified_action_config,
+                        kv_governor_state,
                         mem ? server_kv_pressure_action_ops {
                             [mem](const llama_kv_action_request & request) {
                                 return mem->execute_action(request);
                             },
                         } : server_kv_pressure_action_ops {},
-                        telemetry,
-                        idle,
-                        kv_pressure_runtime.sample_count(),
-                        ++kv_decision_next);
+                        pressure_snapshot,
+                        claimant_snapshots);
+                result.observation.idle = idle;
                 const std::string marker =
                     server_kv_pressure_unified_action_format_marker(result);
-                if (result.release.io_failure || result.release.fail_stop) {
+                if (result.release.io_failure || result.release.fail_stop ||
+                        result.offload.io_failure || result.offload.fail_stop) {
                     SRV_WRN("%s\n", marker.c_str());
                 } else {
                     SRV_INF("%s\n", marker.c_str());
                 }
-                // This decision is terminal after EVALUATE/RELEASE, including
-                // no-candidate, shortfall, partial, or failure outcomes.
                 destructive_phase_did_work = true;
             }
         }
@@ -3293,6 +3359,7 @@ private:
                         }
 
                         slot.n_prompt_tokens_cache = n_past;
+                        slot.kv_reuse_hint_tokens = n_past;
                         slot.n_prompt_tokens_processed = 0;
 
                         slot.prompt.tokens.keep_first(n_past);
@@ -3317,6 +3384,7 @@ private:
                                 slot.release();
                                 continue;
                             }
+                            kv_governor_state.invalidate_claimant(slot.id);
                         }
 
                         // send initial 0% progress update if needed

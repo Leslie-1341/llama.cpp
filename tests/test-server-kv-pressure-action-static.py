@@ -39,14 +39,37 @@ class UnifiedPressureActionStaticTest(unittest.TestCase):
         self.assertEqual(CONTEXT.count("++kv_decision_next"), 2)
         self.assertNotIn("kv_resume_decision_next", CONTEXT)
 
-    def test_action_is_logical_and_single_destructive_release(self):
-        self.assertIn("llama_kv_action::evaluate", ACTION_CPP)
-        self.assertIn("llama_kv_action::release", ACTION_CPP)
-        self.assertNotIn("llama_kv_action::offload", ACTION_CPP)
+    def test_actions_are_logical_and_single_decision_bounded(self):
+        legacy = ACTION_CPP[
+            ACTION_CPP.index("server_kv_pressure_execute_unified_action("):
+            ACTION_CPP.index("void server_kv_governor_state::reset()")]
+        governor = ACTION_CPP[
+            ACTION_CPP.index("server_kv_pressure_execute_governor("):
+            ACTION_CPP.index("server_kv_pressure_unified_action_format_marker(")]
+        self.assertIn("llama_kv_action::evaluate", legacy)
+        self.assertIn("llama_kv_action::release", legacy)
+        self.assertNotIn("llama_kv_action::offload", legacy)
+        self.assertIn("llama_kv_action::release", governor)
+        self.assertIn("llama_kv_action::offload", governor)
+        self.assertIn("if (!state.offload_armed_)", governor)
+        self.assertIn("result.release.reason == llama_kv_action_reason::no_candidate", governor)
         for physical_detail in (
                 "paged_block", "paged_free_list", "paged_resolve", "backing_store", "physical_block"):
             self.assertNotIn(physical_detail, ACTION_H)
             self.assertNotIn(physical_detail, ACTION_CPP)
+
+    def test_governor_snapshot_score_and_lifecycle_wiring(self):
+        for token in (
+                "server_kv_pressure_snapshot", "server_kv_claimant_snapshot",
+                "server_kv_governor_state", "pressure_debt_bytes_",
+                "idle_age_score", "logical_kv_score", "reclaimable_score",
+                "lcp_n_past_penalty", "io_cost_penalty", "failure_penalty"):
+            self.assertIn(token, ACTION_H + ACTION_CPP)
+        self.assertGreaterEqual(CONTEXT.count("kv_governor_state.reset();"), 2)
+        self.assertIn("server_kv_pressure_execute_governor", CONTEXT)
+        self.assertIn("const server_kv_pressure_snapshot pressure_snapshot", CONTEXT)
+        self.assertIn("std::vector<server_kv_claimant_snapshot> claimant_snapshots", CONTEXT)
+        self.assertNotIn("std::thread", ACTION_H + ACTION_CPP)
 
     def test_evaluate_gates_release_and_marker_keeps_results_distinct(self):
         for gate in (
@@ -54,7 +77,9 @@ class UnifiedPressureActionStaticTest(unittest.TestCase):
             self.assertIn(gate, ACTION_CPP)
         for field in (
                 "decision_id=", "transaction_id=", "outcome=", "reason=", "blocks=", "bytes=",
-                "shortfall_bytes=", "io_failure=", "state_changed="):
+                "relieved_bytes=", "shortfall_bytes=", "io_failure=", "io_errno=", "state_changed=",
+                "episode=", "debt_before_bytes=", "debt_after_bytes=",
+                "offload_armed_before=", "offload_armed_after=", "selected_seq_id=", "scores="):
             self.assertIn(field, ACTION_CPP)
         self.assertNotIn("rss_", ACTION_CPP)
         self.assertNotIn("mincore", ACTION_CPP)

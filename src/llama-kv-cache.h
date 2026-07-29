@@ -836,11 +836,17 @@ private:
     void paged_swap_out_block(
             uint32_t physical_block,
             bool do_madvise = true,
-            bool retry_on_io_failure = true) const;
+            bool retry_on_io_failure = true,
+            uint64_t * relieved_bytes = nullptr,
+            bool * io_failure = nullptr,
+            int * io_errno = nullptr) const;
     void paged_swap_out_block_impl(
             uint32_t physical_block,
             bool do_madvise,
-            bool retry_on_io_failure) const;
+            bool retry_on_io_failure,
+            uint64_t * relieved_bytes,
+            bool * io_failure,
+            int * io_errno) const;
     bool paged_swap_in_block(
             uint32_t physical_block,
             bool fatal_on_failure,

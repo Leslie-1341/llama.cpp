@@ -21,6 +21,20 @@ enum class llama_kv_action_outcome : uint8_t {
     partial_failure,
 };
 
+enum class llama_kv_memory_claimant : uint8_t {
+    kv,
+    dense_weight,
+    moe_expert,
+};
+
+enum class llama_kv_io_class : uint8_t {
+    correctness_read,
+    latency_read,
+    capacity_write,
+    background_read,
+    background_write,
+};
+
 enum class llama_kv_action_reason : uint8_t {
     none,
     zero_budget,
@@ -53,6 +67,10 @@ struct llama_kv_action_request {
     // Restore every currently SWAPPED block owned by seq_id; max_blocks is
     // intentionally ignored for this explicit correctness path.
     bool all_required = false;
+    llama_kv_memory_claimant claimant = llama_kv_memory_claimant::kv;
+    llama_kv_io_class io_class = llama_kv_io_class::capacity_write;
+    int32_t priority = 0;
+    uint64_t io_byte_budget = 0;
 };
 
 struct llama_kv_action_capability {
@@ -72,8 +90,10 @@ struct llama_kv_action_result {
     bool state_changed = false;
     bool fail_stop = false;
     bool io_failure = false;
+    int io_errno = 0;
     uint32_t blocks = 0;
     uint64_t bytes = 0;
+    uint64_t relieved_bytes = 0;
     uint64_t shortfall_bytes = 0;
     llama_kv_action_capability capability;
 };

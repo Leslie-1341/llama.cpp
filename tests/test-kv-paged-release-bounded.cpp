@@ -38,6 +38,7 @@
 #include "../src/llama-kv-cache.h"
 #include "../src/llama-kv-cache-release.h"
 
+#include <cerrno>
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
@@ -1629,7 +1630,7 @@ int main(int /*argc*/, char ** /*argv*/) {
             const auto kv_before_offload = g.kv->paged_unified_action_test_read_block_bytes(0);
             CHECK(!kv_before_offload.empty(), "WT25: captures populated KV tensor bytes before offload");
             const auto offload = g.kv->execute_action({
-                llama_kv_action::offload, 7103, 0, 0, 1, false });
+                llama_kv_action::offload, 7103, 0, UINT64_MAX, 1, false });
             CHECK(offload.outcome == llama_kv_action_outcome::completed && offload.state_changed &&
                     offload.blocks == 1 && offload.bytes > 0,
                     "WT25: unified offload swaps one exclusive resident block");
@@ -1649,7 +1650,7 @@ int main(int /*argc*/, char ** /*argv*/) {
 
             g.kv->set_seq_prefetch_protected(0, true);
             const auto protected_offload = g.kv->execute_action({
-                llama_kv_action::offload, 7105, 0, 0, 1, false });
+                llama_kv_action::offload, 7105, 0, UINT64_MAX, 1, false });
             CHECK(protected_offload.outcome == llama_kv_action_outcome::rejected &&
                     protected_offload.reason == llama_kv_action_reason::protected_sequence &&
                     !protected_offload.state_changed,
@@ -1657,7 +1658,7 @@ int main(int /*argc*/, char ** /*argv*/) {
             g.kv->set_seq_prefetch_protected(0, false);
             g.kv->seq_cp(0, 1, -1, -1);
             const auto shared_offload = g.kv->execute_action({
-                llama_kv_action::offload, 7106, 0, 0, 1, false });
+                llama_kv_action::offload, 7106, 0, UINT64_MAX, 1, false });
             CHECK(shared_offload.outcome == llama_kv_action_outcome::rejected &&
                     shared_offload.reason == llama_kv_action_reason::shared_block &&
                     !shared_offload.state_changed,
@@ -1665,7 +1666,7 @@ int main(int /*argc*/, char ** /*argv*/) {
 
             g.kv->seq_rm(1, -1, -1);
             const auto second_offload = g.kv->execute_action({
-                llama_kv_action::offload, 7107, 0, 0, 1, false });
+                llama_kv_action::offload, 7107, 0, UINT64_MAX, 1, false });
             CHECK(second_offload.state_changed, "WT25: second offload succeeds");
             llama_memory_seq_rm(g.mem, 0, -1, -1);
             const auto release = g.kv->execute_action({
@@ -1690,6 +1691,7 @@ int main(int /*argc*/, char ** /*argv*/) {
         setenv("LLAMA_KV_PAGED_TEST_IO_FAIL_SCOPE", "swap_out", 1);
         setenv("LLAMA_KV_PAGED_TEST_IO_FAIL_KIND", "write_enospc_once", 1);
         setenv("LLAMA_KV_PAGED_TEST_IO_FAIL_SEQ_ID", "0", 1);
+        setenv("LLAMA_KV_PAGED_TEST_IO_FAIL_BLOCK", "1", 1);
         setenv("LLAMA_KV_PAGED_TEST_IO_FAIL_ONCE", "1", 1);
         ContextGuard g;
         if (!g.init(model, cparams)) {
@@ -1699,7 +1701,7 @@ int main(int /*argc*/, char ** /*argv*/) {
             int rc = decode_prompt(g.ctx, prompt);
             CHECK(rc == 0, "WT26a: decode ok");
             const auto failed = g.kv->execute_action({
-                llama_kv_action::offload, 7201, 0, 0, 1, false });
+                llama_kv_action::offload, 7201, 0, UINT64_MAX, 1, false });
             CHECK(failed.outcome == llama_kv_action_outcome::failed && failed.io_failure &&
                     !failed.state_changed && failed.core_transaction_id == 0,
                     "WT26a: swap-out I/O failure is structured and has no transaction");
@@ -1709,6 +1711,7 @@ int main(int /*argc*/, char ** /*argv*/) {
         unsetenv("LLAMA_KV_PAGED_TEST_IO_FAIL_SCOPE");
         unsetenv("LLAMA_KV_PAGED_TEST_IO_FAIL_KIND");
         unsetenv("LLAMA_KV_PAGED_TEST_IO_FAIL_SEQ_ID");
+        unsetenv("LLAMA_KV_PAGED_TEST_IO_FAIL_BLOCK");
         unsetenv("LLAMA_KV_PAGED_TEST_IO_FAIL_ONCE");
 
         setenv("LLAMA_KV_PAGED_TEST_IO_FAIL_SCOPE", "prefetch_swap_in", 1);
@@ -1724,7 +1727,7 @@ int main(int /*argc*/, char ** /*argv*/) {
             int rc = decode_prompt(p.ctx, prompt);
             CHECK(rc == 0, "WT26b: decode two blocks");
             const auto offload = p.kv->execute_action({
-                llama_kv_action::offload, 7202, 0, 0, 1, false });
+                llama_kv_action::offload, 7202, 0, UINT64_MAX, 1, false });
             CHECK(offload.state_changed && p.kv->paged_release_bounded_test_read_block_state(1) == 3,
                     "WT26b: unified offload prepares the later SWAPPED block");
             CHECK(p.kv->paged_unified_action_test_swap_out_block(0),
@@ -1774,7 +1777,7 @@ int main(int /*argc*/, char ** /*argv*/) {
             int rc = decode_prompt(q.ctx, prompt);
             CHECK(rc == 0, "WT26c: decode ok");
             const auto offload = q.kv->execute_action({
-                llama_kv_action::offload, 7204, 0, 0, 1, false });
+                llama_kv_action::offload, 7204, 0, UINT64_MAX, 1, false });
             CHECK(offload.state_changed, "WT26c: setup offload succeeds");
             const auto failed = q.kv->execute_action({
                 llama_kv_action::prefetch, 7205, 0, 0, 1, true });
@@ -1789,6 +1792,101 @@ int main(int /*argc*/, char ** /*argv*/) {
         unsetenv("LLAMA_KV_PAGED_TEST_SWAPIN_FAIL_SCOPE");
         unsetenv("LLAMA_KV_PAGED_TEST_SWAPIN_FAIL_AFTER_CELLS");
         unsetenv("LLAMA_KV_PAGED_TEST_SWAPIN_FAIL_ONCE");
+        unsetenv("LLAMA_KV_PAGED_SWAP");
+    }
+
+    // =========================================================================
+    // WT27: bounded multi-block OFFLOAD honors byte/block budgets, publishes one
+    // transaction, and preserves per-block authority across partial I/O failure.
+    // =========================================================================
+    {
+        setenv("LLAMA_KV_PAGED_SWAP", "1", 1);
+        ContextGuard g;
+        if (!g.init(model, cparams)) {
+            CHECK(false, "WT27a: context creation failed");
+        } else {
+            std::vector<llama_token> prompt(48, 125);
+            int rc = decode_prompt(g.ctx, prompt);
+            CHECK(rc == 0, "WT27a: decode three blocks");
+
+            const auto target_one = g.kv->execute_action({
+                llama_kv_action::offload, 7301, 0, 1, 3, false });
+            CHECK(target_one.outcome == llama_kv_action_outcome::completed &&
+                    target_one.reason == llama_kv_action_reason::target_satisfied &&
+                    target_one.blocks == 1 && target_one.bytes > 1 &&
+                    target_one.shortfall_bytes == 0 && target_one.state_changed,
+                    "WT27a: byte target stops after one atomic block overshoot");
+
+            const auto max_one = g.kv->execute_action({
+                llama_kv_action::offload, 7302, 0, UINT64_MAX, 1, false });
+            CHECK(max_one.outcome == llama_kv_action_outcome::completed &&
+                    max_one.reason == llama_kv_action_reason::scan_budget_exhausted &&
+                    max_one.blocks == 1 && max_one.shortfall_bytes == UINT64_MAX - max_one.bytes &&
+                    max_one.core_transaction_id > target_one.core_transaction_id,
+                    "WT27a: max_blocks bounds later offload and reports exact shortfall");
+
+            const auto restore_two = g.kv->execute_action({
+                llama_kv_action::prefetch, 7303, 0, 0, 0, true, true });
+            CHECK(restore_two.outcome == llama_kv_action_outcome::completed &&
+                    restore_two.blocks == 2 && restore_two.state_changed,
+                    "WT27a: all-required prefetch restores both bounded offloads");
+
+            const auto multi = g.kv->execute_action({
+                llama_kv_action::offload, 7304, 0, UINT64_MAX, 3, false });
+            CHECK(multi.outcome == llama_kv_action_outcome::completed &&
+                    multi.blocks == 3 && multi.bytes > 0 && multi.state_changed &&
+                    multi.core_transaction_id > restore_two.core_transaction_id,
+                    "WT27a: one bounded action offloads three blocks under one transaction");
+            CHECK(g.kv->paged_release_bounded_test_read_block_state(0) == 3 &&
+                    g.kv->paged_release_bounded_test_read_block_state(1) == 3 &&
+                    g.kv->paged_release_bounded_test_read_block_state(2) == 3,
+                    "WT27a: every completed block publishes SWAPPED");
+        }
+
+        setenv("LLAMA_KV_PAGED_TEST_IO_FAIL_SCOPE", "swap_out", 1);
+        setenv("LLAMA_KV_PAGED_TEST_IO_FAIL_KIND", "write_enospc_once", 1);
+        setenv("LLAMA_KV_PAGED_TEST_IO_FAIL_SEQ_ID", "0", 1);
+        setenv("LLAMA_KV_PAGED_TEST_IO_FAIL_BLOCK", "1", 1);
+        setenv("LLAMA_KV_PAGED_TEST_IO_FAIL_ONCE", "1", 1);
+        ContextGuard p;
+        if (!p.init(model, cparams)) {
+            CHECK(false, "WT27b: context creation failed");
+        } else {
+            std::vector<llama_token> prompt(48, 126);
+            int rc = decode_prompt(p.ctx, prompt);
+            CHECK(rc == 0, "WT27b: decode three blocks");
+
+            const auto partial = p.kv->execute_action({
+                llama_kv_action::offload, 7311, 0, UINT64_MAX, 3, false });
+            CHECK(partial.outcome == llama_kv_action_outcome::partial_failure &&
+                    partial.reason == llama_kv_action_reason::io_failure &&
+                    partial.io_failure && partial.io_errno == ENOSPC &&
+                    partial.state_changed && partial.core_transaction_id > 0,
+                    "WT27b: second-block ENOSPC returns partial failure and one transaction");
+            CHECK(partial.blocks == 1 && partial.bytes > 0 &&
+                    partial.shortfall_bytes == UINT64_MAX - partial.bytes,
+                    "WT27b: partial offload reports exact completed bytes and shortfall");
+            CHECK(p.kv->paged_release_bounded_test_read_block_state(2) == 3 &&
+                    p.kv->paged_release_bounded_test_read_block_state(1) == 1 &&
+                    p.kv->paged_release_bounded_test_read_block_state(0) == 1,
+                    "WT27b: completed block stays SWAPPED and failed/later blocks stay RESIDENT");
+
+            const auto retry = p.kv->execute_action({
+                llama_kv_action::offload, 7312, 0, UINT64_MAX, 3, false });
+            CHECK(retry.outcome == llama_kv_action_outcome::completed &&
+                    retry.blocks == 2 && retry.state_changed &&
+                    retry.core_transaction_id > partial.core_transaction_id,
+                    "WT27b: new decision retries remaining resident blocks without redoing SWAPPED block");
+            CHECK(p.kv->paged_release_bounded_test_read_block_state(0) == 3 &&
+                    p.kv->paged_release_bounded_test_read_block_state(1) == 3 &&
+                    p.kv->paged_release_bounded_test_read_block_state(2) == 3,
+                    "WT27b: retry completes remaining block publications");
+        }
+        unsetenv("LLAMA_KV_PAGED_TEST_IO_FAIL_SCOPE");
+        unsetenv("LLAMA_KV_PAGED_TEST_IO_FAIL_KIND");
+        unsetenv("LLAMA_KV_PAGED_TEST_IO_FAIL_SEQ_ID");
+        unsetenv("LLAMA_KV_PAGED_TEST_IO_FAIL_BLOCK");
+        unsetenv("LLAMA_KV_PAGED_TEST_IO_FAIL_ONCE");
         unsetenv("LLAMA_KV_PAGED_SWAP");
     }
 
