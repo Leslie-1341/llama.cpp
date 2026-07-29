@@ -1,5 +1,6 @@
 #pragma once
 
+#include "llama-kv-cache-action.h"
 #include "llama-kv-cache-identity.h"
 #include "llama-kv-cache-release.h"
 
@@ -378,6 +379,7 @@ public:
     int32_t prefetch_seq(llama_seq_id seq_id) override;
     int32_t prefetch_seq_step(llama_seq_id seq_id, uint32_t max_blocks) override;
     void set_seq_prefetch_protected(llama_seq_id seq_id, bool enabled) override;
+    llama_kv_action_result execute_action(const llama_kv_action_request & request);
     llama_kv_bounded_release_result bounded_release_dry_run(
             uint64_t target_bytes, uint32_t max_scan_blocks) override;
     llama_kv_release_status paged_release_status() const override;
@@ -598,6 +600,19 @@ public:
     bool paged_release_bounded_test_transaction_open() const {
         return paged_write_transaction_owner != nullptr;
     }
+    bool paged_unified_action_test_begin_transaction(const llama_kv_cache_context * owner) {
+        return paged_begin_write_transaction(owner);
+    }
+    std::vector<uint8_t> paged_unified_action_test_read_block_bytes(uint32_t block) const;
+    bool paged_unified_action_test_swap_out_block(uint32_t block);
+    struct paged_unified_action_test_io_fault_stats {
+        uint64_t matching_attempts = 0;
+        uint64_t trigger_count = 0;
+        uint32_t failed_block = UINT32_MAX;
+        uint64_t failed_attempt_id = 0;
+    };
+    llama_kv_backing_store_stats paged_unified_action_test_read_backing_stats() const;
+    paged_unified_action_test_io_fault_stats paged_unified_action_test_read_io_fault() const;
     bool paged_release_bounded_test_context_invalid() const {
         return paged_write_context_invalid;
     }
@@ -818,12 +833,26 @@ private:
     bool paged_ensure_write_resident(uint32_t phys_cell) const;
     bool paged_check_read_resident(uint32_t phys_cell, bool required_by_active) const;
     bool paged_check_read_resident_impl(uint32_t phys_cell, bool required_by_active) const;
-    void paged_swap_out_block(uint32_t physical_block, bool do_madvise = true) const;
-    void paged_swap_out_block_impl(uint32_t physical_block, bool do_madvise) const;
+    void paged_swap_out_block(
+            uint32_t physical_block,
+            bool do_madvise = true,
+            bool retry_on_io_failure = true) const;
+    void paged_swap_out_block_impl(
+            uint32_t physical_block,
+            bool do_madvise,
+            bool retry_on_io_failure) const;
     bool paged_swap_in_block(
             uint32_t physical_block,
             bool fatal_on_failure,
             llama_paged_swap_error_reason failure_reason) const;
+    struct paged_prefetch_step_result {
+        uint32_t candidate_blocks = 0;
+        uint32_t restored_blocks = 0;
+        uint64_t candidate_bytes = 0;
+        uint64_t restored_bytes = 0;
+        bool failed = false;
+    };
+    paged_prefetch_step_result prefetch_seq_step_impl(llama_seq_id seq_id, uint32_t max_blocks);
     struct paged_release_range {
         void * addr = nullptr;
         size_t len = 0;
@@ -1008,6 +1037,10 @@ private:
     uint64_t paged_bounded_release_calls  = 0;
     uint64_t paged_bounded_release_blocks = 0;
     uint64_t paged_bounded_release_bytes  = 0;
+    uint64_t paged_unified_release_calls  = 0;
+    uint64_t paged_unified_release_blocks = 0;
+    uint64_t paged_unified_release_bytes  = 0;
+    uint64_t paged_unified_action_transaction_next = 0;
     uint64_t paged_bounded_release_unused = 0;
     uint64_t paged_bounded_release_dead   = 0;
 
@@ -1156,6 +1189,7 @@ private:
     struct paged_test_swapin_fault {
         paged_test_swapin_fail_scope scope = paged_test_swapin_fail_scope::OFF;
         uint64_t fail_after_cells = 0;
+        uint64_t successful_cells = 0;
         bool fail_once = true;
         bool consumed = false;
         uint64_t matching_attempts = 0;
@@ -1190,6 +1224,7 @@ private:
         OFF,
         SWAP_OUT,
         ACTIVE_SWAP_IN,
+        PREFETCH_SWAP_IN,
     };
 
     enum class paged_test_io_fail_kind : uint8_t {
@@ -1202,6 +1237,7 @@ private:
         paged_test_io_fail_scope scope = paged_test_io_fail_scope::OFF;
         paged_test_io_fail_kind kind = paged_test_io_fail_kind::NONE;
         llama_seq_id target_seq = -1;
+        uint32_t target_block = PAGED_BLOCK_INVALID;
         bool fail_once = true;
         bool consumed = false;
         uint64_t matching_attempts = 0;

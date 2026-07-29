@@ -783,6 +783,7 @@ llama_kv_cache::llama_kv_cache(
     const char * test_io_scope_env = std::getenv("LLAMA_KV_PAGED_TEST_IO_FAIL_SCOPE");
     const char * test_io_kind_env  = std::getenv("LLAMA_KV_PAGED_TEST_IO_FAIL_KIND");
     const char * test_io_seq_env   = std::getenv("LLAMA_KV_PAGED_TEST_IO_FAIL_SEQ_ID");
+    const char * test_io_block_env = std::getenv("LLAMA_KV_PAGED_TEST_IO_FAIL_BLOCK");
     const char * test_io_once_env  = std::getenv("LLAMA_KV_PAGED_TEST_IO_FAIL_ONCE");
 
     bool test_io_config_valid = true;
@@ -792,6 +793,8 @@ llama_kv_cache::llama_kv_cache(
         paged_test_io_fault_.scope = paged_test_io_fail_scope::SWAP_OUT;
     } else if (std::strcmp(test_io_scope_env, "active_swap_in") == 0) {
         paged_test_io_fault_.scope = paged_test_io_fail_scope::ACTIVE_SWAP_IN;
+    } else if (std::strcmp(test_io_scope_env, "prefetch_swap_in") == 0) {
+        paged_test_io_fault_.scope = paged_test_io_fail_scope::PREFETCH_SWAP_IN;
     } else {
         test_io_config_valid = false;
     }
@@ -817,6 +820,17 @@ llama_kv_cache::llama_kv_cache(
             paged_test_io_fault_.target_seq = (llama_seq_id) target_seq;
         }
 
+        if (paged_test_io_fault_.scope == paged_test_io_fail_scope::PREFETCH_SWAP_IN) {
+            uint64_t target_block = 0;
+            if (!test_io_block_env ||
+                    !llama_kv_parse_u64_strict(test_io_block_env, target_block) ||
+                    target_block > (uint64_t) std::numeric_limits<uint32_t>::max()) {
+                test_io_config_valid = false;
+            } else {
+                paged_test_io_fault_.target_block = (uint32_t) target_block;
+            }
+        }
+
         if (test_io_once_env) {
             uint64_t fail_once = 0;
             if (!llama_kv_parse_u64_strict(test_io_once_env, fail_once) || fail_once > 1) {
@@ -830,7 +844,8 @@ llama_kv_cache::llama_kv_cache(
                 paged_test_io_fault_.kind != paged_test_io_fail_kind::WRITE_ENOSPC_ONCE) {
             test_io_config_valid = false;
         }
-        if (paged_test_io_fault_.scope == paged_test_io_fail_scope::ACTIVE_SWAP_IN &&
+        if ((paged_test_io_fault_.scope == paged_test_io_fail_scope::ACTIVE_SWAP_IN ||
+                paged_test_io_fault_.scope == paged_test_io_fail_scope::PREFETCH_SWAP_IN) &&
                 paged_test_io_fault_.kind != paged_test_io_fail_kind::READ_EOF_ONCE) {
             test_io_config_valid = false;
         }
@@ -1939,9 +1954,12 @@ int32_t llama_kv_cache::prefetch_seq(llama_seq_id seq_id) {
     return this->prefetch_seq_step(seq_id, std::numeric_limits<uint32_t>::max());
 }
 
-int32_t llama_kv_cache::prefetch_seq_step(llama_seq_id seq_id, uint32_t max_blocks) {
+llama_kv_cache::paged_prefetch_step_result llama_kv_cache::prefetch_seq_step_impl(
+        llama_seq_id seq_id,
+        uint32_t max_blocks) {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
+    paged_prefetch_step_result result;
     paged_prefetch_seq_last_owned_blocks = 0;
     paged_prefetch_seq_last_swapped_blocks = 0;
     paged_prefetch_seq_last_resident_blocks = 0;
@@ -1950,19 +1968,20 @@ int32_t llama_kv_cache::prefetch_seq_step(llama_seq_id seq_id, uint32_t max_bloc
     paged_prefetch_seq_last_failures = 0;
 
     if (!kv_paged_enabled) {
-        return 0;
+        return result;
     }
 
     paged_prefetch_seq_calls += 1;
 
     if (!paged_swap_enabled) {
-        return 0;
+        return result;
     }
     if (!kv_swap_store || v_trans || n_stream != 1 || paged_block_size == 0 || paged_n_blocks == 0 ||
             v_cells.empty() || paged_block_states.size() != paged_n_blocks) {
         paged_prefetch_seq_last_failures += 1;
         paged_prefetch_seq_failures += 1;
-        return -1;
+        result.failed = true;
+        return result;
     }
 
     const auto & cells = v_cells[0];
@@ -2009,70 +2028,85 @@ int32_t llama_kv_cache::prefetch_seq_step(llama_seq_id seq_id, uint32_t max_bloc
     }
 
     if (max_blocks == 0) {
-        return 0;
+        return result;
+    }
+
+    std::vector<uint32_t> candidates;
+    for (const uint32_t physical_block : blocks) {
+        if (candidates.size() >= max_blocks || paged_block_states[physical_block] != paged_block_state::SWAPPED) {
+            continue;
+        }
+        const uint32_t begin = physical_block * paged_block_size;
+        const uint32_t end = std::min<uint32_t>(begin + paged_block_size, paged_kv_size);
+        candidates.push_back(physical_block);
+        result.candidate_blocks += 1;
+        result.candidate_bytes += bytes_per_cell * (end - begin);
     }
 
     const bool phase_trace = paged_prefetch_phase_trace_enabled;
     const uint64_t phase_call = phase_trace ? ++paged_prefetch_phase_trace_calls : 0;
-    int32_t n_prefetched = 0;
     uint32_t phase_events = 0;
-    for (const uint32_t physical_block : blocks) {
-        const paged_block_state state = paged_block_states[physical_block];
-        if (state == paged_block_state::SWAPPED) {
-            const uint64_t validate_before = phase_trace ? paged_io_block_in_validate_us : 0;
-            const uint64_t read_before = phase_trace ? paged_io_block_in_read_us : 0;
-            const uint64_t unpack_before = phase_trace ? paged_io_block_in_unpack_us : 0;
-            const uint64_t commit_before = phase_trace ? paged_io_block_in_commit_us : 0;
-            if (!paged_swap_in_block(
-                        physical_block,
-                        false,
-                        llama_paged_swap_error_reason::SWAP_IN_IO_FAILURE)) {
-                paged_prefetch_seq_last_failures += 1;
-                paged_prefetch_seq_failures += 1;
-                LLAMA_LOG_ERROR("%s: paged KV prefetch swap-in failed for physical_block=%u\n", __func__, physical_block);
-                return -1;
-            }
-            n_prefetched += 1;
-            paged_prefetch_seq_blocks += 1;
-            const uint32_t begin = physical_block * paged_block_size;
-            const uint32_t end = std::min<uint32_t>(begin + paged_block_size, paged_kv_size);
-            paged_prefetch_seq_bytes += bytes_per_cell * (end - begin);
-            if (phase_trace) {
-                const uint64_t validate_us = paged_io_block_in_validate_us - validate_before;
-                const uint64_t read_us = paged_io_block_in_read_us - read_before;
-                const uint64_t unpack_us = paged_io_block_in_unpack_us - unpack_before;
-                const uint64_t commit_us = paged_io_block_in_commit_us - commit_before;
-                fprintf(stderr,
-                        "KV_PAGED_PREFETCH_BLOCK_PHASE call=%llu block_index=%u physical_block=%u "
-                        "validate_us=%llu read_us=%llu unpack_us=%llu commit_us=%llu phase_sum_us=%llu\n",
-                        (unsigned long long) phase_call,
-                        phase_events,
-                        physical_block,
-                        (unsigned long long) validate_us,
-                        (unsigned long long) read_us,
-                        (unsigned long long) unpack_us,
-                        (unsigned long long) commit_us,
-                        (unsigned long long) (validate_us + read_us + unpack_us + commit_us));
-                phase_events += 1;
-            }
-            if ((uint32_t) n_prefetched >= max_blocks) {
-                break;
-            }
+    for (const uint32_t physical_block : candidates) {
+        const uint32_t begin = physical_block * paged_block_size;
+        const uint32_t end = std::min<uint32_t>(begin + paged_block_size, paged_kv_size);
+        const uint64_t block_bytes = bytes_per_cell * (end - begin);
+
+        const uint64_t validate_before = phase_trace ? paged_io_block_in_validate_us : 0;
+        const uint64_t read_before = phase_trace ? paged_io_block_in_read_us : 0;
+        const uint64_t unpack_before = phase_trace ? paged_io_block_in_unpack_us : 0;
+        const uint64_t commit_before = phase_trace ? paged_io_block_in_commit_us : 0;
+        if (!paged_swap_in_block(
+                    physical_block,
+                    false,
+                    llama_paged_swap_error_reason::SWAP_IN_IO_FAILURE)) {
+            paged_prefetch_seq_last_failures += 1;
+            paged_prefetch_seq_failures += 1;
+            result.failed = true;
+            LLAMA_LOG_ERROR("%s: paged KV prefetch swap-in failed for physical_block=%u\n", __func__, physical_block);
+            return result;
+        }
+
+        result.restored_blocks += 1;
+        result.restored_bytes += block_bytes;
+        paged_prefetch_seq_blocks += 1;
+        paged_prefetch_seq_bytes += block_bytes;
+        if (phase_trace) {
+            const uint64_t validate_us = paged_io_block_in_validate_us - validate_before;
+            const uint64_t read_us = paged_io_block_in_read_us - read_before;
+            const uint64_t unpack_us = paged_io_block_in_unpack_us - unpack_before;
+            const uint64_t commit_us = paged_io_block_in_commit_us - commit_before;
+            fprintf(stderr,
+                    "KV_PAGED_PREFETCH_BLOCK_PHASE call=%llu block_index=%u physical_block=%u "
+                    "validate_us=%llu read_us=%llu unpack_us=%llu commit_us=%llu phase_sum_us=%llu\n",
+                    (unsigned long long) phase_call,
+                    phase_events,
+                    physical_block,
+                    (unsigned long long) validate_us,
+                    (unsigned long long) read_us,
+                    (unsigned long long) unpack_us,
+                    (unsigned long long) commit_us,
+                    (unsigned long long) (validate_us + read_us + unpack_us + commit_us));
+            phase_events += 1;
         }
     }
 
     if (phase_trace) {
         fprintf(stderr,
                 "KV_PAGED_PREFETCH_PHASE_CALL call=%llu seq_id=%d requested_blocks=%u "
-                "restored_blocks=%d phase_events=%u\n",
+                "restored_blocks=%u phase_events=%u\n",
                 (unsigned long long) phase_call,
                 (int) seq_id,
                 max_blocks,
-                n_prefetched,
+                result.restored_blocks,
                 phase_events);
     }
 
-    return n_prefetched;
+    return result;
+}
+
+int32_t llama_kv_cache::prefetch_seq_step(llama_seq_id seq_id, uint32_t max_blocks) {
+    const auto result = prefetch_seq_step_impl(seq_id, max_blocks);
+    return result.failed ? -1 : (int32_t) result.restored_blocks;
 }
 
 void llama_kv_cache::prefetch_seq_last_stats(
@@ -2112,6 +2146,257 @@ extern "C" bool llama_kv_cache_prefetch_seq_last_stats(
             *invalid_cells,
             *failures);
     return true;
+}
+
+std::vector<uint8_t> llama_kv_cache::paged_unified_action_test_read_block_bytes(uint32_t block) const {
+    std::vector<uint8_t> bytes;
+    if (block >= paged_n_blocks || paged_block_size == 0) {
+        return bytes;
+    }
+
+    const uint32_t begin = block * paged_block_size;
+    const uint32_t end = std::min<uint32_t>(begin + paged_block_size, paged_kv_size);
+    for (uint32_t cell = begin; cell < end; ++cell) {
+        for (const auto & layer : layers) {
+            for (ggml_tensor * tensor : {
+                    layer.k_stream.empty() ? nullptr : layer.k_stream[0],
+                    (!layer.v || layer.v_stream.empty()) ? nullptr : layer.v_stream[0] }) {
+                if (!tensor) {
+                    continue;
+                }
+                const size_t row_size = tensor->nb[1];
+                const size_t offset = bytes.size();
+                bytes.resize(offset + row_size);
+                ggml_backend_tensor_get(tensor, bytes.data() + offset, (size_t) cell * row_size, row_size);
+            }
+        }
+    }
+    return bytes;
+}
+
+bool llama_kv_cache::paged_unified_action_test_swap_out_block(uint32_t block) {
+    if (block >= paged_block_states.size() || paged_block_states[block] != paged_block_state::RESIDENT) {
+        return false;
+    }
+    paged_swap_out_block(block, true, false);
+    return paged_block_states[block] == paged_block_state::SWAPPED;
+}
+
+llama_kv_backing_store_stats llama_kv_cache::paged_unified_action_test_read_backing_stats() const {
+    return kv_swap_store ? kv_swap_store->get_stats() : llama_kv_backing_store_stats {};
+}
+
+llama_kv_cache::paged_unified_action_test_io_fault_stats
+llama_kv_cache::paged_unified_action_test_read_io_fault() const {
+    return {
+        paged_test_io_fault_.matching_attempts,
+        paged_test_io_fault_.trigger_count,
+        paged_test_io_fault_.failed_block,
+        paged_test_io_fault_.failed_attempt_id,
+    };
+}
+
+llama_kv_action_result llama_kv_cache::execute_action(
+        const llama_kv_action_request & request) {
+    llama_kv_action_result result;
+    result.action = request.action;
+    result.decision_id = request.decision_id;
+
+    const bool paged_layout_valid = kv_paged_enabled && !v_trans && n_stream == 1 &&
+        paged_block_size != 0 && paged_n_blocks != 0 &&
+        paged_block_states.size() == paged_n_blocks && !v_cells.empty();
+    const bool write_transaction_open = paged_write_transaction_owner != nullptr;
+    const bool swap_ready = paged_layout_valid && paged_swap_enabled && kv_swap_store;
+
+    result.capability.context_invalid = paged_write_context_invalid;
+    result.capability.write_transaction_open = write_transaction_open;
+    result.capability.can_prefetch = swap_ready && !paged_write_context_invalid && !write_transaction_open;
+    result.capability.can_release = paged_layout_valid && paged_ingraph_enabled &&
+        paged_layers_supported && paged_row_idx_enabled && !paged_write_context_invalid &&
+        !write_transaction_open;
+    result.capability.can_offload = swap_ready && !paged_write_context_invalid && !write_transaction_open;
+
+    if (request.action == llama_kv_action::evaluate) {
+        result.outcome = llama_kv_action_outcome::completed;
+        return result;
+    }
+    if (request.action == llama_kv_action::noop) {
+        return result;
+    }
+    if (paged_write_context_invalid) {
+        result.outcome = llama_kv_action_outcome::rejected;
+        result.reason = llama_kv_action_reason::context_invalid;
+        result.fail_stop = true;
+        return result;
+    }
+    if (write_transaction_open) {
+        result.outcome = llama_kv_action_outcome::rejected;
+        result.reason = llama_kv_action_reason::write_transaction_open;
+        return result;
+    }
+
+    const auto publish_transaction = [&]() {
+        result.state_changed = true;
+        result.core_transaction_id = ++paged_unified_action_transaction_next;
+    };
+
+    if (request.action == llama_kv_action::prefetch) {
+        if (request.max_blocks == 0) {
+            result.reason = llama_kv_action_reason::zero_budget;
+            return result;
+        }
+        if (!result.capability.can_prefetch || request.seq_id < 0 ||
+                (size_t) request.seq_id >= seq_to_stream.size()) {
+            result.outcome = request.seq_id < 0 || (size_t) request.seq_id >= seq_to_stream.size()
+                ? llama_kv_action_outcome::rejected
+                : llama_kv_action_outcome::unsupported;
+            result.reason = request.seq_id < 0 || (size_t) request.seq_id >= seq_to_stream.size()
+                ? llama_kv_action_reason::invalid_sequence
+                : llama_kv_action_reason::unsupported;
+            return result;
+        }
+
+        const auto prefetch = prefetch_seq_step_impl(request.seq_id, request.max_blocks);
+        result.blocks = prefetch.restored_blocks;
+        result.bytes = prefetch.restored_bytes;
+        result.shortfall_bytes = prefetch.candidate_bytes - prefetch.restored_bytes;
+        if (prefetch.restored_blocks > 0) {
+            publish_transaction();
+        }
+        if (prefetch.failed) {
+            result.outcome = prefetch.restored_blocks > 0
+                ? llama_kv_action_outcome::partial_failure
+                : llama_kv_action_outcome::failed;
+            result.reason = llama_kv_action_reason::prefetch_failed;
+            result.io_failure = true;
+            result.fail_stop = request.correctness_required;
+            return result;
+        }
+        result.outcome = prefetch.restored_blocks > 0
+            ? llama_kv_action_outcome::completed
+            : llama_kv_action_outcome::no_op;
+        return result;
+    }
+
+    if (request.action == llama_kv_action::release) {
+        if (request.target_bytes == 0 || request.max_blocks == 0) {
+            result.reason = llama_kv_action_reason::zero_budget;
+            return result;
+        }
+        if (!result.capability.can_release) {
+            result.outcome = llama_kv_action_outcome::unsupported;
+            result.reason = llama_kv_action_reason::unsupported;
+            return result;
+        }
+
+        paged_bounded_release_counters counters;
+        counters.calls = &paged_unified_release_calls;
+        counters.blocks = &paged_unified_release_blocks;
+        counters.bytes = &paged_unified_release_bytes;
+        const auto release = paged_release_blocks_bounded_impl(
+                request.target_bytes, request.max_blocks, counters, false);
+        paged_unified_release_calls += 1;
+        result.blocks = release.released_blocks;
+        result.bytes = release.released_bytes;
+        result.shortfall_bytes = release.shortfall_bytes;
+        if (release.ownership_aborted) {
+            result.outcome = llama_kv_action_outcome::rejected;
+            result.reason = llama_kv_action_reason::ownership_invalid;
+            result.fail_stop = true;
+            return result;
+        }
+        if (release.released_blocks > 0) {
+            publish_transaction();
+            result.outcome = llama_kv_action_outcome::completed;
+        }
+        return result;
+    }
+
+    if (request.action != llama_kv_action::offload) {
+        result.outcome = llama_kv_action_outcome::rejected;
+        result.reason = llama_kv_action_reason::unsupported;
+        return result;
+    }
+    if (request.max_blocks == 0) {
+        result.reason = llama_kv_action_reason::zero_budget;
+        return result;
+    }
+    if (!result.capability.can_offload) {
+        result.outcome = llama_kv_action_outcome::unsupported;
+        result.reason = llama_kv_action_reason::unsupported;
+        return result;
+    }
+    if (request.seq_id < 0 || (size_t) request.seq_id >= seq_to_stream.size()) {
+        result.outcome = llama_kv_action_outcome::rejected;
+        result.reason = llama_kv_action_reason::invalid_sequence;
+        return result;
+    }
+    if ((size_t) request.seq_id < paged_prefetch_protected_seq.size() &&
+            paged_prefetch_protected_seq.test(request.seq_id)) {
+        result.outcome = llama_kv_action_outcome::rejected;
+        result.reason = llama_kv_action_reason::protected_sequence;
+        return result;
+    }
+
+    const auto & cells = v_cells[seq_to_stream[request.seq_id]];
+    std::set<uint32_t> target_blocks;
+    std::set<uint32_t> shared_blocks;
+    for (uint32_t logical_cell = 0; logical_cell < cells.size(); ++logical_cell) {
+        if (cells.is_empty(logical_cell)) continue;
+        const uint32_t physical_cell = paged_resolve(logical_cell);
+        if (physical_cell == PAGED_BLOCK_INVALID || physical_cell / paged_block_size >= paged_n_blocks) {
+            result.outcome = llama_kv_action_outcome::rejected;
+            result.reason = llama_kv_action_reason::ownership_invalid;
+            result.fail_stop = true;
+            return result;
+        }
+        const uint32_t block = physical_cell / paged_block_size;
+        if (cells.seq_has(logical_cell, request.seq_id)) {
+            target_blocks.insert(block);
+        }
+        if (cells.seq_count(logical_cell) != 1 || !cells.seq_has(logical_cell, request.seq_id)) {
+            shared_blocks.insert(block);
+        }
+    }
+    if (target_blocks.empty()) {
+        result.outcome = llama_kv_action_outcome::rejected;
+        result.reason = llama_kv_action_reason::no_eligible_block;
+        return result;
+    }
+    for (uint32_t block : target_blocks) {
+        if (shared_blocks.count(block)) {
+            result.outcome = llama_kv_action_outcome::rejected;
+            result.reason = llama_kv_action_reason::shared_block;
+            return result;
+        }
+        if (paged_block_states[block] != paged_block_state::RESIDENT) {
+            result.outcome = llama_kv_action_outcome::rejected;
+            result.reason = llama_kv_action_reason::state_rejected;
+            return result;
+        }
+    }
+
+    const uint32_t physical_block = *target_blocks.rbegin();
+    uint64_t bytes_per_cell = 0;
+    for (const auto & layer : layers) {
+        if (!layer.k_stream.empty() && layer.k_stream[0]) bytes_per_cell += layer.k_stream[0]->nb[1];
+        if (layer.v && !layer.v_stream.empty() && layer.v_stream[0]) bytes_per_cell += layer.v_stream[0]->nb[1];
+    }
+    const uint32_t begin = physical_block * paged_block_size;
+    const uint32_t end = std::min<uint32_t>(begin + paged_block_size, paged_kv_size);
+    const uint64_t failures_before = paged_swap_backend_failures;
+    paged_swap_out_block(physical_block, true, false);
+    if (paged_block_states[physical_block] != paged_block_state::SWAPPED) {
+        result.outcome = llama_kv_action_outcome::failed;
+        result.reason = llama_kv_action_reason::io_failure;
+        result.io_failure = paged_swap_backend_failures > failures_before;
+        return result;
+    }
+    result.blocks = 1;
+    result.bytes = bytes_per_cell * (end - begin);
+    publish_transaction();
+    result.outcome = llama_kv_action_outcome::completed;
+    return result;
 }
 
 void llama_kv_cache::set_seq_prefetch_protected(llama_seq_id seq_id, bool enabled) {
@@ -3420,19 +3705,25 @@ bool llama_kv_cache::paged_check_read_resident_impl(uint32_t phys_cell, bool req
     return !has_paged_swap_error();
 }
 
-void llama_kv_cache::paged_swap_out_block(uint32_t physical_block, bool do_madvise) const {
+void llama_kv_cache::paged_swap_out_block(
+        uint32_t physical_block,
+        bool do_madvise,
+        bool retry_on_io_failure) const {
     if (!paged_resume_timing_enabled && !paged_resume_timing_step_enabled) {
-        paged_swap_out_block_impl(physical_block, do_madvise);
+        paged_swap_out_block_impl(physical_block, do_madvise, retry_on_io_failure);
         return;
     }
 
     const uint64_t start_us = llama_paged_timing_now_us();
-    paged_swap_out_block_impl(physical_block, do_madvise);
+    paged_swap_out_block_impl(physical_block, do_madvise, retry_on_io_failure);
     paged_timing_swap_out_us += llama_paged_timing_now_us() - start_us;
     paged_timing_swap_out_calls += 1;
 }
 
-void llama_kv_cache::paged_swap_out_block_impl(uint32_t physical_block, bool do_madvise) const {
+void llama_kv_cache::paged_swap_out_block_impl(
+        uint32_t physical_block,
+        bool do_madvise,
+        bool retry_on_io_failure) const {
     if (!kv_paged_enabled || !paged_swap_enabled || !kv_swap_store || v_trans || n_stream != 1 ||
             paged_block_size == 0 || v_cells.empty()) {
         return;
@@ -3608,8 +3899,8 @@ void llama_kv_cache::paged_swap_out_block_impl(uint32_t physical_block, bool do_
                 paged_test_io_fault_.failed_attempt_id = io_fault_attempt_id;
             }
             clear_block_entries();
-            if (io_fault_armed && do_madvise) {
-                paged_swap_out_block_impl(physical_block, do_madvise);
+            if (io_fault_armed && do_madvise && retry_on_io_failure) {
+                paged_swap_out_block_impl(physical_block, do_madvise, true);
             }
             return;
     }
@@ -3800,11 +4091,15 @@ bool llama_kv_cache::paged_swap_in_block(
         return "UNKNOWN";
     };
 
+    const bool io_fault_scope_matches =
+        (fatal_on_failure && paged_test_io_fault_.scope == paged_test_io_fail_scope::ACTIVE_SWAP_IN) ||
+        (!fatal_on_failure && paged_test_io_fault_.scope == paged_test_io_fail_scope::PREFETCH_SWAP_IN);
     bool io_fault_candidate = false;
-    if (fatal_on_failure &&
-            paged_test_io_fault_.scope == paged_test_io_fail_scope::ACTIVE_SWAP_IN &&
+    if (io_fault_scope_matches &&
             paged_test_io_fault_.kind == paged_test_io_fail_kind::READ_EOF_ONCE &&
             paged_test_io_fault_.target_seq >= 0 &&
+            (paged_test_io_fault_.scope != paged_test_io_fail_scope::PREFETCH_SWAP_IN ||
+                    paged_test_io_fault_.target_block == physical_block) &&
             (!paged_test_io_fault_.fail_once || !paged_test_io_fault_.consumed)) {
         for (uint32_t cell = begin; cell < end; ++cell) {
             if (cell < cells.size() && cells.seq_has(cell, paged_test_io_fault_.target_seq)) {
@@ -3876,6 +4171,7 @@ bool llama_kv_cache::paged_swap_in_block(
     }
 
     if (test_fault_attempt &&
+            paged_test_swapin_fault_.successful_cells >= paged_test_swapin_fault_.fail_after_cells &&
             (!paged_test_swapin_fault_.fail_once || !paged_test_swapin_fault_.consumed)) {
         if (paged_test_swapin_fault_.fail_once) paged_test_swapin_fault_.consumed = true;
         paged_test_swapin_fault_.trigger_count += 1;
@@ -3939,13 +4235,17 @@ bool llama_kv_cache::paged_swap_in_block(
                     }
                 }
                 const auto & stats = kv_swap_store->get_stats();
+                const char * io_fault_scope_name =
+                    paged_test_io_fault_.scope == paged_test_io_fail_scope::PREFETCH_SWAP_IN
+                    ? "prefetch_swap_in" : "active_swap_in";
                 LLAMA_LOG_ERROR(
-                        "KV_PAGED_IO_FAULT scope=active_swap_in kind=read_eof_once target_seq=%d "
+                        "KV_PAGED_IO_FAULT scope=%s kind=read_eof_once target_seq=%d "
                         "physical_block=%u physical_cell=%u state_before=%s state_after=%s "
                         "swap_in_counter_before=%llu swap_in_counter_after=%llu "
                         "backend_status=%s backend_errno=%d pread_attempts_before=%llu "
                         "pread_attempts_after=%llu metadata_present_cells=%llu "
                         "failure_reason=%s trigger_count=%llu attempt_id=%llu\n",
+                        io_fault_scope_name,
                         (int) paged_test_io_fault_.target_seq,
                         physical_block,
                         begin,
@@ -4028,6 +4328,7 @@ bool llama_kv_cache::paged_swap_in_block(
         paged_test_io_fault_.failed_attempt_id = 0;
     }
     if (test_fault_attempt) {
+        paged_test_swapin_fault_.successful_cells += cell_count;
         LLAMA_LOG_INFO(
                 "TEST FAULT SWAPIN COMPLETE attempt_id=%llu scope=%s physical_block=%u "
                 "restored_cells=%llu block_state=%d paged_swap_in_calls_before=%llu "
