@@ -35,6 +35,12 @@ enum class llama_kv_action_reason : uint8_t {
     ownership_invalid,
     io_failure,
     prefetch_failed,
+    no_candidate,
+    scan_budget_exhausted,
+    target_satisfied,
+    target_shortfall,
+    blocked,
+    failed,
 };
 
 struct llama_kv_action_request {

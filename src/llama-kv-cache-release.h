@@ -27,6 +27,7 @@ struct llama_kv_bounded_release_result {
     uint32_t blocks_skipped_state = 0;
     uint32_t madvise_failures   = 0;
     bool     block_scan_exhausted = false;
+    bool     scan_budget_exhausted = false;
     bool     ownership_aborted    = false;
 };
 

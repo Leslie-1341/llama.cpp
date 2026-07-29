@@ -31,6 +31,12 @@ const char * action_reason_name(llama_kv_action_reason reason) {
     case llama_kv_action_reason::ownership_invalid:      return "ownership_invalid";
     case llama_kv_action_reason::io_failure:             return "io_failure";
     case llama_kv_action_reason::prefetch_failed:        return "prefetch_failed";
+    case llama_kv_action_reason::no_candidate:           return "no_candidate";
+    case llama_kv_action_reason::scan_budget_exhausted:  return "scan_budget_exhausted";
+    case llama_kv_action_reason::target_satisfied:       return "target_satisfied";
+    case llama_kv_action_reason::target_shortfall:       return "target_shortfall";
+    case llama_kv_action_reason::blocked:                return "blocked";
+    case llama_kv_action_reason::failed:                 return "failed";
     }
     return "unknown";
 }

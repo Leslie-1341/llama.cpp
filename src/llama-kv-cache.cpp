@@ -2287,8 +2287,13 @@ llama_kv_action_result llama_kv_cache::execute_action(
     }
 
     if (request.action == llama_kv_action::release) {
-        if (request.target_bytes == 0 || request.max_blocks == 0) {
+        if (request.target_bytes == 0) {
             result.reason = llama_kv_action_reason::zero_budget;
+            return result;
+        }
+        if (request.max_blocks == 0) {
+            result.reason = llama_kv_action_reason::scan_budget_exhausted;
+            result.shortfall_bytes = request.target_bytes;
             return result;
         }
         if (!result.capability.can_release) {
@@ -2309,14 +2314,40 @@ llama_kv_action_result llama_kv_cache::execute_action(
         result.shortfall_bytes = release.shortfall_bytes;
         if (release.ownership_aborted) {
             result.outcome = llama_kv_action_outcome::rejected;
-            result.reason = llama_kv_action_reason::ownership_invalid;
+            result.reason = llama_kv_action_reason::blocked;
             result.fail_stop = true;
             return result;
         }
         if (release.released_blocks > 0) {
             publish_transaction();
-            result.outcome = llama_kv_action_outcome::completed;
         }
+        if (release.madvise_failures > 0) {
+            result.outcome = release.released_blocks > 0
+                ? llama_kv_action_outcome::partial_failure
+                : llama_kv_action_outcome::failed;
+            result.reason = llama_kv_action_reason::failed;
+            result.io_failure = true;
+            return result;
+        }
+        if (release.released_bytes >= request.target_bytes) {
+            result.outcome = llama_kv_action_outcome::completed;
+            result.reason = llama_kv_action_reason::target_satisfied;
+            return result;
+        }
+        if (release.scan_budget_exhausted) {
+            result.outcome = release.released_blocks > 0
+                ? llama_kv_action_outcome::completed
+                : llama_kv_action_outcome::no_op;
+            result.reason = llama_kv_action_reason::scan_budget_exhausted;
+            return result;
+        }
+        if (release.released_blocks == 0) {
+            result.reason = llama_kv_action_reason::no_candidate;
+            return result;
+        }
+
+        result.outcome = llama_kv_action_outcome::completed;
+        result.reason = llama_kv_action_reason::target_shortfall;
         return result;
     }
 
@@ -6884,6 +6915,7 @@ llama_kv_bounded_release_result llama_kv_cache::paged_release_blocks_bounded_imp
     // scan budget of zero: return immediately without scanning or ownership check.
     if (max_scan_blocks == 0) {
         result.block_scan_exhausted = true;
+        result.scan_budget_exhausted = true;
         result.shortfall_bytes      = target_bytes;
         if (use_test_seams) {
             paged_release_bounded_test_force_ownership_abort     = false;
@@ -7032,6 +7064,8 @@ llama_kv_bounded_release_result llama_kv_cache::paged_release_blocks_bounded_imp
 
     result.blocks_scanned = scanned;
     result.block_scan_exhausted = (scanned >= scan_limit);
+    result.scan_budget_exhausted = result.released_bytes < target_bytes &&
+        scan_limit < paged_n_blocks && scanned >= scan_limit;
 
     if (use_test_seams) {
         paged_release_bounded_test_force_ownership_abort     = false;
@@ -7215,6 +7249,7 @@ llama_kv_bounded_release_result llama_kv_cache::paged_release_blocks_bounded_dry
     // scan budget of zero: return immediately without scanning or ownership check.
     if (max_scan_blocks == 0) {
         result.block_scan_exhausted = true;
+        result.scan_budget_exhausted = true;
         result.shortfall_bytes      = target_bytes;
         return result;
     }
@@ -7315,6 +7350,8 @@ llama_kv_bounded_release_result llama_kv_cache::paged_release_blocks_bounded_dry
 
     result.blocks_scanned = scanned;
     result.block_scan_exhausted = (scanned >= scan_limit);
+    result.scan_budget_exhausted = result.released_bytes < target_bytes &&
+        scan_limit < paged_n_blocks && scanned >= scan_limit;
 
     // NO test-seam access, NO state mutation, NO free-list change,
     // NO backing-metadata clear, NO global-counter increment.

@@ -169,7 +169,23 @@ resume/active requires block
 - core 独占从 logical sequence/budget 到 physical candidate 的解析、候选 ownership/recheck、physical block state transition、free-list/transaction 更新，以及 backing-store read/write 的提交 authority；server 不得枚举或改写 private physical block state。
 - `EVALUATE` 只报告 capability，不创建 transaction。每次 `execute_action()` 调用只执行其 request 指定的一个 action，且只在实际 state transition 后发布一个 core transaction ID；无候选或零预算为 no-op，不隐式串接另一 action。
 - `OFFLOAD` 仅在 backing write 完成后发布 `SWAPPED`；`PREFETCH` 仅在 staging read/validate/unpack 完成后发布 `RESIDENT`。partial PREFETCH backing read failure 保留已恢复 block 的 `RESIDENT` 与失败 block 的 `SWAPPED`，result 返回 `partial_failure`、完成量和 shortfall；correctness-required request 同时置 fail-stop。
-- 当前仅 core 边界与定向单测已实现并验证。server arbitration 尚未接入：未来 server 只能从不可变快照形成上述 logical intent 并提交一次 request，不能替代 core candidate/state/backing authority。
+- 当前 core 边界与定向单测已实现并验证。Stage 3C-1C-1 已接入一个独立的 server request-resume PREFETCH 调用边界；更广义的 pressure action arbitration 尚未接入。server 只能从不可变快照形成 logical intent 并提交一次 request，不能替代 core candidate/state/backing authority。
+
+### 4.2 Stage 3C-1C-1 server request-resume PREFETCH boundary
+
+```text
+server::update_slots()
+  -> n_past determined
+  -> server_kv_resume_gate(seq_id, decision_id)
+  -> set sequence protection
+  -> core execute_action(PREFETCH, correctness_required, all_required)
+  -> strict result gate
+  -> graph/batch setup and decode, or slot release + continue
+```
+
+- gate 位于 `n_past` 确定之后、batch setup/graph compute 前；其只传递 sequence、decision ID 与 correctness-required/all-required logical intent。physical candidate、state、backing I/O 与 transaction authority 仍在 core。
+- 只有 matching decision ID、`completed`/`no_op` outcome、无 I/O failure/fail-stop/context-invalid 且零 shortfall 才允许后续 graph。失败、partial failure 或 nonzero shortfall 均阻止本轮 graph/decode。
+- sequence protection 在 gate 调用前设定，跨成功 graph 生命周期保持；仅在 prompt clear 或 slot release 时清除。该 request-resume boundary 不依赖 pressure state。
 
 ## 5. Static Paged Identity Fast Path
 

@@ -210,10 +210,14 @@ if (UNIX)
         target_include_directories(test-server-kv-pressure PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/src)
         llama_build_and_test(test-server-kv-resume.cpp ${PROJECT_SOURCE_DIR}/tools/server/server-kv-resume.cpp)
         target_include_directories(test-server-kv-resume PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/src)
+        llama_build_and_test(test-server-kv-pressure-action.cpp ${PROJECT_SOURCE_DIR}/tools/server/server-kv-pressure-action.cpp)
+        target_include_directories(test-server-kv-pressure-action PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/src)
         llama_test_cmd(python3 NAME test-server-kv-pressure-static
             ARGS ${PROJECT_SOURCE_DIR}/tests/test-server-kv-pressure-static.py LABEL python)
         llama_test_cmd(python3 NAME test-server-kv-resume-static
             ARGS ${PROJECT_SOURCE_DIR}/tests/test-server-kv-resume-static.py LABEL python)
+        llama_test_cmd(python3 NAME test-server-kv-pressure-action-static
+            ARGS ${PROJECT_SOURCE_DIR}/tests/test-server-kv-pressure-action-static.py LABEL python)
         llama_test_cmd(python3 NAME test-kv-bounded-release-stage3a-2c-parser
             ARGS ${PROJECT_SOURCE_DIR}/tests/test-kv-bounded-release-stage3a-2c-parser.py LABEL python)
         llama_test_cmd(python3 NAME test-runner-bounded-release-stage3a-2c

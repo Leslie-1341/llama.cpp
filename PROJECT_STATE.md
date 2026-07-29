@@ -56,6 +56,13 @@
 - 定向测试 `./build/bin/test-kv-paged-release-bounded` 在该 HEAD 通过（末行 `PASS: paged release bounded correctness`）：WT24 验证 EVALUATE/RELEASE，WT25 验证 OFFLOAD→PREFETCH 的真实 K/V byte-exact roundtrip，WT26 覆盖 swap-out 与 backing-store read fault、partial PREFETCH failure 和 fail-stop。
 - 这是 clean-HEAD core 单测证据，不是 server、真实模型、多 slot、长周期或性能验证。
 
+### Stage 3C-1C-1 — server request resume gate stable node
+
+- Git identity：在分支 `fix/kv-p0-b1-bounded-store` 的 clean committed HEAD `d3bc743d9479e4e46a1941373d5b4ba1a2c49b77` 上验证；写入账本前 `git status --short` 为空。本轮账本同步后工作树仅因四份账本 dirty。
+- `server::update_slots()` 在 `n_past` 确定后、batch setup/graph compute 前调用 resume gate；gate 仅提交 logical `PREFETCH` intent，`correctness_required=true`、`all_required=true`，不读取或改写 private physical KV state。
+- 仅当 decision ID 匹配、outcome 为 `completed` 或 `no_op`、无 I/O failure/fail-stop/context-invalid 且 `shortfall_bytes==0` 时允许 graph；其余情形释放 slot 并跳过本轮 graph/decode。sequence protection 在 gate 前设定，且只由 prompt clear 或 slot release 生命周期清除，不受 pressure gate 控制。
+- Release 构建成功；定向 CTest 3/3 PASS：`test-kv-paged-release-bounded`、`test-server-kv-resume`、`test-server-kv-resume-static`。这是 clean-HEAD 的构建与定向单测证据，不是 HTTP 或真实模型验证。
+
 ### Stage 3A-2C — pressure-driven bounded destructive release
 
 - Server `maybe_sample_kv_pressure()` 已形成三阶段：Phase A telemetry、Phase B dry-run、Phase C bounded release。
@@ -84,23 +91,24 @@
 - Stage 3B-2A 虽覆盖至有效 8064-token 档位和一次 20-request 连续序列，但仍只是一台 Linux CPU、单 slot、单模型、单次运行；未覆盖并发、多模型/quantization、不同 block/page size 或长期重复 episode。
 - DYNAMIC target 的机制与 marker 已受 parser 验证，但本 artifact 不得用于声称正式总 RSS 收益、回收率、TTFT/TPOT/TPS、吞吐或 p95/p99 改善。
 - RSS 是独立真实 server PID 的进程观测；它不替代 KV resident/mincore 或 lifecycle state truth。正释放的 mincore 下降是本协议的正确性证据，非性能指标。
-- Stage 3C-1B 已验证 core 内的统一 action request/result 与单 action transaction 边界；server 对五类 action 的仲裁、互斥/优先级和真实路径错误传播仍尚未实现或验证。权重–KV 共享预算/I/O 仲裁也尚未实现或验证。
+- Stage 3C-1C-1 已验证 server request resume 的 correctness-required PREFETCH 调用边界、严格失败门禁和 sequence protection 生命周期；server pressure 动作仲裁、五类 action 的互斥/优先级和真实路径错误传播仍尚未实现或验证。`all_required` 可能多恢复 tail block，是 P1 性能边界，尚无性能证据。权重–KV 共享预算/I/O 仲裁也尚未实现或验证。
+- 真实模型 HTTP 恢复、OFFLOAD→PREFETCH 的 server 真实路径、长上下文、多 slot、长周期和性能均尚未验证；本节点的定向 CTest 不得推广为上述结论。
 - Stage 3A-2C 的 dirty-tree 单次固定-target 结论保留为历史 diagnostic；新 clean-HEAD artifact 不自动将其推广为生产策略。
 
 ## In Progress
 
-**Stage 3C-1B core action 已关闭；进入 Stage 3C-1C server arbitration。** 下一节点在既有单 owner、单 slot server 路径上，按 D-0014 authority 只提交 logical intent 给 core；当前不新增异步线程，也不接入权重模块。
+**Stage 3C-1C-1 server request resume gate 已关闭；进入 Stage 3C-1C-2 server 压力动作仲裁。** 下一节点仍限既有单 owner、单 slot server 路径，按 D-0014 authority 基于不可变 pressure/slot 快照只提交 logical intent 给 core；不新增异步线程，不接入权重模块。
 
 ## Blocked
 
-无已确认的 Stage 3C-1C server arbitration runtime 阻塞项；但 server 仲裁尚未实现，不能将 Stage 3C-1B core 单测推广为 server 证据。
+无已确认的 Stage 3C-1C-2 server 压力动作仲裁 runtime 阻塞项。Stage 3C-1C-1 的定向构建/CTest 已验证，但不能推广为真实模型 HTTP、OFFLOAD→PREFETCH、长上下文、多 slot、长周期或性能证据。
 
 ## Next Gate
 
-### Stage 3C-1C — 单 owner、单 slot 的 server arbitration
+### Stage 3C-1C-2 — 单 owner、单 slot 的 server 压力动作仲裁
 
-1. 将已有 server 路径改为只基于不可变 pressure/slot 快照选择 `NOOP/EVALUATE/PREFETCH/RELEASE/OFFLOAD` 的 logical intent，并为每个 decision 调用一次 core `execute_action()`；server 不读取或改写 private physical block state。
+1. 在既有 pressure scheduler 中仅基于不可变 pressure/slot 快照选择并提交一次 `NOOP/EVALUATE/PREFETCH/RELEASE/OFFLOAD` logical intent；server 不读取或改写 private physical KV state。不得把已独立实现的 request resume gate 改为 pressure-gated。
 2. 保持 core 独占 physical candidate 解析、ownership/recheck、state transition、backing-store authority 与 transaction ID；同一 decision 不得组合多个 state-changing action，release shortfall 仅交由后续 decision 重新评估。
-3. 验证单 owner、单 slot server 的 response correctness、error propagation、safe no-op、decision/result correlation 与 fail-stop；不把 core 单测替代为真实模型或长期/多 slot 证据。
+3. 验证单 owner、单 slot 的 pressure action decision/result correlation、互斥/优先级、safe no-op、error propagation 与 fail-stop；`all_required` 的可能 tail-block 额外恢复只作为 P1 性能边界记录，不在本正确性节点声称性能收益。
 
 原定 release-only 的持续压力、重复 episode、多 slot、并发及正式 KV-only 性能矩阵合并后移至 **Stage 3C-2**；Stage 3C-2 之前不再单独开展 release-only 容量上限、持续压力或正式性能阶段。

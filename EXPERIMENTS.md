@@ -593,3 +593,12 @@ Stage 3A-2C endpoint is feasible and correct in the stated controlled boundary: 
 - Directed evidence: WT24 covers read-only EVALUATE, structured NOOP and unified RELEASE transaction correlation; WT25 covers unified OFFLOAD/PREFETCH and byte-exact real K/V tensor roundtrip; WT26 fault-injects backing-store I/O, including partial PREFETCH read failure with completed/failed block-state separation, exact shortfall and correctness-required fail-stop.
 - Evidence entry only: this is no server runner/parser artifact and records no performance observation or conclusion.
 - Not covered: Stage 3C-1C server arbitration/priority, response correctness in server, real-model runs, multi-slot, long-duration/repeated episodes, concurrency, performance, or weight–KV integration. These remain unimplemented or unverified as applicable; broader extensions belong to Stage 3C-2.
+
+## E-0015 — Stage 3C-1C-1 server request-resume short validation
+
+- Status: **short verification PASS — Release build and directed CTest only**
+- Identity: `fix/kv-p0-b1-bounded-store`，clean committed HEAD `d3bc743d9479e4e46a1941373d5b4ba1a2c49b77`；验证开始前 `git status --short` 为空。
+- Build entry: `cmake --build build --config Release --target test-kv-paged-release-bounded test-server-kv-resume`，成功；`build/CMakeCache.txt` 的 `CMAKE_BUILD_TYPE=Release`。
+- Test entry: `ctest --test-dir build --output-on-failure -R '^(test-kv-paged-release-bounded|test-server-kv-resume|test-server-kv-resume-static)$'`；3/3 PASS，0 failed。`test-server-kv-resume` 覆盖 no-op/success、first/partial PREFETCH failure、shortfall/fail-stop/context-invalid；静态测试覆盖 `n_past` 后、graph/decode 前的 gate 顺序、strict failure 与 protection 生命周期。
+- Scope: 本条仅登记短验证入口；不记录性能数值或性能结论。
+- Not covered: 真实模型 HTTP 恢复、server 真实 OFFLOAD→PREFETCH、长上下文、多 slot、长周期/重复 episode、并发、性能和权重–KV 融合均尚未验证。`all_required` 可能多恢复 tail block，仅为 P1 性能边界，尚未量化。

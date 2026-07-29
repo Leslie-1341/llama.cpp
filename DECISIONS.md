@@ -799,3 +799,40 @@ D-0014/D-0020 冻结了 unified scheduler 的 authority 与单 action、单 tran
 
 - `./build/bin/test-kv-paged-release-bounded` at the above clean HEAD: PASS（WT24–WT26）。
 - WT25：OFFLOAD→PREFETCH 的真实 K/V byte-exact roundtrip；WT26：backing-store read failure、partial PREFETCH result 与 fail-stop。
+
+## D-0022 — Stage 3C-1C-1 将 correctness-required PREFETCH 置于 server request-resume graph 前
+
+- Date: 2026-07-29
+- Status: accepted（**已提交并完成 Release 构建与定向 CTest；非真实 HTTP/模型验证**）
+- Evidence commit/worktree: `d3bc743d9479e4e46a1941373d5b4ba1a2c49b77` on `fix/kv-p0-b1-bounded-store`；验证开始时 worktree clean。账本同步产生的 dirty 仅包含工程账本。
+- Supersedes: D-0021 中“server arbitration 尚未实现或验证”的泛化状态描述；保留其 core action authority，且不关闭尚未实现的 server pressure action arbitration
+
+**Context**
+
+D-0021 已给出 core `PREFETCH` 的 structured result、partial failure 与 fail-stop 语义，但 server request 在恢复或 active access 后仍可在 graph 前缺少一个将 correctness-required restore 结果转化为 graph 许可的调用边界。该边界必须早于 batch/graph，且不能将 private physical KV state 上移到 server。
+
+**Decision**
+
+1. `server::update_slots()` 在 `n_past` 确定之后、batch setup/graph compute 前，经 `server_kv_resume_gate()` 只提交一次 logical `PREFETCH` request；request 设 `correctness_required=true` 和 `all_required=true`，core 继续拥有 candidate、state、backing I/O 和 transaction authority。
+2. gate 在 request 前设置 sequence protection；成功时 protection 保持到 prompt clear 或 slot release 的既有生命周期，不以 pressure state 为条件清除。
+3. 后续 graph 仅在 decision ID 匹配、outcome 为 `completed`/`no_op`、无 I/O failure/fail-stop/context-invalid 且 `shortfall_bytes==0` 时允许。failed、partial failure、非零 shortfall 或其它不匹配均 fail-closed：释放 slot 并跳过本轮 graph/decode。
+4. `all_required` 的 correctness 语义优先于减少恢复量；它可能额外恢复 tail block，此项只记为 P1 性能边界，须由后续性能协议量化，不据此声称收益或退化。
+
+**Alternatives rejected**
+
+- 在 graph/decode 后才执行 PREFETCH：已无法防止不完整恢复进入本轮 compute。
+- 将 partial failure 或 nonzero shortfall 视为可继续的 success：会绕过 core 的 correctness-required/fail-stop 结果。
+- 由 server 枚举 block 或按 pressure 条件决定 request-resume 的 protection：会违反 core authority，或破坏 request 生命周期的保护语义。
+- 本节点同时接入 pressure action arbitration：超出单一 request-resume correctness 边界；该工作明确后移到 Stage 3C-1C-2。
+
+**Consequences and limits**
+
+- 本决策仅关闭 server request-resume 的 graph 前 correctness PREFETCH、严格失败门禁和 sequence protection 生命周期。
+- 真实模型 HTTP 恢复、server 真实 OFFLOAD→PREFETCH、长上下文、多 slot、长周期、并发、性能及权重–KV 融合均尚未验证。
+- Release 构建和定向 CTest 只提供短验证入口，不替代真实 server/模型 artifact，也不产生性能结论。
+
+**Evidence**
+
+- Release build: `cmake --build build --config Release --target test-kv-paged-release-bounded test-server-kv-resume`。
+- `ctest --test-dir build --output-on-failure -R '^(test-kv-paged-release-bounded|test-server-kv-resume|test-server-kv-resume-static)$'`：3/3 PASS。
+- E-0015。

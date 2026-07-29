@@ -1553,22 +1553,48 @@ int main(int /*argc*/, char ** /*argv*/) {
                     !zero.state_changed && zero.core_transaction_id == 0,
                     "WT24: zero release budget is a no-op");
 
+            const auto zero_scan = g.kv->execute_action({
+                llama_kv_action::release, 7005, -1, 4096, 0, false });
+            CHECK(zero_scan.outcome == llama_kv_action_outcome::no_op &&
+                    zero_scan.reason == llama_kv_action_reason::scan_budget_exhausted &&
+                    zero_scan.shortfall_bytes == 4096 && !zero_scan.state_changed,
+                    "WT24: zero scan budget is an unchanged scan-budget shortfall");
+
             const auto no_swap_prefetch = g.kv->execute_action({
-                llama_kv_action::prefetch, 7005, 0, 0, 0, true, true });
+                llama_kv_action::prefetch, 7006, 0, 0, 0, true, true });
             CHECK(no_swap_prefetch.outcome == llama_kv_action_outcome::no_op &&
                     !no_swap_prefetch.io_failure && !no_swap_prefetch.fail_stop &&
                     no_swap_prefetch.shortfall_bytes == 0,
                     "WT24: all-required prefetch without swap is a safe no-op");
 
+            const auto scan_limited = g.kv->execute_action({
+                llama_kv_action::release, 7003, -1, UINT64_MAX, 1, false });
+            CHECK(scan_limited.decision_id == 7003 && scan_limited.state_changed &&
+                    scan_limited.core_transaction_id > 0 &&
+                    scan_limited.reason == llama_kv_action_reason::scan_budget_exhausted &&
+                    scan_limited.shortfall_bytes > 0,
+                    "WT24: limited scan reports a scan-budget shortfall with one transaction");
+
             const auto release = g.kv->execute_action({
-                llama_kv_action::release, 7003, -1, UINT64_MAX, UINT32_MAX, false });
-            CHECK(release.decision_id == 7003 && release.state_changed &&
-                    release.core_transaction_id > 0,
+                llama_kv_action::release, 7007, -1, UINT64_MAX, UINT32_MAX, false });
+            CHECK(release.decision_id == 7007 && release.state_changed &&
+                    release.core_transaction_id > scan_limited.core_transaction_id,
                     "WT24: release correlates decision and core transaction");
-            CHECK(release.blocks > 0 && release.bytes > 0,
-                    "WT24: unified release reports block and byte effects");
+            CHECK(release.blocks > 0 && release.bytes > 0 &&
+                    release.reason == llama_kv_action_reason::target_shortfall &&
+                    release.shortfall_bytes > 0,
+                    "WT24: full scan reports target shortfall after releasing candidates");
             CHECK(g.kv->paged_release_bounded_test_read_block_state(0) == 2,
                     "WT24: unified release changes the block to RELEASED");
+
+            const auto no_candidate = g.kv->execute_action({
+                llama_kv_action::release, 7008, -1, 4096, UINT32_MAX, false });
+            CHECK(no_candidate.outcome == llama_kv_action_outcome::no_op &&
+                    no_candidate.reason == llama_kv_action_reason::no_candidate &&
+                    no_candidate.blocks == 0 && no_candidate.bytes == 0 &&
+                    no_candidate.shortfall_bytes == 4096 && !no_candidate.state_changed &&
+                    no_candidate.core_transaction_id == 0,
+                    "WT24: complete scan reports no candidate without mutation");
             std::fprintf(stderr, "WT24 unified evaluate/release: tx=%llu blocks=%u OK\n",
                     (unsigned long long) release.core_transaction_id, release.blocks);
         }

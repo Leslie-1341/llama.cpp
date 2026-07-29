@@ -5,6 +5,7 @@
 #include "server-http.h"
 #include "server-kv-resume.h"
 #if defined(__linux__)
+#include "server-kv-pressure-action.h"
 #include "server-kv-pressure.h"
 #endif
 #include "server-task.h"
@@ -718,6 +719,10 @@ private:
     // Independent of LLAMA_KV_PAGED_RELEASE (legacy apply-path gate).
     server_kv_pressure_bounded_release_config kv_pressure_bounded_release_config;
     uint64_t kv_pressure_bounded_release_episode = 0;
+
+    // Unified pressure actions are an independent opt-in path. They only submit
+    // logical EVALUATE/RELEASE requests to core and never inspect KV internals.
+    server_kv_pressure_unified_action_config kv_pressure_unified_action_config;
 #endif
 
     server_metrics metrics;
@@ -733,7 +738,7 @@ private:
     std::set<std::string> model_tags;    // informational tags
 
     bool sleeping = false;
-    uint64_t kv_resume_decision_next = 0;
+    uint64_t kv_decision_next = 0;
 
     void destroy() {
         spec.reset();
@@ -774,6 +779,7 @@ private:
             kv_pressure_dry_run_config = server_kv_pressure_dry_run_config{};
             kv_pressure_bounded_release_config = server_kv_pressure_bounded_release_config{};
             kv_pressure_bounded_release_episode = 0;
+            kv_pressure_unified_action_config = server_kv_pressure_unified_action_config{};
 #endif
             destroy();
         } else {
@@ -784,7 +790,9 @@ private:
 #if defined(__linux__)
             // A reloaded model starts a new telemetry lifecycle. Do not carry
             // pressure state, counters, or sampling deadlines across sleep.
-            init_kv_pressure_sampler();
+            if (!init_kv_pressure_sampler()) {
+                GGML_ABORT("invalid KV pressure action configuration after sleeping");
+            }
 #endif
         }
         sleeping = new_state;
@@ -1097,7 +1105,7 @@ private:
     }
 
 #if defined(__linux__)
-    void init_kv_pressure_sampler() {
+    bool init_kv_pressure_sampler() {
         kv_pressure_sampler_owner.reset();
         kv_pressure_runtime.disable();
         kv_pressure_runtime.dry_run_disable();
@@ -1105,21 +1113,38 @@ private:
         kv_pressure_dry_run_config = server_kv_pressure_dry_run_config{};
         kv_pressure_bounded_release_config = server_kv_pressure_bounded_release_config{};
         kv_pressure_bounded_release_episode = 0;
+        kv_pressure_unified_action_config = server_kv_pressure_unified_action_config{};
+
+        const auto unified_decision =
+                server_kv_pressure_unified_action_startup_decide_from_env();
+        if (unified_decision.status == server_kv_pressure_unified_action_startup_status::invalid ||
+                unified_decision.status == server_kv_pressure_unified_action_startup_status::conflict) {
+            SRV_ERR("KV pressure unified action configuration error: %s; server initialization rejected\n",
+                    unified_decision.error.c_str());
+            return false;
+        }
+        if (unified_decision.status == server_kv_pressure_unified_action_startup_status::enabled) {
+            kv_pressure_unified_action_config = unified_decision.config;
+            SRV_INF("KV pressure unified action enabled: target_bytes=%" PRIu64
+                    " max_blocks=%" PRIu32 "\n",
+                    kv_pressure_unified_action_config.target_bytes,
+                    kv_pressure_unified_action_config.max_blocks);
+        }
 
         const kv_pressure_enablement enablement = kv_pressure_sampler_environment_enablement();
         if (enablement == kv_pressure_enablement::KV_PRESSURE_ENABLEMENT_DISABLED) {
-            return;
+            return true;
         }
         if (enablement == kv_pressure_enablement::KV_PRESSURE_ENABLEMENT_INVALID) {
             SRV_WRN("%s", "invalid LLAMA_KV_PRESSURE_SAMPLER value; pressure telemetry disabled\n");
-            return;
+            return true;
         }
 
         server_kv_pressure_config config;
         std::string error;
         if (!server_kv_pressure_config_from_env(config, error)) {
             SRV_WRN("KV pressure telemetry disabled: %s\n", error.c_str());
-            return;
+            return true;
         }
 
         // Parse dry-run config independently — it is not gated on sampler init
@@ -1220,7 +1245,7 @@ private:
             auto sampler = std::make_unique<kv_pressure_sampler>();
             if (!sampler->init(enablement)) {
                 SRV_WRN("%s", "KV pressure sampler initialization failed; pressure telemetry disabled\n");
-                return;
+                return true;
             }
 
             kv_pressure_sampler_owner = std::move(sampler);
@@ -1230,6 +1255,7 @@ private:
         } catch (...) {
             SRV_WRN("%s", "KV pressure sampler initialization failed; pressure telemetry disabled\n");
         }
+        return true;
     }
 
     void maybe_sample_kv_pressure(bool idle) {
@@ -1344,6 +1370,35 @@ private:
                 } else {
                     SRV_INF("%s\n", marker.c_str());
                 }
+            }
+        }
+
+        // --- Unified pressure action (EVALUATE then at most one RELEASE) ---
+        {
+            const auto & telemetry = kv_pressure_sampler_owner->telemetry();
+            if (kv_pressure_unified_action_config.enabled) {
+                auto * mem = ctx_tgt ? llama_get_memory(ctx_tgt) : nullptr;
+                const auto result = server_kv_pressure_execute_unified_action(
+                        kv_pressure_unified_action_config,
+                        mem ? server_kv_pressure_action_ops {
+                            [mem](const llama_kv_action_request & request) {
+                                return mem->execute_action(request);
+                            },
+                        } : server_kv_pressure_action_ops {},
+                        telemetry,
+                        idle,
+                        kv_pressure_runtime.sample_count(),
+                        ++kv_decision_next);
+                const std::string marker =
+                    server_kv_pressure_unified_action_format_marker(result);
+                if (result.release.io_failure || result.release.fail_stop) {
+                    SRV_WRN("%s\n", marker.c_str());
+                } else {
+                    SRV_INF("%s\n", marker.c_str());
+                }
+                // This decision is terminal after EVALUATE/RELEASE, including
+                // no-candidate, shortfall, partial, or failure outcomes.
+                destructive_phase_did_work = true;
             }
         }
 
@@ -1550,7 +1605,9 @@ private:
         GGML_ASSERT(!sleeping);
 
 #if defined(__linux__)
-        init_kv_pressure_sampler();
+        if (!init_kv_pressure_sampler()) {
+            return false;
+        }
 #endif
 
         // wiring up server queues
@@ -3254,7 +3311,7 @@ private:
                                     } : server_kv_resume_ops {},
                                     server_kv_resume_trigger::active_access,
                                     slot.id,
-                                    ++kv_resume_decision_next);
+                                    ++kv_decision_next);
                             if (!result.graph_allowed) {
                                 send_error(slot, server_kv_resume_failure_message(result), ERROR_TYPE_SERVER);
                                 slot.release();
