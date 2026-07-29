@@ -162,6 +162,15 @@ resume/active requires block
 - 固定槽位 offload、`SWAPPED`、restore/prefetch 与 active restore error propagation 是底层已有路径；它们尚未作为统一 server policy 的动作接入当前 pressure scheduler。
 - Current transaction states are `CLOSED/APPLIED/COMPUTE_STARTED` plus block `PENDING_WRITE/INVALID` behavior；这不是冻结目标契约中的完整 PREPARED/per-cell overlay 实现。
 
+### 4.1 Stage 3C-1B unified core action boundary
+
+`src/llama-kv-cache-action.h` 定义统一的 `llama_kv_action_request/result`；`llama_kv_cache::execute_action()` 在 core 内执行 `NOOP/EVALUATE/PREFETCH/RELEASE/OFFLOAD`。request 只携带 action、decision ID、logical sequence、budget 和 correctness-required intent；result 回传 outcome/reason、capability、completed block/byte、shortfall、fail-stop、state-change 和 core transaction ID。
+
+- core 独占从 logical sequence/budget 到 physical candidate 的解析、候选 ownership/recheck、physical block state transition、free-list/transaction 更新，以及 backing-store read/write 的提交 authority；server 不得枚举或改写 private physical block state。
+- `EVALUATE` 只报告 capability，不创建 transaction。每次 `execute_action()` 调用只执行其 request 指定的一个 action，且只在实际 state transition 后发布一个 core transaction ID；无候选或零预算为 no-op，不隐式串接另一 action。
+- `OFFLOAD` 仅在 backing write 完成后发布 `SWAPPED`；`PREFETCH` 仅在 staging read/validate/unpack 完成后发布 `RESIDENT`。partial PREFETCH backing read failure 保留已恢复 block 的 `RESIDENT` 与失败 block 的 `SWAPPED`，result 返回 `partial_failure`、完成量和 shortfall；correctness-required request 同时置 fail-stop。
+- 当前仅 core 边界与定向单测已实现并验证。server arbitration 尚未接入：未来 server 只能从不可变快照形成上述 logical intent 并提交一次 request，不能替代 core candidate/state/backing authority。
+
 ## 5. Static Paged Identity Fast Path
 
 ```text
@@ -315,7 +324,8 @@ effective-context probe (server stderr effective n_ctx)
 
 - `src/llama-flex.*` / weight-stream files: Dense layer registration, bounded buffers, prefetch and compute callback.
 - `src/llama-moe-buffer.*`, `src/llama-window.*`: expert residency/prefetch and CLG hinting.
-- `src/llama-kv-cache.*`: KV metadata, mapping, backing I/O, swap/restore, release/dry-run, transactions, dummy redirect, counters and error state.
+- `src/llama-kv-cache.*`: KV metadata, mapping, backing I/O, swap/restore, unified core action execution, release/dry-run, transactions, dummy redirect, counters and error state.
+- `src/llama-kv-cache-action.h`: unified core action request/result types for logical intent, capability, transaction correlation and structured failure.
 - `src/llama-kv-cache-release.h`: release capability/result/ownership helpers shared by core and server-facing API.
 - `src/llama-kv-pressure.*`: pressure source parsing, sampling and state transitions only.
 - `tools/server/server-kv-pressure.*`: pressure cadence, dry-run/bounded config, cooldown/backoff, event formatting.
@@ -351,9 +361,9 @@ effective-context probe (server stderr effective n_ctx)
 - Stage 3B-2A 已在单模型、单次协议中覆盖有效 8064-token 档位与同一 server 的 20 次连续请求；仍无并发、多模型/quantization、不同 block/page size、长期重复 release/refault 的证明。
 - DYNAMIC target 与 per-tier calibrated RSS 的正确性证据不等于生产阈值或性能策略；Stage 3A-2C 的 forced CRITICAL/fixed target 仅保留为历史 diagnostic。
 - `mincore`、RSS 和 strace 是诊断/正确性观测；它们会带来开销，正式性能比较必须关闭或单独测量。
-- 固定槽位 offload、`SWAPPED`、restore/prefetch 和 active restore error propagation 已存在于底层 KV 路径，但尚未统一接入 server policy；当前 server 的 state-changing policy 仍是 dynamic bounded destructive release。
-- Current target contracts for three-axis lifecycle, unified five-action scheduler and v5 evidence remain unimplemented.
+- Stage 3C-1B 已提供并单测 unified core action，但它尚未统一接入 server policy；当前 server 的 state-changing policy 仍是 dynamic bounded destructive release。
+- unified five-action **server scheduler**、完整三轴 lifecycle 与 v5 evidence remain unimplemented；core action request/result 不能单独构成这些运行时闭环。
 
 ## 12. Next Architecture Gate
 
-Stage 3C-1 的下一架构门禁是单 owner、单 slot 的最小统一 KV 动作仲裁：沿用 D-0014 authority，在每个 decision 中按 fail-stop → correctness-required restore/prefetch → release → offload → noop 选择动作，并且至多提交一个 state-changing transaction。当前只定义该最小闭环的实现门禁；它不表示完整五动作 scheduler、三轴 lifecycle、异步 prefetch、权重–KV 协同、持续压力、多 slot、并发或正式性能矩阵已经实现。release shortfall 由后续 decision 再进入 offload；上述扩展验证合并至 Stage 3C-2。
+Stage 3C-1C 的下一架构门禁是单 owner、单 slot 的 server arbitration：沿用 D-0014 authority，server 从不可变快照在每个 decision 中按 fail-stop → correctness-required restore/prefetch → release → offload → noop 选择一个 logical action，并向 core 提交一次 `execute_action()` request。core 保持唯一的 physical candidate、state transition、backing-store 与 transaction authority；server 不读取或改写 private block state。该门禁不表示完整五动作 scheduler、三轴 lifecycle、异步 prefetch、权重–KV 协同、真实模型、持续压力、多 slot、并发或正式性能矩阵已经实现。release shortfall 由后续 decision 再进入 offload；上述扩展验证合并至 Stage 3C-2。

@@ -48,6 +48,14 @@
 - 连续 DYNAMIC_RELEASE 20/20 请求全部 HTTP 200、与 OFF baseline 一致、`cumulative_error_count=0`；runner `run_complete`、`RUN_RC=0`、parser `PASS`、`PARSER_RC=0`。
 - 当前证据只关闭该单模型、单次完整协议的正确性和有限稳定性门禁。
 
+### Stage 3C-1B — unified KV core action stable node
+
+- Git identity：source validation 在 branch `fix/kv-p0-b1-bounded-store` 的 clean committed HEAD `bd418879aaf08154d67e1ea2f0722d8853f2159a` 上执行（写入账本前 `git status --short` 为空）。本轮账本同步后工作树仅因这四份账本 dirty；本次提交文件为 `src/llama-kv-cache-action.h`、`src/llama-kv-cache.cpp`、`src/llama-kv-cache.h`、`tests/test-kv-paged-release-bounded.cpp`。
+- Core 已提供统一 `llama_kv_action_request/result` 与 `execute_action()`，覆盖 `NOOP/EVALUATE/PREFETCH/RELEASE/OFFLOAD`；`EVALUATE` 为只读，state-changing action 返回同一 decision 的 core transaction ID。
+- `PREFETCH` 发生部分 backing-store read failure 时返回 `partial_failure`、已完成 block/byte、准确 shortfall 与 `fail_stop`，已恢复 block 保持 `RESIDENT`，失败 block 保持 `SWAPPED`；首次失败则返回 `failed` 且不创建 transaction。
+- 定向测试 `./build/bin/test-kv-paged-release-bounded` 在该 HEAD 通过（末行 `PASS: paged release bounded correctness`）：WT24 验证 EVALUATE/RELEASE，WT25 验证 OFFLOAD→PREFETCH 的真实 K/V byte-exact roundtrip，WT26 覆盖 swap-out 与 backing-store read fault、partial PREFETCH failure 和 fail-stop。
+- 这是 clean-HEAD core 单测证据，不是 server、真实模型、多 slot、长周期或性能验证。
+
 ### Stage 3A-2C — pressure-driven bounded destructive release
 
 - Server `maybe_sample_kv_pressure()` 已形成三阶段：Phase A telemetry、Phase B dry-run、Phase C bounded release。
@@ -76,23 +84,23 @@
 - Stage 3B-2A 虽覆盖至有效 8064-token 档位和一次 20-request 连续序列，但仍只是一台 Linux CPU、单 slot、单模型、单次运行；未覆盖并发、多模型/quantization、不同 block/page size 或长期重复 episode。
 - DYNAMIC target 的机制与 marker 已受 parser 验证，但本 artifact 不得用于声称正式总 RSS 收益、回收率、TTFT/TPOT/TPS、吞吐或 p95/p99 改善。
 - RSS 是独立真实 server PID 的进程观测；它不替代 KV resident/mincore 或 lifecycle state truth。正释放的 mincore 下降是本协议的正确性证据，非性能指标。
-- release、swap/offload、prefetch 的统一互斥/优先级、与权重共享预算/I/O 仲裁尚未实现或验证。
+- Stage 3C-1B 已验证 core 内的统一 action request/result 与单 action transaction 边界；server 对五类 action 的仲裁、互斥/优先级和真实路径错误传播仍尚未实现或验证。权重–KV 共享预算/I/O 仲裁也尚未实现或验证。
 - Stage 3A-2C 的 dirty-tree 单次固定-target 结论保留为历史 diagnostic；新 clean-HEAD artifact 不自动将其推广为生产策略。
 
 ## In Progress
 
-**Stage 3C-1 路线同步，尚未开始 runtime 实现。** 目标是在既有单 owner、单 slot server 路径上，以 D-0014 authority 实现最小统一 KV 动作仲裁；当前不新增异步线程，也不接入权重模块。
+**Stage 3C-1B core action 已关闭；进入 Stage 3C-1C server arbitration。** 下一节点在既有单 owner、单 slot server 路径上，按 D-0014 authority 只提交 logical intent 给 core；当前不新增异步线程，也不接入权重模块。
 
 ## Blocked
 
-无已确认的 Stage 3C-1 runtime 阻塞项；Stage 3C-1 尚未开始实现。
+无已确认的 Stage 3C-1C server arbitration runtime 阻塞项；但 server 仲裁尚未实现，不能将 Stage 3C-1B core 单测推广为 server 证据。
 
 ## Next Gate
 
-### Stage 3C-1 — 单 owner、单 slot 的最小统一 KV 动作仲裁
+### Stage 3C-1C — 单 owner、单 slot 的 server arbitration
 
-1. 沿用 D-0014 的 server/core authority 和优先级，在已有 server 路径将 fail-stop、correctness-required restore/prefetch、release、offload、noop 纳入一个 decision；每个 decision 至多提交一个 state-changing transaction。
-2. 保持 core 独占候选解析、ownership/recheck、状态与事务变更；server 不读取或改写 private block state。release 未满足目标时只记录 shortfall，由后续 decision 再进入 offload。
-3. 验证单 owner、单 slot 闭环的 response correctness、错误传播和 safe no-op；本阶段不新增异步线程、不接入权重模块，也不声称完整三轴 lifecycle 或五动作 scheduler 已实现。
+1. 将已有 server 路径改为只基于不可变 pressure/slot 快照选择 `NOOP/EVALUATE/PREFETCH/RELEASE/OFFLOAD` 的 logical intent，并为每个 decision 调用一次 core `execute_action()`；server 不读取或改写 private physical block state。
+2. 保持 core 独占 physical candidate 解析、ownership/recheck、state transition、backing-store authority 与 transaction ID；同一 decision 不得组合多个 state-changing action，release shortfall 仅交由后续 decision 重新评估。
+3. 验证单 owner、单 slot server 的 response correctness、error propagation、safe no-op、decision/result correlation 与 fail-stop；不把 core 单测替代为真实模型或长期/多 slot 证据。
 
 原定 release-only 的持续压力、重复 episode、多 slot、并发及正式 KV-only 性能矩阵合并后移至 **Stage 3C-2**；Stage 3C-2 之前不再单独开展 release-only 容量上限、持续压力或正式性能阶段。

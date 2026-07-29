@@ -764,3 +764,38 @@ Stage 3B-2A 已作为 release-only 的稳定节点关闭，但仅证明单模型
 
 - D-0014、D-0019。
 - E-0013 的 Stage 3B-2A clean-HEAD artifact 与离线定量摘要。
+
+## D-0021 — Stage 3C-1B 统一 core action 为 single-action transaction 边界
+
+- Date: 2026-07-29
+- Status: accepted（**已提交 core 稳定节点；server arbitration 尚未实现**）
+- Evidence commit/worktree: `bd418879aaf08154d67e1ea2f0722d8853f2159a` on `fix/kv-p0-b1-bounded-store`，clean worktree；新增/修改 `src/llama-kv-cache-action.h`、`src/llama-kv-cache.cpp`、`src/llama-kv-cache.h`、`tests/test-kv-paged-release-bounded.cpp`
+- Supersedes: D-0020 中“Stage 3C-1 runtime 尚未实现”的状态描述；保留 D-0014 的 authority/priority 和 D-0020 的路线边界
+
+**Context**
+
+D-0014/D-0020 冻结了 unified scheduler 的 authority 与单 action、单 transaction 目标，但原 runtime 仍分散在 release、swap/restore 与 prefetch API 中，尚无统一的 core request/result 来表达 logical intent、transaction correlation 或 partial restore failure。
+
+**Decision**
+
+1. core 以 `llama_kv_action_request/result` 和 `execute_action()` 作为 `NOOP/EVALUATE/PREFETCH/RELEASE/OFFLOAD` 的统一 action 边界。request 接收 logical intent、decision ID 与预算；core 独占 physical candidate 解析、ownership/recheck、state transition、backing I/O authority 与 core transaction ID。
+2. 一次 `execute_action()` 只处理 request 指定的一个 action，且只在实际 state change 后发布至多一个 core transaction。`EVALUATE` 不变更 state；zero-budget 或无候选为 structured no-op；release shortfall 不隐式追加 offload，留给后续 decision。
+3. PREFETCH 在已有 block 成功恢复、后续 backing-store read failure 时必须返回 `partial_failure`，报告完成 block/byte 与 shortfall，保留已恢复 `RESIDENT` 和失败 `SWAPPED` 状态；correctness-required request 置 fail-stop。首个 block 失败返回 `failed` 且无 transaction，不能降格为 no-op。
+4. 保持 legacy release API 与独立 bounded-release/server-release authorization、计数和安全门控兼容；统一 action 不以 legacy switch 为前提，也不改变 legacy callers 的行为。
+
+**Alternatives rejected**
+
+- 让 server 基于 private physical state 自行选块或提交 transition：会破坏 D-0014 的 core authority，也无法在 mutation 前 recheck。
+- 在 unified request 中隐式串联 release 后 offload：会违反单 action、单 transaction 的可归因边界。
+- 用 generic failed/no-op 合并 partial PREFETCH：会丢失完成量、未完成量和 fail-stop 所需的状态信息。
+- 用新接口替换或改变 legacy release caller 的 gate/counter：会扩大本节点范围并破坏既有 attribution 兼容性。
+
+**Consequences and limits**
+
+- Stage 3C-1B 仅关闭 core action request/result、single-action transaction、byte-exact core roundtrip 与 structured backing-read fault 的定向单测节点。
+- server arbitration、真实模型、多 slot、长周期、性能与权重–KV 融合均未实现或验证；D-0014 的 priority 尚未在 server runtime 形成闭环。
+
+**Evidence**
+
+- `./build/bin/test-kv-paged-release-bounded` at the above clean HEAD: PASS（WT24–WT26）。
+- WT25：OFFLOAD→PREFETCH 的真实 K/V byte-exact roundtrip；WT26：backing-store read failure、partial PREFETCH result 与 fail-stop。
