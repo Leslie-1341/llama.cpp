@@ -175,3 +175,4 @@ trace_prompts/
 
 # CTest runtime artifacts
 /Testing/
+rss-stage-results/

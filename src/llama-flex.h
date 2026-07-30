@@ -36,8 +36,9 @@ struct llama_flex_params {
     bool   debug_log      = false;
     int    ring_layers    = 4;    // k: number of layer slots kept resident
     int    prefetch_ahead = 2;    // how many layers ahead to stream
-    int    io_threads     = 2;    // background streaming threads
+    int    io_threads     = 4;    // background streaming threads
     size_t lock_bytes     = 0;    // balanced-locking budget (stage 2c); 0 = off
+    std::string pin_policy = "small-first";
 };
 
 struct llama_flex_stats {
@@ -49,9 +50,19 @@ struct llama_flex_stats {
     uint64_t read_ops        = 0;  // number of pread() calls issued for streaming
     uint64_t total_io_us     = 0;
     uint64_t total_wait_us   = 0;
+    uint64_t demand_loads    = 0;  // layer was not already queued/loading when compute needed it
+    uint64_t prefetch_queued = 0;
+    uint64_t queue_requeues  = 0;  // IO worker could not acquire a slot
+    uint64_t evictions       = 0;
+    uint64_t releases        = 0;
+    uint64_t graphs          = 0;
+    uint64_t locked_tensors  = 0;
+    uint64_t streamed_tensors = 0;
     size_t   ring_bytes      = 0;  // total bytes held by the ring
     size_t   locked_bytes    = 0;  // bytes pinned by balanced locking
+    size_t   lock_budget_unused = 0;
     size_t   stream_per_token = 0; // unlocked bytes that must be read each token
+    int      effective_ahead = 0;
 };
 
 struct ggml_tensor;

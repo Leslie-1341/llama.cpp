@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <cinttypes>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -58,6 +59,7 @@ struct llama_flex_context {
 
     // per-graph compute state (written only by ith==0 in the stream callback)
     int cur_compute_layer = -1;
+    uint64_t graph_id = 0;
 
     // ring of slots
     size_t                   slot_bytes = 0;
@@ -74,6 +76,7 @@ struct llama_flex_context {
     std::condition_variable  cv_work;      // wakes IO threads
     std::condition_variable  cv_ready;     // wakes waiters on layer-ready
     bool                     shutdown = false;
+    FILE *                   trace = nullptr;
 
     ~llama_flex_context() {
         {
@@ -93,12 +96,25 @@ struct llama_flex_context {
             const double bw       = io_s > 0 ? phys_mib / io_s : 0.0;          // per-thread achieved MiB/s
             const double redun    = log_mib > 0 ? (phys_mib / log_mib - 1.0) * 100.0 : 0.0;
             const double avg_read = stats.read_ops > 0 ? phys_mib * 1024.0 / stats.read_ops : 0.0; // KiB/read
+            const double wait_ms  = stats.total_wait_us / 1000.0;
+            const double wait_avg = stats.wait_events > 0 ? wait_ms / (double) stats.wait_events : 0.0;
             std::fprintf(stderr,
                 "llama_flex IO: loads=%llu reads=%llu avg_read=%.1f KiB  logical=%.0f MiB phys=%.0f MiB "
-                "align_redundancy=%.2f%%  achieved_bw=%.0f MiB/s (per-thread)  waits=%llu wait=%.0f ms\n",
+                "align_redundancy=%.2f%% achieved_bw=%.0f MiB/s waits=%llu wait=%.0f ms avg_wait=%.2f ms "
+                "demand=%llu prefetch=%llu requeue=%llu evict=%llu release=%llu graphs=%llu ahead=%d\n",
                 (unsigned long long) stats.layer_loads, (unsigned long long) stats.read_ops,
                 avg_read, log_mib, phys_mib, redun, bw,
-                (unsigned long long) stats.wait_events, stats.total_wait_us / 1000.0);
+                (unsigned long long) stats.wait_events, wait_ms, wait_avg,
+                (unsigned long long) stats.demand_loads,
+                (unsigned long long) stats.prefetch_queued,
+                (unsigned long long) stats.queue_requeues,
+                (unsigned long long) stats.evictions,
+                (unsigned long long) stats.releases,
+                (unsigned long long) stats.graphs,
+                stats.effective_ahead);
+        }
+        if (trace) {
+            std::fclose(trace);
         }
         for (void * p : slots) {
             free(p);
@@ -111,6 +127,79 @@ struct llama_flex_context {
         }
     }
 };
+
+static int flex_effective_ahead(const llama_flex_context & ctx) {
+    if (ctx.n_layers <= 1) {
+        return 0;
+    }
+    int room = ctx.slots.empty() ? ctx.params.ring_layers : (int) ctx.slots.size();
+    // Keep at least current + previous/released slot space when the ring is tiny.
+    room = std::max(1, room - 2);
+    return std::max(1, std::min({ ctx.params.prefetch_ahead, ctx.n_layers - 1, room }));
+}
+
+static void flex_trace_locked(
+        llama_flex_context & ctx,
+        const char * event,
+        int layer,
+        int slot,
+        size_t logical,
+        size_t phys,
+        uint64_t us) {
+    if (ctx.trace == nullptr) {
+        return;
+    }
+    std::fprintf(ctx.trace,
+            "%" PRIu64 "\t%s\t%" PRIu64 "\t%d\t%d\t%zu\t%zu\t%" PRIu64 "\t%zu\t%llu\t%llu\t%llu\n",
+            now_us(), event, ctx.graph_id, layer, slot, logical, phys, us,
+            ctx.queue.size(),
+            (unsigned long long) ctx.stats.layer_loads,
+            (unsigned long long) ctx.stats.wait_events,
+            (unsigned long long) ctx.stats.evictions);
+}
+
+static bool flex_name_has(const llama_flex_tensor & t, const char * needle) {
+    return t.name.find(needle) != std::string::npos;
+}
+
+static int flex_pin_group(const llama_flex_tensor & t, const std::string & policy) {
+    if (policy == "attn-first") {
+        return flex_name_has(t, ".attn_") || flex_name_has(t, "attn_") ? 0 : 1;
+    }
+    if (policy == "ffn-first") {
+        return flex_name_has(t, ".ffn_") || flex_name_has(t, "ffn_") ? 0 : 1;
+    }
+    return 0;
+}
+
+static void flex_sort_for_pin(std::vector<llama_flex_tensor> & tensors, const std::string & policy) {
+    std::sort(tensors.begin(), tensors.end(),
+            [&](const llama_flex_tensor & a, const llama_flex_tensor & b) {
+                const int ga = flex_pin_group(a, policy);
+                const int gb = flex_pin_group(b, policy);
+                if (ga != gb) {
+                    return ga < gb;
+                }
+                if (policy == "large-first" || policy == "ffn-first") {
+                    if (a.size != b.size) {
+                        return a.size > b.size;
+                    }
+                } else {
+                    if (a.size != b.size) {
+                        return a.size < b.size;
+                    }
+                }
+                return a.name < b.name;
+            });
+}
+
+static bool flex_pin_policy_valid(const std::string & policy) {
+    return policy == "small-first" ||
+           policy == "large-first" ||
+           policy == "attn-first"  ||
+           policy == "ffn-first"   ||
+           policy == "none";
+}
 
 // Pick a slot for `layer`: a free slot, else evict the least-recently-used
 // resident-and-released layer. Returns slot index or -1 if none available.
@@ -140,6 +229,8 @@ static int flex_acquire_slot(llama_flex_context & ctx, int layer) {
     ctx.layers[victim].slot  = -1;
     ctx.layers[victim].state = layer_state::not_resident;
     ctx.slot_layer[slot]     = layer;
+    ctx.stats.evictions++;
+    flex_trace_locked(ctx, "evict", victim, slot, 0, 0, 0);
     return slot;
 }
 
@@ -215,6 +306,8 @@ static void flex_worker(llama_flex_context * ctx) {
             int slot = flex_acquire_slot(*ctx, layer);
             if (slot < 0) {
                 // No slot available right now; requeue and back off.
+                ctx->stats.queue_requeues++;
+                flex_trace_locked(*ctx, "requeue", layer, -1, 0, 0, 0);
                 ctx->queue.push_back(layer);
                 lock.unlock();
                 std::this_thread::sleep_for(std::chrono::microseconds(200));
@@ -258,11 +351,13 @@ static void flex_worker(llama_flex_context * ctx) {
                 ctx->stats.bytes_read_phys += phys;
                 ctx->stats.read_ops        += ops;
                 ctx->stats.total_io_us     += dt;
+                flex_trace_locked(*ctx, "load", layer, L.slot, streamed, phys, dt);
             } else {
                 // Failed: drop the slot back.
                 ctx->slot_layer[L.slot] = -1;
                 L.slot  = -1;
                 L.state = layer_state::not_resident;
+                flex_trace_locked(*ctx, "load_fail", layer, -1, streamed, phys, dt);
                 if (ctx->params.debug_log) {
                     std::fprintf(stderr, "llama_flex: stream failed for layer %d\n", layer);
                 }
@@ -280,6 +375,16 @@ std::shared_ptr<llama_flex_context> llama_flex_create(
     ctx->params   = params;
     ctx->n_layers = n_layers;
     ctx->layers.resize(std::max(0, n_layers));
+    if (const char * v = std::getenv("LLAMA_FLEX_PIN_POLICY")) {
+        ctx->params.pin_policy = v;
+    }
+    if (!flex_pin_policy_valid(ctx->params.pin_policy)) {
+        if (ctx->params.debug_log) {
+            std::fprintf(stderr, "llama_flex: invalid pin policy '%s', using small-first\n",
+                    ctx->params.pin_policy.c_str());
+        }
+        ctx->params.pin_policy = "small-first";
+    }
 
     if (!params.enabled || n_layers <= 0) {
         return ctx;
@@ -325,6 +430,15 @@ std::shared_ptr<llama_flex_context> llama_flex_create(
         ctx->fds.push_back(fd);
     }
     ctx->direct_io_active = all_direct;
+    if (const char * path = std::getenv("LLAMA_FLEX_TRACE")) {
+        ctx->trace = std::fopen(path, "w");
+        if (ctx->trace != nullptr) {
+            std::fprintf(ctx->trace,
+                    "time_us\tevent\tgraph\tlayer\tslot\tlogical_bytes\tphys_bytes\telapsed_us\tqueue_depth\tloads\twaits\tevictions\n");
+        } else if (params.debug_log) {
+            std::fprintf(stderr, "llama_flex: failed to open trace %s\n", path);
+        }
+    }
 
     return ctx;
 }
@@ -361,22 +475,15 @@ void llama_flex_finalize(llama_flex_context & ctx) {
     // layer, lock tensors in registration order until the budget is hit; since
     // all layers share the same tensor structure this locks the same set per
     // layer. The remaining (unlocked) tensors are streamed through the ring.
-    const size_t per_layer_lock = ctx.n_layers > 0
+    const bool pin_disabled = ctx.params.pin_policy == "none";
+    const size_t per_layer_lock = !pin_disabled && ctx.n_layers > 0
             ? ctx.params.lock_bytes / (size_t) ctx.n_layers : 0;
 
     size_t lock_total = 0;
     for (auto & L : ctx.layers) {
-        // Flexible tensor preservation: lock smallest tensors first. In a
-        // transformer layer the attention projections (and, under GQA, K/V in
-        // particular) are smaller than the FFN tensors, so smallest-first locks
-        // as many tensors as the budget allows -- eliminating the most per-token
-        // IO operations -- while leaving the large FFN tensors to efficient
-        // large streaming reads. Identical layer structure => the same set is
-        // locked in every layer, keeping per-layer streamed IO uniform.
-        std::sort(L.tensors.begin(), L.tensors.end(),
-                [](const llama_flex_tensor & a, const llama_flex_tensor & b) {
-                    return a.size < b.size;
-                });
+        // Balanced pinning keeps the same byte budget per layer so streamed IO
+        // remains uniform. Policies only change tensor order within that budget.
+        flex_sort_for_pin(L.tensors, ctx.params.pin_policy);
         size_t locked_here = 0;
         size_t stream_off  = 0;
         for (auto & t : L.tensors) {
@@ -385,11 +492,16 @@ void llama_flex_finalize(llama_flex_context & ctx) {
                 t.buf_offset = lock_total;   // offset into the global lock buffer
                 lock_total  += t.size;
                 locked_here += t.size;
+                ctx.stats.locked_tensors++;
             } else {
                 t.locked     = false;
                 t.buf_offset = stream_off;   // offset within this layer's slot
                 stream_off  += t.size;
+                ctx.stats.streamed_tensors++;
             }
+        }
+        if (per_layer_lock > locked_here) {
+            ctx.stats.lock_budget_unused += per_layer_lock - locked_here;
         }
         L.stream_bytes    = stream_off;
         L.always_resident = (stream_off == 0);
@@ -454,6 +566,7 @@ void llama_flex_finalize(llama_flex_context & ctx) {
         ctx.slots[s] = p;
     }
     ctx.stats.ring_bytes = ctx.slot_bytes * (size_t) k;
+    ctx.stats.effective_ahead = flex_effective_ahead(ctx);
 
     // Fully-locked layers never need streaming: mark them permanently resident.
     for (auto & L : ctx.layers) {
@@ -471,16 +584,22 @@ void llama_flex_finalize(llama_flex_context & ctx) {
     if (ctx.params.debug_log) {
         std::fprintf(stderr,
                 "llama_flex: layers=%d ring=%d slot=%.2f MiB ring_total=%.2f MiB "
-                "locked=%.2f MiB stream/token=%.2f MiB io_threads=%d direct_io=%d\n",
+                "locked=%.2f MiB stream/token=%.2f MiB io_threads=%d direct_io=%d ahead=%d requested_ahead=%d "
+                "pin_policy=%s locked_tensors=%llu streamed_tensors=%llu lock_unused=%.2f MiB\n",
                 ctx.n_layers, k, ctx.slot_bytes / 1048576.0,
                 ctx.stats.ring_bytes / 1048576.0,
                 ctx.stats.locked_bytes / 1048576.0,
                 ctx.stats.stream_per_token / 1048576.0,
-                nthreads, ctx.direct_io_active ? 1 : 0);
+                nthreads, ctx.direct_io_active ? 1 : 0,
+                ctx.stats.effective_ahead, ctx.params.prefetch_ahead,
+                ctx.params.pin_policy.c_str(),
+                (unsigned long long) ctx.stats.locked_tensors,
+                (unsigned long long) ctx.stats.streamed_tensors,
+                ctx.stats.lock_budget_unused / 1048576.0);
     }
 }
 
-void llama_flex_request_layer(llama_flex_context & ctx, int layer_id) {
+static void flex_request_layer(llama_flex_context & ctx, int layer_id, bool prefetch) {
     if (layer_id < 0 || layer_id >= ctx.n_layers) {
         return;
     }
@@ -493,8 +612,18 @@ void llama_flex_request_layer(llama_flex_context & ctx, int layer_id) {
     if (L.state == layer_state::loading) {
         return;
     }
+    if (prefetch) {
+        ctx.stats.prefetch_queued++;
+    } else {
+        ctx.stats.demand_loads++;
+    }
+    flex_trace_locked(ctx, prefetch ? "prefetch" : "demand", layer_id, -1, 0, 0, 0);
     ctx.queue.push_back(layer_id);
     ctx.cv_work.notify_one();
+}
+
+void llama_flex_request_layer(llama_flex_context & ctx, int layer_id) {
+    flex_request_layer(ctx, layer_id, true);
 }
 
 void llama_flex_wait_layer(llama_flex_context & ctx, int layer_id) {
@@ -508,6 +637,8 @@ void llama_flex_wait_layer(llama_flex_context & ctx, int layer_id) {
     }
     // Make sure it is at least queued.
     if (L.state == layer_state::not_resident) {
+        ctx.stats.demand_loads++;
+        flex_trace_locked(ctx, "demand_front", layer_id, -1, 0, 0, 0);
         ctx.queue.push_front(layer_id);
         ctx.cv_work.notify_one();
     }
@@ -516,7 +647,9 @@ void llama_flex_wait_layer(llama_flex_context & ctx, int layer_id) {
     ctx.cv_ready.wait(lock, [&] {
         return L.state == layer_state::resident || ctx.shutdown;
     });
-    ctx.stats.total_wait_us += now_us() - t0;
+    const uint64_t wait_us = now_us() - t0;
+    ctx.stats.total_wait_us += wait_us;
+    flex_trace_locked(ctx, "wait", layer_id, L.slot, 0, 0, wait_us);
 }
 
 void * llama_flex_get_tensor(llama_flex_context & ctx, int layer_id, const std::string & name) {
@@ -548,6 +681,8 @@ void llama_flex_release_layer(llama_flex_context & ctx, int layer_id) {
     auto & L = ctx.layers[layer_id];
     L.released = true;
     L.last_use = now_us();
+    ctx.stats.releases++;
+    flex_trace_locked(ctx, "release", layer_id, L.slot, 0, 0, 0);
 }
 
 const llama_flex_stats & llama_flex_get_stats(const llama_flex_context & ctx) {
@@ -559,9 +694,16 @@ void llama_flex_graph_begin(llama_flex_context & ctx) {
         return;
     }
     ctx.cur_compute_layer = -1;
-    const int ahead = std::max(1, std::min(ctx.params.prefetch_ahead, ctx.n_layers - 1));
+    ctx.graph_id++;
+    ctx.stats.graphs++;
+    const int ahead = flex_effective_ahead(ctx);
+    ctx.stats.effective_ahead = ahead;
+    {
+        std::lock_guard<std::mutex> lock(ctx.mutex);
+        flex_trace_locked(ctx, "graph_begin", -1, -1, 0, 0, 0);
+    }
     for (int l = 0; l <= ahead; ++l) {
-        llama_flex_request_layer(ctx, l % ctx.n_layers);
+        flex_request_layer(ctx, l % ctx.n_layers, true);
     }
 }
 
@@ -599,9 +741,10 @@ bool llama_flex_stream_callback(struct ggml_tensor * op, int ith, void * user_da
     if (ith == 0 && op_layer != ctx->cur_compute_layer) {
         const int prev = ctx->cur_compute_layer;
         ctx->cur_compute_layer = op_layer;
-        const int ahead = std::max(1, std::min(ctx->params.prefetch_ahead, ctx->n_layers - 1));
+        const int ahead = flex_effective_ahead(*ctx);
+        ctx->stats.effective_ahead = ahead;
         for (int a = 1; a <= ahead; ++a) {
-            llama_flex_request_layer(*ctx, (op_layer + a) % ctx->n_layers);
+            flex_request_layer(*ctx, (op_layer + a) % ctx->n_layers, true);
         }
         if (prev >= 0) {
             llama_flex_release_layer(*ctx, prev);
