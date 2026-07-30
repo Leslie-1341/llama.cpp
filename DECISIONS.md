@@ -872,3 +872,28 @@ D-0021 已冻结 core single-action transaction，D-0022 已关闭 request-resum
 - `python3 tests/test-server-kv-pressure-static.py`：37/37 PASS。
 - 定向 CTest：`test-kv-paged-release-bounded`、`test-server-kv-pressure`、`test-server-kv-resume`、`test-server-kv-pressure-action` 及三个 static tests，7/7 PASS。
 - `git diff --check`：PASS；E-0016。
+
+## D-0024 — Stage 3C-1C-2B-1 EdgeKV Governor policy 与同步 bounded OFFLOAD
+
+- Date: 2026-07-29
+- Status: accepted（**已提交、已推送；code-level stable，非真实模型/压力/性能验证**）
+- Immutable snapshot: branch `fix/kv-p0-b1-bounded-store`，HEAD `55717bb322757a3edde73e8ce35a439f09796747`，与 `origin/fix/kv-p0-b1-bounded-store` ahead/behind 均为 0。
+- Supersedes: PROJECT_STATE/ARCHITECTURE 中“Governor 尚未实现、仅为 architecture audit”的当前状态描述；不改写 D-0023 对早期 `EVALUATE→RELEASE` 单动作边界的历史记录。
+
+**Decision**
+
+1. server scheduler 在每个 decision 先固化 pressure snapshot 和 logical claimant snapshots，再执行 Governor；server 不读取或改写 core private physical KV state。policy state 包含 pressure debt/episode、basis generation、OFFLOAD arm、backoff、claimant epoch/exhaustion 与 failure penalty；NORMAL/reset 清空 policy state，stale snapshot 不推进动作。
+2. 对有效 pressure，先以同一 decision ID 提交只读 `EVALUATE`。若可 release，RELEASE 优先；`no_candidate` 只能 arm 后续 decision 的 OFFLOAD，不能在同一 decision 链式执行。每个 decision 最多一个 state-changing core action。
+3. OFFLOAD 在后续 eligible sample 同步执行，使用 core public logical request 的 bounded byte/block budget、KV claimant 与 capacity-write I/O class。claimant 由 stable、input-order-independent 的逻辑评分选择；active/protected/shared/write-open/fail-stop/empty/epoch mismatch/exhausted 均被排除。OFFLOAD result 的 `relieved_bytes` 是唯一 debt 偿还量；no-candidate、零 relief 或 I/O failure 不虚构还债，并分别推进 exhaustion/epoch 或 backoff/penalty。
+4. core 继续独占 physical candidate、ownership/recheck、transaction、backing I/O、state transition、outcome/reason、relief 与 fail-stop 权威；server 只记录 observation、policy state、logical claimant selection 与 marker。Governor 不创建线程；恢复仍经 request-resume 的 correctness-required PREFETCH gate。
+
+**Consequences and limits**
+
+- 已关闭 immutable input snapshot、pressure debt/episode、RELEASE 优先、`no_candidate` arm 后续 OFFLOAD、确定性 logical claimant、同步 multi-block bounded OFFLOAD、relief/debt 记账、epoch/exhaustion、reset/backoff 和单 decision 单状态变化的代码级节点。
+- 真实模型、多 slot、真实 pressure/RSS、真实 OFFLOAD→PREFETCH、长周期、HTTP 输出、性能及权重–KV 融合尚未验证；不得由本决策声称上述正确性、稳定性或收益。
+
+**Evidence**
+
+- `./build/bin/test-server-kv-pressure-action`：325/325 PASS。
+- 定向 CTest（排除 legacy `test-server-kv-pressure`）：6/6 PASS，0 failed；命令与完整范围见 E-0017。
+- `git diff --check`：PASS；E-0017。

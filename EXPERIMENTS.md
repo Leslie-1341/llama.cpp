@@ -618,3 +618,19 @@ Stage 3A-2C endpoint is feasible and correct in the stated controlled boundary: 
 **Evidence boundary**
 
 本条不包含真实模型 HTTP、真实 pressure 触发、实际 KV resident/release 物理观测、多 slot、长周期/重复 episode、并发、server OFFLOAD→PREFETCH、性能或 Dense/MoE 融合实验；因而不支持上述正确性、稳定性或性能主张。EdgeKV Governor v1 仅为下一 architecture audit/implementation-contract 的计划，未实现且无收益证据。
+
+## E-0017 — Stage 3C-1C-2B-1 EdgeKV Governor code-level verification
+
+- Status: **code-level stable PASS；非真实 server/model artifact**。
+- Immutable identity: branch `fix/kv-p0-b1-bounded-store`，HEAD `55717bb322757a3edde73e8ce35a439f09796747`；验证前 worktree clean，`HEAD...origin/fix/kv-p0-b1-bounded-store = 0 0`。
+- Core Governor entry: `./build/bin/test-server-kv-pressure-action`；**325/325 PASS**。覆盖 immutable pressure/claimant inputs、RELEASE debt repayment and later OFFLOAD arm、input-order-independent score、stale/basis/NORMAL reset、global exclusion/debt saturation、I/O failure backoff/penalty、claimant exhaustion/epoch reuse 与 stale-result pollution rejection。
+- Directed CTest entry: `ctest --test-dir build --output-on-failure -R '^(test-kv-paged-release-bounded|test-server-kv-resume|test-server-kv-pressure-action|test-server-kv-pressure-static|test-server-kv-resume-static|test-server-kv-pressure-action-static)$'`；**6/6 PASS，0 failed**。其中 bounded core test 覆盖同步 multi-block OFFLOAD state change/backing I/O fault；resume tests 保留 graph 前 correctness-required PREFETCH gate；Governor/static tests 覆盖 server/core authority、single-action ordering、configuration and marker shape。
+- Hygiene: `git diff --check` PASS。账本 review Gate artifact：`/tmp/os-agent-gate/gate-review-20260729T165801Z-34507`，`OS_AGENT_GATE_RESULT mode=review profile=verify verdict=PASS code=0 checks=13 pass=3 fail=0 skip=10 unresolved=0 incomplete=0 unverified=0`；artifact 在该路径指针追加前生成，只验证四份账本的实质 diff，不替代上述 source/test evidence。
+
+**Supported conclusion**
+
+该证据只支持源码级 policy 结构：pressure debt/episode 与 relief 记账、RELEASE priority、core `no_candidate` arm 后续 OFFLOAD、确定性的 logical claimant score、同步 bounded multi-block OFFLOAD、claimant epoch/exhaustion、reset/backoff、单 decision 单 state-changing action，以及 server logical-policy/core physical-authority 边界。
+
+**Evidence boundary and next real-model gate**
+
+尚未验证真实模型、多 slot、真实 pressure/RSS、真实 OFFLOAD→PREFETCH、长周期/重复 episode、HTTP 输出与性能。下一门禁为 **Stage 3C-1C-2B-1R real-model multi-slot Governor integration gate**：在真实模型下验证双 claimant 推进、multi-block state changes、debt/relief/marker 一致性、恢复前 PREFETCH、HTTP 输出正确，以及 Governor 与旧 pressure paths 的互斥；同时记录真实 pressure/RSS 与长周期行为，性能结论需另有对照协议。

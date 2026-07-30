@@ -187,22 +187,29 @@ server::update_slots()
 - 只有 matching decision ID、`completed`/`no_op` outcome、无 I/O failure/fail-stop/context-invalid 且零 shortfall 才允许后续 graph。失败、partial failure 或 nonzero shortfall 均阻止本轮 graph/decode。
 - sequence protection 在 gate 调用前设定，跨成功 graph 生命周期保持；仅在 prompt clear 或 slot release 时清除。该 request-resume boundary 不依赖 pressure state。
 
-### 4.3 Stage 3C-1C-2A unified pressure action boundary
+### 4.3 Stage 3C-1C-2B-1 EdgeKV Governor policy and synchronous bounded OFFLOAD boundary
 
-`server_kv_pressure_unified_action_startup_decide_from_env()` 将 unified action 保持为显式 opt-in：仅 `LLAMA_KV_PRESSURE_UNIFIED_ACTION=1` 且 required target/max-blocks 有效、非零时启用；任何 legacy release、dry-run 或 bounded-release opt-in 冲突，或解析/范围错误，都返回 disabled/invalid/conflict，server 不提交 action。
+Governor 保持 unified action 的显式 opt-in/fail-closed startup 边界，但以一次不可变的 `server_kv_pressure_snapshot` 和一次不可变 claimant snapshot 集合驱动每个 scheduler sample。server 仅从 logical slot metadata 形成 `server_kv_claimant_snapshot`（epoch、active/protected/shared、idle age、logical KV tokens、reclaimable bytes、LCP `n_past` hint、I/O cost），不读取 private physical block state。
 
 ```text
-server::maybe_sample_kv_pressure()
-  -> immutable pressure/idle observation + one server decision ID
-  -> server_kv_pressure_execute_unified_action()
+server::maybe_sample_kv_pressure() [single synchronous scheduler owner]
+  -> immutable pressure + claimant snapshots + one decision ID
+  -> server_kv_pressure_execute_governor()
   -> core execute_action(EVALUATE, same decision ID)
-  -> permitted effective pressure only: core execute_action(RELEASE, same decision ID)
-  -> observation reason=release_submitted; core result remains authoritative
+  -> RELEASE has priority while pressure debt exists
+  -> release no_candidate arms a later OFFLOAD; never chains it in this decision
+  -> later eligible sample: deterministic logical claimant score
+  -> core execute_action(OFFLOAD, same decision ID, bounded byte/block budget)
+  -> result/marker records debt, relief, arm, claimant epoch and action result
 ```
 
-- 只有有效且非 stale 的 `PRESSURE/CRITICAL` 观测会尝试 `EVALUATE`。decision mismatch、context-invalid、open write transaction、fail-stop、cannot-release 或 evaluation rejection 全部在 release 前结束；一个 invocation 至多提交一次 `RELEASE`，不链式 OFFLOAD。
-- server 只保存 observation、logical budgets 和 stable submission reason；core 仍独占 physical candidate selection、ownership/recheck、state transition、backing I/O、outcome/reason 与 transaction ID。`EVALUATE` 不改变状态；`RELEASE` 是否产生状态变化及原因由 core result 决定。
-- 这是源码和短验证可确认的结构，非真实压力或真实 HTTP 行为证明。
+- State is server-owned policy state only: pressure basis generation, saturating `pressure_debt_bytes` and episode, OFFLOAD arm, next eligible sample, claimant epoch/exhaustion and I/O-failure penalty. Stale pressure holds state; NORMAL/reset clears debt, arm, backoff and claimant policy state. A basis change starts the applicable pressure episode rather than reusing continuity.
+- Core result is authoritative for physical candidate resolution, ownership/recheck, backing I/O, `SWAPPED` transition, `relieved_bytes`, failure/fail-stop and transaction ID. A successful OFFLOAD relieves debt by the core-reported `relieved_bytes` only; requested bytes, completed bytes, or a failed/no-relief result do not fabricate repayment.
+- RELEASE is tried before OFFLOAD. A `no_candidate` RELEASE can arm OFFLOAD for a subsequent decision; each invocation still submits at most one state-changing action. `EVALUATE` remains read-only. Thus one decision has a single state change and a stable observation marker, while core retains physical authority.
+- Score selection is deterministic and input-order independent: eligibility excludes active, protected, shared, empty, write-open, fail-stop, epoch-mismatched and exhausted claimants; eligible candidates are ranked from normalized idle age, logical KV, reclaimable bytes, LCP penalty, I/O-cost penalty and failure penalty, with a stable tie break. OFFLOAD no-candidate/failure records exhaustion or backoff; a matching later claimant epoch/reuse advances eligibility.
+- No scheduler thread is created. The existing request-resume path alone is responsible for correctness-required PREFETCH before graph/decode; Governor OFFLOAD does not bypass that gate.
+
+这是源码和短验证可确认的结构，非真实压力、真实 RSS 或真实 HTTP 行为证明。
 
 ## 5. Static Paged Identity Fast Path
 
@@ -253,7 +260,7 @@ Phase B: optional bounded dry-run
 Phase C: optional dynamic bounded destructive release
 ```
 
-历史 Phase B/Phase C dry-run 与 dynamic bounded-release 保持独立路径。Stage 3C-1C-2A 另有显式 opt-in 的 unified branch：它在有效压力下只提交同一 decision ID 的 `EVALUATE`，并在允许时至多提交一次 `RELEASE`；它不与 legacy/dry-run/bounded opt-in 混用。固定槽位 offload、`SWAPPED`、restore/prefetch 与其错误传播仍由底层 KV 路径提供；2A 未把它们接成 Governor 或完整五动作 policy。
+历史 Phase B/Phase C dry-run 与 dynamic bounded-release 保持独立路径。显式 opt-in 的 Governor branch 使用 immutable pressure/claimant snapshots：先同一 decision ID 的 `EVALUATE`，再在 pressure debt 下优先至多一次 `RELEASE`；`no_candidate` 只 arm 后续 decision 的同步 bounded `OFFLOAD`。它不与 legacy/dry-run/bounded opt-in 混用。固定槽位 OFFLOAD、`SWAPPED`、restore/PREFETCH 与错误传播仍在 core；server 仅作 logical policy，不拥有 physical state/backing authority。
 
 ### 6.3 Phase C gates
 
@@ -394,9 +401,9 @@ effective-context probe (server stderr effective n_ctx)
 - Stage 3B-2A 已在单模型、单次协议中覆盖有效 8064-token 档位与同一 server 的 20 次连续请求；仍无并发、多模型/quantization、不同 block/page size、长期重复 release/refault 的证明。
 - DYNAMIC target 与 per-tier calibrated RSS 的正确性证据不等于生产阈值或性能策略；Stage 3A-2C 的 forced CRITICAL/fixed target 仅保留为历史 diagnostic。
 - `mincore`、RSS 和 strace 是诊断/正确性观测；它们会带来开销，正式性能比较必须关闭或单独测量。
-- Stage 3C-1B 已提供并单测 unified core action，但它尚未统一接入 server policy；当前 server 的 state-changing policy 仍是 dynamic bounded destructive release。
-- unified five-action **server scheduler**、完整三轴 lifecycle 与 v5 evidence remain unimplemented；core action request/result 不能单独构成这些运行时闭环。
+- Stage 3C-1C-2B-1 已把 Governor 的 RELEASE priority 与 deferred synchronous OFFLOAD 接入 server policy，但只具有 code-level evidence；真实 model/HTTP/RSS、多 slot 与长期 runtime 闭环仍未验证。
+- 完整五动作 server scheduler、完整三轴 lifecycle 与 v5 evidence remain unimplemented；core action request/result 或当前 Governor marker 不能单独构成这些运行时闭环。
 
 ## 12. Next Architecture Gate
 
-Stage 3C-1C-2B-0 的下一架构门禁是 **EdgeKV Governor v1 architecture audit 与 implementation-contract freeze**：审计 pressure debt/高低水位、slot 生命周期与复用信号、backing I/O 的拆分点、预测性 `PREFETCH` logical 接口，以及可供未来 Dense/MoE 共用的 memory claimant、I/O priority 和 byte budget 接口；同时明确 server/core authority、回退路径和线程风险。此项仅是待审计计划，不是现有 runtime、Governor 实现或收益结论；不得在冻结前选定简单 round-robin `OFFLOAD` 策略。
+Stage 3C-1C-2B-1R 的下一架构门禁是 **real-model multi-slot Governor integration**：以真实模型服务器验证双 claimant 的确定性推进、同步 multi-block OFFLOAD 状态变化、debt/`relieved_bytes`/marker 一致、恢复前 correctness-required PREFETCH、HTTP 输出正确与旧 pressure path 互斥；还需覆盖真实 pressure/RSS 观测和重复 episode。该门禁不等于性能证明；性能与 Dense/MoE 融合须进入单独的 baseline、KV-only、weight-only、combined 实验矩阵。
