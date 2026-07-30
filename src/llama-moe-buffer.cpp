@@ -254,6 +254,7 @@ struct moe_managed {
     std::vector<size_t> resident_size;   // bytes charged to resident budget
     std::vector<char> resident_touched;  // touched by a real routed op since load
     std::vector<char> prefetched;        // loaded by async prefetch and not yet used
+    std::vector<char> demand_async_loaded; // demand load completed; first touch remains a cache miss
     std::vector<uint64_t> last_evicted_token;
     std::vector<char> queued;           // async prefetch already queued
     std::vector<int>  queued_bits;       // highest precision still pending for this expert
@@ -264,12 +265,18 @@ struct moe_managed {
 
 struct moe_prefetch_task {
     moe_managed * m = nullptr;
+    bool is_group = false;
+    bool is_demand = false;
+    int layer = -1;
+    int skip_kind = -1;
+    int primary_kind = -1;
     int e = -1;
     int rank = 0;
     int priority = 0;
     int target_bits = 0;
     float score = 0.0f;
     uint64_t seq = 0;
+    uint64_t generation = 0;
 };
 
 struct moe_prefetch_task_less {
@@ -297,6 +304,7 @@ struct moe_sidecar_entry {
 struct moe_group_state {
     int layer = -1;
     int expert = -1;
+    uint64_t evict_scan_generation = 0;
     uint64_t access = 0;
     uint64_t rank0_access = 0;
     uint64_t last_used_epoch = 0;
@@ -336,12 +344,93 @@ struct moe_group_state {
     uint64_t reuse_within_4 = 0;
     uint64_t reuse_within_16 = 0;
     uint64_t last_evicted_token_epoch = 0;
+    bool     last_evicted_valid = false;
     uint8_t  last_evicted_reason = MOE_EVICT_REASON_UNKNOWN;
     uint64_t layer_window_bad_reload = 0;
     uint64_t layer_window_last_bad_reload_token = 0;
+    double   bad_reload_score = 0.0;
+    uint64_t bad_reload_last_token = 0;
+    uint64_t bad_reload_1 = 0;
+    uint64_t bad_reload_4 = 0;
+    uint64_t bad_reload_16 = 0;
+    uint64_t bad_reload_protect_hits = 0;
+    uint64_t bad_reload_soft_hits = 0;
+    double   ghost_reload_risk_ema = 0.0;
+    uint64_t ghost_generation = 0;
+    uint64_t ghost_outcomes = 0;
+    uint64_t ghost_bad_1 = 0;
+    uint64_t ghost_bad_4 = 0;
+    uint64_t ghost_bad_16 = 0;
+    uint64_t ghost_success = 0;
+    uint64_t ghost_last_outcome_token = 0;
+    bool     ghost_pending = false;
+    uint64_t demand_async_generation = 0;
+    bool     demand_async_pending = false;
+    uint64_t demand_admission_token = UINT64_MAX;
+    bool     demand_admission_decided = false;
+    bool     demand_admission_bypass = false;
+    uint64_t admission_outcome_generation = 0;
+    uint64_t admission_outcome_token = 0;
+    uint64_t admission_outcome_deadline = 0;
+    uint8_t  admission_outcome_action = 0; // 1=admit, 2=bypass
+    bool     admission_outcome_pending = false;
+    size_t   admission_staging_reserved_bytes = 0;
+    double   admission_outcome_candidate = 0.0;
+    double   admission_outcome_victim = 0.0;
+    int      admission_outcome_victim_layer = -1;
+    int      admission_outcome_victim_expert = -1;
+    int      admission_outcome_victim_groups = 0;
+    size_t   admission_outcome_victim_bytes = 0;
+    double   admission_feedback_ema = 0.0;
+    uint64_t admission_feedback_samples = 0;
+    double   admission_regret_ema = 0.0;
+    uint64_t admission_regret_samples = 0;
     double   eam_replace_pred = 0.0;
     double   eam_replace_mass = 0.0;
     double   eam_replace_keep = 0.0;
+    uint8_t  cct_conf = 0;
+    uint64_t cct_protect_hits = 0;
+
+    // Same-layer next-token resident predictor. This is intentionally a
+    // retention-only signal: it protects resident groups from layer-done
+    // eviction, but it does not enqueue speculative reads.
+    uint8_t  next_token_conf = 0;
+    uint64_t next_token_protect_until = 0;
+    uint64_t next_token_predicted = 0;
+    uint64_t next_token_hit = 0;
+    uint64_t next_token_miss = 0;
+    uint64_t next_token_protect_hits = 0;
+};
+
+struct moe_cct_entry {
+    uint8_t  conf = 0; // 0..3 saturating counter, branch-predictor style
+    uint64_t hit = 0;
+    uint64_t miss = 0;
+    uint64_t unused = 0;
+    uint64_t replace = 0;
+    uint64_t last_update_token = 0;
+};
+
+struct moe_ghost_record {
+    uint64_t deadline = 0;
+    uint64_t key = 0;
+    uint64_t generation = 0;
+};
+
+struct moe_admission_pair_record {
+    uint64_t id = 0;
+    uint64_t incoming_key = 0;
+    uint64_t victim_key = 0;
+    uint64_t decision_token = 0;
+    uint64_t deadline = 0;
+    uint64_t incoming_gap = UINT64_MAX;
+    uint64_t victim_gap = UINT64_MAX;
+    bool bypass = false;
+};
+
+struct moe_admission_pair_deadline {
+    uint64_t deadline = 0;
+    uint64_t id = 0;
 };
 
 struct moe_eamc_snapshot {
@@ -358,6 +447,25 @@ static void moe_print_stats_impl(const llama_moe_buffer_context & ctx, const cha
 static void moe_eamc_snapshot_current_locked(llama_moe_buffer_context & ctx, bool force);
 static void moe_eam_trace_append_locked(const llama_moe_buffer_context & ctx);
 static void moe_eamc_load_sidecar(llama_moe_buffer_context & ctx);
+static void moe_admission_outcome_finish_locked(
+        llama_moe_buffer_context & ctx,
+        const char *               reason);
+static void moe_admission_regret_finish_locked(
+        llama_moe_buffer_context & ctx,
+        const char *               reason);
+static void moe_cct_trace_write_locked(
+        llama_moe_buffer_context & ctx,
+        const char *               event,
+        int                        src_layer,
+        int                        src_expert,
+        int                        target_layer,
+        int                        target_expert,
+        int                        conf_before,
+        int                        conf_after,
+        const char *               reason);
+static bool moe_next_token_group_protected_locked(
+        const llama_moe_buffer_context & ctx,
+        const moe_group_state &          g);
 
 struct llama_moe_buffer_context {
     llama_moe_buffer_params params;
@@ -395,6 +503,8 @@ struct llama_moe_buffer_context {
     std::condition_variable cv_fuse;   // signalled when a deferred gate/up pair is matched
     std::list<std::pair<moe_managed *, int>> lru;  // front = MRU
     size_t resident_bytes = 0;
+    size_t demand_admission_staging_bytes = 0; // guarded by mtx; included in resident_bytes
+    size_t demand_admission_staging_reserved_bytes = 0; // guarded by mtx
     size_t expert_total   = 0;   // sum of all registered exps tensor bytes
     size_t align          = 4096;
 
@@ -461,6 +571,11 @@ struct llama_moe_buffer_context {
     std::priority_queue<moe_prefetch_task, std::vector<moe_prefetch_task>, moe_prefetch_task_less> queue;
     bool                    stop = false;
     uint64_t                next_task_seq = 0;
+    std::unordered_map<uint64_t, uint64_t> group_prefetch_last_enqueue_token; // guarded by qmtx
+    std::unordered_map<uint64_t, moe_admission_pair_record> admission_pairs; // guarded by mtx
+    std::unordered_map<uint64_t, std::vector<uint64_t>> admission_pair_watchers; // guarded by mtx
+    std::deque<moe_admission_pair_deadline> admission_pair_deadlines; // guarded by mtx
+    uint64_t next_admission_pair_id = 1;
 
     // EAM predictor state. Guarded by mtx. The transition table learns
     // P(next-layer expert | previous-layer expert) from real routed touches
@@ -470,6 +585,9 @@ struct llama_moe_buffer_context {
     std::vector<int>       eam_last_layer_experts;
     int                    eam_last_actual_layer = -1;
     uint64_t               eam_last_actual_token_epoch = 0;
+    std::unordered_map<uint64_t, std::vector<moe_cct_entry>> cct_transition;
+    std::vector<std::vector<int>> cct_recent_layer_experts;
+    std::vector<std::vector<int>> next_token_last_layer_experts;
     int                    evict_target_layer = -1;
     int                    evict_target_ahead = 0;
     size_t                 evict_layer_reserve_bytes = 0;
@@ -488,6 +606,7 @@ struct llama_moe_buffer_context {
     uint64_t               eamc_next_snapshot_id = 1;
     std::vector<moe_eamc_snapshot> eamc_snapshots;
     std::vector<std::pair<size_t, double>> eamc_active_matches;
+    std::deque<moe_ghost_record> ghost_records;
 
     std::atomic<uint64_t> streams{0}, hits{0}, evictions{0}, bytes_read{0};
     std::atomic<uint64_t> enqueued{0}, worker_streams{0};
@@ -514,6 +633,9 @@ struct llama_moe_buffer_context {
     std::atomic<uint64_t> fused_ffn_hits{0}, fused_ffn_misses{0}, fused_ffn_runs{0}, fused_ffn_pairs{0}, fused_ffn_tiles{0}, fused_ffn_fallbacks{0};
     std::atomic<uint64_t> group_touches{0}, group_evictions{0}, group_evicted_slices{0};
     std::atomic<uint64_t> pinned_hits{0}, active_hits{0}, belady_evictions{0}, lru_fallback_evictions{0};
+    std::atomic<uint64_t> evict_scan_calls{0}, evict_scan_entries{0}, evict_scan_unique{0}, evict_scan_duplicates{0};
+    std::atomic<uint64_t> evict_scan_absolute{0}, evict_scan_temporary{0}, evict_scan_normal{0};
+    std::atomic<uint64_t> evict_scan_selected_temporary{0}, evict_scan_no_victim{0};
     std::atomic<uint64_t> eam_access{0}, eam_rank0_access{0}, eam_future_hints{0}, eam_prefetch_queued{0};
     std::atomic<uint64_t> eam_prefetch_hits{0}, eam_prefetch_late{0}, eam_prefetch_unused{0};
     std::atomic<uint64_t> eam_cache_hits{0}, eam_cache_misses{0};
@@ -523,6 +645,25 @@ struct llama_moe_buffer_context {
     std::atomic<uint64_t> eam_prefetch_admit_score_x1000{0};
     std::atomic<uint64_t> eam_prefetch_drop_score_x1000{0};
     std::atomic<uint64_t> eam_speculative_bytes_peak{0};
+    std::atomic<uint64_t> admission_compare_runs{0}, admission_compare_admit{0}, admission_compare_drop{0};
+    std::atomic<uint64_t> admission_compare_no_victim{0};
+    std::atomic<uint64_t> admission_floor_refresh{0}, admission_floor_stale{0};
+    std::atomic<uint64_t> admission_candidate_value_x1000{0}, admission_victim_value_x1000{0};
+    std::atomic<uint64_t> demand_admission_runs{0}, demand_admission_admit{0};
+    std::atomic<uint64_t> demand_admission_bypass{0}, demand_admission_no_victim{0};
+    std::atomic<uint64_t> demand_admission_release_groups{0}, demand_admission_release_slices{0};
+    std::atomic<uint64_t> demand_admission_release_bytes{0}, demand_admission_staging_peak{0};
+    std::atomic<uint64_t> demand_admission_candidate_x1000{0}, demand_admission_victim_x1000{0};
+    std::atomic<uint64_t> admission_outcome_admit_reuse_1{0}, admission_outcome_admit_reuse_4{0};
+    std::atomic<uint64_t> admission_outcome_admit_reuse_16{0}, admission_outcome_admit_unused{0};
+    std::atomic<uint64_t> admission_outcome_bypass_reload_1{0}, admission_outcome_bypass_reload_4{0};
+    std::atomic<uint64_t> admission_outcome_bypass_reload_16{0}, admission_outcome_bypass_success{0};
+    std::atomic<uint64_t> admission_feedback_updates{0}, admission_feedback_positive{0};
+    std::atomic<uint64_t> admission_feedback_negative{0}, admission_feedback_score_candidates{0};
+    std::atomic<uint64_t> admission_regret_pairs{0}, admission_regret_resolved{0};
+    std::atomic<uint64_t> admission_regret_expired{0}, admission_regret_prefer_admit{0};
+    std::atomic<uint64_t> admission_regret_prefer_bypass{0}, admission_regret_tie{0};
+    std::atomic<uint64_t> admission_regret_score_candidates{0};
     std::atomic<uint64_t> eam_predict_runs{0}, eam_predict_candidates{0}, eam_predict_enqueued{0}, eam_predict_dropped{0};
     std::atomic<uint64_t> eam_predict_score_x1000{0};
     std::atomic<uint64_t> eamc_snapshot_count{0}, eamc_match_runs{0}, eamc_match_hits{0}, eamc_match_misses{0};
@@ -535,9 +676,45 @@ struct llama_moe_buffer_context {
     std::atomic<uint64_t> reuse_evict_low{0}, reuse_protect{0};
     std::atomic<uint64_t> reuse_predict_protect{0}, reuse_low_candidates{0};
     std::atomic<uint64_t> reuse_reload_1{0}, reuse_reload_4{0}, reuse_reload_16{0};
+    std::atomic<uint64_t> bad_reload_protect{0}, bad_reload_soft_keep{0};
+    std::atomic<uint64_t> bad_reload_1{0}, bad_reload_4{0}, bad_reload_16{0};
+    std::atomic<uint64_t> ghost_evictions{0}, ghost_success{0};
+    std::atomic<uint64_t> ghost_bad_1{0}, ghost_bad_4{0}, ghost_bad_16{0};
+    uint64_t ghost_score_candidates = 0; // guarded by mtx
+    std::atomic<uint64_t> cct_updates{0}, cct_hits{0}, cct_misses{0}, cct_unused{0}, cct_replaced{0};
+    std::atomic<uint64_t> cct_prefetch_admit{0}, cct_prefetch_drop{0};
+    std::atomic<uint64_t> cct_evict_protect{0}, cct_evict_keep{0};
+    std::atomic<uint64_t> next_token_updates{0}, next_token_predicted{0};
+    std::atomic<uint64_t> next_token_hits{0}, next_token_misses{0}, next_token_admit{0};
+    std::atomic<uint64_t> next_token_layer_done_protect{0}, next_token_evict_protect{0};
+    std::atomic<uint64_t> runq_ops{0}, runq_ready{0}, runq_loading{0}, runq_cold{0};
+    std::atomic<uint64_t> group_fill_sibling_loads{0};
+    std::atomic<uint64_t> demand_async_plans{0}, demand_async_groups{0}, demand_async_submitted{0};
+    std::atomic<uint64_t> demand_async_joined{0}, demand_async_dedup{0}, demand_async_slices{0};
+    std::atomic<uint64_t> demand_async_failed{0}, demand_async_wait_us{0}, demand_async_wall_us{0};
+    std::atomic<uint64_t> demand_async_batch_evict_runs{0}, demand_async_batch_evict_groups{0};
+    std::atomic<uint64_t> demand_async_batch_reserved_bytes{0}, demand_async_batch_reserved_peak{0};
+    std::atomic<uint64_t> demand_async_batch_shortfall{0}, demand_async_worker_evictions{0};
+    std::atomic<uint64_t> group_prefetch_enqueued{0}, group_prefetch_runs{0};
+    std::atomic<uint64_t> group_prefetch_slices{0}, group_prefetch_hit_existing{0};
+    std::atomic<uint64_t> group_prefetch_fail{0}, group_prefetch_bytes{0};
+    std::atomic<uint64_t> group_prefetch_same_layer_ops{0}, group_prefetch_dups{0};
+    std::atomic<uint64_t> layer_done_evict_groups{0}, layer_done_evict_slices{0};
+    std::atomic<uint64_t> layer_done_evict_bytes{0};
+    std::atomic<uint64_t> layer_done_protect_pinned{0}, layer_done_protect_active{0};
+    std::atomic<uint64_t> layer_done_protect_future{0}, layer_done_protect_recent{0};
+    std::atomic<uint64_t> layer_done_protect_bad_reload{0}, layer_done_protect_inflight{0};
+    std::atomic<uint64_t> layer_done_protect_next_token{0};
     uint64_t              exec_epoch = 0;
     uint64_t              future_epoch = 0;
+    uint64_t              evict_scan_generation = 0;
     uint64_t              pin_refresh_at = 0;
+    bool                  admission_floor_valid = false;
+    double                admission_floor_value = 0.0;
+    int                   admission_floor_layer = -1;
+    int                   admission_floor_expert = -1;
+    uint64_t              admission_floor_token = UINT64_MAX;
+    uint64_t              admission_floor_epoch = 0;
     std::atomic<bool>     dyn_real_warned{false};
     mutable std::atomic<bool> sidecar_bit_clamp_warned{false};
 
@@ -597,8 +774,15 @@ struct llama_moe_buffer_context {
     FILE * prefetch_trace = nullptr;
     FILE * resident_trace = nullptr;
     FILE * evict_trace = nullptr;
+    FILE * cct_trace = nullptr;
+    FILE * next_token_trace = nullptr;
+    FILE * run_queue_trace = nullptr;
+    FILE * group_prefetch_trace = nullptr;
+    FILE * admission_trace = nullptr;
+    FILE * admission_regret_trace = nullptr;
     uint64_t resident_trace_last_token = UINT64_MAX;
     int resident_trace_last_layer = -1;
+    bool group_prefetch_selftest_done = false;
 
     ~llama_moe_buffer_context() {
         {
@@ -615,6 +799,8 @@ struct llama_moe_buffer_context {
             std::lock_guard<std::mutex> lock(mtx);
             moe_eamc_snapshot_current_locked(*this, true);
             moe_eam_trace_append_locked(*this);
+            moe_admission_outcome_finish_locked(*this, "teardown");
+            moe_admission_regret_finish_locked(*this, "teardown");
         }
         if (params.debug_log) {
             moe_print_stats_impl(*this, "llama_moe_buffer[teardown]");
@@ -650,15 +836,43 @@ struct llama_moe_buffer_context {
             std::fclose(evict_trace);
             evict_trace = nullptr;
         }
+        if (cct_trace != nullptr) {
+            std::fclose(cct_trace);
+            cct_trace = nullptr;
+        }
+        if (next_token_trace != nullptr) {
+            std::fclose(next_token_trace);
+            next_token_trace = nullptr;
+        }
+        if (run_queue_trace != nullptr) {
+            std::fclose(run_queue_trace);
+            run_queue_trace = nullptr;
+        }
+        if (group_prefetch_trace != nullptr) {
+            std::fclose(group_prefetch_trace);
+            group_prefetch_trace = nullptr;
+        }
+        if (admission_trace != nullptr) {
+            std::fclose(admission_trace);
+            admission_trace = nullptr;
+        }
+        if (admission_regret_trace != nullptr) {
+            std::fclose(admission_regret_trace);
+            admission_regret_trace = nullptr;
+        }
     }
 };
 
 // ---- forward decls of internals ----
-static void moe_stream_slice(llama_moe_buffer_context & ctx, moe_managed & m, int e, bool touch, int target_bits, int rank);
+static void moe_stream_slice(llama_moe_buffer_context & ctx, moe_managed & m, int e, bool touch, int target_bits, int rank,
+        bool group_fill = true, bool demand_async = false);
 static void moe_stream_mwq_slice(llama_moe_buffer_context & ctx, moe_managed & m, int e, bool touch, int target_bits, int rank,
-        bool * out_entry_missing = nullptr, bool * out_read_failed = nullptr);
+        bool * out_entry_missing = nullptr, bool * out_read_failed = nullptr, bool group_fill = true,
+        bool demand_async = false);
 static const moe_sidecar_entry * moe_mwq_entry(const llama_moe_buffer_context & ctx, const moe_managed & m, int e, int bits);
 static moe_group_state & moe_group_get(llama_moe_buffer_context & ctx, int layer, int expert);
+static void moe_prefetch_group_worker(llama_moe_buffer_context & ctx, int layer, int expert, int rank, float score,
+        int skip_kind, bool is_demand = false, int primary_kind = -1);
 
 static bool read_full(int fd, void * dst, size_t size, uint64_t off) {
     uint8_t * p = (uint8_t *) dst;
@@ -1107,7 +1321,7 @@ static void moe_worker_loop(llama_moe_buffer_context * ctx) {
             }
             task = ctx->queue.top();
             ctx->queue.pop();
-            if (task.m != nullptr && task.e >= 0 && task.e < (int) task.m->queued.size()) {
+            if (!task.is_group && task.m != nullptr && task.e >= 0 && task.e < (int) task.m->queued.size()) {
                 if (task.e < (int) task.m->queued_bits.size() && task.m->queued_bits[task.e] > task.target_bits) {
                     ctx->queue_dups.fetch_add(1, std::memory_order_relaxed);
                     continue;
@@ -1117,6 +1331,25 @@ static void moe_worker_loop(llama_moe_buffer_context * ctx) {
                     task.m->queued_bits[task.e] = 0;
                 }
             }
+        }
+        if (task.is_group) {
+            moe_prefetch_group_worker(*ctx, task.layer, task.e, task.rank, task.score, task.skip_kind,
+                    task.is_demand, task.primary_kind);
+            if (task.is_demand) {
+                std::lock_guard<std::mutex> lk(ctx->mtx);
+                auto git = ctx->groups.find(moe_group_key(task.layer, task.e));
+                if (git != ctx->groups.end() &&
+                        git->second.demand_async_generation == task.generation) {
+                    ctx->demand_admission_staging_reserved_bytes -= std::min(
+                            ctx->demand_admission_staging_reserved_bytes,
+                            git->second.admission_staging_reserved_bytes);
+                    git->second.admission_staging_reserved_bytes = 0;
+                    git->second.demand_async_pending = false;
+                }
+                ctx->cv_done.notify_all();
+            }
+            ctx->worker_streams.fetch_add(1, std::memory_order_relaxed);
+            continue;
         }
         if (ctx->params.dynamic_bits && task.m != nullptr) {
             const uint64_t full = task.m->stride;
@@ -1157,7 +1390,7 @@ std::shared_ptr<llama_moe_buffer_context> llama_moe_buffer_create(const llama_mo
             ctx->prefetch_trace = std::fopen(trace_path, "wb");
             if (ctx->prefetch_trace != nullptr) {
                 std::fprintf(ctx->prefetch_trace,
-                        "token\texec\tevent\treason\tlayer\texpert\tkind\trank\ttarget_bits\tclg_score\tadmit_score\tspeculative_mib\tresident_mib\tbudget_mib\tstate\tresident_bits\tresident_mwq\tqueued\tqueued_bits\tprefetched\tresident_groups_total\tresident_groups_current_layer\tresident_groups_other_layer\texact_group_resident_slices\texact_group_resident_bytes\texact_group_full\tgroup_access\tgroup_rank0\tgroup_cache_hit\tgroup_cache_miss\tgroup_prefetch_hit\tgroup_prefetch_unused\tgroup_score\tpinned\tactive\n");
+                        "token\texec\tevent\treason\tlayer\texpert\tkind\trank\ttarget_bits\tclg_score\tadmit_score\tcandidate_value\tvictim_value\tvictim_layer\tvictim_expert\tspeculative_mib\tresident_mib\tbudget_mib\tstate\tresident_bits\tresident_mwq\tqueued\tqueued_bits\tprefetched\tresident_groups_total\tresident_groups_current_layer\tresident_groups_other_layer\texact_group_resident_slices\texact_group_resident_bytes\texact_group_full\tgroup_access\tgroup_rank0\tgroup_cache_hit\tgroup_cache_miss\tgroup_prefetch_hit\tgroup_prefetch_unused\tgroup_score\tpinned\tactive\n");
             } else if (params.debug_log) {
                 std::fprintf(stderr, "llama_moe_buffer: failed to open prefetch trace %s\n", trace_path);
             }
@@ -1168,7 +1401,7 @@ std::shared_ptr<llama_moe_buffer_context> llama_moe_buffer_create(const llama_mo
             ctx->resident_trace = std::fopen(trace_path, "wb");
             if (ctx->resident_trace != nullptr) {
                 std::fprintf(ctx->resident_trace,
-                        "token\texec\tcurrent_layer\tresident_layer\texpert\tslices\tbytes\tfull\tbits_min\tbits_max\tmwq_slices\tprefetched_slices\ttouched_slices\tqueued_slices\tqueued_bits_max\tresident_mib\tbudget_mib\tgroup_access\tgroup_rank0\tgroup_cache_hit\tgroup_cache_miss\tgroup_prefetch_hit\tgroup_prefetch_unused\tgroup_last_token\tgroup_score\treuse_keep\treuse_ema\treuse_gap_ema\treuse_observed\treuse_within_1\treuse_within_4\treuse_within_16\tnext_use_dist\tlayer_dist\treuse_predicted_soon\tpinned\tactive\n");
+                        "token\texec\tcurrent_layer\tresident_layer\texpert\tslices\tbytes\tfull\tbits_min\tbits_max\tmwq_slices\tprefetched_slices\ttouched_slices\tqueued_slices\tqueued_bits_max\tresident_mib\tbudget_mib\tgroup_access\tgroup_rank0\tgroup_cache_hit\tgroup_cache_miss\tgroup_prefetch_hit\tgroup_prefetch_unused\tgroup_last_token\tgroup_score\treuse_keep\treuse_ema\treuse_gap_ema\treuse_observed\treuse_within_1\treuse_within_4\treuse_within_16\tnext_use_dist\tlayer_dist\treuse_predicted_soon\th0_current_layer\th1_next_token_keep\th4_short_reuse\tnext_token_conf\tnext_token_protect_until\tpinned\tactive\n");
             } else if (params.debug_log) {
                 std::fprintf(stderr, "llama_moe_buffer: failed to open resident trace %s\n", trace_path);
             }
@@ -1179,9 +1412,79 @@ std::shared_ptr<llama_moe_buffer_context> llama_moe_buffer_create(const llama_mo
             ctx->evict_trace = std::fopen(trace_path, "wb");
             if (ctx->evict_trace != nullptr) {
                 std::fprintf(ctx->evict_trace,
-                        "event\ttoken\texec\tlayer\texpert\treason\treload_gap\treleased_bytes\tresident_mib\tbudget_mib\tscore\treuse_keep\treuse_ema\treuse_gap_ema\treuse_observed\treuse_within_1\treuse_within_4\treuse_within_16\tseq_access\tseq_rank0\tseq_rate\tcache_hit\tcache_miss\tprefetch_hit\tprefetch_unused\thot_score\teamc_prior\team_replace_pred\team_replace_mass\team_replace_keep\tnext_use_dist\tlayer_dist\tpinned\tactive\trecent\thigh_sequence\tearly_high\tspeculative_unused\tlayer_window\tpredicted_soon\tlast_evict_reason\tlayer_bad_reload\tlayer_last_bad_reload_token\n");
+                        "event\ttoken\texec\tlayer\texpert\treason\treload_gap\treleased_bytes\tresident_mib\tbudget_mib\tscore\treuse_keep\treuse_ema\treuse_gap_ema\treuse_observed\treuse_within_1\treuse_within_4\treuse_within_16\tseq_access\tseq_rank0\tseq_rate\tcache_hit\tcache_miss\tprefetch_hit\tprefetch_unused\thot_score\teamc_prior\team_replace_pred\team_replace_mass\team_replace_keep\tcct_conf\tcct_protect\tbad_reload_score\tbad_reload_effective\tbad_reload_age\tbad_reload_1\tbad_reload_4\tbad_reload_16\tbad_reload_protect\tnext_use_dist\tlayer_dist\tpinned\tactive\trecent\thigh_sequence\tearly_high\tspeculative_unused\tlayer_window\tpredicted_soon\tlast_evict_reason\tlayer_bad_reload\tlayer_last_bad_reload_token\n");
             } else if (params.debug_log) {
                 std::fprintf(stderr, "llama_moe_buffer: failed to open evict trace %s\n", trace_path);
+            }
+        }
+    }
+    if (const char * trace_path = std::getenv("LLAMA_LAZY_MOE_CCT_TRACE")) {
+        if (trace_path[0] != '\0') {
+            ctx->cct_trace = std::fopen(trace_path, "wb");
+            if (ctx->cct_trace != nullptr) {
+                std::fprintf(ctx->cct_trace,
+                        "event\ttoken\texec\tsrc_layer\tsrc_expert\ttarget_layer\ttarget_expert\tconf_before\tconf_after\treason\tresident_mib\tbudget_mib\n");
+            } else if (params.debug_log) {
+                std::fprintf(stderr, "llama_moe_buffer: failed to open CCT trace %s\n", trace_path);
+            }
+        }
+    }
+    if (const char * trace_path = std::getenv("LLAMA_LAZY_MOE_NEXT_TOKEN_TRACE")) {
+        if (trace_path[0] != '\0') {
+            ctx->next_token_trace = std::fopen(trace_path, "wb");
+            if (ctx->next_token_trace != nullptr) {
+                std::fprintf(ctx->next_token_trace,
+                        "event\ttoken\texec\tlayer\texpert\tconf_before\tconf_after\tprotect_until\tresident_mib\tbudget_mib\treason\n");
+            } else if (params.debug_log) {
+                std::fprintf(stderr, "llama_moe_buffer: failed to open next-token trace %s\n", trace_path);
+            }
+        }
+    }
+    if (const char * trace_path = std::getenv("LLAMA_LAZY_MOE_RUN_QUEUE_TRACE")) {
+        if (trace_path[0] != '\0') {
+            ctx->run_queue_trace = std::fopen(trace_path, "wb");
+            if (ctx->run_queue_trace != nullptr) {
+                std::fprintf(ctx->run_queue_trace,
+                        "token\texec\tlayer\texpert\tkind\ttarget_bits\trank\tcount\tstate\torder\n");
+            } else if (params.debug_log) {
+                std::fprintf(stderr, "llama_moe_buffer: failed to open run queue trace %s\n", trace_path);
+            }
+        }
+    }
+    if (const char * trace_path = std::getenv("LLAMA_LAZY_MOE_GROUP_PREFETCH_TRACE")) {
+        if (trace_path[0] != '\0') {
+            ctx->group_prefetch_trace = std::fopen(trace_path, "wb");
+            if (ctx->group_prefetch_trace != nullptr) {
+                std::fprintf(ctx->group_prefetch_trace,
+                        "token\texec\tevent\tlayer\texpert\tkind\ttarget_bits\tstate\tresident_mib\tbudget_mib\n");
+            } else if (params.debug_log) {
+                std::fprintf(stderr, "llama_moe_buffer: failed to open group prefetch trace %s\n", trace_path);
+            }
+        }
+    }
+    if (const char * trace_path = std::getenv("LLAMA_LAZY_MOE_ADMISSION_TRACE")) {
+        if (trace_path[0] != '\0') {
+            ctx->admission_trace = std::fopen(trace_path, "wb");
+            if (ctx->admission_trace != nullptr) {
+                std::fprintf(ctx->admission_trace,
+                        "event\ttoken\texec\tlayer\texpert\tgeneration\taction\tgap\tcandidate_value\tvictim_value\tvictim_layer\tvictim_expert\tvictim_groups\tvictim_bytes\tresident_mib\tbudget_mib\tfeedback_ema\tfeedback_samples\treason\n");
+            } else if (params.debug_log) {
+                std::fprintf(stderr,
+                        "llama_moe_buffer: failed to open admission trace %s\n",
+                        trace_path);
+            }
+        }
+    }
+    if (const char * trace_path = std::getenv("LLAMA_LAZY_MOE_ADMISSION_REGRET_TRACE")) {
+        if (trace_path[0] != '\0') {
+            ctx->admission_regret_trace = std::fopen(trace_path, "wb");
+            if (ctx->admission_regret_trace != nullptr) {
+                std::fprintf(ctx->admission_regret_trace,
+                        "event\ttoken\texec\tpair_id\taction\tincoming_layer\tincoming_expert\tvictim_layer\tvictim_expert\tincoming_gap\tvictim_gap\tregret_target\tregret_ema\tregret_samples\treason\n");
+            } else if (params.debug_log) {
+                std::fprintf(stderr,
+                        "llama_moe_buffer: failed to open admission regret trace %s\n",
+                        trace_path);
             }
         }
     }
@@ -1256,6 +1559,7 @@ bool llama_moe_buffer_register(
     m.resident_size.assign(n_expert, 0);
     m.resident_touched.assign(n_expert, false);
     m.prefetched.assign(n_expert, false);
+    m.demand_async_loaded.assign(n_expert, false);
     m.last_evicted_token.assign(n_expert, 0);
     m.queued.assign(n_expert, false);
     m.queued_bits.assign(n_expert, 0);
@@ -1430,6 +1734,19 @@ static bool moe_is_hot(const llama_moe_buffer_context & ctx, const moe_managed &
     if (m.total_act < (uint64_t) m.n_expert * 2) return false;   // warmup
     return (double) m.activation[e] * m.n_expert >
            (double) ctx.params.hot_ratio * (double) m.total_act;
+}
+
+static bool moe_group_is_hot(const llama_moe_buffer_context & ctx, int layer, int expert) {
+    const auto it = ctx.by_layer.find(layer);
+    if (it == ctx.by_layer.end()) {
+        return false;
+    }
+    for (const moe_managed * m : it->second) {
+        if (m != nullptr && expert >= 0 && expert < m->n_expert && moe_is_hot(ctx, *m, expert)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static moe_tensor_kind moe_kind(const moe_managed & m) {
@@ -1724,6 +2041,7 @@ static bool moe_group_used_within_tokens(const llama_moe_buffer_context & ctx, c
             ctx.profile_token_epoch - g.last_used_token_epoch <= (uint64_t) n_tokens;
 }
 
+static double moe_env_f64(const char * name, double def);
 static int moe_env_i32(const char * name, int def);
 static size_t moe_env_mib_bytes(const char * name, int def_mib);
 static int moe_max_layer_index(const llama_moe_buffer_context & ctx);
@@ -1739,6 +2057,14 @@ static int moe_forward_layer_distance(const llama_moe_buffer_context & ctx, int 
 static bool moe_group_is_high_sequence(const llama_moe_buffer_context & ctx, const moe_group_state & g, double cache_score);
 static bool moe_group_is_early_high_reuse(const moe_group_state & g, double cache_score);
 static bool moe_group_has_speculative_unused(const llama_moe_buffer_context & ctx, int layer, int expert);
+static uint8_t moe_cct_predict_conf_locked(
+        const llama_moe_buffer_context & ctx,
+        int                              target_layer,
+        int                              target_expert);
+static double moe_group_bad_reload_effective_locked(
+        const llama_moe_buffer_context & ctx,
+        const moe_group_state &          g,
+        uint64_t *                       out_age = nullptr);
 static bool moe_group_predicted_soon_for_evict(
         const llama_moe_buffer_context & ctx,
         const moe_group_state &          g,
@@ -1800,11 +2126,11 @@ struct moe_evict_context_guard {
           old_reserve(c.evict_layer_reserve_bytes),
           old_persistent(c.evict_persistent_bytes) {
         const size_t default_reserve = c.params.budget_bytes > 0 && c.params.budget_bytes <= 1280ull * 1048576ull ?
-            192ull * 1048576ull : 0;
+            64ull * 1048576ull : 0;
         const size_t reserve = moe_env_mib_bytes("LLAMA_LAZY_MOE_LAYER_RESERVE_MB", (int) (default_reserve / 1048576ull));
         if (touch && reserve > 0 && m.layer >= 0) {
             c.evict_target_layer = m.layer;
-            c.evict_target_ahead = std::max(0, moe_env_i32("LLAMA_LAZY_MOE_LAYER_RESERVE_AHEAD", 1));
+            c.evict_target_ahead = std::max(0, moe_env_i32("LLAMA_LAZY_MOE_LAYER_RESERVE_AHEAD", 0));
             c.evict_layer_reserve_bytes = reserve;
             c.evict_persistent_bytes = moe_env_mib_bytes("LLAMA_LAZY_MOE_LAYER_RESERVE_PERSISTENT_MB", 640);
         }
@@ -1995,7 +2321,11 @@ static void moe_prefetch_trace_write_locked(
         const char *               reason,
         float                      clg_score,
         double                     admit_score,
-        size_t                     speculative_bytes) {
+        size_t                     speculative_bytes,
+        double                     candidate_value = 0.0,
+        double                     victim_value = 0.0,
+        int                        victim_layer = -1,
+        int                        victim_expert = -1) {
     if (ctx.prefetch_trace == nullptr || e < 0 || e >= m.n_expert) {
         return;
     }
@@ -2048,7 +2378,7 @@ static void moe_prefetch_trace_write_locked(
     }
 
     std::fprintf(ctx.prefetch_trace,
-            "%llu\t%llu\t%s\t%s\t%d\t%d\t%s\t%d\t%d\t%.6f\t%.6f\t%.3f\t%.3f\t%.3f\t%s\t%d\t%d\t%d\t%d\t%d\t%zu\t%zu\t%zu\t%zu\t%zu\t%d\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%.3f\t%d\t%d\n",
+            "%llu\t%llu\t%s\t%s\t%d\t%d\t%s\t%d\t%d\t%.6f\t%.6f\t%.6f\t%.6f\t%d\t%d\t%.3f\t%.3f\t%.3f\t%s\t%d\t%d\t%d\t%d\t%d\t%zu\t%zu\t%zu\t%zu\t%zu\t%d\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%.3f\t%d\t%d\n",
             (unsigned long long) ctx.profile_token_epoch,
             (unsigned long long) ctx.exec_epoch,
             event,
@@ -2060,6 +2390,10 @@ static void moe_prefetch_trace_write_locked(
             target_bits,
             (double) clg_score,
             admit_score,
+            candidate_value,
+            victim_value,
+            victim_layer,
+            victim_expert,
             speculative_bytes / 1048576.0,
             ctx.resident_bytes / 1048576.0,
             ctx.params.budget_bytes / 1048576.0,
@@ -2167,8 +2501,12 @@ static void moe_resident_trace_snapshot_locked(
                 moe_group_predicted_soon_for_evict(ctx, *g,
                         layer_dist <= moe_env_i32("LLAMA_LAZY_MOE_RESIDENT_TRACE_NEAR_AHEAD", 1),
                         next_use_dist);
+            const bool h0_current_layer = resident_layer == current_layer;
+            const bool h1_next_token_keep = g != nullptr && moe_next_token_group_protected_locked(ctx, *g);
+            const bool h4_short_reuse = h1_next_token_keep ||
+                (g != nullptr && (g->reuse_within_4 > 0 || g->inter_token_gap_ema <= 4.0));
             std::fprintf(ctx.resident_trace,
-                    "%llu\t%llu\t%d\t%d\t%d\t%zu\t%zu\t%d\t%d\t%d\t%zu\t%zu\t%zu\t%zu\t%d\t%.3f\t%.3f\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%.3f\t%.3f\t%.6f\t%.3f\t%llu\t%llu\t%llu\t%llu\t%llu\t%d\t%d\t%d\t%d\n",
+                    "%llu\t%llu\t%d\t%d\t%d\t%zu\t%zu\t%d\t%d\t%d\t%zu\t%zu\t%zu\t%zu\t%d\t%.3f\t%.3f\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%.3f\t%.3f\t%.6f\t%.3f\t%llu\t%llu\t%llu\t%llu\t%llu\t%d\t%d\t%d\t%d\t%d\t%u\t%llu\t%d\t%d\n",
                     (unsigned long long) ctx.profile_token_epoch,
                     (unsigned long long) ctx.exec_epoch,
                     current_layer,
@@ -2204,6 +2542,11 @@ static void moe_resident_trace_snapshot_locked(
                     (unsigned long long) next_use_dist,
                     layer_dist,
                     predicted_soon ? 1 : 0,
+                    h0_current_layer ? 1 : 0,
+                    h1_next_token_keep ? 1 : 0,
+                    h4_short_reuse ? 1 : 0,
+                    (unsigned) (g == nullptr ? 0 : g->next_token_conf),
+                    (unsigned long long) (g == nullptr ? 0 : g->next_token_protect_until),
                     g != nullptr && g->pinned ? 1 : 0,
                     g != nullptr && moe_group_is_active(ctx, *g) ? 1 : 0);
         }
@@ -2233,7 +2576,7 @@ static void moe_evict_trace_write_locked(
     const int layer_dist = moe_forward_layer_distance(ctx, layer);
     const bool active = moe_group_is_active(ctx, g);
     const bool recent = moe_group_is_recently_used(ctx, g) || moe_group_in_cooldown(ctx, g) ||
-        moe_group_used_within_tokens(ctx, g, moe_env_i32("LLAMA_LAZY_MOE_EAM_EVICT_RECENT_TOKENS", 1));
+        moe_group_used_within_tokens(ctx, g, moe_env_i32("LLAMA_LAZY_MOE_EAM_EVICT_RECENT_TOKENS", 3));
     const bool high_sequence = moe_group_is_high_sequence(ctx, g, g.hot_score);
     const bool early_high = moe_group_is_early_high_reuse(g, g.hot_score);
     const bool speculative_unused = moe_group_has_speculative_unused(ctx, layer, expert);
@@ -2247,9 +2590,15 @@ static void moe_evict_trace_write_locked(
         eam_replace_mass = g.eam_replace_mass;
         eam_replace_keep = g.eam_replace_keep;
     }
+    const uint8_t cct_conf = moe_cct_predict_conf_locked(ctx, layer, expert);
+    uint64_t bad_reload_age = UINT64_MAX;
+    const double bad_reload_effective =
+        moe_group_bad_reload_effective_locked(ctx, g, &bad_reload_age);
+    const bool bad_reload_protected = bad_reload_effective >=
+        moe_env_f64("LLAMA_LAZY_MOE_BAD_RELOAD_PROTECT_SCORE", 6.0);
 
     std::fprintf(ctx.evict_trace,
-            "%s\t%llu\t%llu\t%d\t%d\t%s\t%llu\t%zu\t%.3f\t%.3f\t%.6f\t%.3f\t%.6f\t%.3f\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%.8f\t%llu\t%llu\t%llu\t%llu\t%.3f\t%.8f\t%.8f\t%.8f\t%.8f\t%llu\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%u\t%llu\t%llu\n",
+            "%s\t%llu\t%llu\t%d\t%d\t%s\t%llu\t%zu\t%.3f\t%.3f\t%.6f\t%.3f\t%.6f\t%.3f\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%.8f\t%llu\t%llu\t%llu\t%llu\t%.3f\t%.8f\t%.8f\t%.8f\t%.8f\t%u\t%llu\t%.3f\t%.3f\t%llu\t%llu\t%llu\t%llu\t%d\t%llu\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%u\t%llu\t%llu\n",
             event,
             (unsigned long long) ctx.profile_token_epoch,
             (unsigned long long) ctx.exec_epoch,
@@ -2280,6 +2629,15 @@ static void moe_evict_trace_write_locked(
             eam_replace_pred,
             eam_replace_mass,
             eam_replace_keep,
+            (unsigned) cct_conf,
+            (unsigned long long) g.cct_protect_hits,
+            g.bad_reload_score,
+            bad_reload_effective,
+            (unsigned long long) bad_reload_age,
+            (unsigned long long) g.bad_reload_1,
+            (unsigned long long) g.bad_reload_4,
+            (unsigned long long) g.bad_reload_16,
+            bad_reload_protected ? 1 : 0,
             (unsigned long long) next_use_dist,
             layer_dist,
             g.pinned ? 1 : 0,
@@ -2293,6 +2651,42 @@ static void moe_evict_trace_write_locked(
             (unsigned) g.last_evicted_reason,
             (unsigned long long) g.layer_window_bad_reload,
             (unsigned long long) g.layer_window_last_bad_reload_token);
+}
+
+static const char * moe_admission_action_label(uint8_t action) {
+    return action == 1 ? "admit" : (action == 2 ? "bypass" : "none");
+}
+
+static void moe_admission_outcome_trace_write_locked(
+        llama_moe_buffer_context & ctx,
+        const char *               event,
+        const moe_group_state &    g,
+        uint64_t                   gap,
+        const char *               reason) {
+    if (ctx.admission_trace == nullptr || g.layer < 0 || g.expert < 0) {
+        return;
+    }
+    std::fprintf(ctx.admission_trace,
+            "%s\t%llu\t%llu\t%d\t%d\t%llu\t%s\t%llu\t%.6f\t%.6f\t%d\t%d\t%d\t%zu\t%.3f\t%.3f\t%.6f\t%llu\t%s\n",
+            event,
+            (unsigned long long) ctx.profile_token_epoch,
+            (unsigned long long) ctx.exec_epoch,
+            g.layer,
+            g.expert,
+            (unsigned long long) g.admission_outcome_generation,
+            moe_admission_action_label(g.admission_outcome_action),
+            (unsigned long long) gap,
+            g.admission_outcome_candidate,
+            g.admission_outcome_victim,
+            g.admission_outcome_victim_layer,
+            g.admission_outcome_victim_expert,
+            g.admission_outcome_victim_groups,
+            g.admission_outcome_victim_bytes,
+            ctx.resident_bytes / 1048576.0,
+            ctx.params.budget_bytes / 1048576.0,
+            g.admission_feedback_ema,
+            (unsigned long long) g.admission_feedback_samples,
+            reason);
 }
 
 static double moe_env_f64(const char * name, double def) {
@@ -2309,6 +2703,144 @@ static bool moe_env_flag(const char * name, int def) {
     return moe_env_i32(name, def) > 0;
 }
 
+static bool moe_group_prefetch_same_layer_enabled() {
+    return moe_env_flag("LLAMA_LAZY_MOE_GROUP_PREFETCH_SAME_LAYER", 0);
+}
+
+static int moe_group_prefetch_same_layer_max_groups() {
+    return std::max(0, moe_env_i32("LLAMA_LAZY_MOE_GROUP_PREFETCH_MAX_GROUPS", 4));
+}
+
+static int moe_group_prefetch_same_layer_min_count() {
+    return std::max(1, moe_env_i32("LLAMA_LAZY_MOE_GROUP_PREFETCH_MIN_COUNT", 1));
+}
+
+static bool moe_next_token_keep_enabled() {
+    return moe_env_flag("LLAMA_LAZY_MOE_NEXT_TOKEN_KEEP", 0);
+}
+
+static int moe_next_token_keep_min_conf() {
+    return std::max(0, std::min(3, moe_env_i32("LLAMA_LAZY_MOE_NEXT_TOKEN_KEEP_MIN_CONF", 2)));
+}
+
+static uint64_t moe_next_token_keep_horizon() {
+    return (uint64_t) std::max(1, moe_env_i32("LLAMA_LAZY_MOE_NEXT_TOKEN_KEEP_HORIZON", 1));
+}
+
+static uint8_t moe_sat_inc2(uint8_t v) {
+    return (uint8_t) std::min(3, (int) v + 1);
+}
+
+static uint8_t moe_sat_dec2(uint8_t v) {
+    return (uint8_t) std::max(0, (int) v - 1);
+}
+
+static void moe_next_token_trace_write_locked(
+        llama_moe_buffer_context & ctx,
+        const char *               event,
+        int                        layer,
+        int                        expert,
+        int                        conf_before,
+        int                        conf_after,
+        uint64_t                   protect_until,
+        const char *               reason) {
+    if (ctx.next_token_trace == nullptr || layer < 0 || expert < 0) {
+        return;
+    }
+    std::fprintf(ctx.next_token_trace,
+            "%s\t%llu\t%llu\t%d\t%d\t%d\t%d\t%llu\t%.3f\t%.3f\t%s\n",
+            event,
+            (unsigned long long) ctx.profile_token_epoch,
+            (unsigned long long) ctx.exec_epoch,
+            layer,
+            expert,
+            conf_before,
+            conf_after,
+            (unsigned long long) protect_until,
+            ctx.resident_bytes / 1048576.0,
+            ctx.params.budget_bytes / 1048576.0,
+            reason == nullptr ? "" : reason);
+}
+
+static bool moe_next_token_group_protected_locked(
+        const llama_moe_buffer_context & ctx,
+        const moe_group_state &          g) {
+    return moe_next_token_keep_enabled() &&
+        g.next_token_conf >= (uint8_t) moe_next_token_keep_min_conf() &&
+        g.next_token_protect_until >= ctx.profile_token_epoch;
+}
+
+static void moe_next_token_update_after_route_locked(
+        llama_moe_buffer_context & ctx,
+        int                        layer,
+        const std::vector<int> &   last_token_experts,
+        int                        n_expert) {
+    if (!moe_next_token_keep_enabled() || layer < 0 || n_expert <= 0) {
+        return;
+    }
+
+    if ((int) ctx.next_token_last_layer_experts.size() <= layer) {
+        ctx.next_token_last_layer_experts.resize((size_t) layer + 1);
+    }
+
+    std::vector<char> actual((size_t) n_expert, 0);
+    for (int expert : last_token_experts) {
+        if (expert >= 0 && expert < n_expert) {
+            actual[(size_t) expert] = 1;
+        }
+    }
+
+    std::vector<int> & previous = ctx.next_token_last_layer_experts[(size_t) layer];
+    for (int expert : previous) {
+        if (expert < 0 || expert >= n_expert) {
+            continue;
+        }
+        moe_group_state & g = moe_group_get(ctx, layer, expert);
+        const uint8_t before = g.next_token_conf;
+        if (actual[(size_t) expert]) {
+            g.next_token_conf = moe_sat_inc2(g.next_token_conf);
+            g.next_token_hit++;
+            ctx.next_token_hits.fetch_add(1, std::memory_order_relaxed);
+            moe_next_token_trace_write_locked(ctx, "hit", layer, expert, before, g.next_token_conf,
+                    g.next_token_protect_until, "predicted_actual");
+        } else {
+            g.next_token_conf = moe_sat_dec2(g.next_token_conf);
+            g.next_token_miss++;
+            ctx.next_token_misses.fetch_add(1, std::memory_order_relaxed);
+            moe_next_token_trace_write_locked(ctx, "miss", layer, expert, before, g.next_token_conf,
+                    g.next_token_protect_until, "predicted_unused");
+        }
+    }
+
+    std::vector<int> deduped;
+    deduped.reserve(last_token_experts.size());
+    for (int expert : last_token_experts) {
+        if (expert < 0 || expert >= n_expert || !actual[(size_t) expert]) {
+            continue;
+        }
+        actual[(size_t) expert] = 0;
+        deduped.push_back(expert);
+        moe_group_state & g = moe_group_get(ctx, layer, expert);
+        const uint8_t before = g.next_token_conf;
+        if (g.next_token_conf < 2) {
+            g.next_token_conf = 2;
+            ctx.next_token_admit.fetch_add(1, std::memory_order_relaxed);
+            moe_next_token_trace_write_locked(ctx, "admit", layer, expert, before, g.next_token_conf,
+                    g.next_token_protect_until, "actual_unseen");
+        }
+        if (g.next_token_conf >= (uint8_t) moe_next_token_keep_min_conf()) {
+            g.next_token_protect_until = ctx.profile_token_epoch + moe_next_token_keep_horizon();
+            g.next_token_predicted++;
+            ctx.next_token_predicted.fetch_add(1, std::memory_order_relaxed);
+            moe_next_token_trace_write_locked(ctx, "protect", layer, expert, g.next_token_conf, g.next_token_conf,
+                    g.next_token_protect_until, "same_layer_next_token");
+        }
+    }
+
+    previous.swap(deduped);
+    ctx.next_token_updates.fetch_add(1, std::memory_order_relaxed);
+}
+
 static size_t moe_env_mib_bytes(const char * name, int def_mib) {
     return (size_t) std::max(0, moe_env_i32(name, def_mib)) * 1048576ull;
 }
@@ -2316,6 +2848,95 @@ static size_t moe_env_mib_bytes(const char * name, int def_mib) {
 static void moe_atomic_max_u64(std::atomic<uint64_t> & dst, uint64_t value) {
     uint64_t old = dst.load(std::memory_order_relaxed);
     while (old < value && !dst.compare_exchange_weak(old, value, std::memory_order_relaxed)) {}
+}
+
+static bool moe_cct_enabled() {
+    return moe_env_flag("LLAMA_LAZY_MOE_CCT", 0);
+}
+
+static bool moe_cct_prefetch_enabled() {
+    return moe_cct_enabled() && moe_env_flag("LLAMA_LAZY_MOE_CCT_PREFETCH", 0);
+}
+
+static bool moe_cct_evict_enabled() {
+    return moe_cct_enabled() && moe_env_flag("LLAMA_LAZY_MOE_CCT_EVICT", 0);
+}
+
+static bool moe_cct_lowmem_active(const llama_moe_buffer_context & ctx) {
+    const int threshold_mb = moe_env_i32("LLAMA_LAZY_MOE_CCT_LOW_BUDGET_MB", 640);
+    return ctx.params.budget_bytes > 0 &&
+        ctx.params.budget_bytes <= (size_t) std::max(0, threshold_mb) * 1048576ull;
+}
+
+static void moe_cct_trace_write_locked(
+        llama_moe_buffer_context & ctx,
+        const char *               event,
+        int                        src_layer,
+        int                        src_expert,
+        int                        target_layer,
+        int                        target_expert,
+        int                        conf_before,
+        int                        conf_after,
+        const char *               reason) {
+    if (ctx.cct_trace == nullptr) {
+        return;
+    }
+    std::fprintf(ctx.cct_trace,
+            "%s\t%llu\t%llu\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%.3f\t%.3f\n",
+            event,
+            (unsigned long long) ctx.profile_token_epoch,
+            (unsigned long long) ctx.exec_epoch,
+            src_layer,
+            src_expert,
+            target_layer,
+            target_expert,
+            conf_before,
+            conf_after,
+            reason == nullptr ? "" : reason,
+            ctx.resident_bytes / 1048576.0,
+            ctx.params.budget_bytes / 1048576.0);
+}
+
+static uint8_t moe_cct_conf_from_source_locked(
+        const llama_moe_buffer_context & ctx,
+        int                              src_layer,
+        int                              src_expert,
+        int                              target_expert) {
+    if (!moe_cct_enabled() || src_layer < 0 || src_expert < 0 || target_expert < 0) {
+        return 0;
+    }
+    auto it = ctx.cct_transition.find(moe_group_key(src_layer, src_expert));
+    if (it == ctx.cct_transition.end() || target_expert >= (int) it->second.size()) {
+        return 0;
+    }
+    return it->second[(size_t) target_expert].conf;
+}
+
+static uint8_t moe_cct_predict_conf_locked(
+        const llama_moe_buffer_context & ctx,
+        int                              target_layer,
+        int                              target_expert) {
+    if (!moe_cct_enabled() || target_layer < 0 || target_expert < 0) {
+        return 0;
+    }
+    const int n_layer = std::max(1, moe_max_layer_index(ctx) + 1);
+    const int src_layer = (target_layer + n_layer - 1) % n_layer;
+
+    const std::vector<int> * src_experts = nullptr;
+    if (ctx.eam_last_actual_layer == src_layer && !ctx.eam_last_layer_experts.empty()) {
+        src_experts = &ctx.eam_last_layer_experts;
+    } else if (src_layer >= 0 && src_layer < (int) ctx.cct_recent_layer_experts.size() &&
+            !ctx.cct_recent_layer_experts[(size_t) src_layer].empty()) {
+        src_experts = &ctx.cct_recent_layer_experts[(size_t) src_layer];
+    }
+    if (src_experts == nullptr) {
+        return 0;
+    }
+    uint8_t best = 0;
+    for (int src_expert : *src_experts) {
+        best = std::max(best, moe_cct_conf_from_source_locked(ctx, src_layer, src_expert, target_expert));
+    }
+    return best;
 }
 
 static bool moe_eamc_enabled() {
@@ -2707,12 +3328,80 @@ static size_t moe_eam_prefetch_budget_bytes(const llama_moe_buffer_context & ctx
         return (size_t) env_mb * 1048576ull;
     }
     if (ctx.params.budget_bytes > 0 && ctx.params.budget_bytes <= 1536ull * 1048576ull) {
-        return 128ull * 1048576ull;
+        return 16ull * 1048576ull;
     }
     if (ctx.params.budget_bytes > 0 && ctx.params.budget_bytes <= 3072ull * 1048576ull) {
         return 192ull * 1048576ull;
     }
     return 256ull * 1048576ull;
+}
+
+static bool moe_force_next_layer_prefetch_enabled() {
+    return moe_env_flag("LLAMA_LAZY_MOE_FORCE_NEXT_LAYER_PREFETCH", 0);
+}
+
+static void moe_layer_speculative_pending_locked(
+        const llama_moe_buffer_context & ctx,
+        int                              layer,
+        int                              candidate_expert,
+        size_t *                         out_groups,
+        size_t *                         out_bytes,
+        bool *                           out_candidate_pending) {
+    size_t groups = 0;
+    size_t bytes = 0;
+    bool candidate_pending = false;
+    auto it = ctx.by_layer.find(layer);
+    if (it == ctx.by_layer.end() || it->second.empty() || it->second[0] == nullptr) {
+        if (out_groups != nullptr) {
+            *out_groups = 0;
+        }
+        if (out_bytes != nullptr) {
+            *out_bytes = 0;
+        }
+        if (out_candidate_pending != nullptr) {
+            *out_candidate_pending = false;
+        }
+        return;
+    }
+
+    const int n_expert = it->second[0]->n_expert;
+    std::vector<char> seen((size_t) std::max(0, n_expert), false);
+    for (const moe_managed * m : it->second) {
+        if (m == nullptr) {
+            continue;
+        }
+        for (int e = 0; e < m->n_expert; ++e) {
+            bool pending = false;
+            if (e < (int) m->queued.size() && m->queued[e]) {
+                pending = true;
+                const int bits = e < (int) m->queued_bits.size() && m->queued_bits[e] > 0 ?
+                    m->queued_bits[e] : ctx.params.base_bits;
+                bytes += moe_effective_stream_bytes_for_target(ctx, *m, e, bits);
+            }
+            if (e < (int) m->prefetched.size() && m->prefetched[e] &&
+                    e < (int) m->resident_touched.size() && !m->resident_touched[e]) {
+                pending = true;
+                bytes += moe_slice_resident_bytes(*m, e);
+            }
+            if (pending && e == candidate_expert) {
+                candidate_pending = true;
+            }
+            if (pending && e >= 0 && e < (int) seen.size() && !seen[(size_t) e]) {
+                seen[(size_t) e] = true;
+                ++groups;
+            }
+        }
+    }
+
+    if (out_groups != nullptr) {
+        *out_groups = groups;
+    }
+    if (out_bytes != nullptr) {
+        *out_bytes = bytes;
+    }
+    if (out_candidate_pending != nullptr) {
+        *out_candidate_pending = candidate_pending;
+    }
 }
 
 static int moe_eam_prefetch_max_distance(const llama_moe_buffer_context & ctx) {
@@ -2768,13 +3457,507 @@ static bool moe_reuse_evict_enabled() {
     return moe_env_i32("LLAMA_LAZY_MOE_REUSE_EVICT", 0) > 0;
 }
 
-static void moe_group_update_reuse_on_touch_locked(llama_moe_buffer_context & ctx, moe_group_state & g) {
-    const uint64_t token = ctx.profile_token_epoch;
-    if (token == 0) {
+static bool moe_bad_reload_evict_enabled() {
+    return moe_env_flag("LLAMA_LAZY_MOE_BAD_RELOAD_EVICT", 1);
+}
+
+static bool moe_ghost_feedback_enabled() {
+    static const bool enabled = moe_env_flag("LLAMA_LAZY_MOE_GHOST_FEEDBACK", 0);
+    return enabled;
+}
+
+static uint64_t moe_ghost_feedback_horizon() {
+    static const uint64_t horizon =
+        (uint64_t) std::max(1, moe_env_i32("LLAMA_LAZY_MOE_GHOST_HORIZON_TOKENS", 16));
+    return horizon;
+}
+
+static void moe_group_ghost_update_locked(
+        llama_moe_buffer_context & ctx,
+        moe_group_state &          g,
+        double                     target,
+        bool                       success,
+        uint64_t                   reload_gap) {
+    static const double alpha = std::max(0.0, std::min(1.0,
+            moe_env_f64("LLAMA_LAZY_MOE_GHOST_ALPHA", 0.25)));
+    g.ghost_reload_risk_ema =
+        (1.0 - alpha) * g.ghost_reload_risk_ema + alpha * std::max(0.0, std::min(1.0, target));
+    g.ghost_outcomes++;
+    g.ghost_last_outcome_token = ctx.profile_token_epoch;
+    if (success) {
+        g.ghost_success++;
+        ctx.ghost_success.fetch_add(1, std::memory_order_relaxed);
+    } else if (reload_gap <= 1) {
+        g.ghost_bad_1++;
+        ctx.ghost_bad_1.fetch_add(1, std::memory_order_relaxed);
+    } else if (reload_gap <= 4) {
+        g.ghost_bad_4++;
+        ctx.ghost_bad_4.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        g.ghost_bad_16++;
+        ctx.ghost_bad_16.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+static void moe_group_ghost_note_reload_locked(
+        llama_moe_buffer_context & ctx,
+        moe_group_state &          g,
+        uint64_t                   reload_gap) {
+    if (!moe_ghost_feedback_enabled() || !g.ghost_pending) {
         return;
     }
-    if (g.last_evicted_token_epoch > 0 && token >= g.last_evicted_token_epoch) {
+    g.ghost_pending = false;
+    const uint64_t horizon = moe_ghost_feedback_horizon();
+    if (reload_gap > horizon) {
+        moe_group_ghost_update_locked(ctx, g, 0.0, true, reload_gap);
+        return;
+    }
+    static const double target_1 = moe_env_f64("LLAMA_LAZY_MOE_GHOST_TARGET_1", 1.0);
+    static const double target_4 = moe_env_f64("LLAMA_LAZY_MOE_GHOST_TARGET_4", 0.65);
+    static const double target_16 = moe_env_f64("LLAMA_LAZY_MOE_GHOST_TARGET_16", 0.25);
+    const double target = reload_gap <= 1 ? target_1 : (reload_gap <= 4 ? target_4 : target_16);
+    moe_group_ghost_update_locked(ctx, g, target, false, reload_gap);
+}
+
+static void moe_ghost_expire_locked(llama_moe_buffer_context & ctx) {
+    if (!moe_ghost_feedback_enabled()) {
+        return;
+    }
+    const uint64_t token = ctx.profile_token_epoch;
+    while (!ctx.ghost_records.empty() && ctx.ghost_records.front().deadline < token) {
+        const moe_ghost_record record = ctx.ghost_records.front();
+        ctx.ghost_records.pop_front();
+        const auto it = ctx.groups.find(record.key);
+        if (it == ctx.groups.end()) {
+            continue;
+        }
+        moe_group_state & g = it->second;
+        if (!g.ghost_pending || g.ghost_generation != record.generation) {
+            continue;
+        }
+        g.ghost_pending = false;
+        moe_group_ghost_update_locked(ctx, g, 0.0, true, token - record.deadline);
+    }
+}
+
+static void moe_admission_outcome_note_reuse_locked(
+        llama_moe_buffer_context & ctx,
+        moe_group_state &          g) {
+    if (!g.admission_outcome_pending ||
+            ctx.profile_token_epoch <= g.admission_outcome_token) {
+        return;
+    }
+    const uint64_t gap = ctx.profile_token_epoch - g.admission_outcome_token;
+    double feedback_target = 0.0;
+    if (g.admission_outcome_action == 1) {
+        if (gap <= 1) {
+            ctx.admission_outcome_admit_reuse_1.fetch_add(1, std::memory_order_relaxed);
+            feedback_target = 4.0;
+        } else if (gap <= 4) {
+            ctx.admission_outcome_admit_reuse_4.fetch_add(1, std::memory_order_relaxed);
+            feedback_target = 2.0;
+        } else {
+            ctx.admission_outcome_admit_reuse_16.fetch_add(1, std::memory_order_relaxed);
+            feedback_target = 0.5;
+        }
+    } else if (g.admission_outcome_action == 2) {
+        if (gap <= 1) {
+            ctx.admission_outcome_bypass_reload_1.fetch_add(1, std::memory_order_relaxed);
+            feedback_target = 8.0;
+        } else if (gap <= 4) {
+            ctx.admission_outcome_bypass_reload_4.fetch_add(1, std::memory_order_relaxed);
+            feedback_target = 4.0;
+        } else {
+            ctx.admission_outcome_bypass_reload_16.fetch_add(1, std::memory_order_relaxed);
+            feedback_target = 1.0;
+        }
+    }
+    const double alpha = std::max(0.0, std::min(1.0,
+            moe_env_f64("LLAMA_LAZY_MOE_ADMISSION_FEEDBACK_ALPHA", 0.125)));
+    g.admission_feedback_ema =
+        (1.0 - alpha) * g.admission_feedback_ema + alpha * feedback_target;
+    g.admission_feedback_samples++;
+    ctx.admission_feedback_updates.fetch_add(1, std::memory_order_relaxed);
+    ctx.admission_feedback_positive.fetch_add(1, std::memory_order_relaxed);
+    moe_admission_outcome_trace_write_locked(
+            ctx,
+            g.admission_outcome_action == 1 ? "reuse" : "reload",
+            g,
+            gap,
+            g.admission_outcome_action == 1 ? "admit_reused" : "bypass_reloaded");
+    g.admission_outcome_pending = false;
+}
+
+static void moe_admission_outcome_note_evicted_locked(
+        llama_moe_buffer_context & ctx,
+        moe_group_state &          g) {
+    if (!g.admission_outcome_pending || g.admission_outcome_action != 1) {
+        return;
+    }
+    const uint64_t gap = ctx.profile_token_epoch >= g.admission_outcome_token ?
+        ctx.profile_token_epoch - g.admission_outcome_token : 0;
+    const double alpha = std::max(0.0, std::min(1.0,
+            moe_env_f64("LLAMA_LAZY_MOE_ADMISSION_FEEDBACK_ALPHA", 0.125)));
+    g.admission_feedback_ema =
+        (1.0 - alpha) * g.admission_feedback_ema + alpha * -4.0;
+    g.admission_feedback_samples++;
+    ctx.admission_feedback_updates.fetch_add(1, std::memory_order_relaxed);
+    ctx.admission_feedback_negative.fetch_add(1, std::memory_order_relaxed);
+    ctx.admission_outcome_admit_unused.fetch_add(1, std::memory_order_relaxed);
+    moe_admission_outcome_trace_write_locked(
+            ctx, "evict_unused", g, gap, "admit_evicted_before_reuse");
+    g.admission_outcome_pending = false;
+}
+
+static void moe_admission_outcome_expire_locked(llama_moe_buffer_context & ctx) {
+    for (auto & kv : ctx.groups) {
+        moe_group_state & g = kv.second;
+        if (!g.admission_outcome_pending ||
+                ctx.profile_token_epoch <= g.admission_outcome_deadline) {
+            continue;
+        }
+        const uint64_t gap = ctx.profile_token_epoch - g.admission_outcome_token;
+        const double target = g.admission_outcome_action == 1 ? -2.0 : -1.0;
+        const double alpha = std::max(0.0, std::min(1.0,
+                moe_env_f64("LLAMA_LAZY_MOE_ADMISSION_FEEDBACK_ALPHA", 0.125)));
+        g.admission_feedback_ema =
+            (1.0 - alpha) * g.admission_feedback_ema + alpha * target;
+        g.admission_feedback_samples++;
+        ctx.admission_feedback_updates.fetch_add(1, std::memory_order_relaxed);
+        ctx.admission_feedback_negative.fetch_add(1, std::memory_order_relaxed);
+        if (g.admission_outcome_action == 1) {
+            ctx.admission_outcome_admit_unused.fetch_add(1, std::memory_order_relaxed);
+            moe_admission_outcome_trace_write_locked(
+                    ctx, "expire", g, gap, "admit_not_reused");
+        } else if (g.admission_outcome_action == 2) {
+            ctx.admission_outcome_bypass_success.fetch_add(1, std::memory_order_relaxed);
+            moe_admission_outcome_trace_write_locked(
+                    ctx, "expire", g, gap, "bypass_not_reloaded");
+        }
+        g.admission_outcome_pending = false;
+    }
+}
+
+static void moe_admission_outcome_finish_locked(
+        llama_moe_buffer_context & ctx,
+        const char *               reason) {
+    for (auto & kv : ctx.groups) {
+        moe_group_state & g = kv.second;
+        if (!g.admission_outcome_pending) {
+            continue;
+        }
+        const uint64_t gap = ctx.profile_token_epoch >= g.admission_outcome_token ?
+            ctx.profile_token_epoch - g.admission_outcome_token : 0;
+        moe_admission_outcome_trace_write_locked(ctx, "unfinished", g, gap, reason);
+        g.admission_outcome_pending = false;
+    }
+}
+
+static double moe_admission_regret_cost(uint64_t gap) {
+    if (gap <= 1) {
+        return 8.0;
+    }
+    if (gap <= 4) {
+        return 4.0;
+    }
+    if (gap <= 16) {
+        return 1.0;
+    }
+    return 0.0;
+}
+
+static void moe_admission_regret_trace_write_locked(
+        llama_moe_buffer_context &       ctx,
+        const char *                     event,
+        const moe_admission_pair_record & record,
+        double                           target,
+        const char *                     reason) {
+    if (ctx.admission_regret_trace == nullptr) {
+        return;
+    }
+    const auto incoming_it = ctx.groups.find(record.incoming_key);
+    const auto victim_it = ctx.groups.find(record.victim_key);
+    if (incoming_it == ctx.groups.end() || victim_it == ctx.groups.end()) {
+        return;
+    }
+    const moe_group_state & incoming = incoming_it->second;
+    const moe_group_state & victim = victim_it->second;
+    std::fprintf(ctx.admission_regret_trace,
+            "%s\t%llu\t%llu\t%llu\t%s\t%d\t%d\t%d\t%d\t%llu\t%llu\t%.6f\t%.6f\t%llu\t%s\n",
+            event,
+            (unsigned long long) ctx.profile_token_epoch,
+            (unsigned long long) ctx.exec_epoch,
+            (unsigned long long) record.id,
+            record.bypass ? "bypass" : "admit",
+            incoming.layer,
+            incoming.expert,
+            victim.layer,
+            victim.expert,
+            (unsigned long long) record.incoming_gap,
+            (unsigned long long) record.victim_gap,
+            target,
+            incoming.admission_regret_ema,
+            (unsigned long long) incoming.admission_regret_samples,
+            reason);
+}
+
+static void moe_admission_regret_resolve_locked(
+        llama_moe_buffer_context & ctx,
+        moe_admission_pair_record & record,
+        bool                       expired) {
+    const double incoming_cost = moe_admission_regret_cost(record.incoming_gap);
+    const double victim_cost = moe_admission_regret_cost(record.victim_gap);
+    const double target = incoming_cost - victim_cost;
+    auto incoming_it = ctx.groups.find(record.incoming_key);
+    if (incoming_it == ctx.groups.end()) {
+        return;
+    }
+    moe_group_state & incoming = incoming_it->second;
+    if (target != 0.0) {
+        const double alpha = std::max(0.0, std::min(1.0,
+                moe_env_f64("LLAMA_LAZY_MOE_ADMISSION_REGRET_ALPHA", 0.125)));
+        incoming.admission_regret_ema =
+            (1.0 - alpha) * incoming.admission_regret_ema + alpha * target;
+        incoming.admission_regret_samples++;
+        if (target > 0.0) {
+            ctx.admission_regret_prefer_admit.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            ctx.admission_regret_prefer_bypass.fetch_add(1, std::memory_order_relaxed);
+        }
+    } else {
+        ctx.admission_regret_tie.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (expired) {
+        ctx.admission_regret_expired.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        ctx.admission_regret_resolved.fetch_add(1, std::memory_order_relaxed);
+    }
+    moe_admission_regret_trace_write_locked(
+            ctx,
+            expired ? "expire" : "resolve",
+            record,
+            target,
+            target > 0.0 ? "incoming_sooner" :
+                (target < 0.0 ? "victim_sooner" : "equal_or_unseen"));
+}
+
+static void moe_admission_regret_compact_watchers_locked(
+        llama_moe_buffer_context & ctx,
+        uint64_t                   key) {
+    auto it = ctx.admission_pair_watchers.find(key);
+    if (it == ctx.admission_pair_watchers.end()) {
+        return;
+    }
+    std::vector<uint64_t> & ids = it->second;
+    ids.erase(std::remove_if(ids.begin(), ids.end(), [&](uint64_t id) {
+        return ctx.admission_pairs.find(id) == ctx.admission_pairs.end();
+    }), ids.end());
+    if (ids.empty()) {
+        ctx.admission_pair_watchers.erase(it);
+    }
+}
+
+static void moe_admission_regret_begin_locked(
+        llama_moe_buffer_context & ctx,
+        const moe_group_state &    incoming,
+        bool                       bypass,
+        const std::vector<uint64_t> & victim_keys) {
+    const uint64_t incoming_key = moe_group_key(incoming.layer, incoming.expert);
+    const uint64_t horizon = (uint64_t) std::max(1,
+            moe_env_i32("LLAMA_LAZY_MOE_ADMISSION_REGRET_TOKENS", 16));
+    for (uint64_t victim_key : victim_keys) {
+        if (victim_key == incoming_key || ctx.groups.find(victim_key) == ctx.groups.end()) {
+            continue;
+        }
+        if (ctx.admission_pair_watchers[incoming_key].size() >= 64) {
+            moe_admission_regret_compact_watchers_locked(ctx, incoming_key);
+        }
+        if (ctx.admission_pair_watchers[victim_key].size() >= 64) {
+            moe_admission_regret_compact_watchers_locked(ctx, victim_key);
+        }
+
+        moe_admission_pair_record record;
+        record.id = ctx.next_admission_pair_id++;
+        record.incoming_key = incoming_key;
+        record.victim_key = victim_key;
+        record.decision_token = ctx.profile_token_epoch;
+        record.deadline = ctx.profile_token_epoch > UINT64_MAX - horizon ?
+            UINT64_MAX : ctx.profile_token_epoch + horizon;
+        record.bypass = bypass;
+        ctx.admission_pairs.emplace(record.id, record);
+        ctx.admission_pair_watchers[incoming_key].push_back(record.id);
+        ctx.admission_pair_watchers[victim_key].push_back(record.id);
+        ctx.admission_pair_deadlines.push_back({record.deadline, record.id});
+        ctx.admission_regret_pairs.fetch_add(1, std::memory_order_relaxed);
+        moe_admission_regret_trace_write_locked(ctx, "decision", record, 0.0, "paired");
+    }
+}
+
+static void moe_admission_regret_note_touch_locked(
+        llama_moe_buffer_context & ctx,
+        uint64_t                   key) {
+    auto watcher_it = ctx.admission_pair_watchers.find(key);
+    if (watcher_it == ctx.admission_pair_watchers.end()) {
+        return;
+    }
+    std::vector<uint64_t> ids = watcher_it->second;
+    for (uint64_t id : ids) {
+        auto pair_it = ctx.admission_pairs.find(id);
+        if (pair_it == ctx.admission_pairs.end()) {
+            continue;
+        }
+        moe_admission_pair_record & record = pair_it->second;
+        if (ctx.profile_token_epoch <= record.decision_token) {
+            continue;
+        }
+        const uint64_t gap = ctx.profile_token_epoch - record.decision_token;
+        if (record.incoming_key == key && record.incoming_gap == UINT64_MAX) {
+            record.incoming_gap = gap;
+        }
+        if (record.victim_key == key && record.victim_gap == UINT64_MAX) {
+            record.victim_gap = gap;
+        }
+        if (record.incoming_gap != UINT64_MAX && record.victim_gap != UINT64_MAX) {
+            moe_admission_pair_record completed = record;
+            moe_admission_regret_resolve_locked(ctx, completed, false);
+            ctx.admission_pairs.erase(pair_it);
+        }
+    }
+    moe_admission_regret_compact_watchers_locked(ctx, key);
+}
+
+static void moe_admission_regret_expire_locked(llama_moe_buffer_context & ctx) {
+    while (!ctx.admission_pair_deadlines.empty() &&
+            ctx.admission_pair_deadlines.front().deadline < ctx.profile_token_epoch) {
+        const moe_admission_pair_deadline deadline =
+            ctx.admission_pair_deadlines.front();
+        ctx.admission_pair_deadlines.pop_front();
+        auto it = ctx.admission_pairs.find(deadline.id);
+        if (it == ctx.admission_pairs.end()) {
+            continue;
+        }
+        moe_admission_pair_record expired = it->second;
+        moe_admission_regret_resolve_locked(ctx, expired, true);
+        ctx.admission_pairs.erase(it);
+    }
+}
+
+static void moe_admission_regret_finish_locked(
+        llama_moe_buffer_context & ctx,
+        const char *               reason) {
+    for (const auto & kv : ctx.admission_pairs) {
+        moe_admission_regret_trace_write_locked(
+                ctx, "unfinished", kv.second, 0.0, reason);
+    }
+    ctx.admission_pairs.clear();
+    ctx.admission_pair_watchers.clear();
+    ctx.admission_pair_deadlines.clear();
+}
+
+static void moe_group_note_evicted_locked(
+        llama_moe_buffer_context & ctx,
+        moe_group_state &          g) {
+    moe_admission_outcome_note_evicted_locked(ctx, g);
+    g.last_evicted_token_epoch = ctx.profile_token_epoch;
+    g.last_evicted_valid = true;
+    if (!moe_ghost_feedback_enabled()) {
+        g.ghost_pending = false;
+        return;
+    }
+    g.ghost_generation++;
+    g.ghost_pending = true;
+    const uint64_t horizon = moe_ghost_feedback_horizon();
+    const uint64_t deadline = ctx.profile_token_epoch > UINT64_MAX - horizon ?
+        UINT64_MAX : ctx.profile_token_epoch + horizon;
+    ctx.ghost_records.push_back({deadline, moe_group_key(g.layer, g.expert), g.ghost_generation});
+    ctx.ghost_evictions.fetch_add(1, std::memory_order_relaxed);
+}
+
+static double moe_group_ghost_keep_score_locked(
+        const llama_moe_buffer_context & ctx,
+        const moe_group_state &          g) {
+    if (!moe_ghost_feedback_enabled() || g.ghost_outcomes == 0 || g.ghost_reload_risk_ema <= 0.0) {
+        return 0.0;
+    }
+    static const double min_samples = std::max(1.0,
+            moe_env_f64("LLAMA_LAZY_MOE_GHOST_MIN_SAMPLES", 4.0));
+    const double confidence = std::min(1.0, (double) g.ghost_outcomes / min_samples);
+    static const double half_life = std::max(1.0,
+            moe_env_f64("LLAMA_LAZY_MOE_GHOST_HALF_LIFE_TOKENS", 128.0));
+    static const double weight =
+        moe_env_f64("LLAMA_LAZY_MOE_GHOST_KEEP_WEIGHT", 5.0e8);
+    const uint64_t age =
+        ctx.profile_token_epoch >= g.ghost_last_outcome_token ?
+        ctx.profile_token_epoch - g.ghost_last_outcome_token : 0;
+    const double risk = g.ghost_reload_risk_ema * half_life / (half_life + (double) age);
+    return risk * confidence * weight;
+}
+
+static double moe_group_bad_reload_effective_locked(
+        const llama_moe_buffer_context & ctx,
+        const moe_group_state &          g,
+        uint64_t *                       out_age) {
+    if (!moe_bad_reload_evict_enabled() || g.bad_reload_last_token == 0 ||
+            ctx.profile_token_epoch < g.bad_reload_last_token) {
+        if (out_age != nullptr) {
+            *out_age = UINT64_MAX;
+        }
+        return 0.0;
+    }
+    const uint64_t age = ctx.profile_token_epoch - g.bad_reload_last_token;
+    if (out_age != nullptr) {
+        *out_age = age;
+    }
+    double scale = 0.0;
+    if (age <= 4) {
+        scale = 1.0;
+    } else if (age <= 8) {
+        scale = 0.75;
+    } else if (age <= 16) {
+        scale = 0.50;
+    } else if (age <= 32) {
+        scale = 0.25;
+    }
+    return g.bad_reload_score * scale;
+}
+
+static void moe_group_note_bad_reload_locked(
+        llama_moe_buffer_context & ctx,
+        moe_group_state &          g,
+        uint64_t                   reload_gap) {
+    if (!moe_bad_reload_evict_enabled()) {
+        return;
+    }
+    double add = 0.0;
+    if (reload_gap <= 1) {
+        add = moe_env_f64("LLAMA_LAZY_MOE_BAD_RELOAD_ADD_1", 4.0);
+        g.bad_reload_1++;
+        ctx.bad_reload_1.fetch_add(1, std::memory_order_relaxed);
+    } else if (reload_gap <= 4) {
+        add = moe_env_f64("LLAMA_LAZY_MOE_BAD_RELOAD_ADD_4", 2.0);
+        g.bad_reload_4++;
+        ctx.bad_reload_4.fetch_add(1, std::memory_order_relaxed);
+    } else if (reload_gap <= 16) {
+        add = moe_env_f64("LLAMA_LAZY_MOE_BAD_RELOAD_ADD_16", 1.0);
+        g.bad_reload_16++;
+        ctx.bad_reload_16.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (add <= 0.0) {
+        return;
+    }
+    uint64_t age = UINT64_MAX;
+    const double old_effective = moe_group_bad_reload_effective_locked(ctx, g, &age);
+    const double cap = moe_env_f64("LLAMA_LAZY_MOE_BAD_RELOAD_SCORE_CAP", 24.0);
+    g.bad_reload_score = std::min(cap, old_effective + add);
+    g.bad_reload_last_token = ctx.profile_token_epoch;
+}
+
+static void moe_group_update_reuse_on_touch_locked(llama_moe_buffer_context & ctx, moe_group_state & g) {
+    const uint64_t token = ctx.profile_token_epoch;
+    if (g.last_evicted_valid && token >= g.last_evicted_token_epoch) {
         const uint64_t reload_gap = token - g.last_evicted_token_epoch;
+        moe_group_ghost_note_reload_locked(ctx, g, reload_gap);
+        moe_group_note_bad_reload_locked(ctx, g, reload_gap);
         moe_evict_trace_write_locked(ctx, "reload", g.layer, g.expert, "reload_after_evict",
                 reload_gap, 0, 0.0);
         const uint64_t layer_reload_guard = (uint64_t) std::max(0,
@@ -2796,8 +3979,11 @@ static void moe_group_update_reuse_on_touch_locked(llama_moe_buffer_context & ct
                 ctx.reuse_reload_16.fetch_add(1, std::memory_order_relaxed);
             }
         }
-        g.last_evicted_token_epoch = 0;
+        g.last_evicted_valid = false;
         g.last_evicted_reason = MOE_EVICT_REASON_UNKNOWN;
+    }
+    if (token == 0) {
+        return;
     }
     if (!moe_reuse_evict_enabled()) {
         return;
@@ -2893,7 +4079,7 @@ static bool moe_group_predicted_soon_for_evict(
 }
 
 static bool moe_eam_replace_enabled() {
-    return moe_env_flag("LLAMA_LAZY_MOE_EAM_REPLACE", 0);
+    return moe_env_flag("LLAMA_LAZY_MOE_EAM_REPLACE", 1);
 }
 
 static double moe_group_eam_replace_pred_locked(
@@ -3067,6 +4253,194 @@ static bool moe_group_is_early_high_reuse(const moe_group_state & g, double cach
     return cache_score >= keep_score || g.seq_rank0_access >= std::max<uint64_t>(4, g.seq_access / 2);
 }
 
+enum class moe_evict_protect_reason : uint8_t {
+    NONE = 0,
+    PINNED,
+    ACTIVE,
+    CURRENT_LAYER,
+    DEMAND,
+    INFLIGHT,
+    LAYER_WINDOW,
+    RECENT,
+    BAD_RELOAD,
+    NEXT_TOKEN,
+    CCT,
+    PREDICTED_SOON,
+    REUSE,
+};
+
+enum class moe_evict_protect_class : uint8_t {
+    NONE = 0,
+    TEMPORARY,
+    ABSOLUTE,
+};
+
+struct moe_evict_protect_options {
+    bool speculative_unused = false;
+    bool current_layer = false;
+    bool layer_window = false;
+    bool protect_layer_window = false;
+    bool protect_recent = true;
+    bool protect_high_recent = false;
+    bool protect_cct = true;
+    bool protect_predicted_soon = true;
+    bool protect_reuse = true;
+    bool protect_next_token = true;
+    int recent_tokens = 3;
+    double recent_score = 0.0;
+    uint64_t bad_reload_guard_tokens = 16;
+    double bad_reload_score = 6.0;
+};
+
+struct moe_evict_protect_result {
+    moe_evict_protect_reason reason = moe_evict_protect_reason::NONE;
+    moe_evict_protect_class protect_class = moe_evict_protect_class::NONE;
+    bool recent = false;
+    bool high_sequence = false;
+    bool early_high = false;
+    bool predicted_soon = false;
+    bool reuse_protected = false;
+    bool cct_protected = false;
+    bool bad_reload_protected = false;
+    bool next_token_protected = false;
+    bool future_ranked = false;
+    uint64_t next_use_dist = UINT64_MAX;
+    int layer_dist = INT_MAX;
+    uint64_t recent_age = UINT64_MAX;
+    uint64_t recent_exec_age = UINT64_MAX;
+    uint64_t bad_reload_age = UINT64_MAX;
+    double bad_reload_effective = 0.0;
+    double reuse_keep = 0.0;
+    double ghost_keep = 0.0;
+    double temporary_keep_score = 0.0;
+    uint8_t cct_conf = 0;
+};
+
+static moe_evict_protect_result moe_group_evict_protect_locked(
+        llama_moe_buffer_context &       ctx,
+        moe_group_state &                g,
+        int                              layer,
+        int                              expert,
+        double                           cache_score,
+        const moe_evict_protect_options & opt) {
+    moe_evict_protect_result r;
+    r.layer_dist = moe_forward_layer_distance(ctx, layer);
+    if (g.next_use_epoch != UINT64_MAX && g.next_use_epoch > ctx.exec_epoch) {
+        r.next_use_dist = g.next_use_epoch - ctx.exec_epoch;
+    }
+    if (g.last_used_token_epoch != 0 && ctx.profile_token_epoch >= g.last_used_token_epoch) {
+        r.recent_age = ctx.profile_token_epoch - g.last_used_token_epoch;
+    }
+    if (g.last_used_epoch != 0 && ctx.exec_epoch >= g.last_used_epoch) {
+        r.recent_exec_age = ctx.exec_epoch - g.last_used_epoch;
+    }
+    r.recent = moe_group_used_within_tokens(ctx, g, opt.recent_tokens) ||
+        moe_group_is_recently_used(ctx, g) || moe_group_in_cooldown(ctx, g);
+    r.high_sequence = moe_group_is_high_sequence(ctx, g, cache_score);
+    r.early_high = moe_group_is_early_high_reuse(g, cache_score);
+    r.reuse_keep = moe_group_short_reuse_keep_score_locked(ctx, g, ctx.evict_target_layer);
+    r.ghost_keep = moe_group_ghost_keep_score_locked(ctx, g);
+    r.bad_reload_effective = moe_group_bad_reload_effective_locked(ctx, g, &r.bad_reload_age);
+    r.bad_reload_protected = !opt.speculative_unused && opt.bad_reload_guard_tokens > 0 &&
+        r.bad_reload_age != UINT64_MAX &&
+        r.bad_reload_age <= opt.bad_reload_guard_tokens &&
+        r.bad_reload_effective >= opt.bad_reload_score;
+    r.next_token_protected = !opt.speculative_unused && opt.protect_next_token &&
+        moe_next_token_group_protected_locked(ctx, g);
+    r.predicted_soon = !opt.speculative_unused &&
+        moe_group_predicted_soon_for_evict(ctx, g, opt.layer_window, r.next_use_dist);
+    r.cct_conf = moe_cct_predict_conf_locked(ctx, layer, expert);
+    g.cct_conf = r.cct_conf;
+    r.cct_protected = !opt.speculative_unused && opt.protect_cct &&
+        moe_cct_evict_enabled() && moe_cct_lowmem_active(ctx) &&
+        (int) r.cct_conf >= moe_env_i32("LLAMA_LAZY_MOE_CCT_PROTECT_CONF", 3) &&
+        r.layer_dist <= std::max(0, moe_env_i32("LLAMA_LAZY_MOE_CCT_PROTECT_DISTANCE", 1));
+    r.reuse_protected = !opt.speculative_unused && opt.protect_reuse &&
+        moe_reuse_evict_enabled() &&
+        r.reuse_keep >= moe_env_f64("LLAMA_LAZY_MOE_REUSE_PROTECT_SCORE", 260.0) &&
+        moe_group_used_within_tokens(ctx, g, moe_env_i32("LLAMA_LAZY_MOE_REUSE_PROTECT_TOKENS", 4));
+
+    if (g.pinned) {
+        r.reason = moe_evict_protect_reason::PINNED;
+    } else if (moe_group_is_active(ctx, g)) {
+        r.reason = moe_evict_protect_reason::ACTIVE;
+    } else if (opt.current_layer) {
+        r.reason = moe_evict_protect_reason::CURRENT_LAYER;
+    } else if (g.demand_async_pending || g.demand_admission_bypass) {
+        r.reason = moe_evict_protect_reason::DEMAND;
+    } else if (moe_group_has_inflight_or_queued(ctx, layer, expert)) {
+        r.reason = moe_evict_protect_reason::INFLIGHT;
+    } else if (opt.protect_layer_window && opt.layer_window) {
+        r.reason = moe_evict_protect_reason::LAYER_WINDOW;
+    } else if (!opt.speculative_unused && opt.protect_recent && r.recent &&
+            (!opt.protect_high_recent || cache_score >= opt.recent_score)) {
+        r.reason = moe_evict_protect_reason::RECENT;
+    } else if (r.bad_reload_protected) {
+        r.reason = moe_evict_protect_reason::BAD_RELOAD;
+    } else if (r.next_token_protected) {
+        r.reason = moe_evict_protect_reason::NEXT_TOKEN;
+    } else if (r.cct_protected) {
+        r.reason = moe_evict_protect_reason::CCT;
+    } else if (opt.protect_predicted_soon && r.predicted_soon) {
+        r.reason = moe_evict_protect_reason::PREDICTED_SOON;
+    } else if (r.reuse_protected) {
+        r.reason = moe_evict_protect_reason::REUSE;
+    }
+
+    switch (r.reason) {
+        case moe_evict_protect_reason::PINNED:
+        case moe_evict_protect_reason::ACTIVE:
+        case moe_evict_protect_reason::CURRENT_LAYER:
+        case moe_evict_protect_reason::DEMAND:
+        case moe_evict_protect_reason::INFLIGHT:
+            r.protect_class = moe_evict_protect_class::ABSOLUTE;
+            break;
+        case moe_evict_protect_reason::NONE:
+            break;
+        default:
+            r.protect_class = moe_evict_protect_class::TEMPORARY;
+            break;
+    }
+
+    if (r.protect_class == moe_evict_protect_class::TEMPORARY) {
+        const double recent_strength =
+            r.recent_age == UINT64_MAX || opt.recent_tokens <= 0 ? 0.0 :
+            (double) std::max<int64_t>(0,
+                    (int64_t) opt.recent_tokens + 1 - (int64_t) r.recent_age);
+        const int exec_guard = std::max(2, ctx.params.active_window);
+        const double recent_exec_strength =
+            r.recent_exec_age == UINT64_MAX ? 0.0 :
+            (double) std::max<int64_t>(0,
+                    (int64_t) exec_guard + 1 - (int64_t) r.recent_exec_age);
+        const double next_use_strength = r.next_use_dist == UINT64_MAX ? 0.0 :
+            1.0 / (1.0 + (double) r.next_use_dist);
+        const double layer_distance_strength =
+            r.layer_dist < 0 || r.layer_dist >= INT_MAX / 2 ? 0.0 :
+            1.0 / (1.0 + (double) r.layer_dist);
+        const double next_use_weight =
+            moe_env_f64("LLAMA_LAZY_MOE_RELAXED_NEXT_USE_WEIGHT", 0.0);
+        r.future_ranked = r.next_use_dist != UINT64_MAX && next_use_weight > 0.0;
+        r.temporary_keep_score =
+            recent_strength * 1.0e9 +
+            recent_exec_strength * 1.0e7 +
+            next_use_strength * next_use_weight +
+            layer_distance_strength *
+                moe_env_f64("LLAMA_LAZY_MOE_RELAXED_LAYER_DISTANCE_WEIGHT", 2.5e8) +
+            (r.next_token_protected ? (double) (1 + g.next_token_conf) * 1.0e9 : 0.0) +
+            (r.cct_protected ? (double) (1 + r.cct_conf) * 5.0e8 : 0.0) +
+            (opt.protect_predicted_soon && r.predicted_soon ? (1.0 + next_use_strength) * 5.0e8 : 0.0) +
+            (opt.protect_layer_window && opt.layer_window ? 2.5e8 : 0.0) +
+            r.bad_reload_effective * 1.0e8 +
+            r.reuse_keep * 1.0e5 +
+            r.ghost_keep +
+            std::max(0.0, cache_score) * 1.0e3;
+        if (r.ghost_keep > 0.0) {
+            ctx.ghost_score_candidates++;
+        }
+    }
+    return r;
+}
+
 static bool moe_group_speculative_unused_evictable(
         const llama_moe_buffer_context & ctx,
         const moe_group_state &          g,
@@ -3115,7 +4489,9 @@ static bool moe_eam_can_reclaim_without_protected_locked(
             moe_group_is_recently_used(ctx, g) &&
             moe_group_cache_score(ctx, g) >= recent_score_threshold;
         if (g.pinned || moe_group_is_active(ctx, g) || recent_high ||
-                moe_group_in_cooldown(ctx, g) || moe_group_has_inflight_or_queued(ctx, m->layer, e)) {
+                moe_group_in_cooldown(ctx, g) ||
+                moe_next_token_group_protected_locked(ctx, g) ||
+                moe_group_has_inflight_or_queued(ctx, m->layer, e)) {
             continue;
         }
         reclaimable += moe_group_resident_bytes(ctx, m->layer, e);
@@ -3162,6 +4538,232 @@ static double moe_eam_prefetch_score_locked(
            hist * moe_eamc_prior(ctx, target_layer, g.expert);
 }
 
+struct moe_prefetch_admission_compare {
+    double candidate_value = 0.0;
+    double victim_value = 0.0;
+    int victim_layer = -1;
+    int victim_expert = -1;
+    bool pressure = false;
+    bool has_victim = false;
+};
+
+static double moe_prefetch_candidate_value_locked(
+        const llama_moe_buffer_context & ctx,
+        const moe_group_state &          g,
+        double                           prefetch_score,
+        size_t                           target_bytes) {
+    uint64_t bad_age = UINT64_MAX;
+    const double bad = moe_group_bad_reload_effective_locked(ctx, g, &bad_age);
+    const double miss_rate = g.seq_access > 0 ?
+        (double) (g.seq_cache_misses + g.seq_prefetch_late) / (double) g.seq_access : 0.15;
+    const double unused_rate = g.seq_prefetch_queued > 0 ?
+        (double) g.seq_prefetch_unused / (double) g.seq_prefetch_queued : 0.0;
+    const double hit_rate = g.seq_prefetch_queued > 0 ?
+        (double) g.seq_prefetch_hits / (double) g.seq_prefetch_queued : 0.0;
+    const double size_mib = (double) target_bytes / 1048576.0;
+    return prefetch_score +
+           bad * moe_env_f64("LLAMA_LAZY_MOE_ADMIT_CAND_BAD_RELOAD_W", 60.0) +
+           miss_rate * moe_env_f64("LLAMA_LAZY_MOE_ADMIT_CAND_MISS_W", 60.0) +
+           hit_rate * moe_env_f64("LLAMA_LAZY_MOE_ADMIT_CAND_HIT_W", 35.0) -
+           unused_rate * moe_env_f64("LLAMA_LAZY_MOE_ADMIT_CAND_UNUSED_W", 80.0) -
+           size_mib * moe_env_f64("LLAMA_LAZY_MOE_ADMIT_CAND_SIZE_W", 1.5);
+}
+
+static double moe_prefetch_victim_value_locked(
+        const llama_moe_buffer_context & ctx,
+        const moe_group_state &          g,
+        size_t                           resident_bytes,
+        double                           cache_score) {
+    uint64_t bad_age = UINT64_MAX;
+    const double bad = moe_group_bad_reload_effective_locked(ctx, g, &bad_age);
+    const bool recent = moe_group_used_within_tokens(ctx, g,
+            moe_env_i32("LLAMA_LAZY_MOE_ADMIT_RECENT_TOKENS", 4)) ||
+        moe_group_is_recently_used(ctx, g) || moe_group_in_cooldown(ctx, g);
+    const bool high_sequence = moe_group_is_high_sequence(ctx, g, cache_score);
+    const bool early_high = moe_group_is_early_high_reuse(g, cache_score);
+    uint64_t next_use_dist = UINT64_MAX;
+    if (g.next_use_epoch != UINT64_MAX && g.next_use_epoch > ctx.exec_epoch) {
+        next_use_dist = g.next_use_epoch - ctx.exec_epoch;
+    }
+    const double next_use = next_use_dist == UINT64_MAX ? 0.0 :
+        1.0 / (1.0 + (double) next_use_dist);
+    const double size_mib = (double) resident_bytes / 1048576.0;
+    return bad * moe_env_f64("LLAMA_LAZY_MOE_ADMIT_VICTIM_BAD_RELOAD_W", 120.0) +
+           (recent ? moe_env_f64("LLAMA_LAZY_MOE_ADMIT_VICTIM_RECENT_W", 180.0) : 0.0) +
+           (high_sequence ? moe_env_f64("LLAMA_LAZY_MOE_ADMIT_VICTIM_HIGH_W", 120.0) : 0.0) +
+           (early_high ? moe_env_f64("LLAMA_LAZY_MOE_ADMIT_VICTIM_EARLY_W", 80.0) : 0.0) +
+           next_use * moe_env_f64("LLAMA_LAZY_MOE_ADMIT_VICTIM_NEXT_USE_W", 200.0) +
+           cache_score * moe_env_f64("LLAMA_LAZY_MOE_ADMIT_VICTIM_CACHE_W", 1.0) -
+           size_mib * moe_env_f64("LLAMA_LAZY_MOE_ADMIT_VICTIM_SIZE_W", 1.0);
+}
+
+static void moe_admission_floor_refresh_locked(llama_moe_buffer_context & ctx) {
+    ctx.admission_floor_valid = false;
+    ctx.admission_floor_value = 0.0;
+    ctx.admission_floor_layer = -1;
+    ctx.admission_floor_expert = -1;
+    ctx.admission_floor_token = ctx.profile_token_epoch;
+    ctx.admission_floor_epoch = ctx.exec_epoch;
+
+    double best_value = 1.0e300;
+    for (auto it = ctx.lru.rbegin(); it != ctx.lru.rend(); ++it) {
+        moe_managed * m = it->first;
+        const int e = it->second;
+        if (m == nullptr || e < 0 || e >= m->n_expert || m->layer < 0) {
+            continue;
+        }
+        moe_group_state & g = moe_group_get(ctx, m->layer, e);
+        if (g.pinned || moe_group_is_active(ctx, g) ||
+                moe_next_token_group_protected_locked(ctx, g) ||
+                moe_group_has_inflight_or_queued(ctx, m->layer, e)) {
+            continue;
+        }
+        const size_t resident = moe_group_resident_bytes(ctx, m->layer, e);
+        if (resident == 0) {
+            continue;
+        }
+        const double cache_score = moe_group_cache_score(ctx, g, resident);
+        const double value = moe_prefetch_victim_value_locked(ctx, g, resident, cache_score);
+        if (value < best_value) {
+            best_value = value;
+            ctx.admission_floor_value = value;
+            ctx.admission_floor_layer = m->layer;
+            ctx.admission_floor_expert = e;
+            ctx.admission_floor_valid = true;
+        }
+    }
+    ctx.admission_floor_refresh.fetch_add(1, std::memory_order_relaxed);
+}
+
+static bool moe_admission_floor_stale_locked(const llama_moe_buffer_context & ctx) {
+    if (!ctx.admission_floor_valid) {
+        return true;
+    }
+    const int refresh_tokens = std::max(1, moe_env_i32("LLAMA_LAZY_MOE_ADMISSION_REFRESH_TOKENS", 1));
+    if (ctx.profile_token_epoch >= ctx.admission_floor_token + (uint64_t) refresh_tokens) {
+        return true;
+    }
+    if (ctx.admission_floor_layer < 0 || ctx.admission_floor_expert < 0 ||
+            moe_group_resident_bytes(ctx, ctx.admission_floor_layer, ctx.admission_floor_expert) == 0) {
+        return true;
+    }
+    return false;
+}
+
+static moe_prefetch_admission_compare moe_prefetch_compare_locked(
+        llama_moe_buffer_context & ctx,
+        const moe_managed &        cand_m,
+        int                        cand_expert,
+        double                     prefetch_score,
+        size_t                     target_bytes,
+        size_t                     speculative_bytes) {
+    moe_prefetch_admission_compare cmp;
+    if (ctx.params.budget_bytes == 0 || !moe_env_flag("LLAMA_LAZY_MOE_ADMISSION_COMPARE", 1)) {
+        return cmp;
+    }
+    const int low_budget_mb = moe_env_i32("LLAMA_LAZY_MOE_ADMISSION_LOW_BUDGET_MB", 768);
+    if (ctx.params.budget_bytes > (size_t) std::max(0, low_budget_mb) * 1048576ull) {
+        return cmp;
+    }
+    const double pressure_threshold = moe_env_f64("LLAMA_LAZY_MOE_ADMISSION_PRESSURE", 0.88);
+    const size_t projected = ctx.resident_bytes + speculative_bytes + target_bytes;
+    cmp.pressure = (double) projected > (double) ctx.params.budget_bytes * pressure_threshold;
+    if (!cmp.pressure) {
+        return cmp;
+    }
+
+    const moe_group_state & cand_g = moe_group_get(ctx, cand_m.layer, cand_expert);
+    cmp.candidate_value = moe_prefetch_candidate_value_locked(ctx, cand_g, prefetch_score, target_bytes);
+
+    if (moe_admission_floor_stale_locked(ctx)) {
+        ctx.admission_floor_stale.fetch_add(1, std::memory_order_relaxed);
+        moe_admission_floor_refresh_locked(ctx);
+    }
+    if (ctx.admission_floor_valid &&
+            !(ctx.admission_floor_layer == cand_m.layer && ctx.admission_floor_expert == cand_expert)) {
+        cmp.victim_layer = ctx.admission_floor_layer;
+        cmp.victim_expert = ctx.admission_floor_expert;
+        cmp.victim_value = ctx.admission_floor_value;
+        cmp.has_victim = true;
+    }
+    return cmp;
+}
+
+static bool moe_demand_admission_enabled() {
+    static const bool enabled = moe_env_flag("LLAMA_LAZY_MOE_DEMAND_ADMISSION", 0);
+    return enabled;
+}
+
+struct moe_demand_admission_request {
+    int layer = -1;
+    int expert = -1;
+    size_t target_bytes = 0;
+    double incoming_value = 0.0;
+    double margin = 0.0;
+};
+
+struct moe_demand_admission_result {
+    bool evaluated = false;
+    bool bypass = false;
+    bool has_victim = false;
+    int victim_layer = -1;
+    int victim_expert = -1;
+    int victim_groups = 0;
+    size_t victim_bytes = 0;
+    double victim_value = 0.0;
+    std::vector<uint64_t> victim_keys;
+};
+
+static void moe_admission_outcome_begin_locked(
+        llama_moe_buffer_context &             ctx,
+        moe_group_state &                      g,
+        bool                                   bypass,
+        double                                 candidate_value,
+        const moe_demand_admission_result &    result) {
+    ++g.admission_outcome_generation;
+    g.admission_outcome_token = ctx.profile_token_epoch;
+    const uint64_t horizon = (uint64_t) std::max(1,
+            moe_env_i32("LLAMA_LAZY_MOE_ADMISSION_OUTCOME_TOKENS", 16));
+    g.admission_outcome_deadline =
+        ctx.profile_token_epoch > UINT64_MAX - horizon ?
+        UINT64_MAX : ctx.profile_token_epoch + horizon;
+    g.admission_outcome_action = bypass ? 2 : 1;
+    g.admission_outcome_pending = true;
+    g.admission_outcome_candidate = candidate_value;
+    g.admission_outcome_victim = result.victim_value;
+    g.admission_outcome_victim_layer = result.victim_layer;
+    g.admission_outcome_victim_expert = result.victim_expert;
+    g.admission_outcome_victim_groups = result.victim_groups;
+    g.admission_outcome_victim_bytes = result.victim_bytes;
+    moe_admission_outcome_trace_write_locked(
+            ctx, "decision", g, 0, result.has_victim ? "real_victim" : "no_victim");
+    moe_admission_regret_begin_locked(ctx, g, bypass, result.victim_keys);
+}
+
+static size_t moe_demand_group_missing_bytes_locked(
+        const llama_moe_buffer_context & ctx,
+        int                              layer,
+        int                              expert,
+        int                              rank) {
+    auto it = ctx.by_layer.find(layer);
+    if (it == ctx.by_layer.end()) {
+        return 0;
+    }
+    size_t bytes = 0;
+    for (const moe_managed * m : it->second) {
+        if (m == nullptr || expert < 0 || expert >= m->n_expert) {
+            continue;
+        }
+        const int bits = moe_target_bits_for_rank(ctx, *m, expert, rank);
+        if (moe_mwq_resolve_loaded_bits(*m, expert, bits) > 0 ||
+                moe_native_resident_compatible(ctx, *m, expert, bits)) {
+            continue;
+        }
+        bytes += moe_effective_stream_bytes_for_target(ctx, *m, expert, bits);
+    }
+    return bytes;
+}
+
 enum class moe_prefetch_admit_result : uint8_t {
     ADMIT = 0,
     BUDGET,
@@ -3170,6 +4772,8 @@ enum class moe_prefetch_admit_result : uint8_t {
     ACTIVE,
     PINNED,
     RECENT,
+    CCT,
+    ADMISSION,
 };
 
 static const char * moe_prefetch_admit_label(moe_prefetch_admit_result r) {
@@ -3181,6 +4785,8 @@ static const char * moe_prefetch_admit_label(moe_prefetch_admit_result r) {
         case moe_prefetch_admit_result::ACTIVE: return "drop_active";
         case moe_prefetch_admit_result::PINNED: return "drop_pinned";
         case moe_prefetch_admit_result::RECENT: return "drop_recent";
+        case moe_prefetch_admit_result::CCT: return "drop_cct";
+        case moe_prefetch_admit_result::ADMISSION: return "drop_admission_value";
     }
     return "drop_unknown";
 }
@@ -3218,6 +4824,12 @@ static void moe_eam_note_prefetch_admission(
         case moe_prefetch_admit_result::RECENT:
             ctx.eam_prefetch_drop_recent.fetch_add(1, std::memory_order_relaxed);
             break;
+        case moe_prefetch_admit_result::CCT:
+            ctx.cct_prefetch_drop.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case moe_prefetch_admit_result::ADMISSION:
+            ctx.admission_compare_drop.fetch_add(1, std::memory_order_relaxed);
+            break;
         case moe_prefetch_admit_result::ADMIT:
             break;
     }
@@ -3254,8 +4866,14 @@ static moe_prefetch_admit_result moe_eam_prefetch_admit_locked(
         int                        rank,
         float                      clg_score,
         int                        target_bits,
+        bool                       force_next_layer,
         double *                   out_score,
-        size_t *                   out_speculative_bytes) {
+        size_t *                   out_speculative_bytes,
+        bool *                     out_forced,
+        double *                   out_candidate_value = nullptr,
+        double *                   out_victim_value = nullptr,
+        int *                      out_victim_layer = nullptr,
+        int *                      out_victim_expert = nullptr) {
     const size_t speculative_bytes = moe_speculative_bytes_locked(ctx);
     const size_t target_bytes = moe_effective_stream_bytes_for_target(ctx, m, e, target_bits);
     const size_t budget = moe_eam_prefetch_budget_bytes(ctx);
@@ -3267,19 +4885,96 @@ static moe_prefetch_admit_result moe_eam_prefetch_admit_locked(
     if (out_speculative_bytes != nullptr) {
         *out_speculative_bytes = speculative_bytes + target_bytes;
     }
+    if (out_forced != nullptr) {
+        *out_forced = false;
+    }
+    auto set_compare_out = [&](const moe_prefetch_admission_compare & cmp) {
+        if (out_candidate_value != nullptr) {
+            *out_candidate_value = cmp.candidate_value;
+        }
+        if (out_victim_value != nullptr) {
+            *out_victim_value = cmp.victim_value;
+        }
+        if (out_victim_layer != nullptr) {
+            *out_victim_layer = cmp.victim_layer;
+        }
+        if (out_victim_expert != nullptr) {
+            *out_victim_expert = cmp.victim_expert;
+        }
+    };
 
     const int dist = moe_forward_layer_distance(ctx, m.layer);
     if (dist > moe_eam_prefetch_max_distance(ctx)) {
         return moe_prefetch_admit_result::DISTANCE;
     }
+    const bool force_candidate = force_next_layer && moe_force_next_layer_prefetch_enabled() && dist == 1;
+    if (budget == 0 && !force_candidate) {
+        return moe_prefetch_admit_result::BUDGET;
+    }
+    if (force_candidate) {
+        const size_t force_budget = (size_t) std::max(0,
+                moe_env_i32("LLAMA_LAZY_MOE_FORCE_NEXT_LAYER_MAX_MB", 16)) * 1048576ull;
+        const size_t max_groups = (size_t) std::max(0,
+                moe_env_i32("LLAMA_LAZY_MOE_FORCE_NEXT_LAYER_MAX_GROUPS", 4));
+        size_t layer_pending_groups = 0;
+        size_t layer_pending_bytes = 0;
+        bool candidate_pending = false;
+        moe_layer_speculative_pending_locked(ctx, m.layer, e,
+                &layer_pending_groups, &layer_pending_bytes, &candidate_pending);
+        if (force_budget == 0 || layer_pending_bytes + target_bytes > force_budget) {
+            return moe_prefetch_admit_result::BUDGET;
+        }
+        if (!candidate_pending && max_groups > 0 && layer_pending_groups >= max_groups) {
+            return moe_prefetch_admit_result::BUDGET;
+        }
+        const double recent_score_threshold = moe_env_f64("LLAMA_LAZY_MOE_EAM_RECENT_SCORE", 80.0);
+        if (!moe_eam_can_reclaim_without_protected_locked(ctx, target_bytes, recent_score_threshold)) {
+            return moe_eam_prefetch_blocked_reason_locked(ctx, recent_score_threshold);
+        }
+        if (out_forced != nullptr) {
+            *out_forced = true;
+        }
+        return moe_prefetch_admit_result::ADMIT;
+    }
+    if (moe_cct_prefetch_enabled() && moe_cct_lowmem_active(ctx)) {
+        const uint8_t cct_conf = moe_cct_predict_conf_locked(ctx, m.layer, e);
+        const int min_conf = moe_env_i32("LLAMA_LAZY_MOE_CCT_PREFETCH_MIN_CONF", 3);
+        if ((int) cct_conf < min_conf) {
+            moe_cct_trace_write_locked(ctx, "prefetch_drop", ctx.eam_last_actual_layer, -1,
+                    m.layer, e, cct_conf, cct_conf, "low_conf");
+            return moe_prefetch_admit_result::CCT;
+        }
+        ctx.cct_prefetch_admit.fetch_add(1, std::memory_order_relaxed);
+        moe_cct_trace_write_locked(ctx, "prefetch_admit", ctx.eam_last_actual_layer, -1,
+                m.layer, e, cct_conf, cct_conf, "high_conf");
+    }
     if (budget > 0 && speculative_bytes + target_bytes > budget) {
         return moe_prefetch_admit_result::BUDGET;
+    }
+    moe_prefetch_admission_compare cmp =
+        moe_prefetch_compare_locked(ctx, m, e, score, target_bytes, speculative_bytes);
+    set_compare_out(cmp);
+    if (cmp.pressure) {
+        ctx.admission_compare_runs.fetch_add(1, std::memory_order_relaxed);
+        ctx.admission_candidate_value_x1000.fetch_add(
+                (uint64_t) std::max(0.0, cmp.candidate_value * 1000.0), std::memory_order_relaxed);
+        ctx.admission_victim_value_x1000.fetch_add(
+                (uint64_t) std::max(0.0, cmp.victim_value * 1000.0), std::memory_order_relaxed);
+        const double margin = moe_env_f64("LLAMA_LAZY_MOE_ADMISSION_MARGIN", 25.0);
+        if (!cmp.has_victim) {
+            ctx.admission_compare_no_victim.fetch_add(1, std::memory_order_relaxed);
+            return moe_prefetch_admit_result::ADMISSION;
+        }
+        if (cmp.candidate_value <= cmp.victim_value + margin) {
+            return moe_prefetch_admit_result::ADMISSION;
+        }
+        ctx.admission_compare_admit.fetch_add(1, std::memory_order_relaxed);
     }
     const double recent_score_threshold = moe_env_f64("LLAMA_LAZY_MOE_EAM_RECENT_SCORE", 80.0);
     if (!moe_eam_can_reclaim_without_protected_locked(ctx, target_bytes, recent_score_threshold)) {
         return moe_eam_prefetch_blocked_reason_locked(ctx, recent_score_threshold);
     }
-    const double min_score = moe_env_f64("LLAMA_LAZY_MOE_EAM_PREFETCH_MIN_SCORE", 1.0);
+    const double min_score = moe_env_f64("LLAMA_LAZY_MOE_EAM_PREFETCH_MIN_SCORE", 30.0);
     if (score < min_score) {
         return moe_prefetch_admit_result::SCORE;
     }
@@ -3304,6 +4999,8 @@ static void moe_group_touch_locked(llama_moe_buffer_context & ctx, moe_managed &
         return;
     }
     moe_group_state & g = moe_group_get(ctx, m.layer, e);
+    moe_admission_regret_note_touch_locked(ctx, moe_group_key(m.layer, e));
+    moe_admission_outcome_note_reuse_locked(ctx, g);
     g.access += count;
     moe_group_update_reuse_on_touch_locked(ctx, g);
     moe_eam_note_token_locked(ctx, g, count, rank);
@@ -3464,9 +5161,19 @@ static void moe_refresh_pins_locked(llama_moe_buffer_context & ctx) {
     ctx.pinned_resident_bytes.store(used, std::memory_order_relaxed);
 }
 
-static void moe_release_slice_locked(llama_moe_buffer_context & ctx, moe_managed & m, int e, bool erase_lru) {
+static void moe_release_slice_locked(
+        llama_moe_buffer_context & ctx,
+        moe_managed &              m,
+        int                        e,
+        bool                       erase_lru,
+        bool                       keep_mwq_transient = false,
+        bool                       count_eviction = true) {
     if (e < 0 || e >= m.n_expert || m.resident[e] != ST_RESIDENT) {
         return;
+    }
+    const bool keep_loaded = keep_mwq_transient && m.resident_mwq[e];
+    if (keep_loaded) {
+        moe_mark_mwq_transient(ctx, m, e, m.resident_bits[e]);
     }
     if (erase_lru) {
         ctx.lru.erase(m.lru_pos[e]);
@@ -3476,7 +5183,7 @@ static void moe_release_slice_locked(llama_moe_buffer_context & ctx, moe_managed
         auto mit = m.mwq.find(m.resident_bits[e]);
         if (mit != m.mwq.end() && mit->second.buf != nullptr) {
             resident_ptr = mit->second.buf + (size_t) e * mit->second.stride;
-            if (e < (int) mit->second.loaded.size()) {
+            if (!keep_loaded && e < (int) mit->second.loaded.size()) {
                 mit->second.loaded[e] = false;
             }
         }
@@ -3491,7 +5198,7 @@ static void moe_release_slice_locked(llama_moe_buffer_context & ctx, moe_managed
             ctx.prof_prefetch_unused.fetch_add(1, std::memory_order_relaxed);
         }
     }
-    if (ctx.profile) {
+    if (ctx.profile && count_eviction) {
         if (e < (int) m.last_evicted_token.size()) {
             m.last_evicted_token[e] = ctx.profile_token_epoch;
         }
@@ -3501,7 +5208,7 @@ static void moe_release_slice_locked(llama_moe_buffer_context & ctx, moe_managed
     const uintptr_t pb   = (base + g_page - 1) & ~(uintptr_t) (g_page - 1);
     const uintptr_t pe   = (base + resident_size) & ~(uintptr_t) (g_page - 1);
 #if defined(MADV_DONTNEED)
-    if (resident_ptr != nullptr && pe > pb) {
+    if (!keep_loaded && resident_ptr != nullptr && pe > pb) {
         madvise((void *) pb, pe - pb, MADV_DONTNEED);
     }
 #endif
@@ -3516,8 +5223,50 @@ static void moe_release_slice_locked(llama_moe_buffer_context & ctx, moe_managed
         m.prefetched[e] = false;
     }
     ctx.resident_bytes -= std::min(ctx.resident_bytes, resident_size);
-    ctx.evictions.fetch_add(1, std::memory_order_relaxed);
-    ctx.group_evicted_slices.fetch_add(1, std::memory_order_relaxed);
+    if (count_eviction) {
+        ctx.evictions.fetch_add(1, std::memory_order_relaxed);
+        ctx.group_evicted_slices.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+static void moe_release_demand_bypass_layer_locked(
+        llama_moe_buffer_context & ctx,
+        int                        layer) {
+    if (!moe_demand_admission_enabled() || layer < 0) {
+        return;
+    }
+    auto it = ctx.by_layer.find(layer);
+    if (it == ctx.by_layer.end() || it->second.empty() || it->second.front() == nullptr) {
+        return;
+    }
+    const int n_expert = it->second.front()->n_expert;
+    for (int expert = 0; expert < n_expert; ++expert) {
+        moe_group_state & g = moe_group_get(ctx, layer, expert);
+        if (!g.demand_admission_bypass) {
+            continue;
+        }
+        size_t released = 0;
+        uint64_t slices = 0;
+        for (moe_managed * m : it->second) {
+            if (m == nullptr || expert >= m->n_expert ||
+                    m->resident[expert] != ST_RESIDENT) {
+                continue;
+            }
+            released += m->resident_size[expert];
+            ++slices;
+            moe_release_slice_locked(ctx, *m, expert, true, true, false);
+        }
+        g.demand_admission_bypass = false;
+        g.demand_admission_decided = false;
+        if (released == 0) {
+            continue;
+        }
+        ctx.demand_admission_staging_bytes -= std::min(
+                ctx.demand_admission_staging_bytes, released);
+        ctx.demand_admission_release_groups.fetch_add(1, std::memory_order_relaxed);
+        ctx.demand_admission_release_slices.fetch_add(slices, std::memory_order_relaxed);
+        ctx.demand_admission_release_bytes.fetch_add(released, std::memory_order_relaxed);
+    }
 }
 
 static size_t moe_release_group_locked(llama_moe_buffer_context & ctx, int layer, int expert) {
@@ -3536,11 +5285,142 @@ static size_t moe_release_group_locked(llama_moe_buffer_context & ctx, int layer
     if (released > 0) {
         if (layer >= 0 && expert >= 0) {
             moe_group_state & g = moe_group_get(ctx, layer, expert);
-            g.last_evicted_token_epoch = ctx.profile_token_epoch;
+            moe_group_note_evicted_locked(ctx, g);
         }
         ctx.group_evictions.fetch_add(1, std::memory_order_relaxed);
     }
     return released;
+}
+
+static size_t moe_drop_group_incompatible_locked(
+        llama_moe_buffer_context & ctx,
+        int                        layer,
+        int                        expert) {
+    auto it = ctx.by_layer.find(layer);
+    if (it == ctx.by_layer.end()) {
+        return 0;
+    }
+    size_t released = 0;
+    for (moe_managed * m : it->second) {
+        if (m == nullptr || expert < 0 || expert >= m->n_expert || m->resident[expert] != ST_RESIDENT) {
+            continue;
+        }
+        released += m->resident_size[expert];
+        moe_release_slice_locked(ctx, *m, expert, true, true);
+    }
+    if (released > 0 && layer >= 0 && expert >= 0) {
+        moe_group_state & g = moe_group_get(ctx, layer, expert);
+        moe_group_note_evicted_locked(ctx, g);
+        ctx.group_evictions.fetch_add(1, std::memory_order_relaxed);
+    }
+    return released;
+}
+
+static bool moe_layer_done_evict_enabled() {
+    return moe_env_flag("LLAMA_LAZY_MOE_EVICT_LAYER_DONE", 0);
+}
+
+static void moe_evict_layer_done_locked(llama_moe_buffer_context & ctx, int layer) {
+    if (!moe_layer_done_evict_enabled() || layer < 0) {
+        return;
+    }
+    auto it = ctx.by_layer.find(layer);
+    if (it == ctx.by_layer.end() || it->second.empty() || it->second[0] == nullptr) {
+        return;
+    }
+
+    const int n_expert = it->second[0]->n_expert;
+    const int recent_tokens = std::max(0, moe_env_i32("LLAMA_LAZY_MOE_EVICT_LAYER_DONE_RECENT_TOKENS", 1));
+    const double recent_score = moe_env_f64("LLAMA_LAZY_MOE_EVICT_LAYER_DONE_RECENT_SCORE", 80.0);
+    const uint64_t future_guard = (uint64_t) std::max(0,
+            moe_env_i32("LLAMA_LAZY_MOE_EVICT_LAYER_DONE_FUTURE_EPOCHS",
+                std::max(4, ctx.params.active_window)));
+    const uint64_t bad_guard = (uint64_t) std::max(0,
+            moe_env_i32("LLAMA_LAZY_MOE_EVICT_LAYER_DONE_BAD_RELOAD_TOKENS", 16));
+    const double bad_score = moe_env_f64("LLAMA_LAZY_MOE_EVICT_LAYER_DONE_BAD_RELOAD_SCORE", 6.0);
+    size_t released_total = 0;
+    const size_t max_release = moe_env_mib_bytes("LLAMA_LAZY_MOE_EVICT_LAYER_DONE_MAX_MB", 0);
+
+    for (int e = 0; e < n_expert; ++e) {
+        const size_t resident = moe_group_resident_bytes(ctx, layer, e);
+        if (resident == 0) {
+            continue;
+        }
+        moe_group_state & g = moe_group_get(ctx, layer, e);
+        g.hot_score = moe_group_cache_score(ctx, g, resident);
+
+        moe_evict_protect_options opt;
+        opt.protect_recent = true;
+        opt.protect_high_recent = true;
+        opt.protect_cct = false;
+        opt.protect_predicted_soon = false;
+        opt.recent_tokens = recent_tokens;
+        opt.recent_score = recent_score;
+        opt.bad_reload_guard_tokens = bad_guard;
+        opt.bad_reload_score = bad_score;
+        const moe_evict_protect_result protect =
+            moe_group_evict_protect_locked(ctx, g, layer, e, g.hot_score, opt);
+        if (protect.reason != moe_evict_protect_reason::NONE) {
+            switch (protect.reason) {
+                case moe_evict_protect_reason::PINNED:
+                    ctx.layer_done_protect_pinned.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                case moe_evict_protect_reason::ACTIVE:
+                case moe_evict_protect_reason::CURRENT_LAYER:
+                    ctx.layer_done_protect_active.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                case moe_evict_protect_reason::INFLIGHT:
+                    ctx.layer_done_protect_inflight.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                case moe_evict_protect_reason::RECENT:
+                    ctx.layer_done_protect_recent.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                case moe_evict_protect_reason::BAD_RELOAD:
+                    ctx.layer_done_protect_bad_reload.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                case moe_evict_protect_reason::NEXT_TOKEN:
+                    g.next_token_protect_hits++;
+                    ctx.next_token_layer_done_protect.fetch_add(1, std::memory_order_relaxed);
+                    ctx.layer_done_protect_next_token.fetch_add(1, std::memory_order_relaxed);
+                    moe_next_token_trace_write_locked(ctx, "layer_done_keep", layer, e,
+                            g.next_token_conf, g.next_token_conf, g.next_token_protect_until,
+                            "hard_protect");
+                    break;
+                case moe_evict_protect_reason::PREDICTED_SOON:
+                    if (future_guard > 0 && protect.next_use_dist != UINT64_MAX &&
+                            protect.next_use_dist <= future_guard) {
+                        ctx.layer_done_protect_future.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    break;
+                default:
+                    break;
+            }
+            continue;
+        }
+
+        if (future_guard > 0 && protect.next_use_dist != UINT64_MAX && protect.next_use_dist <= future_guard) {
+            ctx.layer_done_protect_future.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+
+        const size_t released = moe_release_group_locked(ctx, layer, e);
+        if (released == 0) {
+            continue;
+        }
+        released_total += released;
+        ctx.layer_done_evict_groups.fetch_add(1, std::memory_order_relaxed);
+        ctx.layer_done_evict_slices.fetch_add(3, std::memory_order_relaxed);
+        ctx.layer_done_evict_bytes.fetch_add((uint64_t) released, std::memory_order_relaxed);
+        moe_group_get(ctx, layer, e).last_evicted_reason = MOE_EVICT_REASON_UNKNOWN;
+        moe_evict_trace_write_locked(ctx, "evict", layer, e, "layer_done", 0, released, g.hot_score);
+
+        if (ctx.admission_floor_layer == layer && ctx.admission_floor_expert == e) {
+            ctx.admission_floor_valid = false;
+        }
+        if (max_release > 0 && released_total >= max_release) {
+            break;
+        }
+    }
 }
 
 static bool moe_enqueue_prefetch(
@@ -3548,7 +5428,8 @@ static bool moe_enqueue_prefetch(
         moe_managed &              m,
         int                        e,
         int                        rank,
-        float                      score) {
+        float                      score,
+        bool                       force_next_layer = false) {
     if (e < 0 || e >= m.n_expert) {
         return false;
     }
@@ -3605,18 +5486,28 @@ static bool moe_enqueue_prefetch(
 
     double prefetch_score = 0.0;
     size_t speculative_bytes = 0;
+    double candidate_value = 0.0;
+    double victim_value = 0.0;
+    int victim_layer = -1;
+    int victim_expert = -1;
+    bool forced = false;
     {
         std::lock_guard<std::mutex> lk(ctx.mtx);
         const moe_prefetch_admit_result admit = moe_eam_prefetch_admit_locked(
-                ctx, m, e, rank, score, target_bits, &prefetch_score, &speculative_bytes);
+                ctx, m, e, rank, score, target_bits, force_next_layer,
+                &prefetch_score, &speculative_bytes, &forced,
+                &candidate_value, &victim_value, &victim_layer, &victim_expert);
         moe_eam_note_prefetch_admission(ctx, admit, prefetch_score, speculative_bytes);
         if (admit != moe_prefetch_admit_result::ADMIT) {
             moe_prefetch_trace_write_locked(ctx, m, e, rank, target_bits, "drop",
-                    moe_prefetch_admit_label(admit), score, prefetch_score, speculative_bytes);
+                    moe_prefetch_admit_label(admit), score, prefetch_score, speculative_bytes,
+                    candidate_value, victim_value, victim_layer, victim_expert);
             return false;
         }
-        moe_prefetch_trace_write_locked(ctx, m, e, rank, target_bits, "admit", "admit",
-                score, prefetch_score, speculative_bytes);
+        moe_prefetch_trace_write_locked(ctx, m, e, rank, target_bits, "admit",
+                forced ? "force_next_layer" : "admit",
+                score, prefetch_score, speculative_bytes,
+                candidate_value, victim_value, victim_layer, victim_expert);
     }
 
     if (ctx.params.dynamic_bits && ctx.params.fixed_bits <= 0) {
@@ -3648,8 +5539,10 @@ static bool moe_enqueue_prefetch(
     {
         std::lock_guard<std::mutex> lk(ctx.mtx);
         moe_group_note_prefetch_queued_locked(ctx, m, e);
-        moe_prefetch_trace_write_locked(ctx, m, e, rank, target_bits, "enqueue", "queued",
-                score, prefetch_score, speculative_bytes);
+        moe_prefetch_trace_write_locked(ctx, m, e, rank, target_bits, "enqueue",
+                forced ? "force_next_layer" : "queued",
+                score, prefetch_score, speculative_bytes,
+                candidate_value, victim_value, victim_layer, victim_expert);
     }
     ctx.queue.push(task);
     ctx.enqueued.fetch_add(1, std::memory_order_relaxed);
@@ -3792,11 +5685,29 @@ static void moe_eam_update_transition_locked(
         return;
     }
     const int n_layer = std::max(1, moe_max_layer_index(ctx) + 1);
+    if (moe_cct_enabled() && (int) ctx.cct_recent_layer_experts.size() < n_layer) {
+        ctx.cct_recent_layer_experts.resize((size_t) n_layer);
+    }
     const bool adjacent =
         ctx.eam_last_actual_layer >= 0 &&
         ctx.eam_last_actual_layer != layer &&
         ((ctx.eam_last_actual_layer + 1) % n_layer) == layer;
     if (adjacent && !ctx.eam_last_layer_experts.empty()) {
+        std::vector<uint8_t> predicted_before((size_t) n_expert, 0);
+        if (moe_cct_enabled()) {
+            for (int expert : actual_experts) {
+                if (expert < 0 || expert >= n_expert) {
+                    continue;
+                }
+                for (int prev_expert : ctx.eam_last_layer_experts) {
+                    if (moe_cct_conf_from_source_locked(ctx, ctx.eam_last_actual_layer,
+                                prev_expert, expert) > 0) {
+                        predicted_before[(size_t) expert] = 1;
+                        break;
+                    }
+                }
+            }
+        }
         for (int prev_expert : ctx.eam_last_layer_experts) {
             if (prev_expert < 0) {
                 continue;
@@ -3806,16 +5717,64 @@ static void moe_eam_update_transition_locked(
             if ((int) row.size() < n_expert) {
                 row.resize((size_t) n_expert, 0);
             }
+            std::vector<moe_cct_entry> * cct_row = nullptr;
+            if (moe_cct_enabled()) {
+                cct_row = &ctx.cct_transition[moe_group_key(ctx.eam_last_actual_layer, prev_expert)];
+                if ((int) cct_row->size() < n_expert) {
+                    cct_row->resize((size_t) n_expert);
+                }
+            }
+            std::vector<uint8_t> actual_mask((size_t) n_expert, 0);
             for (int expert : actual_experts) {
                 if (expert >= 0 && expert < n_expert && row[(size_t) expert] != UINT32_MAX) {
                     row[(size_t) expert]++;
+                    actual_mask[(size_t) expert] = 1;
                 }
             }
+            if (cct_row != nullptr) {
+                for (int expert = 0; expert < n_expert; ++expert) {
+                    moe_cct_entry & ent = (*cct_row)[(size_t) expert];
+                    const uint8_t before = ent.conf;
+                    if (actual_mask[(size_t) expert]) {
+                        ent.conf = before == 0 ? 2 : (uint8_t) std::min<int>(3, before + 1);
+                        if (before == 0) {
+                            ent.replace++;
+                            ctx.cct_replaced.fetch_add(1, std::memory_order_relaxed);
+                        } else {
+                            ent.hit++;
+                            ctx.cct_hits.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        moe_cct_trace_write_locked(ctx, "update", ctx.eam_last_actual_layer,
+                                prev_expert, layer, expert, before, ent.conf,
+                                before == 0 ? "replace_actual" : "actual_hit");
+                    } else if (before > 0) {
+                        ent.conf = (uint8_t) (before - 1);
+                        ent.unused++;
+                        ctx.cct_unused.fetch_add(1, std::memory_order_relaxed);
+                        moe_cct_trace_write_locked(ctx, "update", ctx.eam_last_actual_layer,
+                                prev_expert, layer, expert, before, ent.conf, "not_used");
+                    }
+                    ent.last_update_token = ctx.profile_token_epoch;
+                }
+            }
+        }
+        if (moe_cct_enabled()) {
+            for (int expert : actual_experts) {
+                if (expert >= 0 && expert < n_expert && !predicted_before[(size_t) expert]) {
+                    ctx.cct_misses.fetch_add(1, std::memory_order_relaxed);
+                    moe_cct_trace_write_locked(ctx, "miss", ctx.eam_last_actual_layer,
+                            -1, layer, expert, 0, 2, "actual_not_predicted");
+                }
+            }
+            ctx.cct_updates.fetch_add(1, std::memory_order_relaxed);
         }
     }
     ctx.eam_last_actual_layer = layer;
     ctx.eam_last_actual_token_epoch = ctx.profile_token_epoch;
     ctx.eam_last_layer_experts = actual_experts;
+    if (moe_cct_enabled() && layer >= 0 && layer < (int) ctx.cct_recent_layer_experts.size()) {
+        ctx.cct_recent_layer_experts[(size_t) layer] = actual_experts;
+    }
 }
 
 static void moe_eam_predict_after_route(
@@ -3917,7 +5876,7 @@ static void moe_eam_predict_after_route(
                 if (!moe_prefetch_needed_unlocked(ctx, *m, c.expert, target_bits)) {
                     continue;
                 }
-                any = moe_enqueue_prefetch(ctx, *m, c.expert, c.rank, (float) c.score) || any;
+                any = moe_enqueue_prefetch(ctx, *m, c.expert, c.rank, (float) c.score, true) || any;
             }
             if (any) {
                 ++enqueued;
@@ -3945,18 +5904,29 @@ static void moe_eam_predict_after_route(
 // Evict one ExpertGroup. Caller must hold ctx.mtx. Victim selection is a
 // Belady-style approximation: skip pinned/currently protected groups, then
 // prefer groups with no near-future use, lower heat, and older LRU position.
-static bool moe_evict_lru(llama_moe_buffer_context & ctx) {
+static bool moe_evict_lru(
+        llama_moe_buffer_context &              ctx,
+        size_t                                  target_release_bytes = 0,
+        const moe_demand_admission_request *    admission_request = nullptr,
+        moe_demand_admission_result *           admission_result = nullptr,
+        const std::vector<moe_demand_admission_request> * admission_batch = nullptr,
+        std::vector<moe_demand_admission_result> * batch_results = nullptr,
+        size_t                                  batch_free_bytes = 0,
+        size_t                                  batch_staging_bytes = 0) {
     if (ctx.lru.empty()) {
         return false;
     }
     const uint64_t prof_t0 = ctx.profile ? moe_profile_now_ns() : 0;
 
+    moe_ghost_expire_locked(ctx);
     moe_refresh_pins_locked(ctx);
 
     struct victim_candidate {
         int layer = -1;
         int expert = -1;
         double score = -1.0e300;
+        double hot_score = 0.0;
+        uint64_t age = 0;
         bool belady = false;
         enum reason_t {
             SPEC_UNUSED,
@@ -3970,11 +5940,31 @@ static bool moe_evict_lru(llama_moe_buffer_context & ctx) {
     };
 
     victim_candidate best;
-    int lru_depth = 0;
-    const int recent_tokens = moe_env_i32("LLAMA_LAZY_MOE_EAM_EVICT_RECENT_TOKENS", 1);
+    victim_candidate temporary_best;
+    std::vector<victim_candidate> normal_candidates;
+    std::vector<victim_candidate> temporary_candidates;
+    if (target_release_bytes > 0) {
+        normal_candidates.reserve(ctx.groups.size());
+        temporary_candidates.reserve(ctx.groups.size());
+    }
+    double temporary_keep_score = 1.0e300;
+    const int recent_tokens = moe_env_i32("LLAMA_LAZY_MOE_EAM_EVICT_RECENT_TOKENS", 3);
     const bool eam_replace = moe_eam_replace_enabled();
-    const moe_eam_replace_stats eam_replace_stats = eam_replace ?
-        moe_eam_replace_build_stats_locked(ctx) : moe_eam_replace_stats{};
+    bool eam_replace_stats_ready = false;
+    moe_eam_replace_stats eam_replace_stats;
+    uint64_t scan_entries = 0;
+    uint64_t scan_unique = 0;
+    uint64_t scan_duplicates = 0;
+    uint64_t scan_absolute = 0;
+    uint64_t scan_temporary = 0;
+    uint64_t scan_normal = 0;
+    if (++ctx.evict_scan_generation == 0) {
+        for (auto & kv : ctx.groups) {
+            kv.second.evict_scan_generation = 0;
+        }
+        ctx.evict_scan_generation = 1;
+    }
+    const uint64_t scan_generation = ctx.evict_scan_generation;
     size_t target_window_bytes = 0;
     bool layer_reserve_needed = false;
     const bool layer_reload_protect_enabled = moe_env_flag("LLAMA_LAZY_MOE_LAYER_RELOAD_PROTECT", 0);
@@ -4000,7 +5990,8 @@ static bool moe_evict_lru(llama_moe_buffer_context & ctx) {
         }
         layer_reserve_needed = target_window_bytes < ctx.evict_layer_reserve_bytes;
     }
-    for (auto it = ctx.lru.rbegin(); it != ctx.lru.rend(); ++it, ++lru_depth) {
+    for (auto it = ctx.lru.rbegin(); it != ctx.lru.rend(); ++it) {
+        ++scan_entries;
         moe_managed * m = it->first;
         const int e = it->second;
         if (m == nullptr || e < 0 || e >= m->n_expert || m->layer < 0) {
@@ -4014,80 +6005,155 @@ static bool moe_evict_lru(llama_moe_buffer_context & ctx) {
             git = ctx.groups.find(key);
         }
         moe_group_state & g = git->second;
-        if (moe_group_has_inflight_or_queued(ctx, m->layer, e)) {
+        if (g.evict_scan_generation == scan_generation) {
+            ++scan_duplicates;
             continue;
         }
+        g.evict_scan_generation = scan_generation;
 
         const size_t bytes = moe_group_resident_bytes(ctx, m->layer, e);
         if (bytes == 0) {
             continue;
         }
+        ++scan_unique;
+        const uint64_t group_age =
+            g.last_used_epoch == 0 || ctx.exec_epoch < g.last_used_epoch ?
+            UINT64_MAX : ctx.exec_epoch - g.last_used_epoch;
 
         g.hot_score = moe_group_cache_score(ctx, g, bytes);
-        const bool active = moe_group_is_active(ctx, g);
         const bool current_layer = ctx.profile_last_layer >= 0 && m->layer == ctx.profile_last_layer;
         const bool layer_window = moe_layer_in_evict_window(ctx, m->layer);
         const bool speculative_unused = moe_group_has_speculative_unused(ctx, m->layer, e);
-        const bool recent = moe_group_used_within_tokens(ctx, g, recent_tokens) ||
-            moe_group_is_recently_used(ctx, g) || moe_group_in_cooldown(ctx, g);
-        const bool high_sequence = moe_group_is_high_sequence(ctx, g, g.hot_score);
-        const bool early_high = moe_group_is_early_high_reuse(g, g.hot_score);
-        const double reuse_keep = moe_group_short_reuse_keep_score_locked(ctx, g, ctx.evict_target_layer);
-
-        if (g.pinned) {
-            ctx.eam_evict_protect_pinned.fetch_add(1, std::memory_order_relaxed);
-            continue;
-        }
-        if (active || current_layer) {
-            ctx.eam_evict_protect_active.fetch_add(1, std::memory_order_relaxed);
-            continue;
-        }
-        if (!speculative_unused) {
-            if (recent) {
-                ctx.eam_evict_protect_recent.fetch_add(1, std::memory_order_relaxed);
-            }
-            if (high_sequence || moe_is_hot(ctx, *m, e)) {
-                ctx.eam_evict_protect_high.fetch_add(1, std::memory_order_relaxed);
-            }
-            if (early_high) {
-                ctx.eam_evict_protect_early.fetch_add(1, std::memory_order_relaxed);
-            }
-        }
         const bool layer_feedback_guard = !speculative_unused &&
             layer_feedback_protected(g, layer_window);
         if (layer_feedback_guard) {
             ctx.layer_reload_protect.fetch_add(1, std::memory_order_relaxed);
-            if (layer_reload_hard_protect) {
-                continue;
+        }
+
+        moe_evict_protect_options opt;
+        opt.speculative_unused = speculative_unused;
+        opt.current_layer = current_layer;
+        opt.layer_window = layer_window;
+        opt.protect_layer_window = layer_reserve_needed;
+        opt.protect_recent = true;
+        opt.recent_tokens = recent_tokens;
+        const uint64_t bad_reload_guard_tokens = (uint64_t) std::max(0,
+                moe_env_i32("LLAMA_LAZY_MOE_BAD_RELOAD_GUARD_TOKENS", 16));
+        opt.bad_reload_guard_tokens = bad_reload_guard_tokens;
+        opt.bad_reload_score = moe_env_f64("LLAMA_LAZY_MOE_BAD_RELOAD_PROTECT_SCORE", 6.0);
+        const moe_evict_protect_result protect =
+            moe_group_evict_protect_locked(ctx, g, m->layer, e, g.hot_score, opt);
+        if (!speculative_unused) {
+            if (protect.recent) {
+                ctx.eam_evict_protect_recent.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (protect.high_sequence || moe_group_is_hot(ctx, m->layer, e)) {
+                ctx.eam_evict_protect_high.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (protect.early_high) {
+                ctx.eam_evict_protect_early.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (protect.reason != moe_evict_protect_reason::NONE) {
+            switch (protect.reason) {
+                case moe_evict_protect_reason::PINNED:
+                    ctx.eam_evict_protect_pinned.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                case moe_evict_protect_reason::ACTIVE:
+                case moe_evict_protect_reason::CURRENT_LAYER:
+                    ctx.eam_evict_protect_active.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                case moe_evict_protect_reason::BAD_RELOAD:
+                    g.bad_reload_protect_hits++;
+                    ctx.bad_reload_protect.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                case moe_evict_protect_reason::NEXT_TOKEN:
+                    g.next_token_protect_hits++;
+                    ctx.next_token_evict_protect.fetch_add(1, std::memory_order_relaxed);
+                    moe_next_token_trace_write_locked(ctx, "evict_keep", m->layer, e,
+                            g.next_token_conf, g.next_token_conf, g.next_token_protect_until,
+                            "global_victim_protect");
+                    break;
+                case moe_evict_protect_reason::CCT:
+                    g.cct_protect_hits++;
+                    ctx.cct_evict_protect.fetch_add(1, std::memory_order_relaxed);
+                    moe_cct_trace_write_locked(ctx, "evict_protect", ctx.eam_last_actual_layer, -1,
+                            m->layer, e, protect.cct_conf, protect.cct_conf, "near_high_conf");
+                    break;
+                case moe_evict_protect_reason::PREDICTED_SOON:
+                    ctx.reuse_predict_protect.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                case moe_evict_protect_reason::REUSE:
+                    ctx.reuse_protect.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                default:
+                    break;
             }
         }
 
-        uint64_t dist = UINT64_MAX;
-        if (g.next_use_epoch != UINT64_MAX && g.next_use_epoch > ctx.exec_epoch) {
-            dist = g.next_use_epoch - ctx.exec_epoch;
-        }
-        const int layer_dist = moe_forward_layer_distance(ctx, m->layer);
-        const bool predicted_soon = !speculative_unused &&
-            moe_group_predicted_soon_for_evict(ctx, g, layer_window, dist);
+        const uint64_t dist = protect.next_use_dist;
+        const int layer_dist = protect.layer_dist;
+        const bool recent = protect.recent;
+        const bool high_sequence = protect.high_sequence;
+        const bool early_high = protect.early_high;
+        const double reuse_keep = protect.reuse_keep;
+        const double bad_reload_effective = protect.bad_reload_effective;
+        const uint8_t cct_conf = protect.cct_conf;
+        const bool cct_lowmem = moe_cct_evict_enabled() && moe_cct_lowmem_active(ctx);
         const uint64_t eam_replace_next_guard = (uint64_t) std::max(0,
                 moe_env_i32("LLAMA_LAZY_MOE_EAM_REPLACE_NEXT_USE_GUARD",
                     std::max(4, ctx.params.active_window)));
-        if (eam_replace && !speculative_unused && eam_replace_next_guard > 0 &&
-                dist != UINT64_MAX && dist <= eam_replace_next_guard) {
+        const bool eam_replace_next_protected =
+            eam_replace && !speculative_unused && eam_replace_next_guard > 0 &&
+            dist != UINT64_MAX && dist <= eam_replace_next_guard;
+        if (eam_replace_next_protected) {
             ctx.reuse_predict_protect.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (protect.protect_class == moe_evict_protect_class::ABSOLUTE) {
+            ++scan_absolute;
             continue;
         }
-        const bool reuse_protected = !speculative_unused &&
-            moe_reuse_evict_enabled() &&
-            reuse_keep >= moe_env_f64("LLAMA_LAZY_MOE_REUSE_PROTECT_SCORE", 260.0) &&
-            moe_group_used_within_tokens(ctx, g, moe_env_i32("LLAMA_LAZY_MOE_REUSE_PROTECT_TOKENS", 4));
-        if (predicted_soon) {
-            ctx.reuse_predict_protect.fetch_add(1, std::memory_order_relaxed);
+        const bool external_temporary =
+            (layer_feedback_guard && layer_reload_hard_protect) || eam_replace_next_protected;
+        if (protect.protect_class == moe_evict_protect_class::TEMPORARY || external_temporary) {
+            ++scan_temporary;
+            double keep_score = protect.temporary_keep_score;
+            if (layer_feedback_guard && layer_reload_hard_protect) {
+                keep_score += moe_env_f64("LLAMA_LAZY_MOE_LAYER_RELOAD_PROTECT_PENALTY", 4.0e8) *
+                    (double) std::min<uint64_t>(4, g.layer_window_bad_reload);
+            }
+            if (eam_replace_next_protected) {
+                keep_score += (double) (eam_replace_next_guard + 1 - dist) * 1.0e8;
+            }
+            victim_candidate candidate;
+            candidate.layer = m->layer;
+            candidate.expert = e;
+            candidate.score = -keep_score;
+            candidate.hot_score = g.hot_score;
+            candidate.age = group_age;
+            candidate.belady = protect.future_ranked;
+            candidate.reason = victim_candidate::RELAXED;
+            if (target_release_bytes > 0) {
+                temporary_candidates.push_back(candidate);
+            }
+            const bool better_temporary =
+                keep_score < temporary_keep_score ||
+                (keep_score == temporary_keep_score &&
+                    (group_age > temporary_best.age ||
+                        (group_age == temporary_best.age &&
+                            (g.hot_score < temporary_best.hot_score ||
+                                (g.hot_score == temporary_best.hot_score &&
+                                    (m->layer < temporary_best.layer ||
+                                        (m->layer == temporary_best.layer && e < temporary_best.expert)))))));
+            if (better_temporary) {
+                temporary_keep_score = keep_score;
+                temporary_best = candidate;
+            }
             continue;
         }
-        if (reuse_protected) {
-            ctx.reuse_protect.fetch_add(1, std::memory_order_relaxed);
-        }
+        ++scan_normal;
+        const bool predicted_soon = protect.predicted_soon;
+        const bool reuse_protected = protect.reuse_protected;
         const bool spec_evictable = speculative_unused &&
             moe_group_speculative_unused_evictable(ctx, g, dist, layer_dist);
         const double speculative_bonus = spec_evictable ?
@@ -4099,7 +6165,7 @@ static bool moe_evict_lru(llama_moe_buffer_context & ctx) {
         const double spec_guard_penalty = speculative_unused && !spec_evictable ? 4.0e8 : 0.0;
         const double size_bonus = (double) bytes / 1048576.0;
         const double bit_bonus = moe_group_resident_bit_score(ctx, m->layer, e) * 8.0;
-        const double high_penalty = high_sequence || moe_is_hot(ctx, *m, e) ? 5.0e8 : 0.0;
+        const double high_penalty = high_sequence || moe_group_is_hot(ctx, m->layer, e) ? 5.0e8 : 0.0;
         const double early_penalty = early_high ? 2.0e8 : 0.0;
         const double reuse_evict_ceil = moe_env_f64("LLAMA_LAZY_MOE_REUSE_EVICT_CEIL", 170.0);
         const bool reuse_low_candidate = moe_reuse_evict_enabled() && g.reuse_observed > 0 &&
@@ -4125,6 +6191,21 @@ static bool moe_evict_lru(llama_moe_buffer_context & ctx) {
         const double persistent_penalty = !layer_window && ctx.evict_persistent_bytes > 0 &&
             ctx.resident_bytes <= ctx.evict_persistent_bytes && g.hot_score >=
                 moe_env_f64("LLAMA_LAZY_MOE_LAYER_RESERVE_PERSISTENT_SCORE", 120.0) ? 2.0e8 : 0.0;
+        const double bad_reload_penalty = !speculative_unused ?
+            bad_reload_effective * moe_env_f64("LLAMA_LAZY_MOE_BAD_RELOAD_EVICT_WEIGHT", 2.0e8) : 0.0;
+        if (bad_reload_penalty > 0.0) {
+            g.bad_reload_soft_hits++;
+            ctx.bad_reload_soft_keep.fetch_add(1, std::memory_order_relaxed);
+        }
+        const double cct_keep_penalty = cct_lowmem ?
+            (double) cct_conf * moe_env_f64("LLAMA_LAZY_MOE_CCT_EVICT_KEEP_WEIGHT", 2.5e8) : 0.0;
+        if (cct_keep_penalty > 0.0) {
+            ctx.cct_evict_keep.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (eam_replace && !eam_replace_stats_ready) {
+            eam_replace_stats = moe_eam_replace_build_stats_locked(ctx);
+            eam_replace_stats_ready = true;
+        }
         const double layer_replace_mass = eam_replace && m->layer >= 0 && m->layer < eam_replace_stats.n_layers ?
             eam_replace_stats.layer_mass[(size_t) m->layer] : 0.0;
         const double eam_replace_pred = eam_replace ?
@@ -4138,128 +6219,480 @@ static bool moe_evict_lru(llama_moe_buffer_context & ctx) {
         }
         const double score = eam_replace ?
             (-eam_replace_keep * moe_env_f64("LLAMA_LAZY_MOE_EAM_REPLACE_SCORE_SCALE", 1.0e12) +
-                (double) lru_depth * 1.0e-6 + size_bonus) :
+                size_bonus - cct_keep_penalty - bad_reload_penalty) :
             (speculative_bonus + low_score_bonus + reuse_low_bonus + dist_score +
-                (double) lru_depth * 1024.0 + size_bonus + bit_bonus + layer_window_bonus -
+                size_bonus + bit_bonus + layer_window_bonus -
                 recent_penalty - spec_guard_penalty - high_penalty - early_penalty -
                 reuse_keep_penalty - reuse_protect_penalty -
-                layer_window_penalty - layer_feedback_penalty - persistent_penalty);
-        if (score > best.score) {
-            best.layer = m->layer;
-            best.expert = e;
-            best.score = score;
-            best.belady = dist != UINT64_MAX;
-            best.reason = eam_replace ? victim_candidate::EAM_REPLACE :
-                layer_reserve_needed && !layer_window ? victim_candidate::LAYER_WINDOW :
-                spec_evictable ? victim_candidate::SPEC_UNUSED :
-                (reuse_low_bonus > 0.0 && reuse_keep < reuse_evict_ceil ?
-                    victim_candidate::REUSE_LOW :
-                (dist == UINT64_MAX || dist > (uint64_t) std::max(1, ctx.params.active_window) ?
-                    victim_candidate::FAR_FUTURE : victim_candidate::LOW_SCORE));
+                layer_window_penalty - layer_feedback_penalty - persistent_penalty -
+                cct_keep_penalty - bad_reload_penalty);
+        victim_candidate candidate;
+        candidate.layer = m->layer;
+        candidate.expert = e;
+        candidate.score = score;
+        candidate.hot_score = g.hot_score;
+        candidate.age = group_age;
+        candidate.belady = dist != UINT64_MAX;
+        candidate.reason = eam_replace ? victim_candidate::EAM_REPLACE :
+            layer_reserve_needed && !layer_window ? victim_candidate::LAYER_WINDOW :
+            spec_evictable ? victim_candidate::SPEC_UNUSED :
+            (reuse_low_bonus > 0.0 && reuse_keep < reuse_evict_ceil ?
+                victim_candidate::REUSE_LOW :
+            (dist == UINT64_MAX || dist > (uint64_t) std::max(1, ctx.params.active_window) ?
+                victim_candidate::FAR_FUTURE : victim_candidate::LOW_SCORE));
+        if (target_release_bytes > 0) {
+            normal_candidates.push_back(candidate);
+        }
+        const bool better_normal =
+            score > best.score ||
+            (score == best.score &&
+                (group_age > best.age ||
+                    (group_age == best.age &&
+                        (g.hot_score < best.hot_score ||
+                            (g.hot_score == best.hot_score &&
+                                (m->layer < best.layer ||
+                                    (m->layer == best.layer && e < best.expert)))))));
+        if (better_normal) {
+            best = candidate;
         }
     }
 
-    if (best.layer < 0) {
-        for (auto it = ctx.lru.end(); it != ctx.lru.begin(); ) {
-            --it;
-            moe_managed * m = it->first;
-            const int e = it->second;
-            if (m == nullptr || e < 0 || e >= m->n_expert || m->layer < 0) {
-                continue;
-            }
-            const uint64_t key = moe_group_key(m->layer, e);
-            auto git = ctx.groups.find(key);
-            if (git != ctx.groups.end() && git->second.pinned) {
-                continue;
-            }
-            if (git != ctx.groups.end() && moe_group_is_active(ctx, git->second)) {
-                continue;
-            }
-            if (ctx.profile_last_layer >= 0 && m->layer == ctx.profile_last_layer) {
-                continue;
-            }
-            if (layer_reserve_needed && moe_layer_in_evict_window(ctx, m->layer)) {
-                ctx.layer_reserve_protected.fetch_add(1, std::memory_order_relaxed);
-                continue;
-            }
-            if (moe_group_has_inflight_or_queued(ctx, m->layer, e)) {
-                continue;
-            }
-            best.layer = m->layer;
-            best.expert = e;
-            best.belady = false;
-            best.reason = victim_candidate::RELAXED;
-            break;
-        }
-    }
+    ctx.evict_scan_calls.fetch_add(1, std::memory_order_relaxed);
+    ctx.evict_scan_entries.fetch_add(scan_entries, std::memory_order_relaxed);
+    ctx.evict_scan_unique.fetch_add(scan_unique, std::memory_order_relaxed);
+    ctx.evict_scan_duplicates.fetch_add(scan_duplicates, std::memory_order_relaxed);
+    ctx.evict_scan_absolute.fetch_add(scan_absolute, std::memory_order_relaxed);
+    ctx.evict_scan_temporary.fetch_add(scan_temporary, std::memory_order_relaxed);
+    ctx.evict_scan_normal.fetch_add(scan_normal, std::memory_order_relaxed);
 
-    if (best.layer < 0) {
+    auto release_candidate = [&](const victim_candidate & candidate) {
+        const size_t released = moe_release_group_locked(ctx, candidate.layer, candidate.expert);
+        if (released == 0) {
+            return (size_t) 0;
+        }
+        if (ctx.admission_floor_layer == candidate.layer &&
+                ctx.admission_floor_expert == candidate.expert) {
+            ctx.admission_floor_valid = false;
+        }
+        if (candidate.belady) {
+            ctx.belady_evictions.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            ctx.lru_fallback_evictions.fetch_add(1, std::memory_order_relaxed);
+        }
+        const char * evict_reason = "unknown";
+        uint8_t evict_reason_code = MOE_EVICT_REASON_UNKNOWN;
+        switch (candidate.reason) {
+            case victim_candidate::SPEC_UNUSED:
+                evict_reason = "spec_unused";
+                evict_reason_code = MOE_EVICT_REASON_SPEC_UNUSED;
+                ctx.eam_evict_spec_unused.fetch_add(1, std::memory_order_relaxed);
+                break;
+            case victim_candidate::LOW_SCORE:
+                evict_reason = "low_score";
+                evict_reason_code = MOE_EVICT_REASON_LOW_SCORE;
+                ctx.eam_evict_low_score.fetch_add(1, std::memory_order_relaxed);
+                break;
+            case victim_candidate::FAR_FUTURE:
+                evict_reason = "far_future";
+                evict_reason_code = MOE_EVICT_REASON_FAR_FUTURE;
+                ctx.eam_evict_far_future.fetch_add(1, std::memory_order_relaxed);
+                break;
+            case victim_candidate::LAYER_WINDOW:
+                evict_reason = "layer_window";
+                evict_reason_code = MOE_EVICT_REASON_LAYER_WINDOW;
+                ctx.layer_reserve_evictions.fetch_add(1, std::memory_order_relaxed);
+                break;
+            case victim_candidate::REUSE_LOW:
+                evict_reason = "reuse_low";
+                evict_reason_code = MOE_EVICT_REASON_REUSE_LOW;
+                ctx.reuse_evict_low.fetch_add(1, std::memory_order_relaxed);
+                break;
+            case victim_candidate::EAM_REPLACE:
+                evict_reason = "eam_replace";
+                evict_reason_code = MOE_EVICT_REASON_EAM_REPLACE;
+                ctx.eam_evict_low_score.fetch_add(1, std::memory_order_relaxed);
+                break;
+            case victim_candidate::RELAXED:
+                evict_reason = "relaxed";
+                evict_reason_code = MOE_EVICT_REASON_RELAXED;
+                if (layer_reserve_needed) {
+                    ctx.layer_reserve_relaxed.fetch_add(1, std::memory_order_relaxed);
+                }
+                ctx.eam_evict_lru_relaxed.fetch_add(1, std::memory_order_relaxed);
+                break;
+        }
+        moe_group_get(ctx, candidate.layer, candidate.expert).last_evicted_reason = evict_reason_code;
+        moe_evict_trace_write_locked(ctx, "evict", candidate.layer, candidate.expert,
+                evict_reason, 0, released, candidate.score);
+        return released;
+    };
+
+    if (target_release_bytes > 0) {
+        auto better_candidate = [](const victim_candidate & a, const victim_candidate & b) {
+            if (a.score != b.score) {
+                return a.score > b.score;
+            }
+            if (a.age != b.age) {
+                return a.age > b.age;
+            }
+            if (a.hot_score != b.hot_score) {
+                return a.hot_score < b.hot_score;
+            }
+            if (a.layer != b.layer) {
+                return a.layer < b.layer;
+            }
+            return a.expert < b.expert;
+        };
+        std::sort(normal_candidates.begin(), normal_candidates.end(), better_candidate);
+        std::sort(temporary_candidates.begin(), temporary_candidates.end(), better_candidate);
+
+        if (admission_batch != nullptr && batch_results != nullptr) {
+            batch_results->assign(admission_batch->size(), {});
+            std::vector<size_t> order(admission_batch->size());
+            for (size_t i = 0; i < order.size(); ++i) {
+                order[i] = i;
+            }
+            std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+                const moe_demand_admission_request & ra = (*admission_batch)[a];
+                const moe_demand_admission_request & rb = (*admission_batch)[b];
+                if (ra.incoming_value != rb.incoming_value) {
+                    return ra.incoming_value > rb.incoming_value;
+                }
+                if (ra.layer != rb.layer) {
+                    return ra.layer < rb.layer;
+                }
+                return ra.expert < rb.expert;
+            });
+
+            std::vector<victim_candidate> victim_pool;
+            victim_pool.reserve(normal_candidates.size() + temporary_candidates.size());
+            victim_pool.insert(victim_pool.end(), normal_candidates.begin(), normal_candidates.end());
+            victim_pool.insert(victim_pool.end(), temporary_candidates.begin(), temporary_candidates.end());
+
+            std::vector<victim_candidate> selected;
+            selected.reserve(victim_pool.size());
+            size_t victim_cursor = 0;
+            size_t cache_credit = batch_free_bytes;
+            size_t staging_credit = batch_staging_bytes;
+
+            for (size_t request_index : order) {
+                const moe_demand_admission_request & request =
+                    (*admission_batch)[request_index];
+                moe_demand_admission_result & result =
+                    (*batch_results)[request_index];
+                if (request.target_bytes == 0) {
+                    continue;
+                }
+                if (cache_credit >= request.target_bytes) {
+                    cache_credit -= request.target_bytes;
+                    continue;
+                }
+
+                const size_t required = request.target_bytes - cache_credit;
+                size_t peek_cursor = victim_cursor;
+                size_t valued_bytes = 0;
+                size_t full_victim_bytes = 0;
+                double weighted_value = 0.0;
+                while (peek_cursor < victim_pool.size() && valued_bytes < required) {
+                    const victim_candidate & candidate = victim_pool[peek_cursor++];
+                    const size_t resident =
+                        moe_group_resident_bytes(ctx, candidate.layer, candidate.expert);
+                    if (resident == 0) {
+                        continue;
+                    }
+                    moe_group_state & victim =
+                        moe_group_get(ctx, candidate.layer, candidate.expert);
+                    const double cache_score =
+                        moe_group_cache_score(ctx, victim, resident);
+                    const double value = moe_prefetch_victim_value_locked(
+                            ctx, victim, resident, cache_score);
+                    const size_t take = std::min(resident, required - valued_bytes);
+                    weighted_value += value * (double) take / (double) required;
+                    valued_bytes += take;
+                    full_victim_bytes += resident;
+                    if (!result.has_victim) {
+                        result.has_victim = true;
+                        result.victim_layer = candidate.layer;
+                        result.victim_expert = candidate.expert;
+                    }
+                    result.victim_groups++;
+                    result.victim_keys.push_back(
+                            moe_group_key(candidate.layer, candidate.expert));
+                }
+                result.evaluated = true;
+                result.victim_bytes = full_victim_bytes;
+                result.victim_value = weighted_value;
+
+                const bool staging_available =
+                    staging_credit >= request.target_bytes;
+                result.bypass = staging_available &&
+                    (!result.has_victim ||
+                     request.incoming_value <= result.victim_value + request.margin);
+                if (result.bypass) {
+                    staging_credit -= request.target_bytes;
+                    continue;
+                }
+
+                cache_credit = 0;
+                while (victim_cursor < peek_cursor) {
+                    const victim_candidate & candidate = victim_pool[victim_cursor++];
+                    const size_t resident =
+                        moe_group_resident_bytes(ctx, candidate.layer, candidate.expert);
+                    if (resident == 0) {
+                        continue;
+                    }
+                    selected.push_back(candidate);
+                    cache_credit += resident;
+                }
+                cache_credit = cache_credit > required ?
+                    cache_credit - required : 0;
+            }
+
+            size_t released_total = 0;
+            for (const victim_candidate & candidate : selected) {
+                const size_t released = release_candidate(candidate);
+                if (released > 0) {
+                    released_total += released;
+                    if (candidate.reason == victim_candidate::RELAXED) {
+                        ctx.evict_scan_selected_temporary.fetch_add(
+                                1, std::memory_order_relaxed);
+                    }
+                }
+            }
+            if (ctx.profile) {
+                ctx.prof_victim_select_us.fetch_add(
+                        (moe_profile_now_ns() - prof_t0) / 1000,
+                        std::memory_order_relaxed);
+            }
+            return released_total > 0;
+        }
+
+        std::vector<victim_candidate> selected;
+        selected.reserve(normal_candidates.size() + temporary_candidates.size());
+        size_t selected_bytes = 0;
+        auto select_candidates = [&](const std::vector<victim_candidate> & candidates) {
+            for (const victim_candidate & candidate : candidates) {
+                const size_t bytes =
+                    moe_group_resident_bytes(ctx, candidate.layer, candidate.expert);
+                if (bytes == 0) {
+                    continue;
+                }
+                selected.push_back(candidate);
+                selected_bytes += bytes;
+                if (selected_bytes >= target_release_bytes) {
+                    break;
+                }
+            }
+        };
+        select_candidates(normal_candidates);
+        if (selected_bytes < target_release_bytes) {
+            select_candidates(temporary_candidates);
+        }
+
+        if (admission_request != nullptr && admission_result != nullptr) {
+            admission_result->evaluated = true;
+            admission_result->victim_groups = (int) selected.size();
+            admission_result->victim_bytes = selected_bytes;
+            for (const victim_candidate & candidate : selected) {
+                admission_result->victim_keys.push_back(
+                        moe_group_key(candidate.layer, candidate.expert));
+            }
+            if (!selected.empty()) {
+                admission_result->has_victim = true;
+                admission_result->victim_layer = selected.front().layer;
+                admission_result->victim_expert = selected.front().expert;
+                size_t valued_bytes = 0;
+                double weighted_value = 0.0;
+                for (const victim_candidate & candidate : selected) {
+                    const size_t resident =
+                        moe_group_resident_bytes(ctx, candidate.layer, candidate.expert);
+                    if (resident == 0 || valued_bytes >= target_release_bytes) {
+                        continue;
+                    }
+                    moe_group_state & victim =
+                        moe_group_get(ctx, candidate.layer, candidate.expert);
+                    const double cache_score =
+                        moe_group_cache_score(ctx, victim, resident);
+                    const double value = moe_prefetch_victim_value_locked(
+                            ctx, victim, resident, cache_score);
+                    const size_t take =
+                        std::min(resident, target_release_bytes - valued_bytes);
+                    weighted_value += value * (double) take /
+                        (double) target_release_bytes;
+                    valued_bytes += take;
+                }
+                admission_result->victim_value = weighted_value;
+            }
+            admission_result->bypass =
+                !admission_result->has_victim ||
+                admission_request->incoming_value <=
+                    admission_result->victim_value + admission_request->margin;
+            if (admission_result->bypass) {
+                if (!admission_result->has_victim) {
+                    ctx.evict_scan_no_victim.fetch_add(1, std::memory_order_relaxed);
+                }
+                if (ctx.profile) {
+                    ctx.prof_victim_select_us.fetch_add(
+                            (moe_profile_now_ns() - prof_t0) / 1000,
+                            std::memory_order_relaxed);
+                }
+                return false;
+            }
+        }
+
+        size_t released_total = 0;
+        for (const victim_candidate & candidate : selected) {
+            const size_t released = release_candidate(candidate);
+            if (released > 0) {
+                released_total += released;
+                if (candidate.reason == victim_candidate::RELAXED) {
+                    ctx.evict_scan_selected_temporary.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+        if (released_total == 0) {
+            ctx.evict_scan_no_victim.fetch_add(1, std::memory_order_relaxed);
+        }
         if (ctx.profile) {
-            ctx.prof_victim_select_us.fetch_add((moe_profile_now_ns() - prof_t0) / 1000, std::memory_order_relaxed);
+            ctx.prof_victim_select_us.fetch_add(
+                    (moe_profile_now_ns() - prof_t0) / 1000, std::memory_order_relaxed);
+        }
+        return released_total > 0;
+    }
+
+    if (best.layer < 0 && temporary_best.layer >= 0) {
+        best = temporary_best;
+        ctx.evict_scan_selected_temporary.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (best.layer < 0) {
+        ctx.evict_scan_no_victim.fetch_add(1, std::memory_order_relaxed);
+        if (ctx.profile) {
+            ctx.prof_victim_select_us.fetch_add(
+                    (moe_profile_now_ns() - prof_t0) / 1000, std::memory_order_relaxed);
         }
         return false;
     }
 
-    const size_t released = moe_release_group_locked(ctx, best.layer, best.expert);
-    if (released == 0) {
-        if (ctx.profile) {
-            ctx.prof_victim_select_us.fetch_add((moe_profile_now_ns() - prof_t0) / 1000, std::memory_order_relaxed);
-        }
-        return false;
-    }
-    if (best.belady) {
-        ctx.belady_evictions.fetch_add(1, std::memory_order_relaxed);
-    } else {
-        ctx.lru_fallback_evictions.fetch_add(1, std::memory_order_relaxed);
-    }
-    const char * evict_reason = "unknown";
-    uint8_t evict_reason_code = MOE_EVICT_REASON_UNKNOWN;
-    switch (best.reason) {
-        case victim_candidate::SPEC_UNUSED:
-            evict_reason = "spec_unused";
-            evict_reason_code = MOE_EVICT_REASON_SPEC_UNUSED;
-            ctx.eam_evict_spec_unused.fetch_add(1, std::memory_order_relaxed);
-            break;
-        case victim_candidate::LOW_SCORE:
-            evict_reason = "low_score";
-            evict_reason_code = MOE_EVICT_REASON_LOW_SCORE;
-            ctx.eam_evict_low_score.fetch_add(1, std::memory_order_relaxed);
-            break;
-        case victim_candidate::FAR_FUTURE:
-            evict_reason = "far_future";
-            evict_reason_code = MOE_EVICT_REASON_FAR_FUTURE;
-            ctx.eam_evict_far_future.fetch_add(1, std::memory_order_relaxed);
-            break;
-        case victim_candidate::LAYER_WINDOW:
-            evict_reason = "layer_window";
-            evict_reason_code = MOE_EVICT_REASON_LAYER_WINDOW;
-            ctx.layer_reserve_evictions.fetch_add(1, std::memory_order_relaxed);
-            break;
-        case victim_candidate::REUSE_LOW:
-            evict_reason = "reuse_low";
-            evict_reason_code = MOE_EVICT_REASON_REUSE_LOW;
-            ctx.reuse_evict_low.fetch_add(1, std::memory_order_relaxed);
-            break;
-        case victim_candidate::EAM_REPLACE:
-            evict_reason = "eam_replace";
-            evict_reason_code = MOE_EVICT_REASON_EAM_REPLACE;
-            ctx.eam_evict_low_score.fetch_add(1, std::memory_order_relaxed);
-            break;
-        case victim_candidate::RELAXED:
-            evict_reason = "relaxed";
-            evict_reason_code = MOE_EVICT_REASON_RELAXED;
-            if (layer_reserve_needed) {
-                ctx.layer_reserve_relaxed.fetch_add(1, std::memory_order_relaxed);
-            }
-            ctx.eam_evict_lru_relaxed.fetch_add(1, std::memory_order_relaxed);
-            break;
-    }
-    moe_group_get(ctx, best.layer, best.expert).last_evicted_reason = evict_reason_code;
-    moe_evict_trace_write_locked(ctx, "evict", best.layer, best.expert, evict_reason, 0, released, best.score);
+    const bool released = release_candidate(best) > 0;
     if (ctx.profile) {
-        ctx.prof_victim_select_us.fetch_add((moe_profile_now_ns() - prof_t0) / 1000, std::memory_order_relaxed);
+        ctx.prof_victim_select_us.fetch_add(
+                (moe_profile_now_ns() - prof_t0) / 1000, std::memory_order_relaxed);
     }
-    return true;
+    return released;
+}
+
+// Demand admission controls cache replacement, not whether the requested group
+// can execute. It consumes the exact victim set selected by moe_evict_lru()'s
+// single scan. A rejected group temporarily occupies staging and is detached
+// after its layer completes.
+static double moe_demand_incoming_value_locked(
+        llama_moe_buffer_context & ctx,
+        moe_group_state &          g,
+        size_t                     target_bytes,
+        int                        rank) {
+    const double cache_score = moe_group_cache_score(ctx, g, target_bytes);
+    double value =
+        moe_prefetch_victim_value_locked(ctx, g, target_bytes, cache_score) +
+        moe_env_f64("LLAMA_LAZY_MOE_DEMAND_ADMIT_CURRENT_W", 160.0);
+    if (rank == 0) {
+        value += moe_env_f64("LLAMA_LAZY_MOE_DEMAND_ADMIT_RANK0_W", 40.0);
+    }
+    if (moe_env_flag("LLAMA_LAZY_MOE_ADMISSION_FEEDBACK", 0) &&
+            g.admission_feedback_samples > 0) {
+        value += g.admission_feedback_ema *
+            moe_env_f64("LLAMA_LAZY_MOE_ADMISSION_FEEDBACK_WEIGHT", 20.0);
+        ctx.admission_feedback_score_candidates.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (moe_env_flag("LLAMA_LAZY_MOE_ADMISSION_REGRET_FEEDBACK", 0) &&
+            g.admission_regret_samples > 0) {
+        value += g.admission_regret_ema *
+            moe_env_f64("LLAMA_LAZY_MOE_ADMISSION_REGRET_WEIGHT", 30.0);
+        ctx.admission_regret_score_candidates.fetch_add(1, std::memory_order_relaxed);
+    }
+    return value;
+}
+
+static bool moe_demand_admission_bypass_locked(
+        llama_moe_buffer_context & ctx,
+        moe_managed &              m,
+        int                        expert,
+        int                        rank,
+        bool                       real_touch) {
+    if (!moe_demand_admission_enabled() || !ctx.params.dynamic_bits_real ||
+            ctx.params.budget_bytes == 0 ||
+            m.layer < 0 || expert < 0 || expert >= m.n_expert) {
+        return false;
+    }
+
+    moe_group_state & g = moe_group_get(ctx, m.layer, expert);
+    moe_admission_outcome_note_reuse_locked(ctx, g);
+    if (g.demand_admission_decided &&
+            g.demand_admission_token == ctx.profile_token_epoch) {
+        return g.demand_admission_bypass;
+    }
+    if (!real_touch) {
+        return false;
+    }
+
+    g.demand_admission_token = ctx.profile_token_epoch;
+    g.demand_admission_decided = true;
+    g.demand_admission_bypass = false;
+
+    const size_t target_bytes =
+        moe_demand_group_missing_bytes_locked(ctx, m.layer, expert, rank);
+    const size_t cache_bytes = ctx.resident_bytes -
+        std::min(ctx.resident_bytes, ctx.demand_admission_staging_bytes);
+    if (target_bytes == 0 ||
+            cache_bytes + target_bytes <= ctx.params.budget_bytes) {
+        return false;
+    }
+
+    ctx.demand_admission_runs.fetch_add(1, std::memory_order_relaxed);
+    const size_t staging_limit = moe_env_mib_bytes(
+            "LLAMA_LAZY_MOE_DEMAND_ADMISSION_STAGING_MB", 64);
+    if (staging_limit == 0 ||
+            ctx.demand_admission_staging_bytes +
+                ctx.demand_admission_staging_reserved_bytes +
+                target_bytes > staging_limit) {
+        ctx.demand_admission_admit.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    const double candidate_value =
+        moe_demand_incoming_value_locked(ctx, g, target_bytes, rank);
+
+    moe_demand_admission_request request;
+    request.layer = m.layer;
+    request.expert = expert;
+    request.target_bytes = target_bytes;
+    request.incoming_value = candidate_value;
+    request.margin = moe_env_f64("LLAMA_LAZY_MOE_DEMAND_ADMIT_MARGIN", 0.0);
+    moe_demand_admission_result result;
+    const size_t release_needed =
+        cache_bytes + target_bytes - ctx.params.budget_bytes;
+    {
+        moe_evict_context_guard evict_ctx(ctx, m, true);
+        moe_evict_lru(ctx, release_needed, &request, &result);
+    }
+
+    ctx.demand_admission_candidate_x1000.fetch_add(
+            (uint64_t) std::max(0.0, candidate_value * 1000.0),
+            std::memory_order_relaxed);
+    ctx.demand_admission_victim_x1000.fetch_add(
+            (uint64_t) std::max(0.0, result.victim_value * 1000.0),
+            std::memory_order_relaxed);
+    if (result.bypass) {
+        g.demand_admission_bypass = true;
+        ctx.demand_admission_bypass.fetch_add(1, std::memory_order_relaxed);
+        if (!result.has_victim) {
+            ctx.demand_admission_no_victim.fetch_add(1, std::memory_order_relaxed);
+        }
+    } else {
+        ctx.demand_admission_admit.fetch_add(1, std::memory_order_relaxed);
+    }
+    moe_admission_outcome_begin_locked(
+            ctx, g, result.bypass, candidate_value, result);
+    return result.bypass;
 }
 
 // Read expert slice e of m into m.buf + e*stride. No shared state: uses a
@@ -4588,8 +7021,19 @@ static bool moe_pread_slice(llama_moe_buffer_context & ctx, moe_managed & m, int
     return true;
 }
 
+static void moe_group_fill_mwq_siblings(
+        llama_moe_buffer_context & ctx,
+        moe_managed &              src,
+        int                        e,
+        int                        rank);
+static void moe_group_fill_native_siblings(
+        llama_moe_buffer_context & ctx,
+        moe_managed &              src,
+        int                        e,
+        int                        rank);
+
 static void moe_stream_mwq_slice(llama_moe_buffer_context & ctx, moe_managed & m, int e, bool touch, int target_bits, int rank,
-        bool * out_entry_missing, bool * out_read_failed) {
+        bool * out_entry_missing, bool * out_read_failed, bool group_fill, bool demand_async) {
     if (e < 0 || e >= m.n_expert) return;
 
     if (moe_native_entry_available(ctx, m, target_bits)) {
@@ -4622,13 +7066,24 @@ static void moe_stream_mwq_slice(llama_moe_buffer_context & ctx, moe_managed & m
             if (touch) {
                 if (m.activation[e] != UINT32_MAX) { m.activation[e]++; m.total_act++; }
                 moe_group_touch_locked(ctx, m, e, rank, 1);
-                ctx.hits.fetch_add(1, std::memory_order_relaxed);
+                const bool was_demand_async =
+                    e < (int) m.demand_async_loaded.size() && m.demand_async_loaded[e];
                 const bool was_prefetched = e < (int) m.prefetched.size() && m.prefetched[e];
-                moe_group_note_cache_touch_locked(ctx, m, e, was_prefetched, false);
-                if (was_prefetched) {
+                if (was_demand_async) {
+                    m.demand_async_loaded[e] = false;
+                    if (e < (int) m.prefetched.size()) {
+                        m.prefetched[e] = false;
+                    }
+                    moe_group_note_cache_touch_locked(ctx, m, e, false, true);
+                    ctx.prof_cache_miss.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    ctx.hits.fetch_add(1, std::memory_order_relaxed);
+                    moe_group_note_cache_touch_locked(ctx, m, e, was_prefetched, false);
+                }
+                if (!was_demand_async && was_prefetched) {
                     ctx.prof_prefetch_hit.fetch_add(1, std::memory_order_relaxed);
                     m.prefetched[e] = false;
-                } else {
+                } else if (!was_demand_async) {
                     ctx.prof_cache_hit.fetch_add(1, std::memory_order_relaxed);
                 }
                 if (e < (int) m.resident_touched.size()) {
@@ -4637,8 +7092,9 @@ static void moe_stream_mwq_slice(llama_moe_buffer_context & ctx, moe_managed & m
                 if (loaded_bits != target_bits) {
                     ctx.mwq_compat_hits.fetch_add(1, std::memory_order_relaxed);
                 }
-                trace_compute(was_prefetched ? "prefetch_hit_mwq" :
-                        (loaded_bits != target_bits ? "compat_hit_mwq" : "cache_hit_mwq"));
+                trace_compute(was_demand_async ? "demand_async_miss_mwq" :
+                        (was_prefetched ? "prefetch_hit_mwq" :
+                         (loaded_bits != target_bits ? "compat_hit_mwq" : "cache_hit_mwq")));
             }
             return;
         }
@@ -4653,13 +7109,24 @@ static void moe_stream_mwq_slice(llama_moe_buffer_context & ctx, moe_managed & m
                 if (touch) {
                     if (m.activation[e] != UINT32_MAX) { m.activation[e]++; m.total_act++; }
                     moe_group_touch_locked(ctx, m, e, rank, 1);
-                    ctx.hits.fetch_add(1, std::memory_order_relaxed);
+                    const bool was_demand_async =
+                        e < (int) m.demand_async_loaded.size() && m.demand_async_loaded[e];
                     const bool was_prefetched = e < (int) m.prefetched.size() && m.prefetched[e];
-                    moe_group_note_cache_touch_locked(ctx, m, e, was_prefetched, false);
-                    if (was_prefetched) {
+                    if (was_demand_async) {
+                        m.demand_async_loaded[e] = false;
+                        if (e < (int) m.prefetched.size()) {
+                            m.prefetched[e] = false;
+                        }
+                        moe_group_note_cache_touch_locked(ctx, m, e, false, true);
+                        ctx.prof_cache_miss.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        ctx.hits.fetch_add(1, std::memory_order_relaxed);
+                        moe_group_note_cache_touch_locked(ctx, m, e, was_prefetched, false);
+                    }
+                    if (!was_demand_async && was_prefetched) {
                         ctx.prof_prefetch_hit.fetch_add(1, std::memory_order_relaxed);
                         m.prefetched[e] = false;
-                    } else {
+                    } else if (!was_demand_async) {
                         ctx.prof_cache_hit.fetch_add(1, std::memory_order_relaxed);
                     }
                     if (e < (int) m.resident_touched.size()) {
@@ -4668,8 +7135,9 @@ static void moe_stream_mwq_slice(llama_moe_buffer_context & ctx, moe_managed & m
                     if (m.resident_bits[e] != target_bits) {
                         ctx.mwq_compat_hits.fetch_add(1, std::memory_order_relaxed);
                     }
-                    trace_compute(was_prefetched ? "prefetch_hit_native" :
-                            (m.resident_bits[e] != target_bits ? "compat_hit_native" : "cache_hit_native"));
+                    trace_compute(was_demand_async ? "demand_async_miss_native" :
+                            (was_prefetched ? "prefetch_hit_native" :
+                             (m.resident_bits[e] != target_bits ? "compat_hit_native" : "cache_hit_native")));
                 }
                 return;
             }
@@ -4681,32 +7149,36 @@ static void moe_stream_mwq_slice(llama_moe_buffer_context & ctx, moe_managed & m
                 if (touch) {
                     if (m.activation[e] != UINT32_MAX) { m.activation[e]++; m.total_act++; }
                     moe_group_touch_locked(ctx, m, e, rank, 1);
-                    ctx.hits.fetch_add(1, std::memory_order_relaxed);
+                    const bool was_demand_async =
+                        e < (int) m.demand_async_loaded.size() && m.demand_async_loaded[e];
                     const bool was_prefetched = e < (int) m.prefetched.size() && m.prefetched[e];
-                    moe_group_note_cache_touch_locked(ctx, m, e, was_prefetched, false);
-                    if (was_prefetched) {
+                    if (was_demand_async) {
+                        m.demand_async_loaded[e] = false;
+                        if (e < (int) m.prefetched.size()) {
+                            m.prefetched[e] = false;
+                        }
+                        moe_group_note_cache_touch_locked(ctx, m, e, false, true);
+                        ctx.prof_cache_miss.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        ctx.hits.fetch_add(1, std::memory_order_relaxed);
+                        moe_group_note_cache_touch_locked(ctx, m, e, was_prefetched, false);
+                    }
+                    if (!was_demand_async && was_prefetched) {
                         ctx.prof_prefetch_hit.fetch_add(1, std::memory_order_relaxed);
                         m.prefetched[e] = false;
-                    } else {
+                    } else if (!was_demand_async) {
                         ctx.prof_cache_hit.fetch_add(1, std::memory_order_relaxed);
                     }
                     if (e < (int) m.resident_touched.size()) {
                         m.resident_touched[e] = true;
                     }
-                    trace_compute(was_prefetched ? "prefetch_hit_mwq_exact" : "cache_hit_mwq_exact");
+                    trace_compute(was_demand_async ? "demand_async_miss_mwq_exact" :
+                            (was_prefetched ? "prefetch_hit_mwq_exact" : "cache_hit_mwq_exact"));
                 }
                 return;
             }
             trace_compute("resident_incompatible_drop");
-            if (m.resident_mwq[e]) {
-                moe_mark_mwq_transient(ctx, m, e, m.resident_bits[e]);
-            }
-            ctx.lru.erase(m.lru_pos[e]);
-            m.resident[e] = ST_COLD;
-            m.resident_mwq[e] = false;
-            m.resident_bits[e] = 0;
-            ctx.resident_bytes -= std::min(ctx.resident_bytes, m.resident_size[e]);
-            m.resident_size[e] = 0;
+            moe_drop_group_incompatible_locked(ctx, m.layer, e);
             break;
         }
         if (s == ST_INFLIGHT) {
@@ -4753,9 +7225,21 @@ static void moe_stream_mwq_slice(llama_moe_buffer_context & ctx, moe_managed & m
     m.resident_mwq[e] = true;
     m.resident_bits[e] = target_bits;
     m.resident_size[e] = (size_t) ent->encoded_size;
-    if (ctx.params.budget_bytes > 0) {
+    const bool admission_bypass =
+        moe_demand_admission_bypass_locked(ctx, m, e, rank, touch);
+    if (ctx.params.budget_bytes > 0 && !admission_bypass) {
+        const uint64_t evictions_before = ctx.group_evictions.load(std::memory_order_relaxed);
         moe_evict_context_guard evict_ctx(ctx, m, touch);
-        while (ctx.resident_bytes + (size_t) ent->encoded_size > ctx.params.budget_bytes && moe_evict_lru(ctx)) {}
+        while (ctx.resident_bytes - std::min(ctx.resident_bytes, ctx.demand_admission_staging_bytes) +
+                        (size_t) ent->encoded_size > ctx.params.budget_bytes &&
+                moe_evict_lru(ctx)) {}
+        if (demand_async) {
+            const uint64_t evictions_after = ctx.group_evictions.load(std::memory_order_relaxed);
+            if (evictions_after > evictions_before) {
+                ctx.demand_async_worker_evictions.fetch_add(
+                        evictions_after - evictions_before, std::memory_order_relaxed);
+            }
+        }
     }
     if (ctx.profile && e < (int) m.last_evicted_token.size() && m.last_evicted_token[e] > 0) {
         const uint64_t dt = ctx.profile_token_epoch - m.last_evicted_token[e];
@@ -4767,6 +7251,24 @@ static void moe_stream_mwq_slice(llama_moe_buffer_context & ctx, moe_managed & m
         }
     }
     ctx.resident_bytes += (size_t) ent->encoded_size;
+    if (admission_bypass) {
+        if (demand_async) {
+            moe_group_state & g = moe_group_get(ctx, m.layer, e);
+            const size_t transferred = std::min(
+                    g.admission_staging_reserved_bytes,
+                    (size_t) ent->encoded_size);
+            g.admission_staging_reserved_bytes -= transferred;
+            ctx.demand_admission_staging_reserved_bytes -= std::min(
+                    ctx.demand_admission_staging_reserved_bytes, transferred);
+        }
+        ctx.demand_admission_staging_bytes += (size_t) ent->encoded_size;
+        const uint64_t staging = ctx.demand_admission_staging_bytes;
+        uint64_t peak = ctx.demand_admission_staging_peak.load(std::memory_order_relaxed);
+        while (peak < staging &&
+                !ctx.demand_admission_staging_peak.compare_exchange_weak(
+                        peak, staging, std::memory_order_relaxed)) {
+        }
+    }
 
     lk.unlock();
     const uint64_t read_t0 = ctx.profile ? moe_profile_now_ns() : 0;
@@ -4815,6 +7317,10 @@ static void moe_stream_mwq_slice(llama_moe_buffer_context & ctx, moe_managed & m
             store.loaded[e] = false;
         }
         ctx.resident_bytes -= std::min(ctx.resident_bytes, m.resident_size[e]);
+        if (admission_bypass) {
+            ctx.demand_admission_staging_bytes -= std::min(
+                    ctx.demand_admission_staging_bytes, m.resident_size[e]);
+        }
         m.resident_size[e] = 0;
         ctx.sidecar_misses.fetch_add(1, std::memory_order_relaxed);
         if (out_read_failed) *out_read_failed = true;
@@ -4826,13 +7332,19 @@ static void moe_stream_mwq_slice(llama_moe_buffer_context & ctx, moe_managed & m
         }
     }
     ctx.cv_done.notify_all();
+    const bool fill_siblings = ok && group_fill && m.layer >= 0 && e >= 0;
+    lk.unlock();
+    if (fill_siblings) {
+        moe_group_fill_mwq_siblings(ctx, m, e, rank);
+    }
 }
 
 // Ensure expert slice e of m is resident. Coordinates the synchronous callback
 // and the async worker via a per-slot state machine: the pread happens outside
 // the residency mutex; a second thread requesting the same slice waits for the
 // in-flight read to complete instead of issuing a duplicate read.
-static void moe_stream_slice(llama_moe_buffer_context & ctx, moe_managed & m, int e, bool touch, int target_bits, int rank) {
+static void moe_stream_slice(llama_moe_buffer_context & ctx, moe_managed & m, int e, bool touch, int target_bits, int rank,
+        bool group_fill, bool demand_async) {
     if (e < 0 || e >= m.n_expert) return;
 
     std::unique_lock<std::mutex> lk(ctx.mtx);
@@ -4879,12 +7391,7 @@ static void moe_stream_slice(llama_moe_buffer_context & ctx, moe_managed & m, in
                 return;
             }
             trace_compute("resident_incompatible_drop_native");
-            ctx.lru.erase(m.lru_pos[e]);
-            m.resident[e] = ST_COLD;
-            m.resident_mwq[e] = false;
-            m.resident_bits[e] = 0;
-            ctx.resident_bytes -= std::min(ctx.resident_bytes, m.resident_size[e]);
-            m.resident_size[e] = 0;
+            moe_drop_group_incompatible_locked(ctx, m.layer, e);
             break;
         }
         if (s == ST_INFLIGHT) {
@@ -4919,8 +7426,16 @@ static void moe_stream_slice(llama_moe_buffer_context & ctx, moe_managed & m, in
     m.resident_mwq[e] = false;
     m.resident_size[e] = m.stride;
     if (ctx.params.budget_bytes > 0) {
+        const uint64_t evictions_before = ctx.group_evictions.load(std::memory_order_relaxed);
         moe_evict_context_guard evict_ctx(ctx, m, touch);
         while (ctx.resident_bytes + m.stride > ctx.params.budget_bytes && moe_evict_lru(ctx)) {}
+        if (demand_async) {
+            const uint64_t evictions_after = ctx.group_evictions.load(std::memory_order_relaxed);
+            if (evictions_after > evictions_before) {
+                ctx.demand_async_worker_evictions.fetch_add(
+                        evictions_after - evictions_before, std::memory_order_relaxed);
+            }
+        }
     }
     if (ctx.profile && e < (int) m.last_evicted_token.size() && m.last_evicted_token[e] > 0) {
         const uint64_t dt = ctx.profile_token_epoch - m.last_evicted_token[e];
@@ -4972,6 +7487,559 @@ static void moe_stream_slice(llama_moe_buffer_context & ctx, moe_managed & m, in
         trace_compute("miss_read_failed_native");
     }
     ctx.cv_done.notify_all();
+    const bool fill_siblings = ok && group_fill && m.layer >= 0 && e >= 0;
+    lk.unlock();
+    if (fill_siblings) {
+        moe_group_fill_native_siblings(ctx, m, e, rank);
+    }
+}
+
+static bool moe_group_fill_enabled() {
+    return moe_env_flag("LLAMA_LAZY_MOE_GROUP_FILL", 1);
+}
+
+static void moe_group_fill_mwq_siblings(
+        llama_moe_buffer_context & ctx,
+        moe_managed &              src,
+        int                        e,
+        int                        rank) {
+    if (!moe_group_fill_enabled() || src.layer < 0 || e < 0) {
+        return;
+    }
+    auto it = ctx.by_layer.find(src.layer);
+    if (it == ctx.by_layer.end()) {
+        return;
+    }
+    for (moe_managed * m : it->second) {
+        if (m == nullptr || m == &src || e >= m->n_expert) {
+            continue;
+        }
+        const int bits = moe_target_bits_for_rank(ctx, *m, e, rank);
+        bool need = false;
+        {
+            std::lock_guard<std::mutex> lk(ctx.mtx);
+            need = moe_mwq_resolve_loaded_bits(*m, e, bits) <= 0 &&
+                !moe_native_resident_compatible(ctx, *m, e, bits);
+        }
+        if (!need) {
+            continue;
+        }
+        ctx.group_fill_sibling_loads.fetch_add(1, std::memory_order_relaxed);
+        moe_stream_mwq_slice(ctx, *m, e, false, bits, rank, nullptr, nullptr, false);
+    }
+}
+
+static void moe_group_fill_native_siblings(
+        llama_moe_buffer_context & ctx,
+        moe_managed &              src,
+        int                        e,
+        int                        rank) {
+    if (!moe_group_fill_enabled() || src.layer < 0 || e < 0) {
+        return;
+    }
+    auto it = ctx.by_layer.find(src.layer);
+    if (it == ctx.by_layer.end()) {
+        return;
+    }
+    for (moe_managed * m : it->second) {
+        if (m == nullptr || m == &src || e >= m->n_expert) {
+            continue;
+        }
+        const int bits = moe_target_bits_for_rank(ctx, *m, e, rank);
+        bool need = false;
+        {
+            std::lock_guard<std::mutex> lk(ctx.mtx);
+            need = !moe_native_resident_compatible(ctx, *m, e, bits);
+        }
+        if (!need) {
+            continue;
+        }
+        ctx.group_fill_sibling_loads.fetch_add(1, std::memory_order_relaxed);
+        moe_stream_slice(ctx, *m, e, false, bits, rank, false);
+    }
+}
+
+static const char * moe_tensor_kind_cstr(moe_tensor_kind kind) {
+    switch (kind) {
+        case moe_tensor_kind::gate: return "gate";
+        case moe_tensor_kind::up:   return "up";
+        case moe_tensor_kind::down: return "down";
+        default: return "other";
+    }
+}
+
+static void moe_group_prefetch_trace_locked(
+        llama_moe_buffer_context & ctx,
+        const char *               event,
+        int                        layer,
+        int                        expert,
+        const moe_managed &        m,
+        int                        target_bits,
+        const char *               state) {
+    if (ctx.group_prefetch_trace == nullptr) {
+        return;
+    }
+    std::fprintf(ctx.group_prefetch_trace,
+            "%llu\t%llu\t%s\t%d\t%d\t%s\t%d\t%s\t%.3f\t%.3f\n",
+            (unsigned long long) ctx.profile_token_epoch,
+            (unsigned long long) ctx.exec_epoch,
+            event,
+            layer,
+            expert,
+            moe_tensor_kind_cstr(moe_kind(m)),
+            target_bits,
+            state,
+            ctx.resident_bytes / 1048576.0,
+            ctx.params.budget_bytes / 1048576.0);
+}
+
+static int moe_group_missing_sibling_slices_locked(
+        llama_moe_buffer_context & ctx,
+        int                        layer,
+        int                        expert,
+        int                        rank,
+        int                        skip_kind) {
+    if (layer < 0 || expert < 0) {
+        return 0;
+    }
+    auto it = ctx.by_layer.find(layer);
+    if (it == ctx.by_layer.end()) {
+        return 0;
+    }
+    int missing = 0;
+    for (moe_managed * m : it->second) {
+        if (m == nullptr || expert >= m->n_expert) {
+            continue;
+        }
+        if (skip_kind >= 0 && (int) moe_kind(*m) == skip_kind) {
+            continue;
+        }
+        const int bits = moe_target_bits_for_rank(ctx, *m, expert, rank);
+        const bool ready = (ctx.params.dynamic_bits_real && moe_mwq_resolve_loaded_bits(*m, expert, bits) > 0) ||
+            moe_native_resident_compatible(ctx, *m, expert, bits);
+        if (!ready) {
+            ++missing;
+        }
+    }
+    return missing;
+}
+
+static void moe_prefetch_group_worker(
+        llama_moe_buffer_context & ctx,
+        int                        layer,
+        int                        expert,
+        int                        rank,
+        float                      score,
+        int                        skip_kind,
+        bool                       is_demand,
+        int                        primary_kind) {
+    (void) score;
+    if (layer < 0 || expert < 0) {
+        return;
+    }
+    auto it = ctx.by_layer.find(layer);
+    if (it == ctx.by_layer.end()) {
+        return;
+    }
+    if (!is_demand) {
+        ctx.group_prefetch_runs.fetch_add(1, std::memory_order_relaxed);
+    }
+    for (moe_managed * m : it->second) {
+        if (m == nullptr || expert >= m->n_expert) {
+            continue;
+        }
+        if (skip_kind >= 0 && (int) moe_kind(*m) == skip_kind) {
+            continue;
+        }
+        const int bits = moe_target_bits_for_rank(ctx, *m, expert, rank);
+        bool ready = false;
+        {
+            std::lock_guard<std::mutex> lk(ctx.mtx);
+            ready = (ctx.params.dynamic_bits_real && moe_mwq_resolve_loaded_bits(*m, expert, bits) > 0) ||
+                moe_native_resident_compatible(ctx, *m, expert, bits);
+            moe_group_prefetch_trace_locked(ctx, "check", layer, expert, *m, bits,
+                    ready ? "ready" : "need_load");
+        }
+        if (ready) {
+            if (!is_demand) {
+                ctx.group_prefetch_hit_existing.fetch_add(1, std::memory_order_relaxed);
+            }
+            continue;
+        }
+
+        const uint64_t before_streams = ctx.streams.load(std::memory_order_relaxed);
+        const uint64_t before_bytes = ctx.bytes_read.load(std::memory_order_relaxed);
+        bool entry_missing = false;
+        bool read_failed = false;
+        if (ctx.params.dynamic_bits_real && moe_mwq_entry(ctx, *m, expert, bits) != nullptr) {
+            moe_stream_mwq_slice(ctx, *m, expert, false, bits, rank, &entry_missing, &read_failed, false, is_demand);
+        } else {
+            moe_stream_slice(ctx, *m, expert, false, bits, rank, false, is_demand);
+        }
+        const uint64_t after_streams = ctx.streams.load(std::memory_order_relaxed);
+        const uint64_t after_bytes = ctx.bytes_read.load(std::memory_order_relaxed);
+        if (is_demand && !entry_missing && !read_failed) {
+            ctx.demand_async_slices.fetch_add(1, std::memory_order_relaxed);
+        } else if (!is_demand && after_streams > before_streams) {
+            ctx.group_prefetch_slices.fetch_add(after_streams - before_streams, std::memory_order_relaxed);
+        }
+        if (!is_demand && after_bytes > before_bytes) {
+            ctx.group_prefetch_bytes.fetch_add(after_bytes - before_bytes, std::memory_order_relaxed);
+        }
+        if (entry_missing || read_failed) {
+            if (is_demand) {
+                ctx.demand_async_failed.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                ctx.group_prefetch_fail.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lk(ctx.mtx);
+            if (is_demand && !entry_missing && !read_failed &&
+                    (int) moe_kind(*m) == primary_kind &&
+                    expert < (int) m->demand_async_loaded.size() &&
+                    ((ctx.params.dynamic_bits_real && moe_mwq_resolve_loaded_bits(*m, expert, bits) > 0) ||
+                     moe_native_resident_compatible(ctx, *m, expert, bits))) {
+                m->demand_async_loaded[expert] = true;
+                if (expert < (int) m->prefetched.size()) {
+                    m->prefetched[expert] = false;
+                }
+            }
+            if (!is_demand) {
+                moe_group_prefetch_trace_locked(ctx,
+                        entry_missing ? "entry_missing" : (read_failed ? "read_failed" : "load"),
+                        layer, expert, *m, bits, after_streams > before_streams ? "loaded" : "no_stream");
+            }
+        }
+    }
+}
+
+static bool moe_enqueue_group_prefetch_task(
+        llama_moe_buffer_context & ctx,
+        int                        layer,
+        int                        expert,
+        int                        rank,
+        float                      score,
+        int                        priority,
+        uint64_t                   token_epoch,
+        int                        skip_kind) {
+    if (layer < 0 || expert < 0) {
+        return false;
+    }
+    moe_prefetch_task task;
+    task.is_group = true;
+    task.layer = layer;
+    task.skip_kind = skip_kind;
+    task.e = expert;
+    task.rank = rank;
+    task.score = score;
+    task.target_bits = ctx.params.base_bits;
+    task.priority = priority;
+    {
+        std::lock_guard<std::mutex> lk(ctx.qmtx);
+        const uint64_t key = moe_group_key(layer, expert);
+        auto last_it = ctx.group_prefetch_last_enqueue_token.find(key);
+        if (last_it != ctx.group_prefetch_last_enqueue_token.end() && last_it->second == token_epoch) {
+            ctx.group_prefetch_dups.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        ctx.group_prefetch_last_enqueue_token[key] = token_epoch;
+        task.seq = ctx.next_task_seq++;
+        ctx.queue.push(task);
+    }
+    ctx.enqueued.fetch_add(1, std::memory_order_relaxed);
+    ctx.group_prefetch_enqueued.fetch_add(1, std::memory_order_relaxed);
+    ctx.cv_q.notify_one();
+    return true;
+}
+
+static bool moe_demand_async_enabled() {
+    static const bool enabled = moe_env_flag("LLAMA_LAZY_MOE_DEMAND_ASYNC", 0);
+    return enabled;
+}
+
+static int moe_demand_kind_order(moe_tensor_kind kind) {
+    switch (kind) {
+        case moe_tensor_kind::gate: return 0;
+        case moe_tensor_kind::up:   return 1;
+        case moe_tensor_kind::down: return 2;
+        default:                    return 3;
+    }
+}
+
+static void moe_prepare_demand_groups(
+        llama_moe_buffer_context & ctx,
+        int                        layer,
+        const ggml_tensor *        ids) {
+    if (!moe_demand_async_enabled() || !ctx.params.dynamic_bits_real ||
+            layer < 0 || ids == nullptr || ids->data == nullptr || ids->type != GGML_TYPE_I32) {
+        return;
+    }
+    auto layer_it = ctx.by_layer.find(layer);
+    if (layer_it == ctx.by_layer.end() || layer_it->second.empty()) {
+        return;
+    }
+
+    const int n_expert = layer_it->second.front()->n_expert;
+    std::vector<int> min_rank((size_t) n_expert, INT_MAX);
+    for (int64_t token = 0; token < ids->ne[1]; ++token) {
+        for (int64_t rank = 0; rank < ids->ne[0]; ++rank) {
+            const int expert = *(const int32_t *) ((const char *) ids->data +
+                    token * ids->nb[1] + rank * ids->nb[0]);
+            if (expert >= 0 && expert < n_expert) {
+                min_rank[(size_t) expert] = std::min(min_rank[(size_t) expert], (int) rank);
+            }
+        }
+    }
+
+    struct demand_submit {
+        int expert = -1;
+        int rank = 0;
+        int primary_kind = -1;
+        uint64_t generation = 0;
+        size_t needed_bytes = 0;
+    };
+    struct demand_join {
+        uint64_t key = 0;
+        uint64_t generation = 0;
+    };
+    std::vector<demand_submit> submits;
+    std::vector<demand_join> joins;
+    size_t batch_needed_bytes = 0;
+    const uint64_t wall_t0 = ctx.profile ? moe_profile_now_ns() : 0;
+    ctx.demand_async_plans.fetch_add(1, std::memory_order_relaxed);
+
+    {
+        std::lock_guard<std::mutex> lk(ctx.mtx);
+        for (int expert = 0; expert < n_expert; ++expert) {
+            if (min_rank[(size_t) expert] == INT_MAX) {
+                continue;
+            }
+            int primary_kind = -1;
+            int primary_order = INT_MAX;
+            size_t expert_needed_bytes = 0;
+            for (moe_managed * m : layer_it->second) {
+                if (m == nullptr || expert >= m->n_expert) {
+                    continue;
+                }
+                const int bits = moe_target_bits_for_rank(ctx, *m, expert, min_rank[(size_t) expert]);
+                const bool ready =
+                    moe_mwq_resolve_loaded_bits(*m, expert, bits) > 0 ||
+                    moe_native_resident_compatible(ctx, *m, expert, bits);
+                if (ready) {
+                    continue;
+                }
+                expert_needed_bytes += moe_effective_stream_bytes_for_target(
+                        ctx, *m, expert, bits);
+                const int order = moe_demand_kind_order(moe_kind(*m));
+                if (order < primary_order) {
+                    primary_order = order;
+                    primary_kind = (int) moe_kind(*m);
+                }
+            }
+            if (primary_kind < 0) {
+                continue;
+            }
+
+            moe_group_state & g = moe_group_get(ctx, layer, expert);
+            if (g.demand_async_pending) {
+                ctx.demand_async_dedup.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                g.demand_async_pending = true;
+                ++g.demand_async_generation;
+                submits.push_back({
+                    expert,
+                    min_rank[(size_t) expert],
+                    primary_kind,
+                    g.demand_async_generation,
+                    expert_needed_bytes,
+                });
+            }
+            joins.push_back({moe_group_key(layer, expert), g.demand_async_generation});
+        }
+
+        bool batch_admission_planned = false;
+        uint64_t batch_groups_before =
+            ctx.group_evictions.load(std::memory_order_relaxed);
+        if (moe_demand_admission_enabled() && ctx.params.budget_bytes > 0 &&
+                !submits.empty() && layer_it->second.front() != nullptr) {
+            batch_admission_planned = true;
+            const size_t cache_bytes = ctx.resident_bytes -
+                std::min(ctx.resident_bytes, ctx.demand_admission_staging_bytes);
+            const size_t cache_free = ctx.params.budget_bytes -
+                std::min(cache_bytes, ctx.params.budget_bytes);
+            const size_t staging_limit = moe_env_mib_bytes(
+                    "LLAMA_LAZY_MOE_DEMAND_ADMISSION_STAGING_MB", 64);
+            const size_t staging_used =
+                ctx.demand_admission_staging_bytes +
+                ctx.demand_admission_staging_reserved_bytes;
+            const size_t staging_free =
+                staging_limit > staging_used ? staging_limit - staging_used : 0;
+
+            std::vector<moe_demand_admission_request> requests;
+            requests.reserve(submits.size());
+            size_t total_needed_bytes = 0;
+            for (const demand_submit & submit : submits) {
+                moe_group_state & g = moe_group_get(ctx, layer, submit.expert);
+                moe_admission_outcome_note_reuse_locked(ctx, g);
+                g.demand_admission_token = ctx.profile_token_epoch;
+                g.demand_admission_decided = true;
+                g.demand_admission_bypass = false;
+
+                moe_demand_admission_request request;
+                request.layer = layer;
+                request.expert = submit.expert;
+                request.target_bytes = submit.needed_bytes;
+                request.incoming_value = moe_demand_incoming_value_locked(
+                        ctx, g, submit.needed_bytes, submit.rank);
+                request.margin =
+                    moe_env_f64("LLAMA_LAZY_MOE_DEMAND_ADMIT_MARGIN", 0.0);
+                requests.push_back(request);
+                total_needed_bytes += submit.needed_bytes;
+            }
+
+            std::vector<moe_demand_admission_result> results(requests.size());
+            const size_t release_needed =
+                total_needed_bytes > cache_free ? total_needed_bytes - cache_free : 0;
+            if (release_needed > 0) {
+                moe_managed * target = layer_it->second.front();
+                moe_evict_context_guard evict_ctx(ctx, *target, true);
+                moe_evict_lru(
+                        ctx,
+                        release_needed,
+                        nullptr,
+                        nullptr,
+                        &requests,
+                        &results,
+                        cache_free,
+                        staging_free);
+            }
+
+            for (size_t i = 0; i < submits.size(); ++i) {
+                const demand_submit & submit = submits[i];
+                const moe_demand_admission_request & request = requests[i];
+                const moe_demand_admission_result & result = results[i];
+                moe_group_state & g = moe_group_get(ctx, layer, submit.expert);
+                if (result.evaluated) {
+                    ctx.demand_admission_runs.fetch_add(1, std::memory_order_relaxed);
+                    ctx.demand_admission_candidate_x1000.fetch_add(
+                            (uint64_t) std::max(0.0, request.incoming_value * 1000.0),
+                            std::memory_order_relaxed);
+                    ctx.demand_admission_victim_x1000.fetch_add(
+                            (uint64_t) std::max(0.0, result.victim_value * 1000.0),
+                            std::memory_order_relaxed);
+                    if (result.bypass) {
+                        g.demand_admission_bypass = true;
+                        g.admission_staging_reserved_bytes += submit.needed_bytes;
+                        ctx.demand_admission_staging_reserved_bytes += submit.needed_bytes;
+                        ctx.demand_admission_bypass.fetch_add(1, std::memory_order_relaxed);
+                        if (!result.has_victim) {
+                            ctx.demand_admission_no_victim.fetch_add(
+                                    1, std::memory_order_relaxed);
+                        }
+                    } else {
+                        ctx.demand_admission_admit.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    moe_admission_outcome_begin_locked(
+                            ctx, g, result.bypass, request.incoming_value, result);
+                }
+                if (!result.bypass) {
+                    batch_needed_bytes += submit.needed_bytes;
+                }
+            }
+        } else {
+            for (const demand_submit & submit : submits) {
+                batch_needed_bytes += submit.needed_bytes;
+            }
+        }
+
+        if (batch_needed_bytes > 0 && ctx.params.budget_bytes > 0) {
+            ctx.demand_async_batch_evict_runs.fetch_add(1, std::memory_order_relaxed);
+            ctx.demand_async_batch_reserved_bytes.fetch_add(
+                    batch_needed_bytes, std::memory_order_relaxed);
+            uint64_t peak = ctx.demand_async_batch_reserved_peak.load(std::memory_order_relaxed);
+            while (peak < batch_needed_bytes &&
+                    !ctx.demand_async_batch_reserved_peak.compare_exchange_weak(
+                            peak, batch_needed_bytes, std::memory_order_relaxed)) {
+            }
+
+            moe_managed * target = layer_it->second.front();
+            if (!batch_admission_planned && target != nullptr) {
+                moe_evict_context_guard evict_ctx(ctx, *target, true);
+                const size_t cache_bytes = ctx.resident_bytes -
+                    std::min(ctx.resident_bytes, ctx.demand_admission_staging_bytes);
+                const size_t available = ctx.params.budget_bytes -
+                    std::min(cache_bytes, ctx.params.budget_bytes);
+                const size_t release_needed =
+                    batch_needed_bytes > available ? batch_needed_bytes - available : 0;
+                if (release_needed > 0) {
+                    moe_evict_lru(ctx, release_needed);
+                }
+            }
+            const uint64_t groups_after = ctx.group_evictions.load(std::memory_order_relaxed);
+            if (groups_after > batch_groups_before) {
+                ctx.demand_async_batch_evict_groups.fetch_add(
+                        groups_after - batch_groups_before, std::memory_order_relaxed);
+            }
+            const size_t cache_bytes = ctx.resident_bytes -
+                std::min(ctx.resident_bytes, ctx.demand_admission_staging_bytes);
+            if (batch_needed_bytes > ctx.params.budget_bytes -
+                    std::min(cache_bytes, ctx.params.budget_bytes)) {
+                ctx.demand_async_batch_shortfall.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+
+    if (joins.empty()) {
+        return;
+    }
+    ctx.demand_async_groups.fetch_add(joins.size(), std::memory_order_relaxed);
+
+    {
+        std::lock_guard<std::mutex> lk(ctx.qmtx);
+        for (const demand_submit & submit : submits) {
+            moe_prefetch_task task;
+            task.is_group = true;
+            task.is_demand = true;
+            task.layer = layer;
+            task.primary_kind = submit.primary_kind;
+            task.e = submit.expert;
+            task.rank = submit.rank;
+            task.target_bits = ctx.params.base_bits;
+            task.priority = INT_MAX;
+            task.generation = submit.generation;
+            task.seq = ctx.next_task_seq++;
+            ctx.queue.push(task);
+        }
+    }
+    ctx.demand_async_submitted.fetch_add(submits.size(), std::memory_order_relaxed);
+    if (submits.size() > 1) {
+        ctx.cv_q.notify_all();
+    } else if (!submits.empty()) {
+        ctx.cv_q.notify_one();
+    }
+
+    const uint64_t wait_t0 = ctx.profile ? moe_profile_now_ns() : 0;
+    {
+        std::unique_lock<std::mutex> lk(ctx.mtx);
+        ctx.cv_done.wait(lk, [&] {
+            for (const demand_join & join : joins) {
+                auto it = ctx.groups.find(join.key);
+                if (it != ctx.groups.end() &&
+                        it->second.demand_async_pending &&
+                        it->second.demand_async_generation == join.generation) {
+                    return false;
+                }
+            }
+            return true;
+        });
+    }
+    ctx.demand_async_joined.fetch_add(joins.size(), std::memory_order_relaxed);
+    if (ctx.profile) {
+        const uint64_t now = moe_profile_now_ns();
+        ctx.demand_async_wait_us.fetch_add((now - wait_t0) / 1000, std::memory_order_relaxed);
+        ctx.demand_async_wall_us.fetch_add((now - wall_t0) / 1000, std::memory_order_relaxed);
+    }
 }
 
 void llama_moe_buffer_prefetch(
@@ -5003,7 +8071,7 @@ void llama_moe_buffer_prefetch_ranked(
             for (int i = 0; i < n_experts; ++i) {
                 const int e = experts[i];
                 const float score = scores != nullptr ? scores[i] : 0.0f;
-                n_enqueued += moe_enqueue_prefetch(*ctx, *m, e, i, score) ? 1 : 0;
+                n_enqueued += moe_enqueue_prefetch(*ctx, *m, e, i, score, true) ? 1 : 0;
             }
         }
     }
@@ -5032,15 +8100,24 @@ bool llama_moe_buffer_stream_callback(ggml_tensor * op, int ith, void * user_dat
     const uint64_t callback_t0 = (ith == 0 && ctx->profile) ? moe_profile_now_ns() : 0;
 
     if (ith == 0) {
+        uint64_t token_epoch_snapshot = 0;
         {
             std::lock_guard<std::mutex> lk(ctx->mtx);
             if (m.layer >= 0) {
+                const int completed_layer = ctx->profile_last_layer;
+                if (completed_layer >= 0 && completed_layer != m.layer) {
+                    moe_release_demand_bypass_layer_locked(*ctx, completed_layer);
+                    moe_evict_layer_done_locked(*ctx, completed_layer);
+                }
                 if (ctx->profile_last_layer >= 0 && m.layer < ctx->profile_last_layer) {
                     ++ctx->profile_token_epoch;
+                    moe_admission_outcome_expire_locked(*ctx);
+                    moe_admission_regret_expire_locked(*ctx);
                 }
                 ctx->profile_last_layer = m.layer;
             }
             ++ctx->exec_epoch;
+            token_epoch_snapshot = ctx->profile_token_epoch;
         }
         moe_cleanup_mwq_transients(*ctx);
 
@@ -5084,18 +8161,161 @@ bool llama_moe_buffer_stream_callback(ggml_tensor * op, int ith, void * user_dat
                     ctx->prof_route_us.fetch_add((moe_profile_now_ns() - route_t0) / 1000, std::memory_order_relaxed);
                 }
 
+                if (moe_env_flag("LLAMA_LAZY_MOE_GROUP_PREFETCH_SELFTEST", 0) &&
+                        !ctx->group_prefetch_selftest_done && m.layer >= 0) {
+                    for (int expert = 0; expert < m.n_expert; ++expert) {
+                        if (op_counts[expert] > 0) {
+                            ctx->group_prefetch_selftest_done = true;
+                            const int rank = op_min_rank[expert] == 999999 ? 0 : op_min_rank[expert];
+                            moe_enqueue_group_prefetch_task(*ctx, m.layer, expert, rank, 1.0f, INT_MAX / 2,
+                                    token_epoch_snapshot, -1);
+                            break;
+                        }
+                    }
+                }
+
+                struct route_run {
+                    int expert = -1;
+                    int target_bits = 0;
+                    int best_rank = 0;
+                    int count = 0;
+                    int state = 2; // 0=ready, 1=loading/queued, 2=cold
+                };
+                auto classify_run_state = [&](int expert, int target_bits) {
+                    std::lock_guard<std::mutex> lk(ctx->mtx);
+                    if (ctx->params.dynamic_bits_real && moe_mwq_resolve_loaded_bits(m, expert, target_bits) > 0) {
+                        return 0;
+                    }
+                    if (moe_native_resident_compatible(*ctx, m, expert, target_bits)) {
+                        return 0;
+                    }
+                    if (expert >= 0 && expert < m.n_expert &&
+                            (m.resident[expert] == ST_INFLIGHT ||
+                             (expert < (int) m.queued.size() && m.queued[expert]))) {
+                        return 1;
+                    }
+                    return 2;
+                };
+
+                std::vector<route_run> runs;
+                runs.reserve((size_t) m.n_expert);
                 for (int expert = 0; expert < m.n_expert; ++expert) {
-                    const int target_bits = op_target_bits[expert];
-                    if (target_bits <= 0) {
+                    if (op_target_bits[expert] <= 0) {
                         continue;
                     }
-                    const int best_rank = op_min_rank[expert] == 999999 ? 0 : op_min_rank[expert];
+                    route_run run;
+                    run.expert = expert;
+                    run.target_bits = op_target_bits[expert];
+                    run.best_rank = op_min_rank[expert] == 999999 ? 0 : op_min_rank[expert];
+                    run.count = op_counts[expert];
+                    run.state = classify_run_state(expert, run.target_bits);
+                    runs.push_back(run);
+                }
+                if (moe_env_flag("LLAMA_LAZY_MOE_RUN_QUEUE", 1)) {
+                    std::stable_sort(runs.begin(), runs.end(), [](const route_run & a, const route_run & b) {
+                        if (a.state != b.state) {
+                            return a.state < b.state;
+                        }
+                        if (a.count != b.count) {
+                            return a.count > b.count;
+                        }
+                        return a.expert < b.expert;
+                    });
+                }
+                if (!runs.empty()) {
+                    ctx->runq_ops.fetch_add(1, std::memory_order_relaxed);
+                }
+                if (moe_kind(m) == moe_tensor_kind::gate) {
+                    moe_prepare_demand_groups(*ctx, m.layer, ids);
+                }
+                if (moe_kind(m) == moe_tensor_kind::gate && moe_group_prefetch_same_layer_enabled()) {
+                    const int max_groups = moe_group_prefetch_same_layer_max_groups();
+                    const int min_count = moe_group_prefetch_same_layer_min_count();
+                    struct group_prefetch_candidate {
+                        route_run run;
+                        int missing_siblings = 0;
+                    };
+                    std::vector<group_prefetch_candidate> candidates;
+                    candidates.reserve(runs.size());
+                    {
+                        std::lock_guard<std::mutex> lk(ctx->mtx);
+                        for (const route_run & run : runs) {
+                            if (run.count < min_count) {
+                                continue;
+                            }
+                            const int missing = moe_group_missing_sibling_slices_locked(
+                                    *ctx, m.layer, run.expert, run.best_rank, (int) moe_tensor_kind::gate);
+                            if (missing <= 0) {
+                                continue;
+                            }
+                            candidates.push_back({run, missing});
+                        }
+                    }
+                    std::stable_sort(candidates.begin(), candidates.end(),
+                            [](const group_prefetch_candidate & a, const group_prefetch_candidate & b) {
+                        if (a.missing_siblings != b.missing_siblings) {
+                            return a.missing_siblings > b.missing_siblings;
+                        }
+                        if (a.run.count != b.run.count) {
+                            return a.run.count > b.run.count;
+                        }
+                        return a.run.expert < b.run.expert;
+                    });
+                    int submitted = 0;
+                    for (const group_prefetch_candidate & cand : candidates) {
+                        if (max_groups > 0 && submitted >= max_groups) {
+                            break;
+                        }
+                        const route_run & run = cand.run;
+                        const float score = (float) run.count;
+                        const int priority = INT_MAX / 4 + cand.missing_siblings * 2048 + std::min(run.count, 1024);
+                        if (moe_enqueue_group_prefetch_task(*ctx, m.layer, run.expert, run.best_rank, score, priority,
+                                    token_epoch_snapshot, (int) moe_tensor_kind::gate)) {
+                            ++submitted;
+                        }
+                    }
+                    if (submitted > 0) {
+                        ctx->group_prefetch_same_layer_ops.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+
+                int run_order = 0;
+                for (const route_run & run : runs) {
+                    const int expert = run.expert;
+                    const int target_bits = run.target_bits;
+                    const int best_rank = run.best_rank;
+                    if (run.state == 0) {
+                        ctx->runq_ready.fetch_add(1, std::memory_order_relaxed);
+                    } else if (run.state == 1) {
+                        ctx->runq_loading.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        ctx->runq_cold.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    if (ctx->run_queue_trace != nullptr) {
+                        const moe_tensor_kind kind = moe_kind(m);
+                        const char * kind_name = kind == moe_tensor_kind::gate ? "gate" :
+                            (kind == moe_tensor_kind::up ? "up" :
+                             (kind == moe_tensor_kind::down ? "down" : "other"));
+                        std::fprintf(ctx->run_queue_trace,
+                                "%llu\t%llu\t%d\t%d\t%s\t%d\t%d\t%d\t%s\t%d\n",
+                                (unsigned long long) ctx->profile_token_epoch,
+                                (unsigned long long) ctx->exec_epoch,
+                                m.layer,
+                                expert,
+                                kind_name,
+                                target_bits,
+                                best_rank,
+                                run.count,
+                                run.state == 0 ? "ready" : (run.state == 1 ? "loading" : "cold"),
+                                run_order);
+                    }
+                    ++run_order;
                     if (use_mwq_kernel) {
                         moe_stream_mwq_slice(*ctx, m, expert, true, target_bits, best_rank);
                     } else {
                         moe_stream_slice(*ctx, m, expert, true, target_bits, best_rank);
                     }
-                    const int extra = op_counts[expert] - 1;
+                    const int extra = run.count - 1;
                     if (extra > 0) {
                         std::lock_guard<std::mutex> lk(ctx->mtx);
                         const uint64_t add = (uint64_t) extra;
@@ -5107,15 +8327,35 @@ bool llama_moe_buffer_stream_callback(ggml_tensor * op, int ith, void * user_dat
                         ctx->hits.fetch_add(add, std::memory_order_relaxed);
                     }
                 }
-                if (moe_kind(m) == moe_tensor_kind::down && moe_eam_predict_enabled()) {
-                    std::vector<int> actual_experts;
-                    actual_experts.reserve((size_t) m.n_expert);
-                    for (int expert = 0; expert < m.n_expert; ++expert) {
-                        if (op_counts[expert] > 0) {
-                            actual_experts.push_back(expert);
+                if (moe_kind(m) == moe_tensor_kind::down) {
+                    if (moe_next_token_keep_enabled()) {
+                        std::vector<int> last_token_experts;
+                        if (ids->ne[1] > 0) {
+                            const int64_t token = ids->ne[1] - 1;
+                            last_token_experts.reserve((size_t) ids->ne[0]);
+                            for (int64_t rank = 0; rank < ids->ne[0]; ++rank) {
+                                const int expert = *(const int32_t *) ((const char *) ids->data + token * ids->nb[1] + rank * ids->nb[0]);
+                                if (expert >= 0 && expert < m.n_expert) {
+                                    last_token_experts.push_back(expert);
+                                }
+                            }
+                            std::sort(last_token_experts.begin(), last_token_experts.end());
+                            last_token_experts.erase(std::unique(last_token_experts.begin(), last_token_experts.end()),
+                                    last_token_experts.end());
                         }
+                        std::lock_guard<std::mutex> lk(ctx->mtx);
+                        moe_next_token_update_after_route_locked(*ctx, m.layer, last_token_experts, m.n_expert);
                     }
-                    moe_eam_predict_after_route(*ctx, m.layer, actual_experts, m.n_expert);
+                    if (moe_eam_predict_enabled()) {
+                        std::vector<int> actual_experts;
+                        actual_experts.reserve((size_t) m.n_expert);
+                        for (int expert = 0; expert < m.n_expert; ++expert) {
+                            if (op_counts[expert] > 0) {
+                                actual_experts.push_back(expert);
+                            }
+                        }
+                        moe_eam_predict_after_route(*ctx, m.layer, actual_experts, m.n_expert);
+                    }
                 }
                 if (ctx->profile) {
                     ctx->prof_moe_total_us.fetch_add((moe_profile_now_ns() - callback_t0) / 1000, std::memory_order_relaxed);
@@ -5137,6 +8377,24 @@ bool llama_moe_buffer_stream_callback(ggml_tensor * op, int ith, void * user_dat
                         moe_stream_slice(*ctx, m, expert, true, target_bits, (int) rank);  // resident or wait-for-inflight
                     }
                 }
+            }
+            if (moe_kind(m) == moe_tensor_kind::down && moe_next_token_keep_enabled()) {
+                std::vector<int> last_token_experts;
+                if (ids->ne[1] > 0) {
+                    const int64_t token = ids->ne[1] - 1;
+                    last_token_experts.reserve((size_t) ids->ne[0]);
+                    for (int64_t rank = 0; rank < ids->ne[0]; ++rank) {
+                        const int expert = *(const int32_t *) ((const char *) ids->data + token * ids->nb[1] + rank * ids->nb[0]);
+                        if (expert >= 0 && expert < m.n_expert) {
+                            last_token_experts.push_back(expert);
+                        }
+                    }
+                    std::sort(last_token_experts.begin(), last_token_experts.end());
+                    last_token_experts.erase(std::unique(last_token_experts.begin(), last_token_experts.end()),
+                            last_token_experts.end());
+                }
+                std::lock_guard<std::mutex> lk(ctx->mtx);
+                moe_next_token_update_after_route_locked(*ctx, m.layer, last_token_experts, m.n_expert);
             }
         }
         if (ctx->profile) {
@@ -10211,11 +13469,18 @@ static void moe_print_stats_impl(const llama_moe_buffer_context & ctx, const cha
             "egroup_touch=%llu egroup_evict=%llu/%llu pinned_hit=%llu active_hit=%llu belady=%llu lru_fb=%llu "
             "eam={access:%llu,rank0:%llu,future:%llu,queued:%llu,prefetch_hit:%llu,late:%llu,unused:%llu,cache_hit:%llu,cache_miss:%llu} "
             "eam_admit={ok:%llu,drop:%llu,budget:%llu,distance:%llu,score:%llu,active:%llu,pinned:%llu,recent:%llu,avg_ok:%.3f,avg_drop:%.3f,spec_peak:%.1f MiB} "
+            "admission={runs:%llu,ok:%llu,drop:%llu,no_victim:%llu,refresh:%llu,stale:%llu,avg_candidate:%.3f,avg_victim:%.3f} "
             "eam_predict={runs:%llu,cand:%llu,enq:%llu,drop:%llu,avg_score:%.3f} "
             "eamc={snap:%llu,stored:%zu,match:%llu,hit:%llu,miss:%llu,active:%zu,avg_sim:%.3f,prior:%llu} "
             "eam_evict={spec_unused:%llu,low:%llu,far:%llu,relaxed:%llu,protect_active:%llu,pinned:%llu,recent:%llu,high:%llu,early:%llu} "
             "layer_reserve={evict:%llu,protect:%llu,relaxed:%llu,reload_bad:%llu,reload_protect:%llu} "
             "reuse_evict={low:%llu,protect:%llu,predict_protect:%llu,low_cand:%llu,reload1:%llu,reload4:%llu,reload16:%llu} "
+            "bad_reload={protect:%llu,soft:%llu,reload1:%llu,reload4:%llu,reload16:%llu} "
+            "cct={updates:%llu,hit:%llu,miss:%llu,unused:%llu,replaced:%llu,prefetch_admit:%llu,prefetch_drop:%llu,evict_protect:%llu,evict_keep:%llu} "
+            "next_token={updates:%llu,pred:%llu,hit:%llu,miss:%llu,admit:%llu,layer_done_keep:%llu,evict_keep:%llu} "
+            "runq={ops:%llu,ready:%llu,loading:%llu,cold:%llu} group_fill={sibling_loads:%llu} "
+            "group_prefetch={enq:%llu,run:%llu,slices:%llu,hit_existing:%llu,fail:%llu,dups:%llu,same_layer_ops:%llu,bytes:%.1f MiB} "
+            "layer_done={evict:%llu,slices:%llu,bytes:%.1f MiB,protect_pinned:%llu,active:%llu,future:%llu,recent:%llu,bad_reload:%llu,inflight:%llu,next_token:%llu} "
             "dyn_eff=%.1f MiB dyn_saved=%.1f MiB wait=%llu/%.1f ms mwq_actual_saved=%.1f/%.1f MiB "
             "stream_fail_total=%llu direct_swiglu_fail={precheck:%llu,byname:%llu,entry_missing:%llu,read:%llu,range:%llu,kernelpair:%llu,native_prep:%llu,other:%llu}\n",
             prefix,
@@ -10306,6 +13571,16 @@ static void moe_print_stats_impl(const llama_moe_buffer_context & ctx, const cha
             ctx.eam_prefetch_drop.load() > 0 ?
                 (double) ctx.eam_prefetch_drop_score_x1000.load() / 1000.0 / (double) ctx.eam_prefetch_drop.load() : 0.0,
             ctx.eam_speculative_bytes_peak.load() / 1048576.0,
+            (unsigned long long) ctx.admission_compare_runs.load(),
+            (unsigned long long) ctx.admission_compare_admit.load(),
+            (unsigned long long) ctx.admission_compare_drop.load(),
+            (unsigned long long) ctx.admission_compare_no_victim.load(),
+            (unsigned long long) ctx.admission_floor_refresh.load(),
+            (unsigned long long) ctx.admission_floor_stale.load(),
+            ctx.admission_compare_runs.load() > 0 ?
+                (double) ctx.admission_candidate_value_x1000.load() / 1000.0 / (double) ctx.admission_compare_runs.load() : 0.0,
+            ctx.admission_compare_runs.load() > 0 ?
+                (double) ctx.admission_victim_value_x1000.load() / 1000.0 / (double) ctx.admission_compare_runs.load() : 0.0,
             (unsigned long long) ctx.eam_predict_runs.load(),
             (unsigned long long) ctx.eam_predict_candidates.load(),
             (unsigned long long) ctx.eam_predict_enqueued.load(),
@@ -10342,6 +13617,50 @@ static void moe_print_stats_impl(const llama_moe_buffer_context & ctx, const cha
             (unsigned long long) ctx.reuse_reload_1.load(),
             (unsigned long long) ctx.reuse_reload_4.load(),
             (unsigned long long) ctx.reuse_reload_16.load(),
+            (unsigned long long) ctx.bad_reload_protect.load(),
+            (unsigned long long) ctx.bad_reload_soft_keep.load(),
+            (unsigned long long) ctx.bad_reload_1.load(),
+            (unsigned long long) ctx.bad_reload_4.load(),
+            (unsigned long long) ctx.bad_reload_16.load(),
+            (unsigned long long) ctx.cct_updates.load(),
+            (unsigned long long) ctx.cct_hits.load(),
+            (unsigned long long) ctx.cct_misses.load(),
+            (unsigned long long) ctx.cct_unused.load(),
+            (unsigned long long) ctx.cct_replaced.load(),
+            (unsigned long long) ctx.cct_prefetch_admit.load(),
+            (unsigned long long) ctx.cct_prefetch_drop.load(),
+            (unsigned long long) ctx.cct_evict_protect.load(),
+            (unsigned long long) ctx.cct_evict_keep.load(),
+            (unsigned long long) ctx.next_token_updates.load(),
+            (unsigned long long) ctx.next_token_predicted.load(),
+            (unsigned long long) ctx.next_token_hits.load(),
+            (unsigned long long) ctx.next_token_misses.load(),
+            (unsigned long long) ctx.next_token_admit.load(),
+            (unsigned long long) ctx.next_token_layer_done_protect.load(),
+            (unsigned long long) ctx.next_token_evict_protect.load(),
+            (unsigned long long) ctx.runq_ops.load(),
+            (unsigned long long) ctx.runq_ready.load(),
+            (unsigned long long) ctx.runq_loading.load(),
+            (unsigned long long) ctx.runq_cold.load(),
+            (unsigned long long) ctx.group_fill_sibling_loads.load(),
+            (unsigned long long) ctx.group_prefetch_enqueued.load(),
+            (unsigned long long) ctx.group_prefetch_runs.load(),
+            (unsigned long long) ctx.group_prefetch_slices.load(),
+            (unsigned long long) ctx.group_prefetch_hit_existing.load(),
+            (unsigned long long) ctx.group_prefetch_fail.load(),
+            (unsigned long long) ctx.group_prefetch_dups.load(),
+            (unsigned long long) ctx.group_prefetch_same_layer_ops.load(),
+            ctx.group_prefetch_bytes.load() / 1048576.0,
+            (unsigned long long) ctx.layer_done_evict_groups.load(),
+            (unsigned long long) ctx.layer_done_evict_slices.load(),
+            ctx.layer_done_evict_bytes.load() / 1048576.0,
+            (unsigned long long) ctx.layer_done_protect_pinned.load(),
+            (unsigned long long) ctx.layer_done_protect_active.load(),
+            (unsigned long long) ctx.layer_done_protect_future.load(),
+            (unsigned long long) ctx.layer_done_protect_recent.load(),
+            (unsigned long long) ctx.layer_done_protect_bad_reload.load(),
+            (unsigned long long) ctx.layer_done_protect_inflight.load(),
+            (unsigned long long) ctx.layer_done_protect_next_token.load(),
             ctx.dyn_effective_bytes.load() / 1048576.0,
             ctx.dyn_saved_bytes.load() / 1048576.0,
             (unsigned long long) ctx.stream_wait_count.load(),
@@ -10357,6 +13676,100 @@ static void moe_print_stats_impl(const llama_moe_buffer_context & ctx, const cha
             (unsigned long long) ctx.direct_swiglu_fail_kernelpair.load(),
             (unsigned long long) ctx.direct_swiglu_fail_native_prepare.load(),
             (unsigned long long) ctx.direct_swiglu_fail_other.load());
+    std::fprintf(stderr,
+            "%s: demand_async={plans:%llu,groups:%llu,submitted:%llu,joined:%llu,dedup:%llu,"
+            "slices:%llu,failed:%llu,wait_us:%llu,wall_us:%llu,batch_runs:%llu,"
+            "batch_evict:%llu,reserved_mib:%.1f,reserved_peak_mib:%.1f,shortfall:%llu,"
+            "worker_evict:%llu}\n",
+            prefix,
+            (unsigned long long) ctx.demand_async_plans.load(),
+            (unsigned long long) ctx.demand_async_groups.load(),
+            (unsigned long long) ctx.demand_async_submitted.load(),
+            (unsigned long long) ctx.demand_async_joined.load(),
+            (unsigned long long) ctx.demand_async_dedup.load(),
+            (unsigned long long) ctx.demand_async_slices.load(),
+            (unsigned long long) ctx.demand_async_failed.load(),
+            (unsigned long long) ctx.demand_async_wait_us.load(),
+            (unsigned long long) ctx.demand_async_wall_us.load(),
+            (unsigned long long) ctx.demand_async_batch_evict_runs.load(),
+            (unsigned long long) ctx.demand_async_batch_evict_groups.load(),
+            ctx.demand_async_batch_reserved_bytes.load() / 1048576.0,
+            ctx.demand_async_batch_reserved_peak.load() / 1048576.0,
+            (unsigned long long) ctx.demand_async_batch_shortfall.load(),
+            (unsigned long long) ctx.demand_async_worker_evictions.load());
+    std::fprintf(stderr,
+            "%s: demand_admission={runs:%llu,admit:%llu,bypass:%llu,no_victim:%llu,"
+            "release_groups:%llu,release_slices:%llu,release_mib:%.1f,staging_peak_mib:%.1f,"
+            "staging_reserved_mib:%.1f,avg_candidate:%.3f,avg_victim:%.3f}\n",
+            prefix,
+            (unsigned long long) ctx.demand_admission_runs.load(),
+            (unsigned long long) ctx.demand_admission_admit.load(),
+            (unsigned long long) ctx.demand_admission_bypass.load(),
+            (unsigned long long) ctx.demand_admission_no_victim.load(),
+            (unsigned long long) ctx.demand_admission_release_groups.load(),
+            (unsigned long long) ctx.demand_admission_release_slices.load(),
+            ctx.demand_admission_release_bytes.load() / 1048576.0,
+            ctx.demand_admission_staging_peak.load() / 1048576.0,
+            ctx.demand_admission_staging_reserved_bytes / 1048576.0,
+            ctx.demand_admission_runs.load() > 0 ?
+                (double) ctx.demand_admission_candidate_x1000.load() /
+                    1000.0 / (double) ctx.demand_admission_runs.load() : 0.0,
+            ctx.demand_admission_runs.load() > 0 ?
+                (double) ctx.demand_admission_victim_x1000.load() /
+                    1000.0 / (double) ctx.demand_admission_runs.load() : 0.0);
+    std::fprintf(stderr,
+            "%s: admission_outcome={admit_reuse1:%llu,admit_reuse4:%llu,admit_reuse16:%llu,"
+            "admit_unused:%llu,bypass_reload1:%llu,bypass_reload4:%llu,bypass_reload16:%llu,"
+            "bypass_success:%llu} admission_feedback={updates:%llu,positive:%llu,negative:%llu,"
+            "score_candidates:%llu}\n",
+            prefix,
+            (unsigned long long) ctx.admission_outcome_admit_reuse_1.load(),
+            (unsigned long long) ctx.admission_outcome_admit_reuse_4.load(),
+            (unsigned long long) ctx.admission_outcome_admit_reuse_16.load(),
+            (unsigned long long) ctx.admission_outcome_admit_unused.load(),
+            (unsigned long long) ctx.admission_outcome_bypass_reload_1.load(),
+            (unsigned long long) ctx.admission_outcome_bypass_reload_4.load(),
+            (unsigned long long) ctx.admission_outcome_bypass_reload_16.load(),
+            (unsigned long long) ctx.admission_outcome_bypass_success.load(),
+            (unsigned long long) ctx.admission_feedback_updates.load(),
+            (unsigned long long) ctx.admission_feedback_positive.load(),
+            (unsigned long long) ctx.admission_feedback_negative.load(),
+            (unsigned long long) ctx.admission_feedback_score_candidates.load());
+    std::fprintf(stderr,
+            "%s: admission_regret={pairs:%llu,resolved:%llu,expired:%llu,prefer_admit:%llu,"
+            "prefer_bypass:%llu,tie:%llu,score_candidates:%llu,pending:%zu}\n",
+            prefix,
+            (unsigned long long) ctx.admission_regret_pairs.load(),
+            (unsigned long long) ctx.admission_regret_resolved.load(),
+            (unsigned long long) ctx.admission_regret_expired.load(),
+            (unsigned long long) ctx.admission_regret_prefer_admit.load(),
+            (unsigned long long) ctx.admission_regret_prefer_bypass.load(),
+            (unsigned long long) ctx.admission_regret_tie.load(),
+            (unsigned long long) ctx.admission_regret_score_candidates.load(),
+            ctx.admission_pairs.size());
+    std::fprintf(stderr,
+            "%s: evict_scan={calls:%llu,entries:%llu,unique:%llu,dup:%llu,absolute:%llu,"
+            "temporary:%llu,normal:%llu,selected_temporary:%llu,no_victim:%llu}\n",
+            prefix,
+            (unsigned long long) ctx.evict_scan_calls.load(),
+            (unsigned long long) ctx.evict_scan_entries.load(),
+            (unsigned long long) ctx.evict_scan_unique.load(),
+            (unsigned long long) ctx.evict_scan_duplicates.load(),
+            (unsigned long long) ctx.evict_scan_absolute.load(),
+            (unsigned long long) ctx.evict_scan_temporary.load(),
+            (unsigned long long) ctx.evict_scan_normal.load(),
+            (unsigned long long) ctx.evict_scan_selected_temporary.load(),
+            (unsigned long long) ctx.evict_scan_no_victim.load());
+    std::fprintf(stderr,
+            "%s: ghost_feedback={evict:%llu,success:%llu,bad1:%llu,bad4:%llu,bad16:%llu,"
+            "score_candidates:%llu}\n",
+            prefix,
+            (unsigned long long) ctx.ghost_evictions.load(),
+            (unsigned long long) ctx.ghost_success.load(),
+            (unsigned long long) ctx.ghost_bad_1.load(),
+            (unsigned long long) ctx.ghost_bad_4.load(),
+            (unsigned long long) ctx.ghost_bad_16.load(),
+            (unsigned long long) ctx.ghost_score_candidates);
     moe_print_eam_top_impl(ctx, prefix);
     if (ctx.profile) {
         const uint64_t wait_us = ctx.stream_wait_ns.load(std::memory_order_relaxed) / 1000;

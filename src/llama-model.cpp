@@ -1980,7 +1980,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             window_params.clg_predict = clg_env != nullptr &&
                     std::atoi(clg_env) > 0;
             window_params.clg_delta = clg_delta != nullptr
-                    ? std::max(0, std::atoi(clg_delta)) : 2;
+                    ? std::max(0, std::atoi(clg_delta)) : 1;
             window_params.clg_prefill_threshold = clg_pthr != nullptr
                     ? std::max(1, std::atoi(clg_pthr)) : 4;
             // Hot-expert protection: experts activated more than clg_hot_thr_pct% of

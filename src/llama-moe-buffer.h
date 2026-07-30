@@ -29,9 +29,9 @@ struct llama_moe_buffer_params {
     bool   enabled      = false;
     bool   debug_log    = false;
     bool   direct_io    = false;     // O_DIRECT streaming reads (needs alignment)
-    bool   hebf_schedule = false;    // priority scheduling for async expert prefetch
-    bool   dynamic_bits  = false;    // policy-only bit-width selection (no data-format change)
-    bool   dynamic_bits_real = false; // require exact low-bit/MWQ data; fallback to full reads if unavailable
+    bool   hebf_schedule = true;     // priority scheduling for async expert prefetch
+    bool   dynamic_bits  = true;     // policy-only bit-width selection (no data-format change)
+    bool   dynamic_bits_real = true; // require exact low-bit/MWQ data; fallback to full reads if unavailable
     bool   strict_sidecar = false; // abort if the selected sidecar bit width is unavailable
     bool   native_hot = false;       // allow target bits >= base_bits to use original GGUF quant slices in the op override
     bool   fuse_gate_up = true;      // defer ffn_gate/up_exps MUL_MAT_ID until the sibling op is seen, then compute both together
@@ -46,21 +46,21 @@ struct llama_moe_buffer_params {
     bool   vnni_q2_swiglu = true;    // allow the VNNI q2 path for fused gate/up SWIGLU
     int    vnni_block = 64;          // activation int8 quantization block; q2 VNNI currently uses 64-column chunks
     int    avx512_prefetch = 0;      // q2-hier kernel prefetch distance in MWQ blocks; 0 disables explicit prefetch
-    size_t budget_bytes = 0;         // resident-expert byte budget; 0 = unbounded
-    int    n_workers    = 1;         // parallel prefetch workers (raise to lift effective
+    size_t budget_bytes = 1024ull * 1024ull * 1024ull; // resident-expert byte budget; 0 = unbounded
+    int    n_workers    = 2;         // parallel prefetch workers (raise to lift effective
                                      // read bandwidth on NVMe: single-thread O_DIRECT
                                      // random reads under-utilise the device)
-    int    base_bits    = 4;         // current on-disk expert precision for dyn-bit accounting
-    int    hot_bits     = 4;         // target bits for rank-0/hot predicted experts
-    int    warm_bits    = 3;         // target bits for mid-rank predicted experts
+    int    base_bits    = 2;         // current on-disk expert precision for dyn-bit accounting
+    int    hot_bits     = 2;         // target bits for rank-0/hot predicted experts
+    int    warm_bits    = 2;         // target bits for mid-rank predicted experts
     int    cold_bits    = 2;         // target bits for low-rank predicted experts
-    int    gate_bits    = 0;         // optional exact target bits for ffn_gate_exps; 0 = use hot/warm/cold policy
-    int    up_bits      = 0;         // optional exact target bits for ffn_up_exps; 0 = use hot/warm/cold policy
-    int    down_bits    = 0;         // optional exact target bits for ffn_down_exps; 0 = use hot/warm/cold policy
+    int    gate_bits    = 2;         // optional exact target bits for ffn_gate_exps; 0 = use hot/warm/cold policy
+    int    up_bits      = 2;         // optional exact target bits for ffn_up_exps; 0 = use hot/warm/cold policy
+    int    down_bits    = 2;         // optional exact target bits for ffn_down_exps; 0 = use hot/warm/cold policy
     int    fixed_bits   = 0;         // force every expert tensor/rank to this sidecar bit width; 0 = dynamic policy
-    int    gate_min_bits = 3;        // default sensitivity floor: gate logits should not use q2 unless explicitly requested
+    int    gate_min_bits = 2;        // default sensitivity floor: gate logits should not use q2 unless explicitly requested
     int    up_min_bits   = 0;        // up is the least sensitive expert projection; 0 = no floor
-    int    down_min_bits = 3;        // down projection feeds the residual path, keep at least q3 by default
+    int    down_min_bits = 2;        // down projection feeds the residual path, keep at least q3 by default
     int    sync_top_k   = 4;         // routed expert ids are assumed grouped by top-k rank
     float  hot_ratio    = 0.0f;      // relative hotness: an expert is pinned (never
                                      // LRU-evicted) when its activation count exceeds
