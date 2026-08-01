@@ -34,10 +34,13 @@ struct llama_flex_params {
     bool   enabled        = false;
     bool   direct_io      = true; // use O_DIRECT for streaming reads when possible
     bool   debug_log      = false;
+    bool   sched_auto     = false; // cap-aware scheduler: tune ring after pinning
     int    ring_layers    = 4;    // k: number of layer slots kept resident
     int    prefetch_ahead = 2;    // how many layers ahead to stream
     int    io_threads     = 4;    // background streaming threads
     size_t lock_bytes     = 0;    // balanced-locking budget (stage 2c); 0 = off
+    size_t memory_budget_bytes = 0; // cgroup/MemAvailable budget for sched_auto
+    size_t fixed_bytes    = 0;    // non-flex memory reserve for sched_auto
     std::string pin_policy = "small-first";
 };
 
@@ -63,6 +66,9 @@ struct llama_flex_stats {
     size_t   lock_budget_unused = 0;
     size_t   stream_per_token = 0; // unlocked bytes that must be read each token
     int      effective_ahead = 0;
+    size_t   sched_budget_bytes = 0;
+    size_t   sched_fixed_bytes = 0;
+    size_t   sched_ring_room = 0;
 };
 
 struct ggml_tensor;
