@@ -439,7 +439,9 @@ server_kv_pressure_action_result server_kv_pressure_execute_governor(
             result.observed_excess_bytes, state.pressure_debt_bytes_);
     result.episode = state.episode_;
     result.debt_before_bytes = state.pressure_debt_bytes_;
+    result.debt_after_bytes = state.pressure_debt_bytes_;
     result.offload_armed_before = state.offload_armed_;
+    result.offload_armed_after = state.offload_armed_;
 
     if (state.pressure_debt_bytes_ == 0) {
         state.offload_armed_ = false;

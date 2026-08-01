@@ -233,6 +233,37 @@ static void test_evaluate_blocks_invalid_open_or_unsupported() {
     }
 }
 
+
+static void test_release_unsupported_keeps_governor_debt_and_marker_stable() {
+    auto config = enabled_config();
+    server_kv_governor_state state;
+    fake_core core;
+    auto unsupported = evaluation(1030);
+    unsupported.capability.can_release = false;
+    core.responses = { unsupported };
+    server_kv_pressure_snapshot snapshot;
+    snapshot.state = kv_pressure_state::PRESSURE;
+    snapshot.sample_valid = true;
+    snapshot.pressure_basis_valid = true;
+    snapshot.pressure_current_bytes = 12288;
+    snapshot.pressure_low_water_bytes = 4096;
+    snapshot.pressure_basis_generation = 1;
+    snapshot.sample_count = 1;
+    snapshot.decision_id = 1030;
+
+    const auto result = server_kv_pressure_execute_governor(
+            config, state, core.ops(), snapshot, {});
+    CHECK(result.debt_before_bytes == 8192);
+    CHECK(result.debt_after_bytes == result.debt_before_bytes);
+    CHECK(!result.offload_armed_before && !result.offload_armed_after);
+    CHECK(!result.observation.release_attempted && !result.observation.offload_attempted);
+    const auto marker = server_kv_pressure_unified_action_format_marker(result);
+    CHECK(marker.find("debt_before_bytes=8192") != std::string::npos);
+    CHECK(marker.find("debt_after_bytes=8192") != std::string::npos);
+    CHECK(marker.find("offload_armed_before=0") != std::string::npos);
+    CHECK(marker.find("offload_armed_after=0") != std::string::npos);
+}
+
 static void test_evaluate_decision_mismatch_never_releases() {
     fake_core core;
     core.responses = { evaluation(1029) };
@@ -727,6 +758,7 @@ int main() {
     test_default_disabled_and_non_pressure_noop();
     test_stale_and_no_memory_are_blocked();
     test_evaluate_blocks_invalid_open_or_unsupported();
+    test_release_unsupported_keeps_governor_debt_and_marker_stable();
     test_evaluate_decision_mismatch_never_releases();
     test_release_reuses_decision_and_stops_after_one_action();
     test_release_terminal_results_do_not_chain();

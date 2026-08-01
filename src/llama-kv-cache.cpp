@@ -3233,6 +3233,7 @@ void llama_kv_cache::paged_init(uint32_t kv_size) {
     paged_free_list.resize(paged_n_blocks);
 
     paged_build_block_table();
+    paged_release_scan_reset();
 
     paged_alloc_calls     = 0;
     paged_blocks_in_use   = 0;
@@ -3263,6 +3264,7 @@ void llama_kv_cache::paged_reset() {
     paged_released_ranges_by_block.assign(paged_n_blocks, {});
     paged_free_list.resize(paged_n_blocks);
     paged_build_block_table();
+    paged_release_scan_reset();
     paged_blocks_in_use = 0;
     paged_swap_pending = false;
     paged_swap_pending_n_kv = 0;
@@ -3273,6 +3275,9 @@ void llama_kv_cache::paged_build_block_table() {
         return;
     }
 
+    paged_mapping_generation = paged_mapping_generation == UINT64_MAX
+        ? 1
+        : paged_mapping_generation + 1;
     paged_block_mapping_changed = 0;
     paged_mapping_oob_fail = 0;
     paged_non_identity_enabled = false;
@@ -3316,6 +3321,26 @@ void llama_kv_cache::paged_build_block_table() {
     }
 
     paged_non_identity_enabled = paged_mapping_oob_fail == 0 && paged_block_mapping_changed > 0;
+}
+
+void llama_kv_cache::paged_release_scan_reset() {
+    paged_release_scan_cursor = 0;
+    paged_release_scan_scanned_since_release = 0;
+    paged_release_scan_block_size = paged_block_size;
+    paged_release_scan_n_blocks = paged_n_blocks;
+    paged_release_scan_kv_size = paged_kv_size;
+    paged_release_scan_mapping_generation = paged_mapping_generation;
+}
+
+void llama_kv_cache::paged_release_scan_sync_layout() {
+    if (paged_release_scan_block_size != paged_block_size ||
+            paged_release_scan_n_blocks != paged_n_blocks ||
+            paged_release_scan_kv_size != paged_kv_size ||
+            paged_release_scan_mapping_generation != paged_mapping_generation ||
+            paged_release_scan_cursor >= paged_n_blocks ||
+            paged_release_scan_scanned_since_release >= paged_n_blocks) {
+        paged_release_scan_reset();
+    }
 }
 
 void llama_kv_cache::paged_note_cells(const slot_info & sinfo) {
@@ -7032,15 +7057,29 @@ llama_kv_bounded_release_result llama_kv_cache::paged_release_blocks_bounded_imp
     }
     const auto & owned = ownership.owned;
 
-    uint32_t scanned = 0;
-    const uint32_t scan_limit = std::min(max_scan_blocks, paged_n_blocks);
+    paged_release_scan_sync_layout();
 
-    for (uint32_t physical_block = 0; physical_block < scan_limit; ++physical_block) {
-        scanned = physical_block + 1;
+    uint32_t scanned = 0;
+    uint32_t no_release_scanned = paged_release_scan_scanned_since_release;
+    bool no_candidate = false;
+    const uint32_t scan_limit = std::min(max_scan_blocks, paged_n_blocks);
+    const uint32_t start_block = paged_release_scan_cursor;
+    const auto note_no_release = [&]() {
+        no_release_scanned += 1;
+        no_candidate = no_release_scanned >= paged_n_blocks;
+        return no_candidate;
+    };
+
+    for (uint32_t step = 0; step < scan_limit; ++step) {
+        const uint32_t physical_block = (start_block + step) % paged_n_blocks;
+        scanned = step + 1;
 
         // Skip owned blocks (contains live cells)
         if (owned[physical_block]) {
             result.blocks_skipped_owned += 1;
+            if (note_no_release()) {
+                break;
+            }
             continue;
         }
 
@@ -7058,12 +7097,18 @@ llama_kv_bounded_release_result llama_kv_cache::paged_release_blocks_bounded_imp
                 state == paged_block_state::RELEASED ||
                 state == paged_block_state::INVALID) {
             result.blocks_skipped_state += 1;
+            if (note_no_release()) {
+                break;
+            }
             continue;
         }
 
         // Per-candidate recheck: re-confirm safety conditions immediately
         // before madvise — same barrier as the legacy unbounded path.
         if (paged_write_context_invalid) {
+            if (note_no_release()) {
+                break;
+            }
             continue;
         }
         {
@@ -7074,6 +7119,9 @@ llama_kv_bounded_release_result llama_kv_cache::paged_release_blocks_bounded_imp
                 : paged_block_states[physical_block];
             if (recheck_state != paged_block_state::RESIDENT &&
                     recheck_state != paged_block_state::UNUSED) {
+                if (note_no_release()) {
+                    break;
+                }
                 continue;
             }
         }
@@ -7099,6 +7147,9 @@ llama_kv_bounded_release_result llama_kv_cache::paged_release_blocks_bounded_imp
 
         if (advised_bytes == 0) {
             result.madvise_failures += local_failures;
+            if (note_no_release()) {
+                break;
+            }
             continue;
         }
 
@@ -7118,6 +7169,7 @@ llama_kv_bounded_release_result llama_kv_cache::paged_release_blocks_bounded_imp
         paged_block_states[physical_block] = paged_block_state::RELEASED;
         result.released_blocks += 1;
         result.released_bytes += advised_bytes;
+        no_release_scanned = 0;
 
         // Update usage tracking and free list
         if (physical_block < paged_block_used.size() && paged_block_used[physical_block]) {
@@ -7148,8 +7200,21 @@ llama_kv_bounded_release_result llama_kv_cache::paged_release_blocks_bounded_imp
 
     result.blocks_scanned = scanned;
     result.block_scan_exhausted = (scanned >= scan_limit);
-    result.scan_budget_exhausted = result.released_bytes < target_bytes &&
-        scan_limit < paged_n_blocks && scanned >= scan_limit;
+
+    // Resume after the range visited by this call. A successful release starts
+    // a new no-release tour but does not discard the rest of this call's scan
+    // budget; later non-released blocks count toward that fresh tour.
+    paged_release_scan_cursor = (start_block + scanned) % paged_n_blocks;
+    paged_release_scan_scanned_since_release = no_candidate ? 0 : no_release_scanned;
+
+    const bool target_unmet = result.released_bytes < target_bytes;
+
+    // Preserve the existing bounded result split: a partial candidate-space
+    // walk is scan_budget_exhausted, while a full walk since the last successful
+    // release is the only path that falls through to no_candidate. Full-budget
+    // scans that released blocks retain target_shortfall semantics.
+    result.scan_budget_exhausted =
+        target_unmet && !no_candidate && max_scan_blocks < paged_n_blocks;
 
     if (use_test_seams) {
         paged_release_bounded_test_force_ownership_abort     = false;

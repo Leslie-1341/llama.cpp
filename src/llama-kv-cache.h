@@ -532,6 +532,15 @@ public:
         return std::find(paged_free_list.begin(), paged_free_list.end(), block)
             != paged_free_list.end();
     }
+    uint32_t paged_release_bounded_test_read_scan_cursor() const {
+        return paged_release_scan_cursor;
+    }
+    uint32_t paged_release_bounded_test_read_n_blocks() const {
+        return paged_n_blocks;
+    }
+    uint32_t paged_release_bounded_test_read_block_size() const {
+        return paged_block_size;
+    }
     // Test-only accessors for dry-run zero-change verification.
     uint64_t paged_release_bounded_test_read_release_bytes() const {
         return paged_block_release_bytes;
@@ -817,6 +826,8 @@ private:
     void paged_init(uint32_t kv_size);
     void paged_reset();
     void paged_build_block_table();
+    void paged_release_scan_reset();
+    void paged_release_scan_sync_layout();
     void paged_note_cells(const slot_info & sinfo);
     uint32_t paged_resolve(uint32_t cell) const;
     uint32_t paged_write_resolve(uint32_t cell) const;
@@ -986,6 +997,18 @@ private:
     mutable std::vector<paged_release_range> paged_release_post_ranges;
     mutable std::vector<std::vector<paged_release_range>> paged_released_ranges_by_block;
     std::vector<uint32_t> paged_free_list;
+    // Per-cache bounded RELEASE scan state. The cursor resumes after the last
+    // visited block. scanned_since_release counts a candidate-space tour only
+    // while no block is successfully released; a release starts a fresh tour
+    // at the block following the scanned range. Layout and mapping snapshots
+    // reset both fields before a stale cursor can be used.
+    uint32_t paged_release_scan_cursor = 0;
+    uint32_t paged_release_scan_scanned_since_release = 0;
+    uint32_t paged_release_scan_block_size = 0;
+    uint32_t paged_release_scan_n_blocks = 0;
+    uint32_t paged_release_scan_kv_size = 0;
+    uint64_t paged_release_scan_mapping_generation = 0;
+    uint64_t paged_mapping_generation = 0;
     uint64_t paged_alloc_calls     = 0;
     uint64_t paged_blocks_in_use   = 0;
     uint64_t paged_identity_checks = 0;

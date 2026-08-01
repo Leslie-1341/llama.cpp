@@ -29,3 +29,9 @@ server_kv_resume_gate_result server_kv_resume_gate(
         uint64_t decision_id);
 
 std::string server_kv_resume_failure_message(const server_kv_resume_gate_result & result);
+
+std::string server_kv_resume_format_event(
+        const server_kv_resume_gate_result & result,
+        llama_seq_id seq_id,
+        uint64_t claimant_epoch,
+        bool graph_gate);

@@ -19,3 +19,4 @@ test-server-kv-pressure-stage3a-1c-parser	tests/test-server-kv-pressure-stage3a-
 test-kv-paged-identity-controlled-ab-parser	tests/test-kv-paged-identity-controlled-ab-parser.py	module:scripts/parse-kv-paged-identity-controlled-ab.py	tests/test-kv-paged-identity-controlled-ab-parser.py;scripts/parse-kv-paged-identity-controlled-ab.py;scripts/*paged-identity-controlled-ab*	identity
 
 test-kv-bounded-release-stage3b-2a-parser	tests/test-kv-bounded-release-stage3b-2a-parser.py	module:scripts/parse-kv-bounded-release-stage3b-2a.py	tests/test-kv-bounded-release-stage3b-2a-parser.py;scripts/parse-kv-bounded-release-stage3b-2a.py;scripts/*bounded-release-stage3b-2a*	bounded
+test-kv-governor-stage3c-1c-2b-1r-parser	tests/test-kv-governor-stage3c-1c-2b-1r-parser.py	module:scripts/parse-kv-governor-stage3c-1c-2b-1r.py	tests/test-kv-governor-stage3c-1c-2b-1r-parser.py;scripts/parse-kv-governor-stage3c-1c-2b-1r.py;scripts/run-kv-governor-stage3c-1c-2b-1r.py	governor

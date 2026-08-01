@@ -241,6 +241,32 @@ static llama_kv_cache::slot_info make_slot(std::vector<uint32_t> cells) {
     return sinfo;
 }
 
+static bool seed_owned_blocks(
+        llama_kv_cache * kv,
+        uint32_t first_block,
+        uint32_t n_blocks,
+        uint32_t block_size,
+        llama_seq_id seq_id) {
+    std::vector<uint32_t> cells;
+    std::vector<llama_token> tokens;
+    std::vector<llama_pos> positions;
+    const uint32_t first_cell = first_block * block_size;
+    const uint32_t cell_count = n_blocks * block_size;
+    cells.reserve(cell_count);
+    tokens.reserve(cell_count);
+    positions.reserve(cell_count);
+    for (uint32_t i = 0; i < cell_count; ++i) {
+        cells.push_back(first_cell + i);
+        tokens.push_back(1 + (seq_id & 63));
+        positions.push_back(first_cell + i);
+    }
+
+    const auto slot = make_slot(std::move(cells));
+    const auto ubatch = make_ubatch(tokens, positions, seq_id);
+    llama_kv_cache_context tx(kv, { slot }, { ubatch });
+    return tx.apply() && tx.finish_paged_kv_write(llama_paged_kv_write_action::COMMIT);
+}
+
 struct ContextGuard {
     llama_context * ctx = nullptr;
     llama_kv_cache * kv = nullptr;
@@ -1888,6 +1914,304 @@ int main(int /*argc*/, char ** /*argv*/) {
         unsetenv("LLAMA_KV_PAGED_TEST_IO_FAIL_BLOCK");
         unsetenv("LLAMA_KV_PAGED_TEST_IO_FAIL_ONCE");
         unsetenv("LLAMA_KV_PAGED_SWAP");
+    }
+
+    // =========================================================================
+    // WT28: bounded continuous RELEASE scan cursor.
+    // =========================================================================
+
+    // WT28a: the first window is owned; a dead candidate in the second window
+    // is reached on the next bounded call instead of re-scanning block 0.
+    {
+        ContextGuard g;
+        if (!g.init(model, cparams)) {
+            CHECK(false, "WT28a: context creation failed");
+        } else {
+            const uint32_t bs = g.kv->paged_release_bounded_test_read_block_size();
+            CHECK(seed_owned_blocks(g.kv, 0, 2, bs, 0),
+                    "WT28a: seed first two owned blocks");
+            CHECK(seed_owned_blocks(g.kv, 2, 1, bs, 1),
+                    "WT28a: seed second-window candidate");
+            llama_memory_seq_rm(g.mem, 1, -1, -1);
+
+            const auto first = g.kv->execute_action({
+                llama_kv_action::release, 7401, -1, 1, 2, false });
+            CHECK(first.outcome == llama_kv_action_outcome::no_op &&
+                    first.reason == llama_kv_action_reason::scan_budget_exhausted &&
+                    first.blocks == 0 && first.bytes == 0 && first.relieved_bytes == 0 &&
+                    g.kv->paged_release_bounded_test_read_scan_cursor() == 2,
+                    "WT28a: owned prefix exhausts first window and advances cursor");
+
+            const auto second = g.kv->execute_action({
+                llama_kv_action::release, 7402, -1, 1, 2, false });
+            CHECK(second.outcome == llama_kv_action_outcome::completed &&
+                    second.reason == llama_kv_action_reason::target_satisfied &&
+                    second.blocks == 1 && second.bytes > 0 &&
+                    second.relieved_bytes == second.bytes && second.shortfall_bytes == 0 &&
+                    g.kv->paged_release_bounded_test_read_block_state(2) == 2 &&
+                    g.kv->paged_release_bounded_test_read_scan_cursor() == 3,
+                    "WT28a: second window releases its candidate with preserved result fields");
+        }
+    }
+
+    // WT28b: a candidate in the third window is reached only after two bounded
+    // scan_budget_exhausted results.
+    {
+        ContextGuard g;
+        if (!g.init(model, cparams)) {
+            CHECK(false, "WT28b: context creation failed");
+        } else {
+            const uint32_t bs = g.kv->paged_release_bounded_test_read_block_size();
+            CHECK(seed_owned_blocks(g.kv, 0, 4, bs, 0),
+                    "WT28b: seed two owned windows");
+            CHECK(seed_owned_blocks(g.kv, 4, 1, bs, 1),
+                    "WT28b: seed third-window candidate");
+            llama_memory_seq_rm(g.mem, 1, -1, -1);
+
+            const auto first = g.kv->execute_action({
+                llama_kv_action::release, 7411, -1, 1, 2, false });
+            const auto second = g.kv->execute_action({
+                llama_kv_action::release, 7412, -1, 1, 2, false });
+            const auto third = g.kv->execute_action({
+                llama_kv_action::release, 7413, -1, 1, 2, false });
+            CHECK(first.reason == llama_kv_action_reason::scan_budget_exhausted &&
+                    second.reason == llama_kv_action_reason::scan_budget_exhausted &&
+                    first.blocks == 0 && second.blocks == 0,
+                    "WT28b: first two windows remain scan_budget_exhausted");
+            CHECK(third.reason == llama_kv_action_reason::target_satisfied &&
+                    third.blocks == 1 && third.relieved_bytes == third.bytes &&
+                    g.kv->paged_release_bounded_test_read_block_state(4) == 2 &&
+                    g.kv->paged_release_bounded_test_read_scan_cursor() == 5,
+                    "WT28b: third window discovers and releases the candidate");
+        }
+    }
+
+    // WT28c: only a complete candidate-space tour with no release returns
+    // no_candidate. Releasing ownership after wrap creates a new candidate that
+    // is found from the wrapped cursor.
+    {
+        ContextGuard g;
+        if (!g.init(model, cparams)) {
+            CHECK(false, "WT28c: context creation failed");
+        } else {
+            const uint32_t bs = g.kv->paged_release_bounded_test_read_block_size();
+            const uint32_t nb = g.kv->paged_release_bounded_test_read_n_blocks();
+            CHECK(seed_owned_blocks(g.kv, 0, nb, bs, 0),
+                    "WT28c: seed every block as owned");
+
+            llama_kv_action_result last;
+            const uint32_t window = 4;
+            const uint32_t calls = (nb + window - 1) / window;
+            for (uint32_t i = 0; i < calls; ++i) {
+                last = g.kv->execute_action({
+                    llama_kv_action::release, 7420 + i, -1, 1, window, false });
+                if (i + 1 < calls) {
+                    CHECK(last.reason == llama_kv_action_reason::scan_budget_exhausted &&
+                            last.blocks == 0,
+                            "WT28c: incomplete no-release tour stays scan_budget_exhausted");
+                }
+            }
+            CHECK(last.outcome == llama_kv_action_outcome::no_op &&
+                    last.reason == llama_kv_action_reason::no_candidate &&
+                    last.blocks == 0 && last.bytes == 0 && last.relieved_bytes == 0 &&
+                    g.kv->paged_release_bounded_test_read_scan_cursor() == 0,
+                    "WT28c: full no-release tour returns no_candidate and wraps cursor");
+
+            llama_memory_seq_rm(g.mem, 0, -1, -1);
+            const auto after_wrap = g.kv->execute_action({
+                llama_kv_action::release, 7430, -1, 1, window, false });
+            CHECK(after_wrap.reason == llama_kv_action_reason::target_satisfied &&
+                    after_wrap.blocks == 1 && after_wrap.relieved_bytes == after_wrap.bytes &&
+                    g.kv->paged_release_bounded_test_read_block_state(0) == 2 &&
+                    g.kv->paged_release_bounded_test_read_scan_cursor() == 1,
+                    "WT28c: wrapped cursor finds a newly releasable candidate");
+        }
+    }
+
+    // WT28d: a successful release advances to the next block rather than
+    // repeatedly scanning the released prefix.
+    {
+        ContextGuard g;
+        if (!g.init(model, cparams)) {
+            CHECK(false, "WT28d: context creation failed");
+        } else {
+            const uint32_t bs = g.kv->paged_release_bounded_test_read_block_size();
+            CHECK(seed_owned_blocks(g.kv, 0, 2, bs, 1),
+                    "WT28d: seed two releasable blocks");
+            llama_memory_seq_rm(g.mem, 1, -1, -1);
+
+            const auto first = g.kv->execute_action({
+                llama_kv_action::release, 7441, -1, 1, 1, false });
+            const auto second = g.kv->execute_action({
+                llama_kv_action::release, 7442, -1, 1, 1, false });
+            CHECK(first.reason == llama_kv_action_reason::target_satisfied &&
+                    second.reason == llama_kv_action_reason::target_satisfied &&
+                    first.blocks == 1 && second.blocks == 1 &&
+                    g.kv->paged_release_bounded_test_read_block_state(0) == 2 &&
+                    g.kv->paged_release_bounded_test_read_block_state(1) == 2 &&
+                    g.kv->paged_release_bounded_test_read_scan_cursor() == 2,
+                    "WT28d: consecutive calls release blocks 0 then 1");
+        }
+    }
+
+    // WT28e: a real cache reset rebuilds the mapping generation and resets the
+    // cursor. A newly constructed cache with a different block count/layout also
+    // starts from a clean cursor.
+    {
+        ContextGuard g;
+        if (!g.init(model, cparams)) {
+            CHECK(false, "WT28e: context creation failed");
+        } else {
+            const uint32_t bs = g.kv->paged_release_bounded_test_read_block_size();
+            CHECK(seed_owned_blocks(g.kv, 0, 1, bs, 0),
+                    "WT28e: seed owned reset sentinel");
+            CHECK(seed_owned_blocks(g.kv, 1, 1, bs, 1),
+                    "WT28e: seed candidate after sentinel");
+            llama_memory_seq_rm(g.mem, 1, -1, -1);
+
+            const auto before_reset = g.kv->execute_action({
+                llama_kv_action::release, 7451, -1, 1, 1, false });
+            CHECK(before_reset.reason == llama_kv_action_reason::scan_budget_exhausted &&
+                    before_reset.blocks == 0 &&
+                    g.kv->paged_release_bounded_test_read_scan_cursor() == 1,
+                    "WT28e: cursor advances before mapping reset");
+
+            llama_memory_clear(g.mem, true);
+            CHECK(g.kv->paged_release_bounded_test_read_scan_cursor() == 0,
+                    "WT28e: cache reset rebuilds mapping and resets cursor");
+            CHECK(seed_owned_blocks(g.kv, 0, 1, bs, 0),
+                    "WT28e: reseed owned sentinel after reset");
+            CHECK(seed_owned_blocks(g.kv, 1, 1, bs, 1),
+                    "WT28e: reseed candidate after reset");
+            llama_memory_seq_rm(g.mem, 1, -1, -1);
+
+            const auto after_reset = g.kv->execute_action({
+                llama_kv_action::release, 7452, -1, 1, 1, false });
+            CHECK(after_reset.reason == llama_kv_action_reason::scan_budget_exhausted &&
+                    after_reset.blocks == 0 &&
+                    g.kv->paged_release_bounded_test_read_scan_cursor() == 1 &&
+                    g.kv->paged_release_bounded_test_read_block_state(1) == 1,
+                    "WT28e: first scan after reset starts again at block 0");
+            const auto candidate = g.kv->execute_action({
+                llama_kv_action::release, 7453, -1, 1, 1, false });
+            CHECK(candidate.reason == llama_kv_action_reason::target_satisfied &&
+                    candidate.blocks == 1 &&
+                    g.kv->paged_release_bounded_test_read_block_state(1) == 2,
+                    "WT28e: cursor proceeds normally after reset");
+        }
+
+        setenv("LLAMA_KV_PAGED_BLOCK_SIZE", "8", 1);
+        llama_context_params changed = cparams;
+        ContextGuard layout;
+        if (!layout.init(model, changed)) {
+            CHECK(false, "WT28e: changed-layout context creation failed");
+        } else {
+            CHECK(layout.kv->paged_release_bounded_test_read_block_size() == 8 &&
+                    layout.kv->paged_release_bounded_test_read_n_blocks() == cparams.n_ctx / 8 &&
+                    layout.kv->paged_release_bounded_test_read_scan_cursor() == 0,
+                    "WT28e: changed block size/count initializes a reset cursor");
+        }
+        setenv("LLAMA_KV_PAGED_BLOCK_SIZE", "16", 1);
+    }
+
+    // WT28f: madvise failure keeps the existing raw failure/shortfall and block
+    // state while advancing past the scanned block.
+    {
+        setenv("LLAMA_KV_PAGED_RELEASE", "1", 1);
+        ContextGuard g;
+        if (!g.init(model, cparams)) {
+            CHECK(false, "WT28f: context creation failed");
+        } else {
+            const uint32_t bs = g.kv->paged_release_bounded_test_read_block_size();
+            CHECK(seed_owned_blocks(g.kv, 0, 1, bs, 1),
+                    "WT28f: seed failing candidate");
+            llama_memory_seq_rm(g.mem, 1, -1, -1);
+            g.kv->paged_release_bounded_test_madvise_fail_block = 0;
+
+            const auto failed = g.kv->paged_release_blocks_bounded(1, 1);
+            CHECK(failed.madvise_failures == 1 && failed.released_blocks == 0 &&
+                    failed.released_bytes == 0 && failed.shortfall_bytes == 1 &&
+                    failed.scan_budget_exhausted &&
+                    g.kv->paged_release_bounded_test_read_block_state(0) == 1 &&
+                    g.kv->paged_release_bounded_test_read_scan_cursor() == 1,
+                    "WT28f: raw failure propagation and state are unchanged; cursor advances");
+        }
+        setenv("LLAMA_KV_PAGED_RELEASE", "0", 1);
+    }
+
+    // WT28g: a release starts a new no-release tour. The scanner must not
+    // report no_candidate until it has visited the entire space after that
+    // release, including the released block when the cursor wraps.
+    {
+        ContextGuard g;
+        if (!g.init(model, cparams)) {
+            CHECK(false, "WT28g: context creation failed");
+        } else {
+            const uint32_t bs = g.kv->paged_release_bounded_test_read_block_size();
+            const uint32_t nb = g.kv->paged_release_bounded_test_read_n_blocks();
+            CHECK(seed_owned_blocks(g.kv, 1, nb - 1, bs, 0),
+                    "WT28g: seed owned tail");
+            CHECK(seed_owned_blocks(g.kv, 0, 1, bs, 1),
+                    "WT28g: seed releasable head");
+            llama_memory_seq_rm(g.mem, 1, -1, -1);
+
+            const auto released = g.kv->execute_action({
+                llama_kv_action::release, 7471, -1, 1, 1, false });
+            CHECK(released.reason == llama_kv_action_reason::target_satisfied &&
+                    released.blocks == 1 &&
+                    g.kv->paged_release_bounded_test_read_scan_cursor() == 1,
+                    "WT28g: block 0 release starts a new tour at block 1");
+
+            llama_kv_action_result partial;
+            for (uint32_t i = 0; i < nb - 1; ++i) {
+                partial = g.kv->execute_action({
+                    llama_kv_action::release, 7472 + i, -1, 1, 1, false });
+                CHECK(partial.reason == llama_kv_action_reason::scan_budget_exhausted &&
+                        partial.blocks == 0,
+                        "WT28g: no_candidate is not reported before a full post-release tour");
+            }
+
+            const auto complete = g.kv->execute_action({
+                llama_kv_action::release, 7490, -1, 1, 1, false });
+            CHECK(complete.reason == llama_kv_action_reason::no_candidate &&
+                    complete.blocks == 0 &&
+                    g.kv->paged_release_bounded_test_read_scan_cursor() == 1,
+                    "WT28g: wrapped scan reports no_candidate only after a full no-release tour");
+        }
+    }
+
+    // WT28h: if a release occurs at the end of an older no-release tour, the
+    // current call continues with its remaining max_blocks budget.
+    {
+        ContextGuard g;
+        if (!g.init(model, cparams)) {
+            CHECK(false, "WT28h: context creation failed");
+        } else {
+            const uint32_t bs = g.kv->paged_release_bounded_test_read_block_size();
+            const uint32_t nb = g.kv->paged_release_bounded_test_read_n_blocks();
+            CHECK(seed_owned_blocks(g.kv, 0, nb - 1, bs, 0),
+                    "WT28h: seed old owned prefix");
+            CHECK(seed_owned_blocks(g.kv, nb - 1, 1, bs, 1),
+                    "WT28h: seed old-tour tail candidate");
+            llama_memory_seq_rm(g.mem, 1, -1, -1);
+
+            const auto prefix = g.kv->execute_action({
+                llama_kv_action::release, 7501, -1, 1, nb - 1, false });
+            CHECK(prefix.reason == llama_kv_action_reason::scan_budget_exhausted &&
+                    prefix.blocks == 0 &&
+                    g.kv->paged_release_bounded_test_read_scan_cursor() == nb - 1,
+                    "WT28h: old tour stops immediately before the tail candidate");
+
+            llama_memory_seq_rm(g.mem, 0, -1, -1);
+            const auto continued = g.kv->execute_action({
+                llama_kv_action::release, 7502, -1, UINT64_MAX, nb, false });
+            CHECK(continued.reason == llama_kv_action_reason::target_shortfall &&
+                    continued.blocks > 1 && continued.bytes == continued.relieved_bytes &&
+                    g.kv->paged_release_bounded_test_read_block_state(nb - 1) == 2 &&
+                    g.kv->paged_release_bounded_test_read_block_state(0) == 2 &&
+                    g.kv->paged_release_bounded_test_read_scan_cursor() == nb - 1,
+                    "WT28h: release at old-tour end uses remaining budget in the fresh tour");
+        }
     }
 
     llama_model_free(model);

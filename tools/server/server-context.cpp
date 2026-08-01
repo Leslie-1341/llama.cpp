@@ -3379,11 +3379,16 @@ private:
                                     server_kv_resume_trigger::active_access,
                                     slot.id,
                                     ++kv_decision_next);
+                            const uint64_t claimant_epoch = kv_governor_state.claimant_epoch(slot.id);
+                            SRV_INF("%s\n", server_kv_resume_format_event(
+                                    result, slot.id, claimant_epoch, false).c_str());
                             if (!result.graph_allowed) {
                                 send_error(slot, server_kv_resume_failure_message(result), ERROR_TYPE_SERVER);
                                 slot.release();
                                 continue;
                             }
+                            SRV_INF("%s\n", server_kv_resume_format_event(
+                                    result, slot.id, claimant_epoch, true).c_str());
                             kv_governor_state.invalidate_claimant(slot.id);
                         }
 
