@@ -2037,6 +2037,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         fp.enabled = true;
         fp.debug_log   = std::getenv("LLAMA_FLEX_DEBUG") != nullptr;
         fp.direct_io   = std::getenv("LLAMA_FLEX_BUFFERED") == nullptr; // default O_DIRECT
+        const bool flex_ring_explicit    = std::getenv("LLAMA_FLEX_RING")    != nullptr;
+        const bool flex_ahead_explicit   = std::getenv("LLAMA_FLEX_AHEAD")   != nullptr;
+        const bool flex_threads_explicit = std::getenv("LLAMA_FLEX_THREADS") != nullptr;
+        const bool flex_lock_explicit    = std::getenv("LLAMA_FLEX_LOCK_GB") != nullptr;
+        const bool flex_pin_explicit     = std::getenv("LLAMA_FLEX_PIN_POLICY") != nullptr;
+        const bool flex_auto             = std::getenv("LLAMA_FLEX_AUTO") &&
+                std::atoi(std::getenv("LLAMA_FLEX_AUTO")) > 0;
+        const bool flex_sched            = std::getenv("LLAMA_FLEX_SCHED") &&
+                std::atoi(std::getenv("LLAMA_FLEX_SCHED")) > 0;
+
         if (const char * v = std::getenv("LLAMA_FLEX_RING"))    { fp.ring_layers    = std::max(2, std::atoi(v)); }
         if (const char * v = std::getenv("LLAMA_FLEX_AHEAD"))   { fp.prefetch_ahead = std::max(1, std::atoi(v)); }
         if (const char * v = std::getenv("LLAMA_FLEX_THREADS")) { fp.io_threads     = std::max(1, std::atoi(v)); }
@@ -2050,7 +2060,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         //   available <  model    -> ring = (available - non_layer - reserve) / max_layer
         // A pre-scan sums layer-tensor bytes (largest layer sizes the ring slot) and
         // non-layer bytes (embedding/output/norm: stay mmap-resident, the OOM floor).
-        if (std::getenv("LLAMA_FLEX_AUTO") && std::atoi(std::getenv("LLAMA_FLEX_AUTO")) > 0) {
+        if (flex_auto || flex_sched) {
             std::vector<size_t> layer_bytes(hparams.n_layer, 0);
             size_t non_layer = 0, layer_total = 0;
             for (const auto & it : ml.weights_map) {
@@ -2069,19 +2079,52 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
             const size_t avail   = llama_detect_available_memory();
             const size_t reserve = 512ull * 1024 * 1024;  // KV + compute scratch headroom
-            int ring = (int) hparams.n_layer;             // default: all resident
-            if (avail != SIZE_MAX && avail < non_layer + layer_total + reserve) {
+            if (flex_sched) {
+                const size_t mib = avail == SIZE_MAX ? SIZE_MAX : avail / 1048576ull;
+                if (!flex_threads_explicit) {
+                    fp.io_threads = 4;
+                }
+                if (!flex_ahead_explicit) {
+                    fp.prefetch_ahead = 3;
+                }
+                if (!flex_lock_explicit) {
+                    double lock_gb = 1.0;
+                    if (mib != SIZE_MAX && mib <= 1280) {
+                        lock_gb = 0.75;
+                    } else if (mib != SIZE_MAX && mib >= 3072) {
+                        lock_gb = 1.25;
+                    }
+                    fp.lock_bytes = (size_t)(lock_gb * 1024.0 * 1024.0 * 1024.0);
+                }
+                if (!flex_pin_explicit) {
+                    fp.pin_policy = "attn-first";
+                }
+                fp.memory_budget_bytes = avail == SIZE_MAX ? 0 : avail;
+                fp.fixed_bytes = non_layer + reserve;
+                fp.sched_auto = !flex_ring_explicit && fp.memory_budget_bytes > 0;
+            }
+
+            int ring = fp.ring_layers;
+            if (flex_auto && !fp.sched_auto && !flex_ring_explicit) {
+                ring = (int) hparams.n_layer;             // default: all resident
+            }
+            if (flex_auto && !fp.sched_auto && !flex_ring_explicit &&
+                    avail != SIZE_MAX && avail < non_layer + layer_total + reserve) {
                 const size_t fixed = non_layer + reserve;
                 const size_t room  = avail > fixed ? avail - fixed : 0;
                 ring = (int) std::min<size_t>(hparams.n_layer,
                         std::max<size_t>(fp.prefetch_ahead + 2, room / max_layer));
+                fp.ring_layers = ring;
             }
-            fp.ring_layers = ring;
             if (fp.debug_log) {
-                LLAMA_LOG_INFO("%s: flex adaptive ring=%d/%d (avail=%.0f MiB, "
-                        "max_layer=%.0f MiB, non_layer=%.0f MiB)\n", __func__,
-                        ring, (int) hparams.n_layer, avail == SIZE_MAX ? -1.0 : avail / 1048576.0,
-                        max_layer / 1048576.0, non_layer / 1048576.0);
+                LLAMA_LOG_INFO("%s: flex adaptive ring=%d/%d sched=%d (avail=%.0f MiB, "
+                        "max_layer=%.0f MiB, non_layer=%.0f MiB, lock=%.0f MiB, ahead=%d, "
+                        "threads=%d, pin=%s)\n", __func__,
+                        fp.ring_layers, (int) hparams.n_layer, fp.sched_auto ? 1 : 0,
+                        avail == SIZE_MAX ? -1.0 : avail / 1048576.0,
+                        max_layer / 1048576.0, non_layer / 1048576.0,
+                        fp.lock_bytes / 1048576.0, fp.prefetch_ahead,
+                        fp.io_threads, fp.pin_policy.c_str());
             }
         }
 

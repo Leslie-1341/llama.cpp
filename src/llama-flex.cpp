@@ -551,6 +551,19 @@ void llama_flex_finalize(llama_flex_context & ctx) {
         ctx.stats.stream_per_token += L.stream_bytes;
     }
 
+    if (ctx.params.sched_auto && ctx.params.memory_budget_bytes > 0 && ctx.slot_bytes > 0) {
+        const size_t used_fixed = ctx.params.fixed_bytes + ctx.stats.locked_bytes;
+        const size_t room = ctx.params.memory_budget_bytes > used_fixed
+                ? ctx.params.memory_budget_bytes - used_fixed : 0;
+        int auto_k = (int) std::min<size_t>(ctx.n_layers,
+                std::max<size_t>(1, room / ctx.slot_bytes));
+        const int min_k = std::min(ctx.n_layers, std::max(2, ctx.params.prefetch_ahead + 2));
+        auto_k = std::max(auto_k, min_k);
+        ctx.params.ring_layers = auto_k;
+        ctx.stats.sched_budget_bytes = ctx.params.memory_budget_bytes;
+        ctx.stats.sched_fixed_bytes  = ctx.params.fixed_bytes;
+        ctx.stats.sched_ring_room    = room;
+    }
     const int k = std::max(1, std::min(ctx.params.ring_layers, ctx.n_layers));
     ctx.slots.resize(k, nullptr);
     ctx.slot_layer.assign(k, -1);
@@ -585,7 +598,8 @@ void llama_flex_finalize(llama_flex_context & ctx) {
         std::fprintf(stderr,
                 "llama_flex: layers=%d ring=%d slot=%.2f MiB ring_total=%.2f MiB "
                 "locked=%.2f MiB stream/token=%.2f MiB io_threads=%d direct_io=%d ahead=%d requested_ahead=%d "
-                "pin_policy=%s locked_tensors=%llu streamed_tensors=%llu lock_unused=%.2f MiB\n",
+                "pin_policy=%s locked_tensors=%llu streamed_tensors=%llu lock_unused=%.2f MiB "
+                "sched=%d budget=%.0f MiB fixed=%.0f MiB ring_room=%.0f MiB\n",
                 ctx.n_layers, k, ctx.slot_bytes / 1048576.0,
                 ctx.stats.ring_bytes / 1048576.0,
                 ctx.stats.locked_bytes / 1048576.0,
@@ -595,7 +609,11 @@ void llama_flex_finalize(llama_flex_context & ctx) {
                 ctx.params.pin_policy.c_str(),
                 (unsigned long long) ctx.stats.locked_tensors,
                 (unsigned long long) ctx.stats.streamed_tensors,
-                ctx.stats.lock_budget_unused / 1048576.0);
+                ctx.stats.lock_budget_unused / 1048576.0,
+                ctx.params.sched_auto ? 1 : 0,
+                ctx.stats.sched_budget_bytes / 1048576.0,
+                ctx.stats.sched_fixed_bytes / 1048576.0,
+                ctx.stats.sched_ring_room / 1048576.0);
     }
 }
 
