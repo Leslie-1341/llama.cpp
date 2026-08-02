@@ -158,7 +158,9 @@ if (g_weight_stream_cb != NULL && g_weight_stream_cb(tensor, params->ith, g_weig
 |---|---|---|
 | `LLAMA_FLEX` | 启用 flex（>0） | 关 |
 | `LLAMA_FLEX_RING` | ring 槽位数 k | 4 |
-| `LLAMA_FLEX_AHEAD` | 预取提前层数 | 2 |
+| `LLAMA_FLEX_AHEAD` | 初始/固定预取提前层数 | 2 |
+| `LLAMA_FLEX_ADAPTIVE_AHEAD` | 运行时自适应调节预取深度（0=固定 `LLAMA_FLEX_AHEAD`） | 1 |
+| `LLAMA_FLEX_MAX_AHEAD` | 自适应预取深度上限 | 8 |
 | `LLAMA_FLEX_LOCK_GB` | balanced locking 预算（GB） | 0（关） |
 | `LLAMA_FLEX_THREADS` | IO 线程数 | 2 |
 | `LLAMA_FLEX_BUFFERED` | 强制 buffered（关 O_DIRECT） | 关（默认 O_DIRECT） |

@@ -2039,6 +2039,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         fp.direct_io   = std::getenv("LLAMA_FLEX_BUFFERED") == nullptr; // default O_DIRECT
         const bool flex_ring_explicit    = std::getenv("LLAMA_FLEX_RING")    != nullptr;
         const bool flex_ahead_explicit   = std::getenv("LLAMA_FLEX_AHEAD")   != nullptr;
+        const bool flex_max_ahead_explicit = std::getenv("LLAMA_FLEX_MAX_AHEAD") != nullptr;
         const bool flex_threads_explicit = std::getenv("LLAMA_FLEX_THREADS") != nullptr;
         const bool flex_lock_explicit    = std::getenv("LLAMA_FLEX_LOCK_GB") != nullptr;
         const bool flex_pin_explicit     = std::getenv("LLAMA_FLEX_PIN_POLICY") != nullptr;
@@ -2049,6 +2050,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
         if (const char * v = std::getenv("LLAMA_FLEX_RING"))    { fp.ring_layers    = std::max(2, std::atoi(v)); }
         if (const char * v = std::getenv("LLAMA_FLEX_AHEAD"))   { fp.prefetch_ahead = std::max(1, std::atoi(v)); }
+        if (const char * v = std::getenv("LLAMA_FLEX_MAX_AHEAD")) {
+            fp.prefetch_ahead_max = std::max(1, std::atoi(v));
+        }
+        if (const char * v = std::getenv("LLAMA_FLEX_ADAPTIVE_AHEAD")) {
+            fp.adaptive_ahead = std::atoi(v) > 0;
+        }
         if (const char * v = std::getenv("LLAMA_FLEX_THREADS")) { fp.io_threads     = std::max(1, std::atoi(v)); }
         if (const char * v = std::getenv("LLAMA_FLEX_LOCK_GB")) {
             fp.lock_bytes = (size_t)(std::max(0.0, std::atof(v)) * 1024.0 * 1024.0 * 1024.0);
@@ -2087,6 +2094,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 if (!flex_ahead_explicit) {
                     fp.prefetch_ahead = 3;
                 }
+                if (!flex_max_ahead_explicit) {
+                    fp.prefetch_ahead_max = 8;
+                }
                 if (!flex_lock_explicit) {
                     double lock_gb = 1.0;
                     if (mib != SIZE_MAX && mib <= 1280) {
@@ -2119,11 +2129,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (fp.debug_log) {
                 LLAMA_LOG_INFO("%s: flex adaptive ring=%d/%d sched=%d (avail=%.0f MiB, "
                         "max_layer=%.0f MiB, non_layer=%.0f MiB, lock=%.0f MiB, ahead=%d, "
-                        "threads=%d, pin=%s)\n", __func__,
+                        "adaptive_ahead=%d, max_ahead=%d, threads=%d, pin=%s)\n", __func__,
                         fp.ring_layers, (int) hparams.n_layer, fp.sched_auto ? 1 : 0,
                         avail == SIZE_MAX ? -1.0 : avail / 1048576.0,
                         max_layer / 1048576.0, non_layer / 1048576.0,
                         fp.lock_bytes / 1048576.0, fp.prefetch_ahead,
+                        fp.adaptive_ahead ? 1 : 0, fp.prefetch_ahead_max,
                         fp.io_threads, fp.pin_policy.c_str());
             }
         }

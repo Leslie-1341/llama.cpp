@@ -35,8 +35,10 @@ struct llama_flex_params {
     bool   direct_io      = true; // use O_DIRECT for streaming reads when possible
     bool   debug_log      = false;
     bool   sched_auto     = false; // cap-aware scheduler: tune ring after pinning
+    bool   adaptive_ahead = true;  // runtime prefetch-depth controller
     int    ring_layers    = 4;    // k: number of layer slots kept resident
-    int    prefetch_ahead = 2;    // how many layers ahead to stream
+    int    prefetch_ahead = 2;    // initial/fixed layers ahead to stream
+    int    prefetch_ahead_max = 8; // max runtime ahead when adaptive_ahead is enabled
     int    io_threads     = 4;    // background streaming threads
     size_t lock_bytes     = 0;    // balanced-locking budget (stage 2c); 0 = off
     size_t memory_budget_bytes = 0; // cgroup/MemAvailable budget for sched_auto
@@ -59,6 +61,7 @@ struct llama_flex_stats {
     uint64_t evictions       = 0;
     uint64_t releases        = 0;
     uint64_t graphs          = 0;
+    uint64_t ahead_adjustments = 0;
     uint64_t locked_tensors  = 0;
     uint64_t streamed_tensors = 0;
     size_t   ring_bytes      = 0;  // total bytes held by the ring
@@ -66,6 +69,8 @@ struct llama_flex_stats {
     size_t   lock_budget_unused = 0;
     size_t   stream_per_token = 0; // unlocked bytes that must be read each token
     int      effective_ahead = 0;
+    int      min_effective_ahead = 0;
+    int      max_effective_ahead = 0;
     size_t   sched_budget_bytes = 0;
     size_t   sched_fixed_bytes = 0;
     size_t   sched_ring_room = 0;
