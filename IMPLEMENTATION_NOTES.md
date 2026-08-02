@@ -313,6 +313,7 @@ pimpl->cpu_buft_list = make_cpu_buft_list(
 | `LLAMA_FLEX=1` | flex | dense 匿名 ring 流式 |
 | `LLAMA_FLEX_AUTO=1` | flex | 自适应 ring（按可用内存定层数）|
 | `LLAMA_FLEX_RING=N` / `LLAMA_FLEX_THREADS=N` | flex | 固定 ring 层数 / 并行 IO 线程 |
+| `LLAMA_FLEX_AHEAD=N` / `LLAMA_FLEX_MAX_AHEAD=N` / `LLAMA_FLEX_ADAPTIVE_AHEAD=0` | flex | 初始 ahead / 自适应上限 / 关闭运行时自适应 |
 
 ---
 

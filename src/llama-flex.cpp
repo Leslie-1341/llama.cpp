@@ -60,6 +60,7 @@ struct llama_flex_context {
     // per-graph compute state (written only by ith==0 in the stream callback)
     int cur_compute_layer = -1;
     uint64_t graph_id = 0;
+    uint64_t last_layer_enter_us = 0;
 
     // ring of slots
     size_t                   slot_bytes = 0;
@@ -77,6 +78,16 @@ struct llama_flex_context {
     std::condition_variable  cv_ready;     // wakes waiters on layer-ready
     bool                     shutdown = false;
     FILE *                   trace = nullptr;
+
+    // Adaptive prefetch-depth controller. IO EWMA is updated by workers under
+    // mutex; compute/wait EWMAs are updated by ith==0 on layer transitions.
+    int      adaptive_ahead = 0;
+    uint64_t adaptive_transitions = 0;
+    uint64_t adaptive_quiet = 0;
+    uint64_t adaptive_last_requeues = 0;
+    double   ewma_io_us = 0.0;
+    double   ewma_compute_us = 0.0;
+    double   ewma_wait_us = 0.0;
 
     ~llama_flex_context() {
         {
@@ -101,7 +112,8 @@ struct llama_flex_context {
             std::fprintf(stderr,
                 "llama_flex IO: loads=%llu reads=%llu avg_read=%.1f KiB  logical=%.0f MiB phys=%.0f MiB "
                 "align_redundancy=%.2f%% achieved_bw=%.0f MiB/s waits=%llu wait=%.0f ms avg_wait=%.2f ms "
-                "demand=%llu prefetch=%llu requeue=%llu evict=%llu release=%llu graphs=%llu ahead=%d\n",
+                "demand=%llu prefetch=%llu requeue=%llu evict=%llu release=%llu graphs=%llu ahead=%d "
+                "ahead_adj=%llu ahead_range=[%d,%d] io_ewma=%.2f ms compute_ewma=%.2f ms\n",
                 (unsigned long long) stats.layer_loads, (unsigned long long) stats.read_ops,
                 avg_read, log_mib, phys_mib, redun, bw,
                 (unsigned long long) stats.wait_events, wait_ms, wait_avg,
@@ -111,7 +123,10 @@ struct llama_flex_context {
                 (unsigned long long) stats.evictions,
                 (unsigned long long) stats.releases,
                 (unsigned long long) stats.graphs,
-                stats.effective_ahead);
+                stats.effective_ahead,
+                (unsigned long long) stats.ahead_adjustments,
+                stats.min_effective_ahead, stats.max_effective_ahead,
+                ewma_io_us / 1000.0, ewma_compute_us / 1000.0);
         }
         if (trace) {
             std::fclose(trace);
@@ -128,14 +143,139 @@ struct llama_flex_context {
     }
 };
 
-static int flex_effective_ahead(const llama_flex_context & ctx) {
+static void flex_ewma(double & dst, double sample, double alpha = 0.2) {
+    dst = dst == 0.0 ? sample : dst * (1.0 - alpha) + sample * alpha;
+}
+
+static int flex_ring_room_ahead(const llama_flex_context & ctx) {
     if (ctx.n_layers <= 1) {
         return 0;
     }
     int room = ctx.slots.empty() ? ctx.params.ring_layers : (int) ctx.slots.size();
     // Keep at least current + previous/released slot space when the ring is tiny.
     room = std::max(1, room - 2);
-    return std::max(1, std::min({ ctx.params.prefetch_ahead, ctx.n_layers - 1, room }));
+    return std::max(1, std::min(ctx.n_layers - 1, room));
+}
+
+static int flex_effective_ahead(const llama_flex_context & ctx) {
+    if (ctx.n_layers <= 1) {
+        return 0;
+    }
+    const int ring_room = flex_ring_room_ahead(ctx);
+    const int requested = ctx.params.adaptive_ahead
+            ? (ctx.adaptive_ahead > 0 ? ctx.adaptive_ahead : ctx.params.prefetch_ahead)
+            : ctx.params.prefetch_ahead;
+    const int max_ahead = ctx.params.adaptive_ahead
+            ? std::max(ctx.params.prefetch_ahead, ctx.params.prefetch_ahead_max)
+            : ctx.params.prefetch_ahead;
+    return std::max(1, std::min({ requested, max_ahead, ring_room }));
+}
+
+static void flex_trace_locked(
+        llama_flex_context & ctx,
+        const char * event,
+        int layer,
+        int slot,
+        size_t logical,
+        size_t phys,
+        uint64_t us);
+
+static int flex_ring_occupancy_locked(const llama_flex_context & ctx) {
+    int n = 0;
+    for (int layer : ctx.slot_layer) {
+        if (layer >= 0) {
+            ++n;
+        }
+    }
+    return n;
+}
+
+static void flex_note_ahead_locked(llama_flex_context & ctx) {
+    const int ahead = flex_effective_ahead(ctx);
+    ctx.stats.effective_ahead = ahead;
+    if (ctx.stats.min_effective_ahead == 0 || ahead < ctx.stats.min_effective_ahead) {
+        ctx.stats.min_effective_ahead = ahead;
+    }
+    if (ahead > ctx.stats.max_effective_ahead) {
+        ctx.stats.max_effective_ahead = ahead;
+    }
+}
+
+static void flex_adapt_after_layer(llama_flex_context & ctx, uint64_t wait_us) {
+    if (!ctx.params.adaptive_ahead || ctx.n_layers <= 1) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(ctx.mutex);
+    const uint64_t now = now_us();
+    if (ctx.last_layer_enter_us != 0) {
+        const uint64_t interval = now - ctx.last_layer_enter_us;
+        const uint64_t compute = interval > wait_us ? interval - wait_us : interval;
+        flex_ewma(ctx.ewma_compute_us, (double) std::max<uint64_t>(compute, 1));
+    }
+    flex_ewma(ctx.ewma_wait_us, (double) wait_us);
+    ctx.last_layer_enter_us = now;
+
+    ctx.adaptive_transitions++;
+    if ((ctx.adaptive_transitions % 4) != 0) {
+        flex_note_ahead_locked(ctx);
+        return;
+    }
+
+    const int old_ahead = flex_effective_ahead(ctx);
+    int next_ahead = old_ahead;
+    const int max_ahead = std::min(
+            std::max(ctx.params.prefetch_ahead, ctx.params.prefetch_ahead_max),
+            flex_ring_room_ahead(ctx));
+    const int occupancy = flex_ring_occupancy_locked(ctx);
+    const int slots = (int) ctx.slots.size();
+    const uint64_t requeues = ctx.stats.queue_requeues - ctx.adaptive_last_requeues;
+    ctx.adaptive_last_requeues = ctx.stats.queue_requeues;
+
+    // A full ring is the normal steady state for dense sequential prefetching:
+    // all slots should hold current/future layers. Treat it as backpressure only
+    // when workers actually fail to acquire a reusable slot and requeue work.
+    const bool ring_backpressure = requeues > 0;
+    const bool stalled = wait_us > 1000 || ctx.ewma_wait_us > 1000.0;
+    const bool io_lagging = ctx.ewma_compute_us > 0.0 && ctx.ewma_io_us > 0.0 &&
+            ctx.ewma_io_us > ctx.ewma_compute_us * (double) std::max(1, old_ahead) * 1.10;
+
+    if (ring_backpressure && old_ahead > 1) {
+        next_ahead = old_ahead - 1;
+        ctx.adaptive_quiet = 0;
+    } else if ((stalled || io_lagging) && old_ahead < max_ahead) {
+        next_ahead = old_ahead + 1;
+        ctx.adaptive_quiet = 0;
+    } else {
+        const bool has_slack = ctx.ewma_compute_us > 0.0 && ctx.ewma_io_us > 0.0 &&
+                old_ahead > 1 &&
+                ctx.ewma_io_us * 1.40 < ctx.ewma_compute_us * (double) (old_ahead - 1);
+        if (wait_us == 0 && has_slack) {
+            ctx.adaptive_quiet++;
+        } else {
+            ctx.adaptive_quiet = 0;
+        }
+        if (ctx.adaptive_quiet >= 8) {
+            next_ahead = old_ahead - 1;
+            ctx.adaptive_quiet = 0;
+        }
+    }
+
+    next_ahead = std::max(1, std::min(next_ahead, max_ahead));
+    if (next_ahead != old_ahead) {
+        ctx.adaptive_ahead = next_ahead;
+        ctx.stats.ahead_adjustments++;
+        flex_trace_locked(ctx, "adapt_ahead", ctx.cur_compute_layer, -1,
+                (size_t) old_ahead, (size_t) next_ahead, wait_us);
+        if (ctx.params.debug_log) {
+            std::fprintf(stderr,
+                    "llama_flex: adapt ahead %d -> %d (wait=%.2f ms io=%.2f ms compute=%.2f ms occ=%d/%d requeues=%llu)\n",
+                    old_ahead, next_ahead, wait_us / 1000.0,
+                    ctx.ewma_io_us / 1000.0, ctx.ewma_compute_us / 1000.0,
+                    occupancy, slots, (unsigned long long) requeues);
+        }
+    }
+    flex_note_ahead_locked(ctx);
 }
 
 static void flex_trace_locked(
@@ -351,6 +491,7 @@ static void flex_worker(llama_flex_context * ctx) {
                 ctx->stats.bytes_read_phys += phys;
                 ctx->stats.read_ops        += ops;
                 ctx->stats.total_io_us     += dt;
+                flex_ewma(ctx->ewma_io_us, (double) std::max<uint64_t>(dt, 1));
                 flex_trace_locked(*ctx, "load", layer, L.slot, streamed, phys, dt);
             } else {
                 // Failed: drop the slot back.
@@ -579,7 +720,10 @@ void llama_flex_finalize(llama_flex_context & ctx) {
         ctx.slots[s] = p;
     }
     ctx.stats.ring_bytes = ctx.slot_bytes * (size_t) k;
+    ctx.adaptive_ahead = std::max(1, std::min(ctx.params.prefetch_ahead, flex_ring_room_ahead(ctx)));
     ctx.stats.effective_ahead = flex_effective_ahead(ctx);
+    ctx.stats.min_effective_ahead = ctx.stats.effective_ahead;
+    ctx.stats.max_effective_ahead = ctx.stats.effective_ahead;
 
     // Fully-locked layers never need streaming: mark them permanently resident.
     for (auto & L : ctx.layers) {
@@ -598,7 +742,7 @@ void llama_flex_finalize(llama_flex_context & ctx) {
         std::fprintf(stderr,
                 "llama_flex: layers=%d ring=%d slot=%.2f MiB ring_total=%.2f MiB "
                 "locked=%.2f MiB stream/token=%.2f MiB io_threads=%d direct_io=%d ahead=%d requested_ahead=%d "
-                "pin_policy=%s locked_tensors=%llu streamed_tensors=%llu lock_unused=%.2f MiB "
+                "adaptive_ahead=%d max_ahead=%d pin_policy=%s locked_tensors=%llu streamed_tensors=%llu lock_unused=%.2f MiB "
                 "sched=%d budget=%.0f MiB fixed=%.0f MiB ring_room=%.0f MiB\n",
                 ctx.n_layers, k, ctx.slot_bytes / 1048576.0,
                 ctx.stats.ring_bytes / 1048576.0,
@@ -606,6 +750,7 @@ void llama_flex_finalize(llama_flex_context & ctx) {
                 ctx.stats.stream_per_token / 1048576.0,
                 nthreads, ctx.direct_io_active ? 1 : 0,
                 ctx.stats.effective_ahead, ctx.params.prefetch_ahead,
+                ctx.params.adaptive_ahead ? 1 : 0, ctx.params.prefetch_ahead_max,
                 ctx.params.pin_policy.c_str(),
                 (unsigned long long) ctx.stats.locked_tensors,
                 (unsigned long long) ctx.stats.streamed_tensors,
@@ -644,14 +789,14 @@ void llama_flex_request_layer(llama_flex_context & ctx, int layer_id) {
     flex_request_layer(ctx, layer_id, true);
 }
 
-void llama_flex_wait_layer(llama_flex_context & ctx, int layer_id) {
+static uint64_t flex_wait_layer_us(llama_flex_context & ctx, int layer_id) {
     if (layer_id < 0 || layer_id >= ctx.n_layers) {
-        return;
+        return 0;
     }
     std::unique_lock<std::mutex> lock(ctx.mutex);
     auto & L = ctx.layers[layer_id];
     if (L.state == layer_state::resident) {
-        return;
+        return 0;
     }
     // Make sure it is at least queued.
     if (L.state == layer_state::not_resident) {
@@ -668,6 +813,11 @@ void llama_flex_wait_layer(llama_flex_context & ctx, int layer_id) {
     const uint64_t wait_us = now_us() - t0;
     ctx.stats.total_wait_us += wait_us;
     flex_trace_locked(ctx, "wait", layer_id, L.slot, 0, 0, wait_us);
+    return wait_us;
+}
+
+void llama_flex_wait_layer(llama_flex_context & ctx, int layer_id) {
+    (void) flex_wait_layer_us(ctx, layer_id);
 }
 
 void * llama_flex_get_tensor(llama_flex_context & ctx, int layer_id, const std::string & name) {
@@ -712,6 +862,7 @@ void llama_flex_graph_begin(llama_flex_context & ctx) {
         return;
     }
     ctx.cur_compute_layer = -1;
+    ctx.last_layer_enter_us = 0;
     ctx.graph_id++;
     ctx.stats.graphs++;
     const int ahead = flex_effective_ahead(ctx);
@@ -732,6 +883,7 @@ bool llama_flex_stream_callback(struct ggml_tensor * op, int ith, void * user_da
     }
 
     int op_layer = -1;
+    uint64_t wait_us_total = 0;
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
         ggml_tensor * s = op->src[i];
         if (s == nullptr || s->name[0] == '\0') {
@@ -743,7 +895,8 @@ bool llama_flex_stream_callback(struct ggml_tensor * op, int ith, void * user_da
         }
         op_layer = it->second;
         if (ith == 0) {
-            llama_flex_wait_layer(*ctx, op_layer);
+            const uint64_t wait_us = flex_wait_layer_us(*ctx, op_layer);
+            wait_us_total += wait_us;
             void * p = llama_flex_get_tensor(*ctx, op_layer, s->name);
             if (p != nullptr) {
                 s->data = p;
@@ -758,6 +911,7 @@ bool llama_flex_stream_callback(struct ggml_tensor * op, int ith, void * user_da
     // Drive prefetch/release when compute advances to a new layer (ith==0 only).
     if (ith == 0 && op_layer != ctx->cur_compute_layer) {
         const int prev = ctx->cur_compute_layer;
+        flex_adapt_after_layer(*ctx, wait_us_total);
         ctx->cur_compute_layer = op_layer;
         const int ahead = flex_effective_ahead(*ctx);
         ctx->stats.effective_ahead = ahead;
