@@ -162,11 +162,19 @@ if (g_weight_stream_cb != NULL && g_weight_stream_cb(tensor, params->ith, g_weig
 | `LLAMA_FLEX_ADAPTIVE_AHEAD` | 运行时自适应调节预取深度（0=固定 `LLAMA_FLEX_AHEAD`） | 1 |
 | `LLAMA_FLEX_MAX_AHEAD` | 自适应预取深度上限 | 8 |
 | `LLAMA_FLEX_LOCK_GB` | balanced locking 预算（GB） | 0（关） |
+| `LLAMA_FLEX_PIN_POLICY` | lock 预算内的 tensor 选择策略：`small-first` / `large-first` / `attn-first` / `ffn-first` / `cost-aware` / `none` | `small-first` |
+| `LLAMA_FLEX_READ_COST_KB` | `cost-aware` 中每个 stream read 的固定开销，按等效 KiB 加到 pin value；设为 `auto` 时启动校准 | 0 |
+| `LLAMA_FLEX_READ_COST_AUTO` | 自动估算 `fixed_read_cost_bytes ≈ disk_bw × per_pread_latency` | 0 |
+| `LLAMA_FLEX_GLOBAL_REBALANCE` | `cost-aware` 每层 knapsack 后，把剩余全局 lock budget 补给高 stream-cost 层 | 0 |
 | `LLAMA_FLEX_THREADS` | IO 线程数 | 2 |
 | `LLAMA_FLEX_BUFFERED` | 强制 buffered（关 O_DIRECT） | 关（默认 O_DIRECT） |
 | `LLAMA_FLEX_DEBUG` | 调试日志 | 关 |
 
 调参指引：RSS ≈ `(k/N)×model + lock_bytes + embd/output(~1GB) + 激活`。先用 `LLAMA_FLEX_RING` 设最低可行 RSS，再用 `LLAMA_FLEX_LOCK_GB` 把剩余内存预算换成速度。
+
+`cost-aware` / `cost-aware-balanced` 仍保持每层均分 lock 预算，但层内改用小规模 0/1 knapsack：`weight = tensor.size`，`value = O_DIRECT` 对齐后的物理读字节数 + `LLAMA_FLEX_READ_COST_KB` 等效字节，目标是在每层预算内最大化被 pin 掉的磁盘读与固定 `pread` 开销；若 value 相同，则优先填满预算、减少剩余流式读。`LLAMA_FLEX_READ_COST_KB=auto` / `LLAMA_FLEX_READ_COST_AUTO=1` 会在启动时用小读/大读校准 `time = latency + bytes / bandwidth`，并把 `latency × bandwidth` 作为等效字节。异常多 tensor 的层会回退到 cost-aware 贪心。
+
+`LLAMA_FLEX_GLOBAL_REBALANCE=1` 是第二阶段 water-filling：先完整执行每层 balanced knapsack，再把自然产生的碎片预算池用于高 `stream_cost` 层。每轮枚举候选层的新 knapsack 状态，允许组合替换，按 `score = (new_value - old_value) / (new_used - old_used) × layer_stream_pressure` 选择最优升级，直到碎片池无法再解锁收益。该模式只使用 per-layer knapsack 后的剩余预算，避免更激进的异构预算带来的 read_ops 增长和层间 stall。
 
 ---
 

@@ -314,6 +314,10 @@ pimpl->cpu_buft_list = make_cpu_buft_list(
 | `LLAMA_FLEX_AUTO=1` | flex | 自适应 ring（按可用内存定层数）|
 | `LLAMA_FLEX_RING=N` / `LLAMA_FLEX_THREADS=N` | flex | 固定 ring 层数 / 并行 IO 线程 |
 | `LLAMA_FLEX_AHEAD=N` / `LLAMA_FLEX_MAX_AHEAD=N` / `LLAMA_FLEX_ADAPTIVE_AHEAD=0` | flex | 初始 ahead / 自适应上限 / 关闭运行时自适应 |
+| `LLAMA_FLEX_PIN_POLICY=cost-aware` | flex | 按 O_DIRECT 对齐读放大选择每层 lock tensor（别名：`cost-aware-balanced`） |
+| `LLAMA_FLEX_READ_COST_KB=N` | flex | `cost-aware` 中每个流式 read 的固定开销等效字节，鼓励减少 read_ops |
+| `LLAMA_FLEX_READ_COST_KB=auto` / `LLAMA_FLEX_READ_COST_AUTO=1` | flex | 启动时估算 `disk_bw × per_pread_latency` 作为 read cost |
+| `LLAMA_FLEX_GLOBAL_REBALANCE=1` | flex | 每层 knapsack 后用全局剩余 lock budget 追加 pin 高 stream-cost 层 |
 
 ---
 
