@@ -43,7 +43,10 @@ struct llama_flex_params {
     size_t lock_bytes     = 0;    // balanced-locking budget (stage 2c); 0 = off
     size_t memory_budget_bytes = 0; // cgroup/MemAvailable budget for sched_auto
     size_t fixed_bytes    = 0;    // non-flex memory reserve for sched_auto
-    std::string pin_policy = "small-first";
+    size_t read_cost_bytes = 0;   // per-stream-read fixed cost in equivalent bytes for cost-aware pinning
+    bool   read_cost_auto = false; // estimate read_cost_bytes from startup pread latency/bandwidth calibration
+    bool   global_rebalance = false; // spend leftover per-layer lock budget on high stream-cost layers
+    std::string pin_policy = "small-first"; // small-first, large-first, attn-first, ffn-first, cost-aware, none
 };
 
 struct llama_flex_stats {
@@ -74,6 +77,9 @@ struct llama_flex_stats {
     size_t   sched_budget_bytes = 0;
     size_t   sched_fixed_bytes = 0;
     size_t   sched_ring_room = 0;
+    size_t   read_cost_bytes = 0;
+    size_t   global_rebalance_bytes = 0;
+    uint64_t global_rebalance_tensors = 0;
 };
 
 struct ggml_tensor;

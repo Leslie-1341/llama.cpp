@@ -312,6 +312,32 @@ static int flex_pin_group(const llama_flex_tensor & t, const std::string & polic
     return 0;
 }
 
+static size_t flex_aligned_read_bytes(const llama_flex_context & ctx, const llama_flex_tensor & t) {
+    if (!ctx.direct_io_active) {
+        return t.size;
+    }
+    const size_t A    = ctx.align;
+    const size_t aoff = t.file_offset & ~(A - 1);
+    const size_t head = t.file_offset - aoff;
+    size_t bytes = head + t.size;
+    bytes = (bytes + A - 1) & ~(A - 1);
+    if (t.file_idx < ctx.file_sizes.size()) {
+        const size_t fsz = ctx.file_sizes[t.file_idx];
+        if (aoff < fsz && aoff + bytes > fsz) {
+            bytes = fsz - aoff;
+        }
+    }
+    return bytes;
+}
+
+static bool flex_policy_cost_aware(const std::string & policy) {
+    return policy == "cost-aware" || policy == "cost-aware-balanced";
+}
+
+static size_t flex_pin_value_bytes(const llama_flex_context & ctx, const llama_flex_tensor & t) {
+    return flex_aligned_read_bytes(ctx, t) + ctx.params.read_cost_bytes;
+}
+
 static void flex_sort_for_pin(std::vector<llama_flex_tensor> & tensors, const std::string & policy) {
     std::sort(tensors.begin(), tensors.end(),
             [&](const llama_flex_tensor & a, const llama_flex_tensor & b) {
@@ -333,11 +359,300 @@ static void flex_sort_for_pin(std::vector<llama_flex_tensor> & tensors, const st
             });
 }
 
+static void flex_sort_for_pin(
+        const llama_flex_context & ctx,
+        std::vector<llama_flex_tensor> & tensors,
+        const std::string & policy) {
+    if (!flex_policy_cost_aware(policy)) {
+        flex_sort_for_pin(tensors, policy);
+        return;
+    }
+
+    std::sort(tensors.begin(), tensors.end(),
+            [&](const llama_flex_tensor & a, const llama_flex_tensor & b) {
+                const double score_a = a.size > 0
+                        ? (double) flex_pin_value_bytes(ctx, a) / (double) a.size : 0.0;
+                const double score_b = b.size > 0
+                        ? (double) flex_pin_value_bytes(ctx, b) / (double) b.size : 0.0;
+                if (score_a != score_b) {
+                    return score_a > score_b;
+                }
+                const size_t benefit_a = flex_pin_value_bytes(ctx, a);
+                const size_t benefit_b = flex_pin_value_bytes(ctx, b);
+                if (benefit_a != benefit_b) {
+                    return benefit_a > benefit_b;
+                }
+                if (a.size != b.size) {
+                    return a.size < b.size;
+                }
+                return a.name < b.name;
+            });
+}
+
+static std::vector<bool> flex_choose_cost_aware_pins(
+        const llama_flex_context & ctx,
+        std::vector<llama_flex_tensor> & tensors,
+        size_t budget) {
+    std::vector<bool> selected(tensors.size(), false);
+    if (budget == 0 || tensors.empty()) {
+        return selected;
+    }
+
+    // Dense layers normally have only a small handful of tensors. Exhaustive
+    // per-layer 0/1 knapsack gives the best budget fill while preserving the
+    // balanced per-layer budget. Fall back to the cost-aware greedy order for
+    // unusual architectures with many tensors per layer.
+    constexpr size_t max_exact_items = 22;
+    if (tensors.size() > max_exact_items) {
+        flex_sort_for_pin(ctx, tensors, "cost-aware");
+        size_t used = 0;
+        for (size_t i = 0; i < tensors.size(); ++i) {
+            if (used + tensors[i].size <= budget) {
+                selected[i] = true;
+                used += tensors[i].size;
+            }
+        }
+        return selected;
+    }
+
+    const uint64_t n_mask = 1ull << tensors.size();
+    uint64_t best_mask = 0;
+    size_t best_value = 0;
+    size_t best_weight = 0;
+    int best_count = 0;
+
+    for (uint64_t mask = 1; mask < n_mask; ++mask) {
+        size_t value = 0;
+        size_t weight = 0;
+        int count = 0;
+        bool ok = true;
+
+        for (size_t i = 0; i < tensors.size(); ++i) {
+            if ((mask & (1ull << i)) == 0) {
+                continue;
+            }
+            weight += tensors[i].size;
+            if (weight > budget) {
+                ok = false;
+                break;
+            }
+            value += flex_pin_value_bytes(ctx, tensors[i]);
+            count++;
+        }
+        if (!ok) {
+            continue;
+        }
+
+        if (value > best_value ||
+                (value == best_value && weight > best_weight) ||
+                (value == best_value && weight == best_weight && count > best_count)) {
+            best_mask = mask;
+            best_value = value;
+            best_weight = weight;
+            best_count = count;
+        }
+    }
+
+    for (size_t i = 0; i < tensors.size(); ++i) {
+        selected[i] = (best_mask & (1ull << i)) != 0;
+    }
+    return selected;
+}
+
+struct flex_pin_state {
+    uint64_t mask = 0;
+    size_t used = 0;
+    size_t value = 0;
+    int count = 0;
+};
+
+static flex_pin_state flex_solve_layer_knapsack_state(
+        const llama_flex_context & ctx,
+        const std::vector<llama_flex_tensor> & tensors,
+        size_t budget) {
+    flex_pin_state best;
+    if (budget == 0 || ctx.layers.empty()) {
+        return best;
+    }
+    constexpr size_t max_exact_items = 22;
+    if (tensors.size() > max_exact_items) {
+        return best;
+    }
+
+    const uint64_t n_mask = 1ull << tensors.size();
+    for (uint64_t mask = 1; mask < n_mask; ++mask) {
+        flex_pin_state cur;
+        cur.mask = mask;
+        bool ok = true;
+        for (size_t i = 0; i < tensors.size(); ++i) {
+            if ((mask & (1ull << i)) == 0) {
+                continue;
+            }
+            cur.used += tensors[i].size;
+            if (cur.used > budget) {
+                ok = false;
+                break;
+            }
+            cur.value += flex_pin_value_bytes(ctx, tensors[i]);
+            cur.count++;
+        }
+        if (!ok) {
+            continue;
+        }
+        if (cur.value > best.value ||
+                (cur.value == best.value && cur.used > best.used) ||
+                (cur.value == best.value && cur.used == best.used && cur.count > best.count)) {
+            best = cur;
+        }
+    }
+    return best;
+}
+
+static void flex_apply_state_to_layer(flex_layer & L, const flex_pin_state & state) {
+    for (size_t i = 0; i < L.tensors.size(); ++i) {
+        L.tensors[i].locked = (state.mask & (1ull << i)) != 0;
+    }
+}
+
+static flex_pin_state flex_current_layer_state(
+        const llama_flex_context & ctx,
+        const std::vector<llama_flex_tensor> & tensors) {
+    flex_pin_state state;
+    for (size_t i = 0; i < tensors.size(); ++i) {
+        if (!tensors[i].locked) {
+            continue;
+        }
+        state.mask |= 1ull << i;
+        state.used += tensors[i].size;
+        state.value += flex_pin_value_bytes(ctx, tensors[i]);
+        state.count++;
+    }
+    return state;
+}
+
+static size_t flex_layer_total_value(
+        const llama_flex_context & ctx,
+        const std::vector<llama_flex_tensor> & tensors) {
+    size_t value = 0;
+    for (const auto & t : tensors) {
+        value += flex_pin_value_bytes(ctx, t);
+    }
+    return value;
+}
+
+static void flex_apply_global_rebalance(llama_flex_context & ctx, size_t budget) {
+    if (budget == 0 || ctx.layers.empty()) {
+        return;
+    }
+
+    std::vector<flex_pin_state> states(ctx.layers.size());
+    std::vector<size_t> layer_total_value(ctx.layers.size(), 0);
+    size_t base_locked = 0;
+    int base_locked_count = 0;
+    for (size_t il = 0; il < ctx.layers.size(); ++il) {
+        states[il] = flex_current_layer_state(ctx, ctx.layers[il].tensors);
+        layer_total_value[il] = flex_layer_total_value(ctx, ctx.layers[il].tensors);
+        base_locked += states[il].used;
+        base_locked_count += states[il].count;
+    }
+
+    struct proposal {
+        int layer = -1;
+        flex_pin_state state;
+        size_t extra = 0;
+        size_t gain = 0;
+        double score = 0.0;
+    };
+
+    while (budget > 0) {
+        std::vector<size_t> layer_stream_cost(ctx.layers.size(), 0);
+        size_t total_stream_cost = 0;
+        for (size_t il = 0; il < ctx.layers.size(); ++il) {
+            layer_stream_cost[il] = layer_total_value[il] > states[il].value
+                    ? layer_total_value[il] - states[il].value : 0;
+            total_stream_cost += layer_stream_cost[il];
+        }
+        if (total_stream_cost == 0) {
+            break;
+        }
+        const double avg_stream_cost = (double) total_stream_cost / (double) ctx.layers.size();
+
+        proposal best;
+        for (size_t il = 0; il < ctx.layers.size(); ++il) {
+            if ((double) layer_stream_cost[il] < avg_stream_cost) {
+                continue;
+            }
+            const auto & tensors = ctx.layers[il].tensors;
+            if (tensors.size() > 22) {
+                continue;
+            }
+            const double pressure = avg_stream_cost > 0.0
+                    ? (double) layer_stream_cost[il] / avg_stream_cost : 1.0;
+            const uint64_t n_mask = 1ull << tensors.size();
+            for (uint64_t mask = 1; mask < n_mask; ++mask) {
+                flex_pin_state cand;
+                cand.mask = mask;
+                bool ok = true;
+                for (size_t i = 0; i < tensors.size(); ++i) {
+                    if ((mask & (1ull << i)) == 0) {
+                        continue;
+                    }
+                    cand.used += tensors[i].size;
+                    if (cand.used > states[il].used + budget) {
+                        ok = false;
+                        break;
+                    }
+                    cand.value += flex_pin_value_bytes(ctx, tensors[i]);
+                    cand.count++;
+                }
+                if (!ok || cand.used <= states[il].used || cand.value <= states[il].value) {
+                    continue;
+                }
+                const size_t extra = cand.used - states[il].used;
+                const size_t gain = cand.value - states[il].value;
+                const double score = extra > 0 ? pressure * (double) gain / (double) extra : 0.0;
+                if (best.layer < 0 ||
+                        score > best.score ||
+                        (score == best.score && gain > best.gain) ||
+                        (score == best.score && gain == best.gain && extra < best.extra) ||
+                        (score == best.score && gain == best.gain && extra == best.extra && cand.used > best.state.used) ||
+                        (score == best.score && gain == best.gain && extra == best.extra && cand.used == best.state.used && (int) il < best.layer)) {
+                    best = { (int) il, cand, extra, gain, score };
+                }
+            }
+        }
+        if (best.layer < 0) {
+            break;
+        }
+        states[best.layer] = best.state;
+        budget -= best.extra;
+    }
+
+    size_t final_locked = 0;
+    int final_locked_count = 0;
+    for (size_t il = 0; il < ctx.layers.size(); ++il) {
+        flex_apply_state_to_layer(ctx.layers[il], states[il]);
+        final_locked += states[il].used;
+        final_locked_count += states[il].count;
+    }
+    ctx.stats.global_rebalance_bytes = final_locked > base_locked ? final_locked - base_locked : 0;
+    ctx.stats.global_rebalance_tensors = final_locked_count > base_locked_count
+            ? (uint64_t) (final_locked_count - base_locked_count) : 0;
+    if (ctx.params.debug_log && ctx.stats.global_rebalance_bytes > 0) {
+        std::fprintf(stderr,
+                "llama_flex: global water-fill pinned %llu tensors, %.2f MiB\n",
+                (unsigned long long) ctx.stats.global_rebalance_tensors,
+                ctx.stats.global_rebalance_bytes / 1048576.0);
+    }
+}
+
 static bool flex_pin_policy_valid(const std::string & policy) {
     return policy == "small-first" ||
            policy == "large-first" ||
            policy == "attn-first"  ||
            policy == "ffn-first"   ||
+           policy == "cost-aware"  ||
+           policy == "cost-aware-balanced" ||
            policy == "none";
 }
 
@@ -412,6 +727,80 @@ static bool flex_read(llama_flex_context * ctx,
     std::memcpy(dst, bounce + head, size);
     if (phys_out) *phys_out = want;
     return true;
+}
+
+static double flex_calibration_avg_pread_us(int fd, void * buf, size_t size, off_t offset, int repeats) {
+    if (repeats <= 0 || size == 0) {
+        return 0.0;
+    }
+    uint64_t total_us = 0;
+    for (int i = 0; i < repeats; ++i) {
+        const uint64_t t0 = now_us();
+        ssize_t r = pread(fd, buf, size, offset);
+        const uint64_t dt = now_us() - t0;
+        if (r < 0 || (size_t) r < size) {
+            return 0.0;
+        }
+        total_us += std::max<uint64_t>(dt, 1);
+    }
+    return (double) total_us / (double) repeats;
+}
+
+static size_t flex_calibrate_read_cost_bytes(llama_flex_context & ctx) {
+    if (!ctx.direct_io_active || ctx.fds.empty() || ctx.file_sizes.empty()) {
+        return 0;
+    }
+
+    const size_t A = ctx.align;
+    const size_t fsz = ctx.file_sizes[0];
+    if (fsz < 2 * A) {
+        return 0;
+    }
+
+    const size_t small = A;
+    size_t large = 16ull * 1024 * 1024;
+    large = std::min(large, fsz & ~(A - 1));
+    if (large <= small) {
+        return 0;
+    }
+
+    void * small_buf = nullptr;
+    void * large_buf = nullptr;
+    if (posix_memalign(&small_buf, A, small) != 0 || posix_memalign(&large_buf, A, large) != 0) {
+        free(small_buf);
+        free(large_buf);
+        return 0;
+    }
+
+    const int fd = ctx.fds[0];
+    const double small_us = flex_calibration_avg_pread_us(fd, small_buf, small, 0, 32);
+    const double large_us = flex_calibration_avg_pread_us(fd, large_buf, large, 0, 4);
+    free(small_buf);
+    free(large_buf);
+
+    if (small_us <= 0.0 || large_us <= small_us) {
+        return 0;
+    }
+
+    const double bw_bytes_per_us = ((double) large - (double) small) / (large_us - small_us);
+    if (bw_bytes_per_us <= 0.0) {
+        return 0;
+    }
+    const double fixed_us = small_us - (double) small / bw_bytes_per_us;
+    if (fixed_us <= 0.0) {
+        return 0;
+    }
+
+    const double fixed_bytes = fixed_us * bw_bytes_per_us;
+    const size_t cap = 4ull * 1024 * 1024;
+    const size_t result = (size_t) std::min<double>(fixed_bytes, (double) cap);
+    if (ctx.params.debug_log) {
+        std::fprintf(stderr,
+                "llama_flex: read-cost calibration small=%.2f us large=%.2f us bw=%.0f MiB/s fixed=%.2f us read_cost=%.1f KiB\n",
+                small_us, large_us, bw_bytes_per_us * 1000000.0 / 1048576.0,
+                fixed_us, result / 1024.0);
+    }
+    return result;
 }
 
 static void flex_worker(llama_flex_context * ctx) {
@@ -519,6 +908,20 @@ std::shared_ptr<llama_flex_context> llama_flex_create(
     if (const char * v = std::getenv("LLAMA_FLEX_PIN_POLICY")) {
         ctx->params.pin_policy = v;
     }
+    if (const char * v = std::getenv("LLAMA_FLEX_READ_COST_KB")) {
+        if (std::strcmp(v, "auto") == 0 || std::strcmp(v, "AUTO") == 0) {
+            ctx->params.read_cost_auto = true;
+        } else {
+            const double kb = std::max(0.0, std::atof(v));
+            ctx->params.read_cost_bytes = (size_t) (kb * 1024.0);
+        }
+    }
+    if (const char * v = std::getenv("LLAMA_FLEX_READ_COST_AUTO")) {
+        ctx->params.read_cost_auto = std::atoi(v) > 0;
+    }
+    if (const char * v = std::getenv("LLAMA_FLEX_GLOBAL_REBALANCE")) {
+        ctx->params.global_rebalance = std::atoi(v) > 0;
+    }
     if (!flex_pin_policy_valid(ctx->params.pin_policy)) {
         if (ctx->params.debug_log) {
             std::fprintf(stderr, "llama_flex: invalid pin policy '%s', using small-first\n",
@@ -610,6 +1013,9 @@ void llama_flex_finalize(llama_flex_context & ctx) {
         return;
     }
     const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+    if (ctx.params.read_cost_auto) {
+        ctx.params.read_cost_bytes = flex_calibrate_read_cost_bytes(ctx);
+    }
 
     // Balanced memory locking: give every layer the same lock budget so the
     // per-layer streamed IO stays uniform (avoids pipeline stalls). Within a
@@ -620,32 +1026,64 @@ void llama_flex_finalize(llama_flex_context & ctx) {
     const size_t per_layer_lock = !pin_disabled && ctx.n_layers > 0
             ? ctx.params.lock_bytes / (size_t) ctx.n_layers : 0;
 
-    size_t lock_total = 0;
+    size_t balanced_locked_total = 0;
     for (auto & L : ctx.layers) {
         // Balanced pinning keeps the same byte budget per layer so streamed IO
         // remains uniform. Policies only change tensor order within that budget.
-        flex_sort_for_pin(L.tensors, ctx.params.pin_policy);
+        std::vector<bool> cost_aware_pins;
+        if (flex_policy_cost_aware(ctx.params.pin_policy)) {
+            cost_aware_pins = flex_choose_cost_aware_pins(ctx, L.tensors, per_layer_lock);
+        } else {
+            flex_sort_for_pin(ctx, L.tensors, ctx.params.pin_policy);
+        }
         size_t locked_here = 0;
-        size_t stream_off  = 0;
-        for (auto & t : L.tensors) {
-            if (locked_here + t.size <= per_layer_lock) {
+        for (size_t i = 0; i < L.tensors.size(); ++i) {
+            auto & t = L.tensors[i];
+            const bool should_lock = flex_policy_cost_aware(ctx.params.pin_policy)
+                    ? cost_aware_pins[i] : locked_here + t.size <= per_layer_lock;
+            if (should_lock) {
                 t.locked     = true;
-                t.buf_offset = lock_total;   // offset into the global lock buffer
-                lock_total  += t.size;
                 locked_here += t.size;
-                ctx.stats.locked_tensors++;
             } else {
                 t.locked     = false;
-                t.buf_offset = stream_off;   // offset within this layer's slot
-                stream_off  += t.size;
-                ctx.stats.streamed_tensors++;
             }
         }
         if (per_layer_lock > locked_here) {
             ctx.stats.lock_budget_unused += per_layer_lock - locked_here;
         }
+        balanced_locked_total += locked_here;
+    }
+
+    if (ctx.params.global_rebalance && flex_policy_cost_aware(ctx.params.pin_policy) &&
+            ctx.params.lock_bytes > balanced_locked_total) {
+        flex_apply_global_rebalance(ctx, ctx.params.lock_bytes - balanced_locked_total);
+    }
+
+    size_t lock_total = 0;
+    ctx.stats.locked_tensors = 0;
+    ctx.stats.streamed_tensors = 0;
+    ctx.stats.lock_budget_unused = 0;
+    ctx.stats.stream_per_token = 0;
+    for (auto & L : ctx.layers) {
+        size_t stream_off = 0;
+        size_t locked_here = 0;
+        for (auto & t : L.tensors) {
+            if (t.locked) {
+                t.buf_offset = lock_total;   // offset into the global lock buffer
+                lock_total  += t.size;
+                locked_here += t.size;
+                ctx.stats.locked_tensors++;
+            } else {
+                t.buf_offset = stream_off;   // offset within this layer's slot
+                stream_off  += t.size;
+                ctx.stats.streamed_tensors++;
+            }
+        }
         L.stream_bytes    = stream_off;
         L.always_resident = (stream_off == 0);
+    }
+    if (ctx.params.lock_bytes > lock_total) {
+        ctx.stats.lock_budget_unused = ctx.params.lock_bytes - lock_total;
     }
 
     size_t max_bytes = 0;
@@ -720,6 +1158,7 @@ void llama_flex_finalize(llama_flex_context & ctx) {
         ctx.slots[s] = p;
     }
     ctx.stats.ring_bytes = ctx.slot_bytes * (size_t) k;
+    ctx.stats.read_cost_bytes = ctx.params.read_cost_bytes;
     ctx.adaptive_ahead = std::max(1, std::min(ctx.params.prefetch_ahead, flex_ring_room_ahead(ctx)));
     ctx.stats.effective_ahead = flex_effective_ahead(ctx);
     ctx.stats.min_effective_ahead = ctx.stats.effective_ahead;
@@ -742,7 +1181,8 @@ void llama_flex_finalize(llama_flex_context & ctx) {
         std::fprintf(stderr,
                 "llama_flex: layers=%d ring=%d slot=%.2f MiB ring_total=%.2f MiB "
                 "locked=%.2f MiB stream/token=%.2f MiB io_threads=%d direct_io=%d ahead=%d requested_ahead=%d "
-                "adaptive_ahead=%d max_ahead=%d pin_policy=%s locked_tensors=%llu streamed_tensors=%llu lock_unused=%.2f MiB "
+                "adaptive_ahead=%d max_ahead=%d pin_policy=%s read_cost=%.1f KiB locked_tensors=%llu streamed_tensors=%llu lock_unused=%.2f MiB "
+                "global_rebalance=%d global_locked=%.2f MiB global_tensors=%llu "
                 "sched=%d budget=%.0f MiB fixed=%.0f MiB ring_room=%.0f MiB\n",
                 ctx.n_layers, k, ctx.slot_bytes / 1048576.0,
                 ctx.stats.ring_bytes / 1048576.0,
@@ -752,9 +1192,13 @@ void llama_flex_finalize(llama_flex_context & ctx) {
                 ctx.stats.effective_ahead, ctx.params.prefetch_ahead,
                 ctx.params.adaptive_ahead ? 1 : 0, ctx.params.prefetch_ahead_max,
                 ctx.params.pin_policy.c_str(),
+                ctx.params.read_cost_bytes / 1024.0,
                 (unsigned long long) ctx.stats.locked_tensors,
                 (unsigned long long) ctx.stats.streamed_tensors,
                 ctx.stats.lock_budget_unused / 1048576.0,
+                ctx.params.global_rebalance ? 1 : 0,
+                ctx.stats.global_rebalance_bytes / 1048576.0,
+                (unsigned long long) ctx.stats.global_rebalance_tensors,
                 ctx.params.sched_auto ? 1 : 0,
                 ctx.stats.sched_budget_bytes / 1048576.0,
                 ctx.stats.sched_fixed_bytes / 1048576.0,
