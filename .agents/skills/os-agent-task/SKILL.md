@@ -1,100 +1,75 @@
 ---
 name: os-agent-task
-description: Lightweight evidence-driven workflow for one bounded OS competition engineering task: contract, audit, implement, review, review-fix, script, or memory. Invoke explicitly with $os-agent-task or /os-agent-task.
-argument-hint: "<contract|audit|implement|review|review-fix|script|memory> <目标与验收>"
+description: High-precision, core-goal workflow for one bounded OS competition engineering task, with direct evidence and minimal verification.
+argument-hint: "<目标价值；关键边界；最小验收；停止条件>"
 disable-model-invocation: true
 ---
 
-# OS Agent Task v3 — 轻量上下文版
+# OS Agent Task — 核心目标轻量工作流
 
-把用户目标收敛为一次可独立验收的任务。优先当前源码、diff 和运行证据；不把局部报错、代理摘要遗漏或未来理论风险直接升级为阻塞项。
+用于完成一次边界明确、能够独立验收的工程任务。默认直接实现并运行与本次改动直接相关的构建或测试，不机械串联额外阶段。
 
-## 1. 解析输入
+## 1. 任务契约
 
-提取：`mode`、目标、验收、本轮特殊边界。未给 mode 时按语义选择：
-
-- 指令/提示词 → `contract`
-- 审计/定位/评估 → `audit`
-- 实现/修改/接入 → `implement`
-- 审查当前改动 → `review`
-- 按已确认阻塞修复 → `review-fix`
-- 实验/回归/解析脚本 → `script`
-- 工程账本初始化/检查/同步 → `memory`
-
-只有权限或目标确实歧义时询问一次；不要为恢复固定背景追问。
-
-## 2. 最小上下文策略
-
-先运行：
-
-```bash
-bash "${SKILL_DIR:-.agents/skills/os-agent-task}/scripts/collect-task-context.sh"
-```
-
-然后按 [references/context-policy.md](references/context-policy.md) 取上下文。核心规则：
-
-1. 默认只读当前 Git 身份、diff 摘要、`PROJECT_STATE.md` 当前阶段/阻塞/下一门禁，以及本轮直接相关源码和测试。
-2. `ARCHITECTURE.md`、`DECISIONS.md`、`EXPERIMENTS.md` 先看标题索引，只读取匹配章节；禁止默认整本加载。
-3. `EXPERIMENTS.md` 仅用于实验、脚本、正式结果或证据口径任务。
-4. 高风险任务才读取 [references/high-risk.md](references/high-risk.md) 和对应目标契约；不读取无关历史章节。
-5. 定位工具一次只选一种：优先 CodeGraph 或 `rg`；首轮不足再换工具，避免 CodeGraph、grep、全仓搜索重复定位。
-6. 日志、diff、Gate 默认只读摘要和命中片段，不把完整大文件灌入上下文。
-
-仓库客户端通常已注入 `AGENTS.md` 或 `CLAUDE.md`。除非规则缺失、冲突、发生变化或本轮修改治理文件，不再主动完整读取两份。
-
-## 3. 固定契约
-
-执行 [references/project-contract.md](references/project-contract.md)。只在一个地方维护固定 Git、证据、分工和账本规则，不在各模式重复加载。
-
-## 4. 阻塞项准入
-
-新增阻塞项必须同时满足：
-
-- **源码可达**：真实调用链可到达；
-- **阶段内**：属于当前节点目标；
-- **真实风险**：会导致错误行为、错误传播或证据假通过。
-
-代理未提及某路径、parser 未覆盖某字段、理论上可能出错、未来扩展不完整，都不能单独构成阻塞项。同一问题连续两轮未关闭时停止局部 `review-fix`，退回一次系统级 `audit`。
-
-## 5. 选择并读取当前模式
-
-只读取一个模式文件：
+开始前只提取四项：
 
 ```text
-references/modes/<mode>.md
+目标价值：这次改动解决什么真实问题，为什么当前需要。
+关键边界：允许修改什么，必须保留什么，不得扩大到什么。
+最小验收：哪些直接命令或可观察结果足以证明本次目标。
+停止条件：何时因证据不足、范围冲突、风险升级或超时停止。
 ```
 
-模型推荐仅在 `contract` 或用户明确询问时读取 [references/model-selection.md](references/model-selection.md)。不要读取其他模式、示例或通用输出模板。
+用户未逐项书写但语义明确时直接归纳，不要求补格式。只有缺失信息会改变实现方向、破坏数据或扩大范围时才询问。
 
-## 6. Gate 与验证
+## 2. 工作流选择
 
-- `implement`、`review-fix`：修改完成后运行对应 Gate。
-- `review`：运行 review Gate，除非本次只审查用户已提供且身份完整的同一 diff Gate artifact；复用时必须明确 artifact、HEAD 和当前 diff 未变化。
-- `audit`：只读 audit Gate；clean tree 的 `NO_CHANGES` 不证明正确性。
-- `contract`、纯 `memory` 不强制 Gate；`script` 修改 Harness/parser 时按实际修改运行相应 Gate。
+- **implement（默认）**：根因和边界已足够明确时，完成最小改动，并直接运行相关构建、单测、fixture 或短集成测试。实验 runner、parser 和回归脚本也归入 implement，不设独立脚本流程。
+- **audit（例外）**：仅在根因未知、真实调用链不清或竞争解释无法由现有证据区分时使用。只读定位首个真实错误，并给出最小实现边界。
+- **contract（例外）**：仅在高风险公共契约、跨模块接口、状态机或证据协议尚未冻结时使用。普通实现不先生成契约。
+- **review（例外）**：仅在高风险稳定节点需要独立反例检查时使用。它不是每次实现后的固定步骤。
+- **memory update（提交后）**：仅在用户已完成 commit、显式要求同步时执行；只记录能绑定该 commit 的已验证事实。
 
-```bash
-bash scripts/os-agent/gate-runner <mode>
-```
+这些流程互不自动串联。已确认且仍在原边界内的问题直接在当前 implement 中修复；根因重新变得不确定时才停止并转为 audit。
 
-默认只读取 `OS_AGENT_GATE_RESULT` 和 `summary.txt`。非 PASS 时先按失败 check 名称在 `full.log` 中提取局部上下文，不直接读取完整日志。
+## 3. 执行规则
 
-Gate verdict：`PASS / FAIL / UNRESOLVED / INCOMPLETE / NO_CHANGES / UNVERIFIED`。只有 PASS 可声明该层短检查通过；Gate 不替代真实 server、模型、clean-HEAD 或正式实验。
+1. 遵守 [references/project-contract.md](references/project-contract.md)，只读取会改变本次判断的源码、diff、测试和必要账本片段。
+2. 修改前定位生产入口、真实调用链和数据流；高风险任务再读取 [references/high-risk.md](references/high-risk.md)。
+3. 只做实现目标所需的最小修改，不顺手重构，不预埋后续阶段，不覆盖无关 dirty 改动。
+4. 代理直接执行必要命令，不经通用包装器。优先使用已有构建目录、明确 target 和具体测试文件。
+5. 每项验收只保留一组足够且直接的证据。代码或条件未变化时不重复同一验证；结果含糊时才补充区分性检查。
+6. 不扩张与目标无关的负例，不因纯格式偏好、代理摘要遗漏、未来扩展设想或理论不可达问题阻塞。
+7. 发现失败时先定位首个真实错误。无关既有失败如实记录，但不自动扩大本次范围。
 
-## 7. 账本边界
+## 4. P0 准入
 
-普通任务不自动修改四份账本。只有显式 `memory update` 才同步。任务结束仅在确有影响时给一行账本建议。
+只有以下三项同时成立，问题才标为 P0 并停止低优先级工作：
 
-- `PROJECT_STATE.md`：当前状态，可覆盖；
-- `ARCHITECTURE.md`：已验证稳定结构；
-- `DECISIONS.md`：追加/supersede；
-- `EXPERIMENTS.md`：追加实验索引，不复制大日志。
+- **生产路径可达**：当前配置和真实入口能够到达该路径；
+- **影响正确性或核心结论**：会造成崩溃、数据损坏、并发错误、错误结果、构建/演示失败，或使关键实验结论失真；
+- **存在真实证据**：源码调用链、可复现失败、原始日志、测试或运行结果能够证明，而非只靠理论推测。
 
-## 8. 完成措辞
+缺任一项时不得按 P0 阻塞；应标为非阻塞、证据不足或仅供讨论。
 
-- 静态/单元/短集成：`代码已实现并通过短验证，真实路径尚未验证`；
-- dirty-tree 真实短协议：`已诊断验证，尚不可归档`；
-- clean-HEAD 正式协议：`已实现并验证`；
-- 证据不足：`目前无法确认`。
+## 5. 验证边界
 
-最终输出结论先行，列修改/证据/未验证/唯一下一步；不复述固定背景和常规工具过程。
+- 默认验收是“本次改动直接相关的构建/测试”，不是全仓回归。
+- 文档或 Skill 变更只做对应结构检查、引用检查和 `git diff --check`。
+- 正式模型、长稳定性、性能矩阵、cgroup/strace/mincore 等仍由用户执行，除非用户明确授权且环境已具备。
+- 短验证通过只能证明对应层级；不得抬高为正式性能、长期稳定性或 clean-commit 结论。
+
+## 6. 45 分钟停止条件
+
+单次执行达到 45 分钟仍未完成时立即停止，不以重复验证或扩大范围延长。输出可续接检查点：
+
+- 已完成的修改与直接证据；
+- 当前首个错误、根因置信度和未确认事项；
+- 工作区涉及文件；
+- 下一条精确命令或下一处代码入口。
+
+遇到破坏性操作、范围冲突、无权覆盖的现有改动、需要用户选择的公共契约，或新的已证实 P0，也立即停止。
+
+## 7. 输出
+
+结论先行，并明确区分：已实现并验证、已实现但证据不足、尚未实现、仅供讨论。随后只报告修改范围、直接验证、保留边界和未确认事项；不复述常规工具过程，不把未运行结果写成通过。

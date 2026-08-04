@@ -69,16 +69,17 @@ KV Cache 侧重点：内存占用与碎片、分配/回收/复用策略、数据
 
 ## 7. 工作入口
 
-所有任务通过 `/os-agent-task` 驱动，模式包括 contract / audit / implement / review / review-fix / script / memory。
-具体流程、交付物和停止条件由 Skill（`.claude/skills/os-agent-task/`）及其 references 定义。
+所有任务通过 `/os-agent-task` 的轻量工作流驱动。任务契约只保留：目标价值、关键边界、最小验收、停止条件。
 
-implement、review、review-fix、audit 四种模式完成后必须通过 gate 门禁：
+- 默认执行 `implement`，完成最小改动后直接运行与本次改动相关的构建或测试。
+- `audit` 仅用于根因未知、真实调用链不清或现有证据无法区分竞争解释。
+- `contract` 仅用于高风险公共契约、跨模块接口、状态机或证据协议。
+- `review` 仅用于高风险稳定节点，不作为每次实现后的固定步骤。
+- `memory update` 仅在用户已经 commit 且显式要求同步时执行。
 
-```bash
-bash scripts/os-agent/gate-runner <mode>
-```
+这些流程不机械串联，也不设置独立修复或脚本流程。代理直接执行必要命令，不经通用包装器；禁止重复验证、无关负例扩张，以及因纯格式偏好或理论不可达问题阻塞。
 
-gate 输出 `OS_AGENT_GATE_RESULT verdict=PASS` 方可声明完成。
+P0 必须同时满足：生产路径可达、影响正确性或核心结论、存在真实证据。单次执行达到 45 分钟仍未完成时停止，并输出可续接检查点。
 
 ## 8. 工程账本
 

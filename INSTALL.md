@@ -1,33 +1,29 @@
-# 安装或升级 `os-agent-task` v1.1
+# 安装或升级 `os-agent-task` 轻量版
 
-本目录内容以仓库根目录为相对路径。v1.1 可直接覆盖 v1.0 的 Skill 文件，不会覆盖已有工程账本。
+本目录内容以仓库根目录为相对路径。安装包只更新两套 Skill 和使用说明，不初始化或覆盖四份工程账本。
 
 ```bash
 cd /root/oscomp/llama.cpp
 
-tar -tzf ./os-agent-task-skill-v1.1.tar.gz | sed -n '1,40p'
-tar -xzf ./os-agent-task-skill-v1.1.tar.gz
+tar -tzf ./os-agent-task-skill.tar.gz
+tar -xzf ./os-agent-task-skill.tar.gz
 
-bash .agents/skills/os-agent-task/scripts/validate-skill.sh
 bash .claude/skills/os-agent-task/scripts/validate-skill.sh
-
-bash .agents/skills/os-agent-task/scripts/init-project-ledger.sh
-bash .agents/skills/os-agent-task/scripts/init-project-ledger.sh check
-
+git diff --check
 git status --short
 ```
 
-预期新增或更新：
+预期核心文件：
 
 ```text
-.agents/skills/os-agent-task/
-.claude/skills/os-agent-task/
+.agents/skills/os-agent-task/SKILL.md
+.agents/skills/os-agent-task/agents/openai.yaml
+.agents/skills/os-agent-task/references/high-risk.md
+.agents/skills/os-agent-task/references/project-contract.md
+.agents/skills/os-agent-task/scripts/validate-skill.sh
+.claude/skills/os-agent-task/（相同内容）
 docs/os-agent-task-usage.md
 INSTALL.md
-PROJECT_STATE.md
-ARCHITECTURE.md
-DECISIONS.md
-EXPERIMENTS.md
 ```
 
-初始化脚本只创建缺失账本，不覆盖已有文件。先用 `memory check` 和一个真实 `implement` 任务验证，再决定提交。
+validator 会同时检查 Skill 的任务字段、核心策略、文件集合、脚本语法和两套镜像一致性。已运行的 Claude Code 或其他客户端如未发现更新，重启对应会话。

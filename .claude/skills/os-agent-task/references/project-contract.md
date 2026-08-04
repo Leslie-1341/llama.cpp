@@ -1,37 +1,34 @@
 # 项目固定契约
 
-本文件是固定规则唯一入口。各模式不得重复加载或复述这些内容。
+本文件只保留所有任务都会用到的稳定边界；具体目标与验收由当次四字段任务契约决定。
 
 ## 事实优先级
 
-当前源码、Git diff、真实运行结果 > 构建/二进制/模型/脚本身份 > 四份工程账本 > README/设计文档 > 历史聊天与理论推测。
+当前源码、当前 diff、真实运行原始证据 > 构建/二进制/模型/脚本身份 > 四份工程账本 > README 与设计文档 > 历史对话和理论推测。
 
-缺代码、日志、commit、构建或实验依据时写“目前无法确认”，并说明缺失证据。历史 README 数值、单次运行、理论收益和旧分支结果不能自动成为当前 HEAD 结论。
+证据不足时写“目前无法确认”，并指出缺少的代码、身份、日志、测试或实验。不得把计划、历史数值、单次观察或理论收益描述成当前实现结论。
 
-## 分工与 Git
+## Git 与修改边界
 
-- 代理可做：源码修改、定向构建、单测、fixture、无模型短 smoke、脚本和只读审计。
-- 用户执行：正式模型/server/cgroup/strace/mincore、长稳定性、正式性能矩阵、commit、push、merge、rebase、tag、发布。
-- 不自动 commit/push/merge/rebase/tag；不使用 destructive Git；不覆盖无关 dirty 修改。
-- 默认不生成 patch；只有跨环境交付、严格差异审查或回滚需要时使用。
+- 不主动 commit、push、merge、rebase、tag、release，不使用破坏性 Git 操作。
+- 不覆盖与当前任务无关的 dirty 改动；发现重叠先确认真实差异。
+- 只修改目标所需文件；不顺手整理业务代码或扩展下一阶段。
+- 删除、覆盖、发布或外部写入前必须已有明确授权，并先核对目标内容。
+
+## 直接证据
+
+- 修改前定位真实入口、调用链、状态 authority 和错误传播。
+- 代理直接运行与改动相关的构建、单测、fixture 或短集成命令，不借助替代包装层推断结果。
+- runner 只记录事实，parser 独占实验 verdict；缺 case、身份、原始证据或关键字段必须 fail-closed。
+- build 成功、exit=0、marker、内部计数或单次 RSS 变化都不能单独证明正确性或性能。
+- 正式性能结论必须绑定 commit、worktree、binary/model/script、硬件系统、参数、预热、重复、原始 artifact 和正确性门槛。
 
 ## 工程节奏
 
-一个任务只对应一个可独立验收的稳定节点。先明确阶段目标和边界，再实现；短验证后只做一次阶段级 review。没有新证据不反复打开已冻结阶段，不用后续功能掩盖当前 P0。
+一次任务只完成一个可独立验收节点。默认 implement 后运行直接相关验证；只有根因未知时 audit，只有高风险公共契约时 contract，只有高风险稳定节点时 review。
 
-P0：正确性、稳定性、证据可信度和演示；P1：性能、创新和融合；P2：体验与非关键优化。
+P0 必须同时满足生产路径可达、影响正确性或核心结论、存在真实证据。格式偏好、理论不可达风险、未来扩展或无关测试缺口不得单独阻塞。
 
-## 证据与工具
+## 账本边界
 
-- runner 记录事实，parser 独占 verdict；缺 case、重复、顺序/身份/字段错误必须 fail-closed。
-- build、exit=0、marker、Gate PASS、内部计数下降都不能单独证明正确性或性能。
-- 正式性能必须具备固定基线、身份、硬件/系统/cgroup、指标定义、预热、重复、交错顺序、原始 artifact、正确性门槛和波动。
-- Gate 只证明 diff-aware 短检查，不抬高证据层。
-
-## KV 与融合边界
-
-KV 任务重点核对 physical resident、ownership、active visibility、release/offload/restore/reuse、backing I/O 原子性、commit/rollback、fail-stop、prefetch/defer/fallback 和多会话。
-
-不能把轻量 paged row mapping 描述成完整 PagedAttention，除非源码具备真实 block table、非连续物理页管理和对应 attention 读取。
-
-权重–KV协同必须存在共享资源和联合决策，例如共享物理内存预算或统一 I/O 仲裁；同时打开两个独立模块不构成协同创新。
+普通任务不修改 `PROJECT_STATE.md`、`ARCHITECTURE.md`、`DECISIONS.md`、`EXPERIMENTS.md`。只有用户已 commit 且显式要求 `memory update` 时，才用该 commit 的已验证事实同步；dirty 单次诊断和未运行实验不得归档为正式结果。

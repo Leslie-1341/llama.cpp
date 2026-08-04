@@ -2,96 +2,65 @@
 
 ## 定位
 
-该 Skill 封装项目中反复出现的七类工作，而不是封装某个 KV 阶段：
+该 Skill 用于一次边界明确、可独立验收的工程任务。它强调核心目标、真实调用链和直接证据，不提供统一验证包装，也不把多个阶段机械串联。
 
-- `contract`：生成精简 CC/Codex 指令；
-- `audit`：只读源码与工程资产审计；
-- `implement`：最小范围实现；
-- `review`：审查当前 diff；
-- `review-fix`：只修阻塞问题；
-- `script`：编写实验、回归或解析脚本；
-- `memory`：初始化、检查或同步长期工程账本。
-
-它不会替代网页端的架构决策、实验审查和阶段门禁，也不会自动 commit 或 push。
-
-## v1.1 新增：四个工程账本
-
-仓库根目录长期维护：
+两套镜像位于：
 
 ```text
-PROJECT_STATE.md
-ARCHITECTURE.md
-DECISIONS.md
-EXPERIMENTS.md
+.agents/skills/os-agent-task/
+.claude/skills/os-agent-task/
 ```
 
-普通任务会读取这些文件，但不会自动修改。只有显式调用 `memory update` 或明确要求同步账本时才写入。
+## 输入格式
 
-初始化：
+每次任务只需要四项：
 
-```bash
-bash .agents/skills/os-agent-task/scripts/init-project-ledger.sh
-bash .claude/skills/os-agent-task/scripts/init-project-ledger.sh check
+```text
+目标价值：要解决的真实问题及当前价值。
+关键边界：允许修改、必须保留和明确排除的范围。
+最小验收：足以证明本次目标的直接命令或结果。
+停止条件：证据不足、范围冲突、风险升级或超时的停止点。
 ```
 
-## 安装或从 v1.0 升级
+语义明确时无需为格式补问。例如：
 
-将 v1.1 压缩包解压到仓库根目录，会覆盖 Skill 自身文件，不会覆盖四个工程账本：
+```text
+$os-agent-task
+目标价值：修复 G0-S1 parser 对缺失 case 的假通过。
+关键边界：只改 parser 与直接单测；保留 runner 协议和正式实验脚本。
+最小验收：parser 单测通过，git diff --check 通过。
+停止条件：发现 producer schema 需变化，或 45 分钟仍未闭合。
+```
+
+## 工作流选择
+
+- 默认 `implement`：最小实现后直接运行相关构建、单测、fixture 或短集成测试。
+- `audit`：仅在根因未知、调用链不清或竞争解释无法区分时只读定位。
+- `contract`：仅在高风险公共契约、跨模块接口、状态机或证据协议尚未冻结时使用。
+- `review`：仅在高风险稳定节点需要独立反例检查时使用。
+- `memory update`：仅在用户已 commit 且显式要求同步时执行。
+
+实验 runner、parser、fixture 和回归脚本属于 implement 的正常产物；已确认且仍在原边界内的问题也直接在当前 implement 中修复。
+
+## 直接验证
+
+代理直接执行本次改动所需命令，例如明确 target 的增量构建、具体测试文件或短 smoke。默认不做全仓回归，不重复运行未受新改动影响的同一验证，不扩张无关负例。
+
+纯格式偏好、代理摘要遗漏、未来扩展设想或理论不可达问题不能单独阻塞。P0 必须同时满足：生产路径可达、影响正确性或核心结论、存在真实证据。
+
+单次执行达到 45 分钟仍未完成时停止，报告已完成内容、首个错误、根因置信度、涉及文件和下一条精确命令。
+
+## 工程账本
+
+普通任务不修改四份工程账本。只有用户完成 commit 后显式调用 `memory update`，才用该 commit 的已验证事实同步；dirty 单次诊断和未运行实验不得归档为正式结果。
+
+## 维护与校验
+
+两套 Skill 必须逐文件一致。修改 canonical 副本后同步另一份，并运行一次轻量校验：
 
 ```bash
-cd /root/oscomp/llama.cpp
-tar -xzf ./os-agent-task-skill-v1.1.tar.gz
-
-bash .agents/skills/os-agent-task/scripts/validate-skill.sh
 bash .claude/skills/os-agent-task/scripts/validate-skill.sh
-bash .agents/skills/os-agent-task/scripts/init-project-ledger.sh
-
-git status --short
+git diff --check
 ```
 
-Codex 或 Claude Code 已经运行时，如未发现更新，重启对应会话。
-
-## 推荐输入
-
-每次只需给：
-
-```text
-mode
-目标结果
-验收标准或本轮特殊限制（必要时）
-```
-
-例如 implement 保持简洁：
-
-```text
-$os-agent-task implement
-修复 E0–E5 parser 假通过：UNVERIFIED、矩阵缺失/重复、必要指标缺失或重复关键字段均非零退出；保留协议和 dry-run，用小型 fixture 覆盖。
-```
-
-固定仓库规则、Git 分工、长测分工、账本读取和输出格式不再重复。
-
-## 工程账本调用
-
-```text
-$os-agent-task memory init
-```
-
-```text
-$os-agent-task memory check
-核对四个账本与当前源码、分支和 diff 是否一致。
-```
-
-```text
-$os-agent-task memory update
-同步本轮已验证成果；未运行的正式实验不得写入 EXPERIMENTS.md。
-```
-
-## 维护
-
-`.agents` 与 `.claude` 保存相同内容。修改其中一份后，应同步另一份并运行两个 validator：
-
-```bash
-rsync -a --delete .agents/skills/os-agent-task/ .claude/skills/os-agent-task/
-bash .agents/skills/os-agent-task/scripts/validate-skill.sh
-bash .claude/skills/os-agent-task/scripts/validate-skill.sh
-```
+校验器会检查文件集合、关键策略字段、脚本语法和两套镜像一致性。
