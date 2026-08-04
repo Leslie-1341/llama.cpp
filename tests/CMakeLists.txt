@@ -156,8 +156,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-grammar-integration.cpp)
     llama_build_and_test(test-llama-grammar.cpp)
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
-    target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
-    target_link_libraries(test-chat PRIVATE server-context)
+    target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)
+    target_link_libraries(test-chat PRIVATE server-context mtmd)
     # TODO: disabled on loongarch64 because the ggml-ci node lacks Python 3.8
     if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "loongarch64")
         llama_build_and_test(test-json-schema-to-grammar.cpp   WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
@@ -204,13 +204,13 @@ if (UNIX)
     # No SKIP_RETURN_CODE: this test builds an in-memory synthetic
     # LLM_ARCH_LLAMA model (llama_model_init_from_user) and always runs —
     # never needs an external GGUF model file.
-    llama_build_and_test(test-kv-pressure-sampler.cpp)
+    llama_build_and_test(test-kv-pressure-sampler.cpp ${PROJECT_SOURCE_DIR}/src/llama-kv-pressure.cpp)
     if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
-        llama_build_and_test(test-server-kv-pressure.cpp ${PROJECT_SOURCE_DIR}/tools/server/server-kv-pressure.cpp)
+        llama_build_and_test(test-server-kv-pressure.cpp ${PROJECT_SOURCE_DIR}/tools/server/server-kv-pressure.cpp ${PROJECT_SOURCE_DIR}/src/llama-kv-pressure.cpp)
         target_include_directories(test-server-kv-pressure PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/src)
         llama_build_and_test(test-server-kv-resume.cpp ${PROJECT_SOURCE_DIR}/tools/server/server-kv-resume.cpp)
         target_include_directories(test-server-kv-resume PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/src)
-        llama_build_and_test(test-server-kv-pressure-action.cpp ${PROJECT_SOURCE_DIR}/tools/server/server-kv-pressure-action.cpp)
+        llama_build_and_test(test-server-kv-pressure-action.cpp ${PROJECT_SOURCE_DIR}/tools/server/server-kv-pressure-action.cpp ${PROJECT_SOURCE_DIR}/src/llama-kv-pressure.cpp)
         target_include_directories(test-server-kv-pressure-action PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/src)
         llama_test_cmd(python3 NAME test-server-kv-pressure-static
             ARGS ${PROJECT_SOURCE_DIR}/tests/test-server-kv-pressure-static.py LABEL python)

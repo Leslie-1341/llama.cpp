@@ -1268,7 +1268,8 @@ void llama_memory_recurrent_context::mark_paged_kv_compute_started() {
 bool llama_memory_recurrent_context::finish_paged_kv_write(llama_paged_kv_write_action action) {
     failure_handled = false;
 
-    if (action == llama_paged_kv_write_action::INVALIDATE_COMPUTE_STARTED || compute_started) {
+    if (action != llama_paged_kv_write_action::COMMIT &&
+            (action == llama_paged_kv_write_action::INVALIDATE_COMPUTE_STARTED || compute_started)) {
         mem->invalidate_find_slot();
         failure_handled = true;
     } else if (mem && mem->find_slot_failed()) {

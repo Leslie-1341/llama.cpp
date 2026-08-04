@@ -1262,6 +1262,10 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    if (mctx) {
+        mctx->clear_paged_swap_error();
+    }
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1309,6 +1313,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         const auto alloc_t1 = std::chrono::steady_clock::now();
         if (!alloc_ok) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+            if (mctx) {
+                mctx->finish_paged_kv_write(llama_paged_kv_write_action::ROLLBACK_PRE_COMPUTE);
+            }
+            ret = GGML_STATUS_ALLOC_FAILED;
+            return nullptr;
+        }
+        if (mctx && mctx->test_paged_kv_fail_graph_alloc()) {
+            LLAMA_LOG_ERROR("%s: injected graph allocation failure\n", __func__);
+            mctx->finish_paged_kv_write(llama_paged_kv_write_action::ROLLBACK_PRE_COMPUTE);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
@@ -1323,12 +1336,40 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
+    if (mctx && mctx->has_paged_swap_error()) {
+        LLAMA_LOG_ERROR("%s: failed to set graph inputs\n", __func__);
+        mctx->finish_paged_kv_write(llama_paged_kv_write_action::ROLLBACK_PRE_COMPUTE);
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
 
+    if (mctx) {
+        mctx->mark_paged_kv_compute_started();
+    }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+        if (mctx) {
+            mctx->finish_paged_kv_write(llama_paged_kv_write_action::INVALIDATE_COMPUTE_STARTED);
+        }
         ret = status;
         return nullptr;
+    }
+    if (mctx && mctx->test_paged_kv_fail_after_compute()) {
+        LLAMA_LOG_ERROR("%s: injected post-compute failure\n", __func__);
+        mctx->finish_paged_kv_write(llama_paged_kv_write_action::INVALIDATE_COMPUTE_STARTED);
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+    if (mctx) {
+        if (mctx->needs_paged_kv_post_graph_sync()) {
+            ggml_backend_sched_synchronize(sched.get());
+        }
+        if (!mctx->finish_paged_kv_write(llama_paged_kv_write_action::COMMIT)) {
+            LLAMA_LOG_ERROR("%s: failed to commit paged KV writes\n", __func__);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -1805,26 +1846,32 @@ int llama_context::decode(const llama_batch & batch_inp) {
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
         if (!res) {
+            const bool paged_compute_failure_handled =
+                mctx && mctx->paged_kv_failure_handled() &&
+                mctx->get_paged_swap_error().reason == llama_paged_swap_error_reason::PAGED_WRITE_COMPUTE_FAILURE;
+
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
-            llama_pos pos_min[LLAMA_MAX_SEQ];
-            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
-                pos_min[s] = std::numeric_limits<llama_pos>::max();
-            }
-
-            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-                const auto & seq_id = ubatch.seq_id[i][0];
-
-                pos_min[seq_id] = std::min(pos_min[seq_id], ubatch.pos[i]);
-            }
-
-            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
-                if (pos_min[s] == std::numeric_limits<llama_pos>::max()) {
-                    continue;
+            if (!paged_compute_failure_handled) {
+                llama_pos pos_min[LLAMA_MAX_SEQ];
+                for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                    pos_min[s] = std::numeric_limits<llama_pos>::max();
                 }
 
-                LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, pos_min[s]);
+                for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                    const auto & seq_id = ubatch.seq_id[i][0];
 
-                memory->seq_rm(s, pos_min[s], -1);
+                    pos_min[seq_id] = std::min(pos_min[seq_id], ubatch.pos[i]);
+                }
+
+                for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                    if (pos_min[s] == std::numeric_limits<llama_pos>::max()) {
+                        continue;
+                    }
+
+                    LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, pos_min[s]);
+
+                    memory->seq_rm(s, pos_min[s], -1);
+                }
             }
 
             switch (status) {

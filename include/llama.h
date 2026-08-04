@@ -796,6 +796,20 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
+    LLAMA_API int32_t llama_memory_prefetch_seq(
+            llama_memory_t mem,
+              llama_seq_id seq_id);
+
+    LLAMA_API int32_t llama_memory_prefetch_seq_step(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                uint32_t   max_blocks);
+
+    LLAMA_API void llama_memory_set_seq_prefetch_protected(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                    bool   enabled);
+
     //
     // State / sessions
     //
