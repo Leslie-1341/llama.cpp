@@ -2,9 +2,9 @@
 
 > 记录当前源码和运行证据可验证的稳定结构。目标契约、计划和未验证机制必须明确标记，不能混入当前 runtime。
 
-- Last verified: 2026-07-29
-- Runtime evidence commits: `cffe4f5ae`、`0fe0aed12`、`a94381a31`、`64301af3d`、`ca4c95210`
-- Evidence scope: Stage 3A-2C historical diagnostic、Stage 3B-2A clean-HEAD artifact，以及 Stage 3C-1C-2A unified pressure code-level short verification
+- Last verified: 2026-08-04
+- Runtime evidence commits: `cffe4f5ae`、`0fe0aed12`、`a94381a31`、`64301af3d`、`ca4c95210`、`55717bb32`、`117fe1870`
+- Evidence scope: Stage 3A-2C historical diagnostic、Stage 3B-2A clean-HEAD release artifact、Stage 3C Governor code-level evidence，以及 G0-S1 single-session real-server OFFLOAD→PREFETCH PASS artifact
 
 ## 1. Authority and Scope
 
@@ -159,7 +159,7 @@ resume/active requires block
 - Swap-out 先完成整块 I/O 再发布 metadata；部分写失败不能成为可见 SWAPPED block。
 - Swap-in 先读 staging，再提交 tensor/state；active-required restore failure 通过 context-local error 在 graph compute 前失败传播。
 - Destructive release 与 swap 在当前 capability 上互斥；SWAPPED block 永不进入 RELEASED。
-- 固定槽位 offload、`SWAPPED`、restore/prefetch 与 active restore error propagation 是底层已有路径；它们尚未作为统一 server policy 的动作接入当前 pressure scheduler。
+- 固定槽位 OFFLOAD、`SWAPPED`、restore/PREFETCH 与 active restore error propagation 已通过 unified core action、Governor pressure policy 和 request-resume graph gate 接入当前 server 路径；G0-S1 已在单 slot、单会话真实模型服务器上验证一次完整闭环。多 slot active 隔离与长期/并发行为仍未关闭。
 - Current transaction states are `CLOSED/APPLIED/COMPUTE_STARTED` plus block `PENDING_WRITE/INVALID` behavior；这不是冻结目标契约中的完整 PREPARED/per-cell overlay 实现。
 
 ### 4.1 Stage 3C-1B unified core action boundary
@@ -209,7 +209,29 @@ server::maybe_sample_kv_pressure() [single synchronous scheduler owner]
 - Score selection is deterministic and input-order independent: eligibility excludes active, protected, shared, empty, write-open, fail-stop, epoch-mismatched and exhausted claimants; eligible candidates are ranked from normalized idle age, logical KV, reclaimable bytes, LCP penalty, I/O-cost penalty and failure penalty, with a stable tie break. OFFLOAD no-candidate/failure records exhaustion or backoff; a matching later claimant epoch/reuse advances eligibility.
 - No scheduler thread is created. The existing request-resume path alone is responsible for correctness-required PREFETCH before graph/decode; Governor OFFLOAD does not bypass that gate.
 
-这是源码和短验证可确认的结构，非真实压力、真实 RSS 或真实 HTTP 行为证明。
+上述 policy/core 分层由源码和定向测试确认；G0-S1 进一步提供了单会话真实 server 的 runtime 闭环证据，但仍不构成多 slot、并发、长期稳定性或性能证明。
+
+### 4.4 G0-S1 single-session runtime closure
+
+```text
+step1 fixed long-prefix fill (1088 tokens / 17 paged blocks)
+  -> slot 0 becomes idle, claimant epoch 2
+  -> Governor OFFLOAD decision 3 / core transaction 2
+  -> 17 RESIDENT blocks become SWAPPED
+  -> transaction-bound mincore sample shows physical resident drop
+  -> pressure debt repaid only by core relieved_bytes
+  -> same-session step2 reaccess
+  -> core PREFETCH transaction 3 completes for seq 0 / epoch 2
+  -> matching graph_gate event publishes graph_allowed=1
+  -> HTTP continuation completes and matches OFF baseline
+```
+
+- Runtime identity is closure commit `117fe1870c93ad18c200a73c6a32e22e191af064` plus artifact `/root/oscomp/kv_logs/kv_governor_g0_s1_20260804T114709Z_5ac4d5257c`; full binary/model/runner/parser hashes and provenance reconciliation are recorded in E-0018.
+- The designated OFFLOAD result reports `blocks=17`、`bytes=427,819,008`、`relieved_bytes=424,476,672`、`transaction_id=2`、zero I/O failure. Post-transaction claimant state reports `eligible_resident_blocks=0` and `swapped_blocks=17`.
+- The resident observation is bound to the same server PID, KV object/generation, decision, sequence and transaction. Resident bytes move from `430,571,520` to `6,094,848`; the `424,476,672`-byte drop exactly equals both core `relieved_bytes` and `debt_before_bytes - debt_after_bytes` (`6,618,016,768 - 6,193,540,096`). Completed logical OFFLOAD `bytes` is not substituted for physical relief/debt repayment.
+- Resume scope is bound to the recorded step2 request. Its two ordered events share `seq=0`、claimant epoch 2 and core transaction 3: first completed PREFETCH, then graph gate; both record `graph_allowed=1`. The parser rejects missing, duplicated, reordered or mismatched pairs.
+- OFF and GOVERNOR_ON use identical requests and capability, differ only in the three unified Governor environment keys, return HTTP 200 for both steps, and have identical continuation response SHA-256 `09c1ce30ca06e8faf43ceb60a0cc738024e6eb455b49d3f1961c113faaa60792`.
+- This architecture evidence closes G0-S1 only. G0-S2 remains a deferred release-level active-isolation gate; G0-S3 is non-blocking extension coverage. Neither is evidence that multi-slot isolation or performance has already passed.
 
 ## 5. Static Paged Identity Fast Path
 
@@ -368,11 +390,12 @@ effective-context probe (server stderr effective n_ctx)
 - `src/llama-kv-cache-action.h`: unified core action request/result types for logical intent, capability, transaction correlation and structured failure.
 - `src/llama-kv-cache-release.h`: release capability/result/ownership helpers shared by core and server-facing API.
 - `src/llama-kv-pressure.*`: pressure source parsing, sampling and state transitions only.
-- `tools/server/server-kv-pressure.*`: pressure cadence, dry-run/bounded config, cooldown/backoff, event formatting.
-- `tools/server/server-context.cpp`: single-owner lifecycle and Phase A/B/C invocation.
-- `src/llama-memory.h`: memory-level capability and action virtual interfaces.
+- `tools/server/server-kv-pressure.*`: pressure cadence, dry-run/bounded config, cooldown/backoff and telemetry formatting.
+- `tools/server/server-kv-pressure-action.*`: Governor pressure debt/episode、claimant scoring/exclusion、RELEASE→deferred OFFLOAD policy、core result accounting and unified action marker formatting.
+- `tools/server/server-context.cpp`: single-owner lifecycle、Governor invocation、request-resume PREFETCH/graph gate and transaction-bound G0-S1 resident observation.
+- `src/llama-memory.h`: memory-level capability、logical action and resident-observation virtual interfaces.
 - `src/llama-graph.cpp`: paged row-index input and dummy row redirect.
-- `scripts/run-*`, `scripts/parse-*`, `tests/test-*-parser.py`: stage-local runner/parser and negative fixtures.
+- `scripts/run-*`, `scripts/parse-*`, `tests/test-*-parser.py`: stage-local runner/parser、identity/raw evidence capture、fail-closed verdict and negative fixtures；G0-S1 uses dedicated `run/parse-kv-governor-g0-s1.py` pair.
 - `scripts/os-agent/`: agent gate harness.
 
 ## 10. Current Invariants
@@ -401,9 +424,13 @@ effective-context probe (server stderr effective n_ctx)
 - Stage 3B-2A 已在单模型、单次协议中覆盖有效 8064-token 档位与同一 server 的 20 次连续请求；仍无并发、多模型/quantization、不同 block/page size、长期重复 release/refault 的证明。
 - DYNAMIC target 与 per-tier calibrated RSS 的正确性证据不等于生产阈值或性能策略；Stage 3A-2C 的 forced CRITICAL/fixed target 仅保留为历史 diagnostic。
 - `mincore`、RSS 和 strace 是诊断/正确性观测；它们会带来开销，正式性能比较必须关闭或单独测量。
-- Stage 3C-1C-2B-1 已把 Governor 的 RELEASE priority 与 deferred synchronous OFFLOAD 接入 server policy，但只具有 code-level evidence；真实 model/HTTP/RSS、多 slot 与长期 runtime 闭环仍未验证。
-- 完整五动作 server scheduler、完整三轴 lifecycle 与 v5 evidence remain unimplemented；core action request/result 或当前 Governor marker 不能单独构成这些运行时闭环。
+- G0-S1 已为 Governor 的单 slot、单会话真实 model/HTTP OFFLOAD→PREFETCH 链路提供 transaction-bound resident/relief/debt closure；多 slot active 隔离、并发、长期重复 episode、多模型、GPU 和性能仍未验证。
+- 完整五动作 server scheduler、完整三轴 lifecycle、统一 weight/KV physical-memory budget 与 v5 evidence remain unimplemented；G0-S1 artifact、core action result 或当前 Governor marker 均不能单独构成这些更宽的运行时闭环。
 
-## 12. Next Architecture Gate
+## 12. Architecture Progression After G0-S1
 
-Stage 3C-1C-2B-1R 的下一架构门禁是 **real-model multi-slot Governor integration**：以真实模型服务器验证双 claimant 的确定性推进、同步 multi-block OFFLOAD 状态变化、debt/`relieved_bytes`/marker 一致、恢复前 correctness-required PREFETCH、HTTP 输出正确与旧 pressure path 互斥；还需覆盖真实 pressure/RSS 观测和重复 episode。该门禁不等于性能证明；性能与 Dense/MoE 融合须进入单独的 baseline、KV-only、weight-only、combined 实验矩阵。
+- **G0-S1: PASS.** 单会话真实 server 已关闭 fill→17-block OFFLOAD→transaction-bound resident/relief/debt closure→same-session PREFETCH→graph gate→HTTP/output identity。
+- **G0-S2: deferred / post-release.** active 隔离保留为发布级后置门禁，不再阻塞当前融合主线；通过前仍不得声称 multi-slot active isolation 已验证。
+- **G0-S3: non-blocking.** 扩展覆盖另立实验契约，不作为当前 architecture/implementation 的前置条件。
+- **Immediate mainline: weight–KV unified scheduling.** 下一架构任务可以直接冻结 Dense Flex/MoE weight path 与 KV Governor 之间的共享内存预算、I/O 优先级、反压和降级边界。既有 fail-stop → correctness-required PREFETCH 优先级、server logical policy/core physical authority、单 decision 单 state-changing action 不得被融合层绕过。
+- 正式融合收益仍须使用 baseline、KV-only、weight-only、combined 四组对照及必要消融；诊断 `mincore`/RSS 不能替代 TTFT/TPOT/TPS、吞吐、峰值内存和正确性/精度证据。

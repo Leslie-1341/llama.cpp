@@ -634,3 +634,64 @@ Stage 3A-2C endpoint is feasible and correct in the stated controlled boundary: 
 **Evidence boundary and next real-model gate**
 
 尚未验证真实模型、多 slot、真实 pressure/RSS、真实 OFFLOAD→PREFETCH、长周期/重复 episode、HTTP 输出与性能。下一门禁为 **Stage 3C-1C-2B-1R real-model multi-slot Governor integration gate**：在真实模型下验证双 claimant 推进、multi-block state changes、debt/relief/marker 一致性、恢复前 PREFETCH、HTTP 输出正确，以及 Governor 与旧 pressure paths 的互斥；同时记录真实 pressure/RSS 与长周期行为，性能结论需另有对照协议。
+
+## E-0018 — G0-S1 single-session long-context OFFLOAD→PREFETCH real-server gate
+
+- Status: **PASS — 单模型、单 slot、单会话真实 server correctness gate**。
+- Closure identity: branch `fix/kv-p0-b1-bounded-store`，clean committed HEAD `117fe1870c93ad18c200a73c6a32e22e191af064`（`kv: close G0-S1 single-session offload-resume gate`）；memory update 开始前 `git status --porcelain=v1` 为空，`HEAD...origin/fix/kv-p0-b1-bounded-store = 0 0`。
+- Artifact: `/root/oscomp/kv_logs/kv_governor_g0_s1_20260804T114709Z_5ac4d5257c`；protocol `kv_governor_g0_s1`，version 1，source marker schema `kv_governor_stage3c_1c_2b_1r/v6`，started `20260804T114709Z`，finished `20260804T114821Z`。
+- Artifact file identity: `manifest.json` SHA-256 `716d5e627ef9d33d7929de6f515f58e035ff168baebf14cc490425f63da0c843`；`parser.json` SHA-256 `b1492fac7538cf85949caede0fff67384a5d6b178218b58847c3a1b63769f591`；manifest `tracked_diff_fingerprint=ced43e3e2dde6144f4dd01ecc886eddee2b287da686cc05aa3da4ed04d04fa99`。
+
+**Provenance and post-commit binding**
+
+- Artifact manifest records `capture_mode=diagnostic_dirty` and parent HEAD `e6a0f06b255c3ea8b55cd28f9a691309f3d3483c`; it is **not** an archival-clean capture and is not reclassified as one。
+- Manifest records 16 dirty paths. Their normalized path set exactly equals the 16 changed paths in closure commit `117fe1870`；artifact-only and commit-only sets are both empty。
+- Artifact runner/parser identities exactly match the files committed at `117fe1870`，and the currently present executed binary exactly matches the manifest binary SHA-256. This is a transparent post-commit reconciliation for the G0-S1 correctness gate, not proof of a separate clean-HEAD rerun。
+
+**Model, binary and scripts**
+
+- Model: `/root/models/Qwen1.5-MoE-A2.7B-20-experts-SFT-trained/Qwen1.5-MoE-A2.7B-20-experts-SFT-trained.Q4_K_M.gguf`；size `3,951,892,704` bytes；SHA-256 `4a6aee7704af34e46ea2056720d1bd9eb24e84b20ec4d17d08a3cb02e3a1373f`。
+- Binary: `/root/oscomp/llama.cpp/build/bin/llama-server`；size `12,830,280` bytes；SHA-256 `0d5a0a9db729fc386395f260888455679522db85544e9e88ea9e04d8a6a91cba`。
+- Runner: `/root/oscomp/llama.cpp/scripts/run-kv-governor-g0-s1.py`；size `41,386` bytes；SHA-256 `5c73f92286621a670829afa80ed9abc746f066453d847eea826279799284ac53`。
+- Parser: `/root/oscomp/llama.cpp/scripts/parse-kv-governor-g0-s1.py`；size `52,161` bytes；SHA-256 `1a44bb1077eebd66274dfb8f79ede56e91a43f6a35e01f5701f8f25ae72c4211`。
+
+**Protocol and workload**
+
+- Linux CPU server argv fixes `--ctx-size 2048 --parallel 1 --kv-unified --no-cache-idle-slots --threads 4 --n-gpu-layers 0 --cache-type-k f32 --cache-type-v f32 --no-warmup`；slot 0、`n_stream=1`、paged block size 64、seed 1、temperature 0、step2 `n_predict=32`。
+- OFF and GOVERNOR_ON use identical binary/model/argv/capability and identical requests。Both cases carry the same fixed paged/swap/mincore instrumentation；the only environment differences are the three unified Governor keys validated by parser。
+- Tokenized fixed prefix contains 1088 tokens and exactly 17 paged blocks；common prefix 1151 tokens，continuation prompt 1159 tokens，full context 1191 tokens，fits `ctx=2048`。该 workload 用 step1 fill 后释放 slot，再以 step2 重访同一会话。
+- PREFLIGHT confirms one slot and required production capabilities：`kv_unified/paged_metadata/ingraph_gather/release_supported/offload_supported/prefetch_supported/backing_ready/swap_explicit_only = 1`，并从 `GET /slots.kv_resident` 获得可用 physical resident sample。
+
+**17-block OFFLOAD and physical closure**
+
+- Parser-designated OFFLOAD marker: pressure decision 3，episode 1，selected `seq_id=0`，claimant epoch 2，core transaction 2，`outcome=completed`，`state_changed=1`，`blocks=17`，`bytes=427,819,008`，`relieved_bytes=424,476,672`，`shortfall_bytes=645,922,816`，`io_failure=0`，`io_errno=0`。
+- Pre-transaction claimant has 17 target/eligible resident blocks and zero swapped/shared/blocked blocks；post snapshot keeps the same `seq=0/epoch=2`，reports `eligible_resident_blocks=0`、`swapped_blocks=17`、`active=false`、`valid=true`。
+- Transaction-bound resident observation is from the same server PID 65277，KV object 2，generation 3，page size 4096，total bytes/pages unchanged at `805,109,760 / 196,560`。
+- Physical resident changes from `430,571,520` bytes / 105,120 pages to `6,094,848` bytes / 1,488 pages。Observed drop is exactly `424,476,672` bytes / 103,632 pages。
+- Pressure debt changes from `6,618,016,768` to `6,193,540,096` bytes，also exactly `424,476,672` bytes。Therefore this run closes `resident_drop == debt_drop == core relieved_bytes` for transaction 2；the parser requires a valid directional resident drop, while this exact byte equality is an observed result of this artifact, not a universal invariant。
+
+**Same-session PREFETCH, graph gate and HTTP correctness**
+
+- Step2 request scope starts after the designated OFFLOAD and post snapshot。Within that exact raw stderr range，the only resume pair is ordered as PREFETCH then graph gate。
+- Both events bind `seq_id=0`、claimant epoch 2、core transaction 3、`action=prefetch`、`outcome=completed`、`reason=none`、`graph_allowed=1`。Thus the same-session restore completes before graph/decode permission is published。
+- OFF and GOVERNOR_ON step1/step2 all return HTTP 200。Step1 request/response SHA-256 are identical across cases；step1 response SHA-256 is `fe0663fd13cdb08743dca3d2d5d1168762556ea36f77d8ab6009306d12a6f351`。
+- Step2 request SHA-256 is `9ff2c122488fb259960d341f5ffe0f4743477cb99bbfdb9121cb3340456acbbb` in both cases；continuation response SHA-256 is `09c1ce30ca06e8faf43ceb60a0cc738024e6eb455b49d3f1961c113faaa60792` in both cases，so OFF/ON output is byte-identical。
+- Both server processes exit 0 without TERM/KILL timeout or residual process；per-case backing directories are removed successfully。
+
+**Runner/parser validation**
+
+- Manifest `runner_status=run_complete`；saved `parser.json` has `status=PASS`、empty details and parser SHA-256 matching the committed parser。
+- Re-verification: `PYTHONUTF8=1 python3 scripts/parse-kv-governor-g0-s1.py /root/oscomp/kv_logs/kv_governor_g0_s1_20260804T114709Z_5ac4d5257c --verify-result /root/oscomp/kv_logs/kv_governor_g0_s1_20260804T114709Z_5ac4d5257c/parser.json` → **`PASS (verified)`**。
+- Parser fixtures: `PYTHONUTF8=1 python3 tests/test-kv-governor-g0-s1-parser.py` → **33/33 PASS**。Fixtures fail closed on missing/extra cases, identity/environment drift, malformed or duplicated markers, incomplete block transition, absent/non-declining resident evidence, PREFETCH/graph reordering or mismatch, response divergence and cleanup failure。
+
+**Supported conclusion**
+
+G0-S1 is **PASS** for the exact recorded scope：single-session long-context fill → 17-block Governor OFFLOAD → transaction-bound physical resident drop with core relief/debt closure → same-session PREFETCH → graph gate → successful HTTP and OFF/ON output identity。
+
+**Limits and gate disposition**
+
+- This is correctness evidence, not a performance result。It does not establish net RSS savings, TTFT/TPOT/TPS/throughput improvement, production threshold quality, long-run I/O behavior or combined weight–KV benefit。
+- It covers one Linux CPU host、one Qwen MoE Q4_K_M model、one binary、one slot/session and one recorded run；multi-slot active isolation、concurrency、repeated episodes、multiple models/quantizations、different block/page sizes and GPU remain unverified。
+- **G0-S2** is deferred to a post-release, release-level active-isolation gate；it remains required before that publication claim but no longer blocks unified scheduling work。
+- **G0-S3** is a non-blocking extension item；its future cases require a separate protocol/artifact。
+- With G0-S1 closed, the weight–KV unified scheduling mainline may proceed immediately。Any benefit claim still requires baseline、KV-only、weight-only、combined controls and necessary ablations。

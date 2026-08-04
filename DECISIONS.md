@@ -897,3 +897,43 @@ D-0021 已冻结 core single-action transaction，D-0022 已关闭 request-resum
 - `./build/bin/test-server-kv-pressure-action`：325/325 PASS。
 - 定向 CTest（排除 legacy `test-server-kv-pressure`）：6/6 PASS，0 failed；命令与完整范围见 E-0017。
 - `git diff --check`：PASS；E-0017。
+
+## D-0025 — G0-S1 关闭单会话 runtime gate，并解除权重–KV 统一调度前置阻塞
+
+- Date: 2026-08-04
+- Status: accepted（**G0-S1 PASS；G0-S2 后置为发布级 active 隔离门禁；G0-S3 为非阻塞扩展项**）
+- Closure commit: `117fe1870c93ad18c200a73c6a32e22e191af064` on `fix/kv-p0-b1-bounded-store`；memory update 开始前 worktree clean，且与远端 ahead/behind 为 0/0。
+- Runtime artifact: `/root/oscomp/kv_logs/kv_governor_g0_s1_20260804T114709Z_5ac4d5257c`；protocol `kv_governor_g0_s1/v1`；parser verdict PASS。
+- Supersedes: D-0024 中“真实模型 HTTP 与 server OFFLOAD→PREFETCH 尚未验证”的泛化当前状态；保留其对 multi-slot、并发、长周期、性能与权重–KV 融合尚未验证的边界。
+
+**Context**
+
+D-0024 已关闭 Governor 的 code-level policy/core 边界，但此前将真实模型、multi-slot、active isolation、长周期和 HTTP 恢复捆绑为一个宽门禁。最新 fail-closed G0-S1 artifact 已提供可归因的单会话最小 runtime 闭环；继续要求所有发布级扩展先完成，会不必要地阻塞已经具备正确性前提的权重–KV 融合工作。
+
+**Decision**
+
+1. 将 G0-S1 定义为单模型、单 slot、单会话真实 server 的最小 correctness gate，并标记为 **PASS**。通过条件是固定长前缀产生多 block KV，Governor 完成 state-changing OFFLOAD，物理 resident 下降与 core relief/debt 事务闭合，同一会话在 graph 前完成 correctness-required PREFETCH，HTTP 成功且 OFF/ON 输出一致。
+2. 本次 designated transaction 为 decision 3、`seq=0`、claimant epoch 2、core transaction 2：17 blocks 从 resident claimant 转为 `SWAPPED`，`relieved_bytes=424,476,672`；resident 与 debt 均下降同样字节数。step2 以同一 `seq/epoch` 的 core transaction 3 完成 PREFETCH，之后才发布 matching graph gate。
+3. G0-S2 改为**后置发布级 active 隔离门禁**。它仍是发布前需要关闭的正确性/稳定性项，但不再作为权重–KV 统一调度设计与最小实现的前置阻塞；在其 PASS 前不得声称 multi-slot active isolation 已验证。
+4. G0-S3 定位为**非阻塞扩展项**。其具体扩展范围由后续独立实验契约定义，不因尚未执行而阻塞当前融合主线，也不得被描述为已验证。
+5. 权重–KV 统一调度可立即推进。融合层必须保留 fail-stop → correctness-required PREFETCH 的最高正确性优先级、server logical-policy/core physical-authority、单 decision 单 state-changing action 和 fail-closed 降级；正式收益必须另以 baseline、KV-only、weight-only、combined 四组对照及必要消融验证。
+6. Artifact provenance 必须如实记录：本次 artifact 在父提交 `e6a0f06b255c3ea8b55cd28f9a691309f3d3483c` 的 `diagnostic_dirty` worktree 上捕获。其 16-path dirty set 与 closure commit changed set 一致，committed runner/parser 及当前执行 binary 哈希与 manifest 一致；该 post-commit reconciliation 足以登记 G0-S1 closure，但不把 artifact 改称 `archival_clean`。
+
+**Alternatives rejected**
+
+- 继续以原 real-model multi-slot umbrella gate 阻塞权重–KV 融合：把最小单会话 correctness、发布级 active isolation 和扩展覆盖耦合在一起，不能反映现有已验证边界。
+- 将 G0-S1 外推为 multi-slot、并发、长期稳定性或性能 PASS：artifact 没有这些 case，也没有正式性能对照。
+- 忽略 artifact 的 dirty capture mode，只记录新 clean commit：会隐藏真实证据身份并削弱可复核性。
+- 因 artifact 不是 archival-clean 而否定所有 runtime 结果：runner/parser/binary identity、changed-path reconciliation、raw transaction evidence 和当前 parser re-verification 已足以支持限定范围内的 correctness closure；正确做法是保留 provenance 限制，而不是抹去真实 PASS。
+
+**Consequences and limits**
+
+- 当前可陈述：单会话真实 server 的 17-block OFFLOAD、物理 resident 下降、core relief/debt 闭合、同会话 PREFETCH→graph gate、HTTP 与 OFF/ON 输出一致均已实现并验证。
+- 当前不可陈述：G0-S2 active isolation、G0-S3 扩展、multi-slot/并发/长周期、生产阈值、性能收益、GPU 或 combined 融合效果已通过。
+- 统一调度现为下一主线，但其 runtime 和性能结论仍须由后续实现与独立 artifact 建立，不能复用 G0-S1 数值替代。
+
+**Evidence**
+
+- Closure commit `117fe1870c93ad18c200a73c6a32e22e191af064`；artifact、模型、binary、runner/parser、事务和 HTTP 身份详见 E-0018。
+- Saved parser result `PASS`；`python3 scripts/parse-kv-governor-g0-s1.py <artifact> --verify-result <artifact>/parser.json`：`PASS (verified)`。
+- `PYTHONUTF8=1 python3 tests/test-kv-governor-g0-s1-parser.py`：33/33 PASS。

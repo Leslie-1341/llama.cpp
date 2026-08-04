@@ -2,10 +2,10 @@
 
 > 当前项目快照。只记录可验证事实；历史决策和实验索引分别进入 `DECISIONS.md` 与 `EXPERIMENTS.md`。
 
-- Last updated: 2026-07-29
-- Immutable snapshot: branch `fix/kv-p0-b1-bounded-store`，HEAD `55717bb322757a3edde73e8ce35a439f09796747`（`server: add EdgeKV pressure governor`）。
+- Last updated: 2026-08-04
+- Immutable snapshot: branch `fix/kv-p0-b1-bounded-store`，HEAD `117fe1870c93ad18c200a73c6a32e22e191af064`（`kv: close G0-S1 single-session offload-resume gate`）。
 - Remote synchronization: `HEAD...origin/fix/kv-p0-b1-bounded-store = 0 0`；HEAD 已推送且与远端同一提交。
-- Source validation: 验证开始前 worktree clean；`git diff --check` PASS。
+- Source validation: 本次 memory update 开始前 worktree clean；G0-S1 已用当前 committed parser 重新验证为 `PASS (verified)`，parser fixtures **33/33 PASS**。
 
 ## Goal
 
@@ -13,7 +13,7 @@
 
 ## Current Stage
 
-**Current Stage：Stage 3C-1C-2B-1 — EdgeKV Governor Policy + synchronous bounded OFFLOAD 已关闭为 code-level stable；下一门禁为 Stage 3C-1C-2B-1R real-model multi-slot Governor integration gate。** Stage 3B-2A 的 release-only clean-HEAD archival correctness and limited-stability 结论保持不变；2B-1 不构成真实模型 HTTP、真实压力/RSS、多 slot、长周期或性能结论。
+**Current Stage：G0-S1 单会话长上下文 Governor OFFLOAD→PREFETCH runtime gate 已关闭为 PASS；权重–KV 统一调度主线已解除此前置阻塞，可立即推进。** G0-S2 调整为后置的发布级 active 隔离门禁；G0-S3 为非阻塞扩展项。G0-S1 只关闭本次单模型、单 slot、单会话真实 server 正确性闭环，不构成多 slot、并发、长期稳定性或性能结论。
 
 ## Stage 3A-2C Verified Result
 
@@ -74,6 +74,17 @@
 - server 仅传递 logical sequence、budget、KV claimant 与 capacity-write I/O class；core 独占 physical candidate、ownership/recheck、state transition、backing I/O、transaction/outcome/reason/fail-stop。core `relieved_bytes` 是唯一 debt 偿还来源；零 relief/I/O failure 不还债，并推进 exhaustion 或 backoff。
 - `./build/bin/test-server-kv-pressure-action`：**325/325 PASS**；六项定向 CTest：**6/6 PASS，0 failed**；完整命令、scope 和 Gate artifact 见 E-0017。该节点仅为 code-level stable。
 
+### G0-S1 — single-session long-context Governor OFFLOAD→PREFETCH runtime gate
+
+- Closure identity：branch `fix/kv-p0-b1-bounded-store`，clean committed HEAD `117fe1870c93ad18c200a73c6a32e22e191af064`；artifact 为 `/root/oscomp/kv_logs/kv_governor_g0_s1_20260804T114709Z_5ac4d5257c`，protocol `kv_governor_g0_s1/v1`，manifest SHA-256 `716d5e627ef9d33d7929de6f515f58e035ff168baebf14cc490425f63da0c843`。
+- Provenance：artifact 在父提交 `e6a0f06b255c3ea8b55cd28f9a691309f3d3483c` 的 dirty worktree 上捕获，`capture_mode=diagnostic_dirty`；其 16 个 dirty path 与 closure commit 的 16 个 changed path 集合一致，且 committed runner/parser 与当前已执行 binary 的 SHA-256 分别仍为 `5c73f922...ac53`、`1a44bb10...4211`、`0d5a0a9d...1cba`。该对账绑定 G0-S1 closure，但不把 artifact 重分类为 `archival_clean`。
+- Identity：模型 `Qwen1.5-MoE-A2.7B-20-experts-SFT-trained.Q4_K_M.gguf`，SHA-256 `4a6aee77...373f`；binary `build/bin/llama-server`，12,830,280 bytes；runner `scripts/run-kv-governor-g0-s1.py`；parser `scripts/parse-kv-governor-g0-s1.py`。完整路径、大小和哈希见 E-0018。
+- Workload：Linux CPU、`ctx=2048`、`parallel=1`、`n_stream=1`、slot 0、paged block size 64、seed 1、temperature 0；固定长前缀形成 1088-token/17-block KV fill，随后同一会话 continuation。
+- OFFLOAD closure：decision 3、`seq=0`、claimant epoch 2、core transaction 2 完成 17-block OFFLOAD；`bytes=427,819,008`、`relieved_bytes=424,476,672`、I/O failure 0。KV resident 从 `430,571,520` 降至 `6,094,848` bytes，下降 `424,476,672`；pressure debt 从 `6,618,016,768` 降至 `6,193,540,096` bytes，下降量同样精确等于 core `relieved_bytes`。post snapshot 为 `eligible_resident_blocks=0`、`swapped_blocks=17`。
+- Resume closure：同一 `seq=0/epoch=2` 在 step2 request scope 内以 core transaction 3 完成 PREFETCH，随后同 transaction 的 graph gate 才以 `graph_allowed=1` 放行。
+- Correctness：OFF 与 GOVERNOR_ON 的 step1/step2 均 HTTP 200；两侧请求一致，step2 response SHA-256 均为 `09c1ce30ca06e8faf43ceb60a0cc738024e6eb455b49d3f1961c113faaa60792`。runner `run_complete`，两侧 server exit 0、无 residual process、backing cleanup 完成；saved parser verdict `PASS`，当前 parser 复验 `PASS (verified)`，fixtures 33/33 PASS。
+- Supported boundary：G0-S1 已实现并验证“单会话 fill→17-block OFFLOAD→事务绑定物理驻留下降/relief 闭合→同会话 PREFETCH→graph gate→HTTP 与 OFF/ON 输出一致”。它不是性能收益、多 slot active 隔离、并发、长期重复 episode、多模型或 GPU 证明。
+
 ### Stage 3A-2C — pressure-driven bounded destructive release
 
 - Server `maybe_sample_kv_pressure()` 已形成三阶段：Phase A telemetry、Phase B dry-run、Phase C bounded release。
@@ -102,22 +113,29 @@
 - Stage 3B-2A 虽覆盖至有效 8064-token 档位和一次 20-request 连续序列，但仍只是一台 Linux CPU、单 slot、单模型、单次运行；未覆盖并发、多模型/quantization、不同 block/page size 或长期重复 episode。
 - DYNAMIC target 的机制与 marker 已受 parser 验证，但本 artifact 不得用于声称正式总 RSS 收益、回收率、TTFT/TPOT/TPS、吞吐或 p95/p99 改善。
 - RSS 是独立真实 server PID 的进程观测；它不替代 KV resident/mincore 或 lifecycle state truth。正释放的 mincore 下降是本协议的正确性证据，非性能指标。
-- Stage 3C-1C-2A/2B-1 已通过 code-level 短验证，但真实模型 HTTP、真实压力/RSS、多 slot、长周期/重复 episode、并发、真实 server OFFLOAD→PREFETCH、长上下文、性能与权重–KV 融合仍未验证；静态/定向 CTest 不得推广为这些结论。`all_required` 的 restore tail 与 Governor 的 I/O/claimant score 都是未量化的 P1 性能边界。
+- G0-S1 已补齐单模型、单 slot、单会话真实 server 的长前缀 fill→OFFLOAD→PREFETCH→graph/HTTP 正确性证据；但多 slot active 隔离、并发、长周期/重复 episode、多模型/quantization、GPU、正式压力阈值、性能与权重–KV combined 效果仍未验证。`all_required` 的 restore tail 与 Governor 的 I/O/claimant score 仍是未量化的 P1 性能边界。
 - Stage 3A-2C 的 dirty-tree 单次固定-target 结论保留为历史 diagnostic；新 clean-HEAD artifact 不自动将其推广为生产策略。
 
 ## In Progress
 
-**Stage 3C-1C-2B-1 已关闭为 code-level stable；进入 Stage 3C-1C-2B-1R real-model multi-slot Governor integration gate。** 该门禁验证已实现结构在真实模型服务器路径中的正确性与互斥，不产生性能收益结论。
+**权重–KV 统一调度主线可立即推进。** G0-S1 已关闭单会话真实 server 正确性前置门禁；下一任务可以直接进入权重与 KV 的统一内存预算、I/O 优先级和反压边界设计/实现，不再等待多 slot 扩展验证。
 
 ## Blocked
 
-无已确认的 code-level P0 阻塞项。Governor 的真实模型、多 slot、真实 pressure/RSS、恢复链路、长周期与性能尚未验证，不能宣称已关闭这些 runtime/性能结论。
+无已确认的 code-level P0 阻塞项。G0-S2 与 G0-S3 均不阻塞当前统一调度主线；正式性能、组合收益和发布级稳定性仍必须由各自证据门禁关闭。
+
+## Gate Disposition
+
+| Gate | State | Evidence boundary |
+|---|---|---|
+| G0-S1 single-session OFFLOAD→resume | **PASS** | 单模型、单 slot、单会话真实 server；17-block OFFLOAD、resident/relief/debt 闭合、同会话 PREFETCH→graph gate、HTTP 与输出一致 |
+| G0-S2 active isolation | **deferred / post-release** | 后置发布级 active 隔离门禁；不作为权重–KV 统一调度的前置阻塞 |
+| G0-S3 extensions | **non-blocking** | 扩展覆盖项；具体范围另立实验契约，不作为当前主线前置条件 |
 
 ## Next Gate
 
-### Stage 3C-1C-2B-1R — real-model multi-slot Governor integration gate
+### Weight–KV unified scheduling — immediate mainline
 
-1. 在真实模型、多 slot server 下，制造可审计的双 claimant 场景，验证确定性 claimant 推进、exhaustion/epoch reuse 与旧路径互斥。
-2. 验证一次 bounded OFFLOAD 实际改变多个 block state，且 pressure debt、core `relieved_bytes`、server marker、decision/claimant epoch 一致；记录真实 RSS/pressure 为观测而非 lifecycle truth。
-3. 证明 OFFLOAD 后 request-resume 的 correctness-required PREFETCH 在 graph/decode 前完成，I/O failure/shortfall 保持 fail-closed；核对 HTTP 输出与 OFF baseline 的正确性要求。
-4. 覆盖持续/重复 episode 与 reset/backoff 的长周期行为。性能、KV-only/weight-only/combined 四组对照及 Dense/MoE 融合仍需独立正式实验协议。
+1. 在不改变现有 server logical-policy/core physical-authority 和 correctness-required PREFETCH 优先级的前提下，冻结权重与 KV 的共享预算、I/O 仲裁、优先级和反压边界。
+2. 先完成范围明确、可回滚的最小 runtime 接入和直接正确性验证；不得把 G0-S1 的单会话证据外推为统一调度收益。
+3. 融合效果必须使用 baseline、KV-only、weight-only、combined 四组对照及必要消融；涉及压缩、量化或近似计算时另加精度/正确性对照。
