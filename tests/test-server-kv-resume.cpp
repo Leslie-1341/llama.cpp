@@ -85,6 +85,25 @@ static void test_success_keeps_protection_until_lifecycle_end() {
     CHECK(core.protections.size() == 2 && !core.protections.back());
 }
 
+
+static void test_resume_events_bind_prefetch_to_graph_gate() {
+    fake_core core;
+    core.next = completed(1151);
+    core.next.core_transaction_id = 91;
+
+    const auto result = server_kv_resume_gate(
+            core.ops(), server_kv_resume_trigger::active_access, 7, 1151);
+    const auto prefetch = server_kv_resume_format_event(result, 7, 4, false);
+    const auto graph_gate = server_kv_resume_format_event(result, 7, 4, true);
+    CHECK(prefetch.find("kv_resume_order_event phase=prefetch") != std::string::npos);
+    CHECK(prefetch.find("decision_id=1151") != std::string::npos);
+    CHECK(prefetch.find("seq_id=7") != std::string::npos);
+    CHECK(prefetch.find("claimant_epoch=4") != std::string::npos);
+    CHECK(prefetch.find("transaction_id=91") != std::string::npos);
+    CHECK(prefetch.find("graph_allowed=1") != std::string::npos);
+    CHECK(graph_gate.find("phase=graph_gate") != std::string::npos);
+}
+
 static void test_first_block_failure_blocks_graph() {
     fake_core core;
     core.next.action = llama_kv_action::prefetch;
@@ -151,6 +170,7 @@ static void test_shortfall_fail_stop_and_context_invalid_block_graph() {
 int main() {
     test_no_swap_noop_and_legacy_compatibility();
     test_success_keeps_protection_until_lifecycle_end();
+    test_resume_events_bind_prefetch_to_graph_gate();
     test_first_block_failure_blocks_graph();
     test_partial_failure_preserves_result_and_blocks_graph();
     test_shortfall_fail_stop_and_context_invalid_block_graph();

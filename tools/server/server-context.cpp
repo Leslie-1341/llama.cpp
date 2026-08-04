@@ -26,7 +26,12 @@
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <sstream>
 #include <utility>
+
+#if defined(__linux__)
+#include <unistd.h>
+#endif
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -40,6 +45,41 @@
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+#if defined(__linux__)
+static std::string format_kv_g0_s1_resident_observation(
+        const llama_kv_action_request & request,
+        const llama_kv_action_result & result,
+        uint64_t server_pid,
+        const llama_kv_resident_sample & before,
+        const llama_kv_resident_sample & after) {
+    std::ostringstream out;
+    out << "kv_g0_s1_resident_observation"
+        << " source=paged_sample_mincore"
+        << " action=offload"
+        << " decision_id=" << request.decision_id
+        << " seq_id=" << request.seq_id
+        << " transaction_id=" << result.core_transaction_id
+        << " server_pid=" << server_pid
+        << " before_available=" << (before.available ? 1 : 0)
+        << " before_object_id=" << before.object_id
+        << " before_generation=" << before.generation
+        << " before_page_size=" << before.page_size
+        << " before_total_bytes=" << before.total_bytes
+        << " before_resident_bytes=" << before.resident_bytes
+        << " before_total_pages=" << before.total_pages
+        << " before_resident_pages=" << before.resident_pages
+        << " after_available=" << (after.available ? 1 : 0)
+        << " after_object_id=" << after.object_id
+        << " after_generation=" << after.generation
+        << " after_page_size=" << after.page_size
+        << " after_total_bytes=" << after.total_bytes
+        << " after_resident_bytes=" << after.resident_bytes
+        << " after_total_pages=" << after.total_pages
+        << " after_resident_pages=" << after.resident_pages;
+    return out.str();
+}
+#endif
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
@@ -753,6 +793,9 @@ private:
 
     bool sleeping = false;
     uint64_t kv_decision_next = 0;
+    bool kv_governor_claimant_trace = false;
+    bool kv_g0_s1_resident_observation = false;
+    bool kv_g0_s1_resident_preflight = false;
 
     void destroy() {
         spec.reset();
@@ -1059,6 +1102,8 @@ private:
             slot.reset();
         }
 
+        log_kv_governor_capability();
+
         {
             const char * LLAMA_TRACE = getenv("LLAMA_TRACE");
             trace = LLAMA_TRACE ? atoi(LLAMA_TRACE) : 0;
@@ -1133,6 +1178,8 @@ private:
         kv_pressure_bounded_release_episode = 0;
         kv_pressure_unified_action_config = server_kv_pressure_unified_action_config{};
         kv_governor_state.reset();
+        const char * claimant_trace = std::getenv("LLAMA_KV_PRESSURE_GOVERNOR_CLAIMANT_TRACE");
+        kv_governor_claimant_trace = claimant_trace && std::strcmp(claimant_trace, "1") == 0;
 
         const auto unified_decision =
                 server_kv_pressure_unified_action_startup_decide_from_env();
@@ -1143,6 +1190,14 @@ private:
             return false;
         }
         if (unified_decision.status == server_kv_pressure_unified_action_startup_status::enabled) {
+            const auto * mem = ctx_tgt ? llama_get_memory(ctx_tgt) : nullptr;
+            const auto capability = mem ? mem->get_kv_runtime_capability() : llama_kv_runtime_capability {};
+            if (capability.backing_ready && !capability.swap_explicit_only) {
+                SRV_ERR("%s", "KV pressure unified action requires LLAMA_KV_PAGED_SWAP_EXPLICIT_ONLY=1 "
+                        "to prevent legacy window swap from preempting Governor ownership; "
+                        "server initialization rejected\n");
+                return false;
+            }
             kv_pressure_unified_action_config = unified_decision.config;
             SRV_INF("KV pressure unified action enabled: target_bytes=%" PRIu64
                     " max_blocks=%" PRIu32 "\n",
@@ -1413,11 +1468,16 @@ private:
                 };
 
                 std::vector<server_kv_claimant_snapshot> claimant_snapshots;
+                std::vector<server_kv_claimant_runtime_observation> runtime_claimants;
                 claimant_snapshots.reserve(slots.size());
+                if (kv_governor_claimant_trace) {
+                    runtime_claimants.reserve(slots.size());
+                }
                 const int64_t now_us = ggml_time_us();
                 for (const auto & slot : slots) {
                     const bool active = slot.is_processing() || slot.task != nullptr;
                     const bool shared = slot.task && (slot.task->is_parent() || slot.task->is_child());
+                    const uint64_t epoch = kv_governor_state.claimant_epoch(slot.id);
                     const uint64_t idle_age_us = !active && slot.t_last_used >= 0 && now_us > slot.t_last_used
                         ? (uint64_t) (now_us - slot.t_last_used)
                         : 0;
@@ -1431,7 +1491,7 @@ private:
                     claimant_snapshots.push_back({
                             llama_kv_memory_claimant::kv,
                             slot.id,
-                            kv_governor_state.claimant_epoch(slot.id),
+                            epoch,
                             active,
                             slot.kv_resume_protected,
                             shared,
@@ -1443,19 +1503,41 @@ private:
                                 : 0,
                             reclaimable_bytes,
                     });
+                    if (kv_governor_claimant_trace) {
+                        runtime_claimants.push_back({
+                                slot.id,
+                                epoch,
+                                active,
+                                kv_governor_state.claimant_exhausted(slot.id, epoch),
+                                mem ? mem->get_kv_runtime_claimant(slot.id) : llama_kv_runtime_claimant {},
+                        });
+                    }
                 }
 
                 auto result = server_kv_pressure_execute_governor(
                         kv_pressure_unified_action_config,
                         kv_governor_state,
                         mem ? server_kv_pressure_action_ops {
-                            [mem](const llama_kv_action_request & request) {
-                                return mem->execute_action(request);
+                            [mem, observe_resident = kv_g0_s1_resident_observation](
+                                    const llama_kv_action_request & request) {
+                                if (!observe_resident || request.action != llama_kv_action::offload) {
+                                    return mem->execute_action(request);
+                                }
+                                const auto before = mem->sample_kv_resident();
+                                const auto action_result = mem->execute_action(request);
+                                const auto after = mem->sample_kv_resident();
+                                const auto observation = format_kv_g0_s1_resident_observation(
+                                        request, action_result, (uint64_t) ::getpid(), before, after);
+                                SRV_INF("%s\n", observation.c_str());
+                                return action_result;
                             },
                         } : server_kv_pressure_action_ops {},
                         pressure_snapshot,
                         claimant_snapshots);
                 result.observation.idle = idle;
+                if (kv_governor_claimant_trace) {
+                    result.runtime_claimants = std::move(runtime_claimants);
+                }
                 const std::string marker =
                     server_kv_pressure_unified_action_format_marker(result);
                 if (result.release.io_failure || result.release.fail_stop ||
@@ -1663,12 +1745,35 @@ private:
     }
 #endif
 
+    void log_kv_governor_capability() const {
+        const auto * mem = ctx_tgt ? llama_get_memory(ctx_tgt) : nullptr;
+        const auto capability = mem ? mem->get_kv_runtime_capability() : llama_kv_runtime_capability {};
+        SRV_INF("KV_GOVERNOR_CAPABILITY n_slots=%zu n_seq_max=%u n_stream=%u kv_unified=%d "
+                "paged_metadata=%d ingraph_gather=%d release_supported=%d offload_supported=%d "
+                "prefetch_supported=%d backing_ready=%d swap_explicit_only=%d\n",
+                slots.size(),
+                (unsigned) capability.n_seq_max,
+                (unsigned) capability.n_stream,
+                capability.kv_unified ? 1 : 0,
+                capability.paged_metadata ? 1 : 0,
+                capability.ingraph_gather ? 1 : 0,
+                capability.release_supported ? 1 : 0,
+                capability.offload_supported ? 1 : 0,
+                capability.prefetch_supported ? 1 : 0,
+                capability.backing_ready ? 1 : 0,
+                capability.swap_explicit_only ? 1 : 0);
+    }
+
     // unlike load_model(), this is only called once during initialization
     bool init() {
         GGML_ASSERT(ctx_tgt   != nullptr);
         GGML_ASSERT(model_tgt != nullptr);
 
         GGML_ASSERT(!sleeping);
+
+        const char * resident_observation = std::getenv("LLAMA_KV_G0_S1_RESIDENT_OBSERVATION");
+        kv_g0_s1_resident_observation = resident_observation && std::strcmp(resident_observation, "1") == 0;
+        kv_g0_s1_resident_preflight = resident_observation && std::strcmp(resident_observation, "preflight") == 0;
 
 #if defined(__linux__)
         if (!init_kv_pressure_sampler()) {
@@ -2655,9 +2760,51 @@ private:
 
                     int n_idle_slots       = 0;
                     int n_processing_slots = 0;
+                    const auto * mem = ctx_tgt ? llama_get_memory(ctx_tgt) : nullptr;
+                    const auto resident = kv_g0_s1_resident_preflight && mem
+                        ? mem->sample_kv_resident()
+                        : llama_kv_resident_sample {};
 
                     for (server_slot & slot : slots) {
                         json slot_data = slot.to_json(slots_debug == 0);
+                        const auto runtime = mem
+                            ? mem->get_kv_runtime_claimant(slot.id)
+                            : llama_kv_runtime_claimant {};
+                        uint64_t claimant_epoch = 1;
+                        bool claimant_exhausted = false;
+#if defined(__linux__)
+                        claimant_epoch = kv_governor_state.claimant_epoch(slot.id);
+                        claimant_exhausted = kv_governor_state.claimant_exhausted(slot.id, claimant_epoch);
+#endif
+                        slot_data["kv_claimant"] = {
+                            {"epoch", claimant_epoch},
+                            {"exhausted", claimant_exhausted},
+                            {"valid", runtime.valid},
+                            {"target_blocks", runtime.target_blocks},
+                            {"eligible_resident_blocks", runtime.eligible_resident_blocks},
+                            {"swapped_blocks", runtime.swapped_blocks},
+                            {"shared_blocks", runtime.shared_blocks},
+                            {"blocked_blocks", runtime.blocked_blocks},
+                        };
+                        if (kv_g0_s1_resident_preflight) {
+                            if (resident.available) {
+                                slot_data["kv_resident"] = {
+                                    {"status", "available"},
+                                    {"source", "paged_sample_mincore"},
+                                    {"object_id", resident.object_id},
+                                    {"generation", resident.generation},
+                                    {"page_size", resident.page_size},
+                                    {"total_bytes", resident.total_bytes},
+                                    {"resident_bytes", resident.resident_bytes},
+                                    {"total_pages", resident.total_pages},
+                                    {"resident_pages", resident.resident_pages},
+                                };
+                            } else {
+                                slot_data["kv_resident"] = {
+                                    {"status", "unavailable"},
+                                };
+                            }
+                        }
 
                         if (slot.is_processing()) {
                             n_processing_slots++;
@@ -3401,11 +3548,16 @@ private:
                                     server_kv_resume_trigger::active_access,
                                     slot.id,
                                     ++kv_decision_next);
+                            const uint64_t claimant_epoch = kv_governor_state.claimant_epoch(slot.id);
+                            SRV_INF("%s\n", server_kv_resume_format_event(
+                                    result, slot.id, claimant_epoch, false).c_str());
                             if (!result.graph_allowed) {
                                 send_error(slot, server_kv_resume_failure_message(result), ERROR_TYPE_SERVER);
                                 slot.release();
                                 continue;
                             }
+                            SRV_INF("%s\n", server_kv_resume_format_event(
+                                    result, slot.id, claimant_epoch, true).c_str());
                             kv_governor_state.invalidate_claimant(slot.id);
                         }
 

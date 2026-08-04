@@ -218,6 +218,8 @@ if (UNIX)
             ARGS ${PROJECT_SOURCE_DIR}/tests/test-server-kv-resume-static.py LABEL python)
         llama_test_cmd(python3 NAME test-server-kv-pressure-action-static
             ARGS ${PROJECT_SOURCE_DIR}/tests/test-server-kv-pressure-action-static.py LABEL python)
+        llama_test_cmd(python3 NAME test-kv-governor-g0-s1-parser
+            ARGS ${PROJECT_SOURCE_DIR}/tests/test-kv-governor-g0-s1-parser.py LABEL python)
         llama_test_cmd(python3 NAME test-kv-bounded-release-stage3a-2c-parser
             ARGS ${PROJECT_SOURCE_DIR}/tests/test-kv-bounded-release-stage3a-2c-parser.py LABEL python)
         llama_test_cmd(python3 NAME test-runner-bounded-release-stage3a-2c

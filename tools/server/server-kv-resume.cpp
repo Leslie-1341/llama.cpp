@@ -1,6 +1,7 @@
 #include "server-kv-resume.h"
 
 #include <cstdio>
+#include <sstream>
 
 namespace {
 
@@ -99,4 +100,25 @@ std::string server_kv_resume_failure_message(const server_kv_resume_gate_result 
             action.fail_stop ? 1 : 0,
             action.capability.context_invalid ? 1 : 0);
     return buffer;
+}
+
+
+std::string server_kv_resume_format_event(
+        const server_kv_resume_gate_result & result,
+        llama_seq_id seq_id,
+        uint64_t claimant_epoch,
+        bool graph_gate) {
+    const auto & action = result.action;
+    std::ostringstream out;
+    out << "kv_resume_order_event"
+        << " phase=" << (graph_gate ? "graph_gate" : "prefetch")
+        << " decision_id=" << result.decision_id
+        << " seq_id=" << seq_id
+        << " claimant_epoch=" << claimant_epoch
+        << " transaction_id=" << action.core_transaction_id
+        << " action=prefetch"
+        << " outcome=" << action_outcome_name(action.outcome)
+        << " reason=" << action_reason_name(action.reason)
+        << " graph_allowed=" << (result.graph_allowed ? 1 : 0);
+    return out.str();
 }

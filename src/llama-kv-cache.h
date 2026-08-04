@@ -380,6 +380,8 @@ public:
     int32_t prefetch_seq_step(llama_seq_id seq_id, uint32_t max_blocks) override;
     void set_seq_prefetch_protected(llama_seq_id seq_id, bool enabled) override;
     llama_kv_action_result execute_action(const llama_kv_action_request & request) override;
+    llama_kv_runtime_capability get_kv_runtime_capability() const override;
+    llama_kv_runtime_claimant get_kv_runtime_claimant(llama_seq_id seq_id) const override;
     llama_kv_bounded_release_result bounded_release_dry_run(
             uint64_t target_bytes, uint32_t max_scan_blocks) override;
     llama_kv_release_status paged_release_status() const override;
@@ -388,6 +390,7 @@ public:
     bool bounded_release_can_enable() const override;
     llama_kv_bounded_release_capability bounded_release_can_enable_diagnose() const override;
     uint64_t sample_kv_resident_bytes() const override;
+    llama_kv_resident_sample sample_kv_resident() const override;
     llama_kv_release_budget_snapshot sample_kv_release_budget() const override;
     uint64_t bounded_release_counter_bytes() const override {
         return paged_bounded_release_bytes;
@@ -531,6 +534,15 @@ public:
     bool paged_release_bounded_test_block_in_free_list(uint32_t block) const {
         return std::find(paged_free_list.begin(), paged_free_list.end(), block)
             != paged_free_list.end();
+    }
+    uint32_t paged_release_bounded_test_read_scan_cursor() const {
+        return paged_release_scan_cursor;
+    }
+    uint32_t paged_release_bounded_test_read_n_blocks() const {
+        return paged_n_blocks;
+    }
+    uint32_t paged_release_bounded_test_read_block_size() const {
+        return paged_block_size;
     }
     // Test-only accessors for dry-run zero-change verification.
     uint64_t paged_release_bounded_test_read_release_bytes() const {
@@ -744,6 +756,7 @@ private:
 
     bool v_trans = true;  // the value tensor is transposed
 
+    const bool kv_unified = false;
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
 
@@ -817,6 +830,8 @@ private:
     void paged_init(uint32_t kv_size);
     void paged_reset();
     void paged_build_block_table();
+    void paged_release_scan_reset();
+    void paged_release_scan_sync_layout();
     void paged_note_cells(const slot_info & sinfo);
     uint32_t paged_resolve(uint32_t cell) const;
     uint32_t paged_write_resolve(uint32_t cell) const;
@@ -986,6 +1001,18 @@ private:
     mutable std::vector<paged_release_range> paged_release_post_ranges;
     mutable std::vector<std::vector<paged_release_range>> paged_released_ranges_by_block;
     std::vector<uint32_t> paged_free_list;
+    // Per-cache bounded RELEASE scan state. The cursor resumes after the last
+    // visited block. scanned_since_release counts a candidate-space tour only
+    // while no block is successfully released; a release starts a fresh tour
+    // at the block following the scanned range. Layout and mapping snapshots
+    // reset both fields before a stale cursor can be used.
+    uint32_t paged_release_scan_cursor = 0;
+    uint32_t paged_release_scan_scanned_since_release = 0;
+    uint32_t paged_release_scan_block_size = 0;
+    uint32_t paged_release_scan_n_blocks = 0;
+    uint32_t paged_release_scan_kv_size = 0;
+    uint64_t paged_release_scan_mapping_generation = 0;
+    uint64_t paged_mapping_generation = 0;
     uint64_t paged_alloc_calls     = 0;
     uint64_t paged_blocks_in_use   = 0;
     uint64_t paged_identity_checks = 0;
@@ -1103,6 +1130,7 @@ private:
     mutable bool paged_test_force_active_release_consumed = false;
     mutable uint64_t paged_test_force_active_release_triggers = 0;
     bool     paged_swap_enabled = false;
+    bool     paged_swap_explicit_only = false;
     mutable uint64_t paged_swap_out_calls = 0;
     mutable uint64_t paged_swap_in_calls = 0;
     mutable uint64_t paged_blocks_swapped_out = 0;
@@ -1271,6 +1299,8 @@ private:
     bool     paged_mincore_requested = false;
     mutable bool     paged_mincore_enabled = false;
     mutable bool     paged_mincore_warned  = false;
+    uint64_t         paged_resident_object_id = 0;
+    uint64_t         paged_resident_generation = 1;
     mutable uint64_t paged_mincore_sample_calls = 0;
     mutable uint64_t paged_mincore_failures = 0;
     // last-sample aggregate (overwritten each sample)

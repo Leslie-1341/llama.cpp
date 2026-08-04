@@ -81,6 +81,43 @@ struct llama_kv_action_capability {
     bool can_offload = false;
 };
 
+// Snapshot of the production KV object used by server integration checks.  These
+// fields describe resolved runtime state, not command-line intent.
+struct llama_kv_runtime_capability {
+    uint32_t n_seq_max = 0;
+    uint32_t n_stream = 0;
+    bool kv_unified = false;
+    bool paged_metadata = false;
+    bool ingraph_gather = false;
+    bool release_supported = false;
+    bool offload_supported = false;
+    bool prefetch_supported = false;
+    bool backing_ready = false;
+    bool swap_explicit_only = false;
+};
+
+struct llama_kv_runtime_claimant {
+    bool valid = false;
+    uint32_t target_blocks = 0;
+    uint32_t eligible_resident_blocks = 0;
+    uint32_t swapped_blocks = 0;
+    uint32_t shared_blocks = 0;
+    uint32_t blocked_blocks = 0;
+};
+
+// A read-only, whole-KV mincore sample.  `available` distinguishes a valid
+// zero-resident result from an unsupported or failed platform probe.
+struct llama_kv_resident_sample {
+    bool available = false;
+    uint64_t object_id = 0;
+    uint64_t generation = 0;
+    uint64_t page_size = 0;
+    uint64_t total_bytes = 0;
+    uint64_t resident_bytes = 0;
+    uint64_t total_pages = 0;
+    uint64_t resident_pages = 0;
+};
+
 struct llama_kv_action_result {
     llama_kv_action action = llama_kv_action::noop;
     uint64_t decision_id = 0;
