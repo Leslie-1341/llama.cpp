@@ -354,6 +354,11 @@ uint64_t server_kv_governor_state::claimant_epoch(llama_seq_id seq_id) const {
     return it == claimant_epochs_.end() ? 1 : it->second;
 }
 
+bool server_kv_governor_state::claimant_exhausted(llama_seq_id seq_id, uint64_t epoch) const {
+    const auto it = exhausted_claimants_.find(seq_id);
+    return it != exhausted_claimants_.end() && it->second == epoch;
+}
+
 void server_kv_governor_state::invalidate_claimant(llama_seq_id seq_id) {
     if (seq_id < 0) {
         return;
@@ -669,7 +674,26 @@ std::string server_kv_pressure_unified_action_format_marker(
         << " decision_reason=" << observation.reason
         << " sample_count=" << observation.sample_count
         << " idle=" << (observation.idle ? 1 : 0)
-        << " scores=";
+        << " claimants=";
+    if (result.runtime_claimants.empty()) {
+        out << "none";
+    } else {
+        for (size_t i = 0; i < result.runtime_claimants.size(); ++i) {
+            if (i != 0) out << ';';
+            const auto & claimant = result.runtime_claimants[i];
+            out << claimant.seq_id << ':'
+                << claimant.epoch << ':'
+                << (claimant.active ? 1 : 0) << ':'
+                << (claimant.exhausted ? 1 : 0) << ':'
+                << (claimant.runtime.valid ? 1 : 0) << ':'
+                << claimant.runtime.target_blocks << ':'
+                << claimant.runtime.eligible_resident_blocks << ':'
+                << claimant.runtime.swapped_blocks << ':'
+                << claimant.runtime.shared_blocks << ':'
+                << claimant.runtime.blocked_blocks;
+        }
+    }
+    out << " scores=";
     if (result.scores.empty()) {
         out << "none";
     } else {

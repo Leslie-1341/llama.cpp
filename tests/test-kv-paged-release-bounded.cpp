@@ -1917,6 +1917,50 @@ int main(int /*argc*/, char ** /*argv*/) {
     }
 
     // =========================================================================
+    // WT27c: explicit-only swap preserves claimant resident capacity until the
+    // Governor submits OFFLOAD, and the read-only snapshot follows ownership.
+    // =========================================================================
+    {
+        setenv("LLAMA_KV_PAGED_SWAP", "1", 1);
+        setenv("LLAMA_KV_PAGED_SWAP_EXPLICIT_ONLY", "1", 1);
+        ContextGuard g;
+        if (!g.init(model, cparams)) {
+            CHECK(false, "WT27c: context creation failed");
+        } else {
+            CHECK(seed_owned_blocks(g.kv, 0, 4, 16, 0),
+                    "WT27c: seed four claimant blocks");
+            CHECK(seed_owned_blocks(g.kv, 4, 1, 16, 1),
+                    "WT27c: second apply does not trigger legacy window swap");
+
+            const auto capability = g.kv->get_kv_runtime_capability();
+            const auto before = g.kv->get_kv_runtime_claimant(0);
+            CHECK(capability.backing_ready && capability.swap_explicit_only,
+                    "WT27c: runtime capability reports explicit-only backing");
+            CHECK(before.valid && before.target_blocks == 4 &&
+                    before.eligible_resident_blocks == 4 && before.swapped_blocks == 0 &&
+                    before.shared_blocks == 0 && before.blocked_blocks == 0,
+                    "WT27c: claimant retains four eligible resident blocks");
+
+            const auto one = g.kv->execute_action({
+                    llama_kv_action::offload, 7321, 0, UINT64_MAX, 1, false });
+            const auto after_one = g.kv->get_kv_runtime_claimant(0);
+            CHECK(one.state_changed && one.blocks == 1 &&
+                    after_one.valid && after_one.target_blocks == 4 &&
+                    after_one.eligible_resident_blocks == 3 && after_one.swapped_blocks == 1,
+                    "WT27c: one explicit OFFLOAD changes exactly one capacity block");
+
+            g.kv->seq_cp(0, 1, -1, -1);
+            const auto shared = g.kv->get_kv_runtime_claimant(0);
+            CHECK(shared.valid && shared.target_blocks == 4 &&
+                    shared.eligible_resident_blocks == 0 && shared.swapped_blocks == 0 &&
+                    shared.shared_blocks == 4 && shared.blocked_blocks == 0,
+                    "WT27c: shared ownership removes all eligible resident capacity");
+        }
+        unsetenv("LLAMA_KV_PAGED_SWAP_EXPLICIT_ONLY");
+        unsetenv("LLAMA_KV_PAGED_SWAP");
+    }
+
+    // =========================================================================
     // WT28: bounded continuous RELEASE scan cursor.
     // =========================================================================
 

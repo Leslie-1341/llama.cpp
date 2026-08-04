@@ -116,12 +116,21 @@ struct server_kv_claimant_score {
     int64_t total = 0;
 };
 
+struct server_kv_claimant_runtime_observation {
+    llama_seq_id seq_id = -1;
+    uint64_t epoch = 1;
+    bool active = false;
+    bool exhausted = false;
+    llama_kv_runtime_claimant runtime;
+};
+
 struct server_kv_pressure_action_result;
 
 class server_kv_governor_state {
 public:
     void reset();
     uint64_t claimant_epoch(llama_seq_id seq_id) const;
+    bool claimant_exhausted(llama_seq_id seq_id, uint64_t epoch) const;
     void invalidate_claimant(llama_seq_id seq_id);
     void invalidate_all_claimants();
 
@@ -163,6 +172,7 @@ struct server_kv_pressure_action_result {
     uint64_t next_action_sample = 0;
     llama_seq_id selected_seq_id = -1;
     uint64_t selected_claimant_epoch = 0;
+    std::vector<server_kv_claimant_runtime_observation> runtime_claimants;
     std::vector<server_kv_claimant_score> scores;
 };
 

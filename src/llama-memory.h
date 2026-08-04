@@ -188,6 +188,15 @@ struct llama_memory_i {
         return result;
     }
 
+    virtual llama_kv_runtime_capability get_kv_runtime_capability() const {
+        return {};
+    }
+
+    virtual llama_kv_runtime_claimant get_kv_runtime_claimant(llama_seq_id seq_id) const {
+        GGML_UNUSED(seq_id);
+        return {};
+    }
+
     // Dry-run bounded release: read-only evaluation of would-be release candidates
     // under given budget constraints.  Default no-op returns empty result — only
     // paged-KV memory implementations provide a real scanner.
@@ -225,6 +234,13 @@ struct llama_memory_i {
     // kv_size) in page-table walks.  Callers must rate-limit accordingly.
     virtual uint64_t sample_kv_resident_bytes() const {
         return 0;
+    }
+
+    // Read-only sample with an object/generation binding and explicit
+    // availability.  This shares the resident-byte sampler; it does not alter
+    // KV state or participate in scheduling decisions.
+    virtual llama_kv_resident_sample sample_kv_resident() const {
+        return {};
     }
 
     virtual llama_kv_release_budget_snapshot sample_kv_release_budget() const {

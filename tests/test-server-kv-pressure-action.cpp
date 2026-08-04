@@ -316,12 +316,17 @@ static void test_release_terminal_results_do_not_chain() {
 static void test_marker_keeps_observation_and_core_result_separate() {
     fake_core core;
     core.responses = { evaluation(1050), release(1050) };
-    const auto result = server_kv_pressure_execute_unified_action(
+    auto result = server_kv_pressure_execute_unified_action(
             enabled_config(), core.ops(), pressure(), true, 9, 1050);
+    result.runtime_claimants.push_back({
+            0, 1, false, false,
+            { true, 3, 2, 1, 0, 0 },
+    });
     const auto marker = server_kv_pressure_unified_action_format_marker(result);
     CHECK(marker.find("decision_id=1050") != std::string::npos);
     CHECK(marker.find("transaction_id=99") != std::string::npos);
     CHECK(marker.find("state_changed=1") != std::string::npos);
+    CHECK(marker.find("claimants=0:1:0:0:1:3:2:1:0:0") != std::string::npos);
     CHECK(marker.find("rss_") == std::string::npos);
 
     const llama_kv_action_reason reasons[] = {
@@ -425,6 +430,10 @@ static server_kv_claimant_snapshot claimant(
     return snapshot;
 }
 
+static server_kv_claimant_snapshot active_producer() {
+    return claimant(999, true);
+}
+
 static void arm_governor_offload(
         server_kv_governor_state & state,
         const server_kv_pressure_unified_action_config & config,
@@ -440,6 +449,25 @@ static void arm_governor_offload(
     CHECK(core.requests[1].action == llama_kv_action::release);
     CHECK(result.offload_armed_after && state.offload_armed());
     CHECK(!result.observation.offload_attempted);
+}
+
+static void test_governor_scores_idle_claimant_without_active_producer() {
+    const auto config = enabled_config();
+    server_kv_governor_state state;
+    arm_governor_offload(state, config, 1, 1991);
+
+    auto offload = release(1992);
+    offload.action = llama_kv_action::offload;
+    fake_core core;
+    core.responses = { evaluation(1992), offload };
+    const auto result = server_kv_pressure_execute_governor(
+            config, state, core.ops(), governor_pressure(2, 1992), { claimant(2) });
+    CHECK(core.requests.size() == 2);
+    CHECK(core.requests[0].action == llama_kv_action::evaluate);
+    CHECK(core.requests[1].action == llama_kv_action::offload);
+    CHECK(result.observation.offload_attempted && result.selected_seq_id == 2);
+    CHECK(std::string(result.observation.reason) == "offload_submitted");
+    CHECK(result.scores.size() == 1 && result.scores[0].eligible);
 }
 
 static void test_governor_debt_release_then_later_offload() {
@@ -507,7 +535,7 @@ static void test_governor_debt_release_then_later_offload() {
     no_relief_core.responses = { evaluation(2012), logical_only };
     const auto no_relief = server_kv_pressure_execute_governor(
             config, no_relief_state, no_relief_core.ops(),
-            governor_pressure(2, 2012), { claimant(2) });
+            governor_pressure(2, 2012), { claimant(2), active_producer() });
     CHECK(no_relief.offload.bytes == 4096 && no_relief.offload.relieved_bytes == 0);
     CHECK(no_relief.debt_after_bytes == no_relief.debt_before_bytes);
     CHECK(no_relief.offload_armed_after);
@@ -516,7 +544,7 @@ static void test_governor_debt_release_then_later_offload() {
     exhausted_core.responses = { evaluation(2013), no_candidate_offload(2013) };
     const auto exhausted = server_kv_pressure_execute_governor(
             config, no_relief_state, exhausted_core.ops(),
-            governor_pressure(3, 2013), { claimant(2), claimant(5) });
+            governor_pressure(3, 2013), { claimant(2), claimant(5), active_producer() });
     CHECK(exhausted.selected_seq_id == 2);
     CHECK(exhausted.offload.reason == llama_kv_action_reason::no_candidate);
 
@@ -524,7 +552,7 @@ static void test_governor_debt_release_then_later_offload() {
     advance_core.responses = { evaluation(2014), offload_result(2014, 4096) };
     const auto advance = server_kv_pressure_execute_governor(
             config, no_relief_state, advance_core.ops(),
-            governor_pressure(4, 2014), { claimant(2), claimant(5) });
+            governor_pressure(4, 2014), { claimant(2), claimant(5), active_producer() });
     CHECK(advance.selected_seq_id == 5);
     CHECK(advance.scores[0].seq_id == 5);
     CHECK(advance.scores[1].seq_id == 2 &&
@@ -534,10 +562,10 @@ static void test_governor_debt_release_then_later_offload() {
 static void test_governor_sort_is_input_order_independent() {
     auto config = enabled_config();
     const std::vector<server_kv_claimant_snapshot> forward = {
-        claimant(8), claimant(3), claimant(5),
+        claimant(8), claimant(3), claimant(5), active_producer(),
     };
     const std::vector<server_kv_claimant_snapshot> reverse = {
-        claimant(5), claimant(3), claimant(8),
+        claimant(5), claimant(3), claimant(8), active_producer(),
     };
 
     for (const auto * order : { &forward, &reverse }) {
@@ -548,9 +576,10 @@ static void test_governor_sort_is_input_order_independent() {
         const auto result = server_kv_pressure_execute_governor(
                 config, state, core.ops(), governor_pressure(2, 2102), *order);
         CHECK(result.selected_seq_id == 3);
-        CHECK(result.scores.size() == 3);
+        CHECK(result.scores.size() == 4);
         CHECK(result.scores[0].seq_id == 3 &&
-                result.scores[1].seq_id == 5 && result.scores[2].seq_id == 8);
+                result.scores[1].seq_id == 5 && result.scores[2].seq_id == 8 &&
+                result.scores[3].seq_id == 999);
     }
 }
 
@@ -614,7 +643,7 @@ static void test_governor_global_exclusions_and_debt_saturation() {
     open_evaluation.capability.write_transaction_open = true;
     open_core.responses = { open_evaluation };
     const auto open = server_kv_pressure_execute_governor(
-            config, state, open_core.ops(), governor_pressure(3, 2253), { claimant(2) });
+            config, state, open_core.ops(), governor_pressure(3, 2253), { claimant(2), active_producer() });
     CHECK(open_core.requests.size() == 1);
     CHECK(!open.observation.offload_attempted);
     CHECK(std::string(open.observation.reason) == "write_transaction_open");
@@ -624,7 +653,7 @@ static void test_governor_global_exclusions_and_debt_saturation() {
     fail_stop_evaluation.fail_stop = true;
     fail_stop_core.responses = { fail_stop_evaluation };
     const auto fail_stop = server_kv_pressure_execute_governor(
-            config, state, fail_stop_core.ops(), governor_pressure(4, 2254), { claimant(2) });
+            config, state, fail_stop_core.ops(), governor_pressure(4, 2254), { claimant(2), active_producer() });
     CHECK(fail_stop_core.requests.size() == 1);
     CHECK(!fail_stop.observation.offload_attempted);
     CHECK(std::string(fail_stop.observation.reason) == "fail_stop");
@@ -640,7 +669,7 @@ static void test_governor_io_failure_backoff_and_penalty() {
     failed_core.responses = { evaluation(2302), offload_result(2302, 0, true) };
     const auto failed = server_kv_pressure_execute_governor(
             config, state, failed_core.ops(), governor_pressure(2, 2302),
-            { claimant(2), claimant(5) });
+            { claimant(2), claimant(5), active_producer() });
     CHECK(failed.selected_seq_id == 2);
     CHECK(failed.offload.io_failure && failed.offload.io_errno == ENOSPC);
     CHECK(state.next_action_sample() == 6);
@@ -648,7 +677,7 @@ static void test_governor_io_failure_backoff_and_penalty() {
     fake_core held_core;
     const auto held = server_kv_pressure_execute_governor(
             config, state, held_core.ops(), governor_pressure(3, 2303),
-            { claimant(2), claimant(5) });
+            { claimant(2), claimant(5), active_producer() });
     CHECK(held_core.requests.empty());
     CHECK(std::string(held.observation.reason) == "backoff");
 
@@ -656,7 +685,7 @@ static void test_governor_io_failure_backoff_and_penalty() {
     retry_core.responses = { evaluation(2306), offload_result(2306, 4096) };
     const auto retry = server_kv_pressure_execute_governor(
             config, state, retry_core.ops(), governor_pressure(6, 2306),
-            { claimant(2), claimant(5) });
+            { claimant(2), claimant(5), active_producer() });
     CHECK(retry.selected_seq_id == 5);
     CHECK(retry.scores[0].seq_id == 5);
     CHECK(retry.scores[1].seq_id == 2 && retry.scores[1].failure_penalty > 0);
@@ -672,15 +701,16 @@ static void test_governor_exhaustion_epoch_and_stable_noop() {
     exhausted_core.responses = { evaluation(2402), no_candidate_offload(2402) };
     const auto exhausted = server_kv_pressure_execute_governor(
             config, state, exhausted_core.ops(), governor_pressure(2, 2402),
-            { claimant(2), claimant(5) });
+            { claimant(2), claimant(5), active_producer() });
     CHECK(exhausted.selected_seq_id == 2);
     CHECK(exhausted.scores[0].exclusion == server_kv_claimant_exclusion::none);
+    CHECK(state.claimant_exhausted(2, old_epoch));
 
     fake_core advance_core;
     advance_core.responses = { evaluation(2403), offload_result(2403, 4096) };
     const auto advance = server_kv_pressure_execute_governor(
             config, state, advance_core.ops(), governor_pressure(3, 2403),
-            { claimant(2), claimant(5) });
+            { claimant(2), claimant(5), active_producer() });
     CHECK(advance.selected_seq_id == 5);
     CHECK(advance.scores[1].exclusion == server_kv_claimant_exclusion::exhausted);
     CHECK(advance.scores[1].seq_id == 2);
@@ -690,11 +720,11 @@ static void test_governor_exhaustion_epoch_and_stable_noop() {
     fake_core first;
     first.responses = { evaluation(2405), no_candidate_offload(2405) };
     server_kv_pressure_execute_governor(
-            config, all_exhausted, first.ops(), governor_pressure(2, 2405), { claimant(2) });
+            config, all_exhausted, first.ops(), governor_pressure(2, 2405), { claimant(2), active_producer() });
     fake_core stable;
     stable.responses = { evaluation(2406) };
     const auto noop = server_kv_pressure_execute_governor(
-            config, all_exhausted, stable.ops(), governor_pressure(3, 2406), { claimant(2) });
+            config, all_exhausted, stable.ops(), governor_pressure(3, 2406), { claimant(2), active_producer() });
     CHECK(stable.requests.size() == 1 && stable.requests[0].action == llama_kv_action::evaluate);
     CHECK(!noop.observation.offload_attempted && noop.selected_seq_id == -1);
     CHECK(std::string(noop.observation.reason) == "claimant_no_candidate");
@@ -703,12 +733,13 @@ static void test_governor_exhaustion_epoch_and_stable_noop() {
 
     state.invalidate_claimant(2);
     CHECK(state.claimant_epoch(2) != old_epoch);
+    CHECK(!state.claimant_exhausted(2, state.claimant_epoch(2)));
     fake_core invalidated;
     invalidated.responses = { evaluation(2407), offload_result(2407, 4096) };
     auto reused_claimant = claimant(2);
     reused_claimant.epoch = state.claimant_epoch(2);
     const auto reused = server_kv_pressure_execute_governor(
-            config, state, invalidated.ops(), governor_pressure(4, 2407), { reused_claimant });
+            config, state, invalidated.ops(), governor_pressure(4, 2407), { reused_claimant, active_producer() });
     CHECK(reused.selected_seq_id == 2);
     CHECK(reused.scores[0].seq_id == 2 && reused.scores[0].eligible);
 
@@ -728,7 +759,7 @@ static void test_governor_exhaustion_result_pollution_is_ignored() {
     fake_core stale;
     stale.responses = { evaluation(2412), mismatched };
     const auto stale_result = server_kv_pressure_execute_governor(
-            config, state, stale.ops(), governor_pressure(2, 2412), { claimant(2), claimant(5) });
+            config, state, stale.ops(), governor_pressure(2, 2412), { claimant(2), claimant(5), active_producer() });
     CHECK(stale_result.selected_seq_id == 2);
 
     auto failed = no_candidate_offload(2413);
@@ -736,18 +767,18 @@ static void test_governor_exhaustion_result_pollution_is_ignored() {
     fake_core failed_core;
     failed_core.responses = { evaluation(2413), failed };
     server_kv_pressure_execute_governor(
-            config, state, failed_core.ops(), governor_pressure(3, 2413), { claimant(2), claimant(5) });
+            config, state, failed_core.ops(), governor_pressure(3, 2413), { claimant(2), claimant(5), active_producer() });
 
     auto changed = no_candidate_offload(2414);
     changed.state_changed = true;
     fake_core changed_core;
     changed_core.responses = { evaluation(2414), changed };
     server_kv_pressure_execute_governor(
-            config, state, changed_core.ops(), governor_pressure(4, 2414), { claimant(2), claimant(5) });
+            config, state, changed_core.ops(), governor_pressure(4, 2414), { claimant(2), claimant(5), active_producer() });
     fake_core retry;
     retry.responses = { evaluation(2415), offload_result(2415, 4096) };
     const auto retried = server_kv_pressure_execute_governor(
-            config, state, retry.ops(), governor_pressure(5, 2415), { claimant(2), claimant(5) });
+            config, state, retry.ops(), governor_pressure(5, 2415), { claimant(2), claimant(5), active_producer() });
     CHECK(retried.selected_seq_id == 2);
 }
 
@@ -763,6 +794,7 @@ int main() {
     test_release_reuses_decision_and_stops_after_one_action();
     test_release_terminal_results_do_not_chain();
     test_marker_keeps_observation_and_core_result_separate();
+    test_governor_scores_idle_claimant_without_active_producer();
     test_governor_debt_release_then_later_offload();
     test_governor_sort_is_input_order_independent();
     test_governor_stale_basis_normal_and_reset();

@@ -380,6 +380,8 @@ public:
     int32_t prefetch_seq_step(llama_seq_id seq_id, uint32_t max_blocks) override;
     void set_seq_prefetch_protected(llama_seq_id seq_id, bool enabled) override;
     llama_kv_action_result execute_action(const llama_kv_action_request & request) override;
+    llama_kv_runtime_capability get_kv_runtime_capability() const override;
+    llama_kv_runtime_claimant get_kv_runtime_claimant(llama_seq_id seq_id) const override;
     llama_kv_bounded_release_result bounded_release_dry_run(
             uint64_t target_bytes, uint32_t max_scan_blocks) override;
     llama_kv_release_status paged_release_status() const override;
@@ -388,6 +390,7 @@ public:
     bool bounded_release_can_enable() const override;
     llama_kv_bounded_release_capability bounded_release_can_enable_diagnose() const override;
     uint64_t sample_kv_resident_bytes() const override;
+    llama_kv_resident_sample sample_kv_resident() const override;
     llama_kv_release_budget_snapshot sample_kv_release_budget() const override;
     uint64_t bounded_release_counter_bytes() const override {
         return paged_bounded_release_bytes;
@@ -753,6 +756,7 @@ private:
 
     bool v_trans = true;  // the value tensor is transposed
 
+    const bool kv_unified = false;
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
 
@@ -1126,6 +1130,7 @@ private:
     mutable bool paged_test_force_active_release_consumed = false;
     mutable uint64_t paged_test_force_active_release_triggers = 0;
     bool     paged_swap_enabled = false;
+    bool     paged_swap_explicit_only = false;
     mutable uint64_t paged_swap_out_calls = 0;
     mutable uint64_t paged_swap_in_calls = 0;
     mutable uint64_t paged_blocks_swapped_out = 0;
@@ -1294,6 +1299,8 @@ private:
     bool     paged_mincore_requested = false;
     mutable bool     paged_mincore_enabled = false;
     mutable bool     paged_mincore_warned  = false;
+    uint64_t         paged_resident_object_id = 0;
+    uint64_t         paged_resident_generation = 1;
     mutable uint64_t paged_mincore_sample_calls = 0;
     mutable uint64_t paged_mincore_failures = 0;
     // last-sample aggregate (overwritten each sample)
