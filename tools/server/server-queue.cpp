@@ -197,8 +197,11 @@ void server_queue::start_loop(int64_t idle_sleep_ms, int64_t cont_batching_wait_
                 break; // go back to process new tasks or terminate
             }
 
+            const bool idle_update_pending = callback_idle_update_pending &&
+                callback_idle_update_pending();
+
             // no tasks, check for sleeping state
-            if (should_sleep()) {
+            if (should_sleep() && !idle_update_pending) {
                 QUE_INF("%s", "entering sleeping state\n");
                 sleeping = true;
                 callback_sleeping_state(true);
@@ -222,8 +225,8 @@ void server_queue::start_loop(int64_t idle_sleep_ms, int64_t cont_batching_wait_
                 bool res = condition_tasks.wait_for(lock, max_wait_time, [&]{
                     return (!queue_tasks.empty() || !running);
                 });
-                if (res) {
-                    break; // new task arrived or terminate
+                if (res || idle_update_pending) {
+                    break; // new task, terminate, or one rate-limited idle update
                 }
                 // otherwise, loop again to check sleeping condition
             }

@@ -13,6 +13,8 @@ KV_CACHE_H = (ROOT / "src/llama-kv-cache.h").read_text(encoding="utf-8")
 KV_CACHE_CPP = (ROOT / "src/llama-kv-cache.cpp").read_text(encoding="utf-8")
 ACTION_H = (ROOT / "tools/server/server-kv-pressure-action.h").read_text(encoding="utf-8")
 ACTION_CPP = (ROOT / "tools/server/server-kv-pressure-action.cpp").read_text(encoding="utf-8")
+QUEUE_H = (ROOT / "tools/server/server-queue.h").read_text(encoding="utf-8")
+QUEUE_CPP = (ROOT / "tools/server/server-queue.cpp").read_text(encoding="utf-8")
 
 
 class UnifiedPressureActionStaticTest(unittest.TestCase):
@@ -160,6 +162,34 @@ class UnifiedPressureActionStaticTest(unittest.TestCase):
         self.assertIn('slot_data["kv_claimant"]', CONTEXT)
         self.assertIn("claimant_exhausted", ACTION_H + ACTION_CPP)
         self.assertNotIn("std::thread", ACTION_H + ACTION_CPP)
+
+    def test_idle_follow_up_uses_progress_bounded_rate_limited_queue_updates(self):
+        self.assertIn("bool idle_follow_up_pending() const", ACTION_H)
+        governor = ACTION_CPP[
+            ACTION_CPP.index("server_kv_pressure_execute_governor("):
+            ACTION_CPP.index("server_kv_pressure_unified_action_format_marker(")]
+        self.assertIn("release_retry_scheduled", governor)
+        self.assertIn("offload_retry_scheduled", governor)
+        self.assertIn("release_progressed || release_scan_advanced || armed_offload ||", governor)
+        self.assertIn(
+            "offload_progressed || claimant_exhausted || offload_retry_scheduled", governor)
+        self.assertIn("state.idle_follow_up_pending_ = false", governor)
+
+        hook_start = CONTEXT.index("queue_tasks.on_idle_update_pending(")
+        hook_end = CONTEXT.index("queue_tasks.on_sleeping_state(", hook_start)
+        hook = CONTEXT[hook_start:hook_end]
+        self.assertIn("kv_pressure_unified_action_config.enabled", hook)
+        self.assertIn("kv_governor_state.idle_follow_up_pending()", hook)
+        self.assertNotIn("queue_tasks.post", hook)
+
+        self.assertIn("callback_idle_update_pending", QUEUE_H)
+        wait_start = QUEUE_CPP.index("const bool idle_update_pending")
+        wait_end = QUEUE_CPP.index("void server_queue::cleanup_pending_task", wait_start)
+        idle_wait = QUEUE_CPP[wait_start:wait_end]
+        self.assertIn("if (should_sleep() && !idle_update_pending)", idle_wait)
+        self.assertIn("condition_tasks.wait_for(lock, max_wait_time", idle_wait)
+        self.assertIn("if (res || idle_update_pending)", idle_wait)
+        self.assertNotIn("queue_tasks.push", idle_wait)
 
     def test_evaluate_gates_release_and_marker_keeps_results_distinct(self):
         for gate in (

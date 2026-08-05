@@ -343,6 +343,7 @@ void server_kv_governor_state::reset() {
     pressure_basis_generation_ = 0;
     pressure_debt_bytes_ = 0;
     offload_armed_ = false;
+    idle_follow_up_pending_ = false;
     next_action_sample_ = 0;
     claimant_epochs_.clear();
     exhausted_claimants_.clear();
@@ -401,13 +402,16 @@ server_kv_pressure_action_result server_kv_pressure_execute_governor(
     result.next_action_sample = state.next_action_sample_;
 
     if (!config.enabled) {
+        state.idle_follow_up_pending_ = false;
         return result;
     }
     if (!ops.execute) {
+        state.idle_follow_up_pending_ = false;
         observation.reason = "no_memory";
         return result;
     }
     if (!pressure.sample_valid || pressure.stale) {
+        state.idle_follow_up_pending_ = false;
         observation.reason = "stale_hold";
         return result;
     }
@@ -422,6 +426,7 @@ server_kv_pressure_action_result server_kv_pressure_execute_governor(
         return result;
     }
     if (!pressure.pressure_basis_valid) {
+        state.idle_follow_up_pending_ = false;
         observation.reason = "invalid_basis_hold";
         return result;
     }
@@ -450,6 +455,7 @@ server_kv_pressure_action_result server_kv_pressure_execute_governor(
 
     if (state.pressure_debt_bytes_ == 0) {
         state.offload_armed_ = false;
+        state.idle_follow_up_pending_ = false;
         observation.reason = "zero_debt";
         result.debt_after_bytes = 0;
         result.offload_armed_after = false;
@@ -461,6 +467,7 @@ server_kv_pressure_action_result server_kv_pressure_execute_governor(
         return result;
     }
 
+    state.idle_follow_up_pending_ = false;
     observation.evaluate_attempted = true;
     result.evaluation = ops.execute({
             llama_kv_action::evaluate,
@@ -521,13 +528,24 @@ server_kv_pressure_action_result server_kv_pressure_execute_governor(
         const bool release_matches_decision =
             result.release.action == llama_kv_action::release &&
             result.release.decision_id == pressure.decision_id;
+        const bool release_progressed = release_matches_decision &&
+            !result.release.io_failure && result.release.state_changed &&
+            result.release.relieved_bytes > 0;
+        const bool release_scan_advanced = release_matches_decision &&
+            !result.release.io_failure && !result.release.fail_stop &&
+            result.release.reason == llama_kv_action_reason::scan_budget_exhausted &&
+            (result.release.outcome == llama_kv_action_outcome::completed ||
+             result.release.outcome == llama_kv_action_outcome::no_op);
+        const bool release_retry_scheduled = release_matches_decision &&
+            result.release.io_failure && !result.release.fail_stop;
         if (release_matches_decision) {
             state.pressure_debt_bytes_ = saturating_sub(
                     state.pressure_debt_bytes_, result.release.relieved_bytes);
         }
-        if (release_matches_decision &&
-                result.release.reason == llama_kv_action_reason::no_candidate &&
-                state.pressure_debt_bytes_ > 0) {
+        const bool armed_offload = release_matches_decision &&
+            result.release.reason == llama_kv_action_reason::no_candidate &&
+            state.pressure_debt_bytes_ > 0;
+        if (armed_offload) {
             state.offload_armed_ = true;
         }
         if (result.release.io_failure) {
@@ -537,6 +555,9 @@ server_kv_pressure_action_result server_kv_pressure_execute_governor(
         } else {
             state.next_action_sample_ = next_cooldown;
         }
+        state.idle_follow_up_pending_ = state.pressure_debt_bytes_ > 0 &&
+            (release_progressed || release_scan_advanced || armed_offload ||
+             release_retry_scheduled);
         observation.reason = "release_submitted";
     } else {
         if (!evaluate_allows_offload(result.evaluation)) {
@@ -595,6 +616,11 @@ server_kv_pressure_action_result server_kv_pressure_execute_governor(
             const bool offload_matches_decision =
                 result.offload.action == llama_kv_action::offload &&
                 result.offload.decision_id == pressure.decision_id;
+            const bool offload_progressed = offload_matches_decision &&
+                !result.offload.io_failure && result.offload.state_changed &&
+                result.offload.relieved_bytes > 0;
+            const bool offload_retry_scheduled = offload_matches_decision &&
+                result.offload.io_failure && !result.offload.fail_stop;
             if (offload_matches_decision) {
                 state.pressure_debt_bytes_ = saturating_sub(
                         state.pressure_debt_bytes_, result.offload.relieved_bytes);
@@ -621,12 +647,15 @@ server_kv_pressure_action_result server_kv_pressure_execute_governor(
             } else {
                 state.next_action_sample_ = next_cooldown;
             }
+            state.idle_follow_up_pending_ = state.pressure_debt_bytes_ > 0 &&
+                (offload_progressed || claimant_exhausted || offload_retry_scheduled);
             observation.reason = "offload_submitted";
         }
     }
 
     if (state.pressure_debt_bytes_ == 0) {
         state.offload_armed_ = false;
+        state.idle_follow_up_pending_ = false;
     }
     result.debt_after_bytes = state.pressure_debt_bytes_;
     result.offload_armed_after = state.offload_armed_;

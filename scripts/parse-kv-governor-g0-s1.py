@@ -19,6 +19,14 @@ RESUME_MARKER = "kv_resume_order_event"
 RESIDENT_OBSERVATION_MARKER = "kv_g0_s1_resident_observation"
 CAPABILITY_MARKER = "KV_GOVERNOR_CAPABILITY"
 CASES = ("OFF", "GOVERNOR_ON")
+SUPPORTED_CTX_SIZES = {1024, 2048, 4096, 8064}
+PAGED_BLOCK_SIZE = 64
+MIN_PREFIX_TOKENS = 2 * PAGED_BLOCK_SIZE
+N_PREDICT = 32
+WORKLOAD_RESULT_FIELDS = {
+    "target_prefix_tokens", "actual_p_token_count", "actual_pq_token_count",
+    "actual_p_block_count", "target_prefix_token_delta",
+}
 UINT = re.compile(r"[0-9]+$")
 SHA256 = re.compile(r"[0-9a-f]{64}$")
 
@@ -73,6 +81,10 @@ def digest(path: pathlib.Path) -> str:
 
 def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def token_ids_sha256(tokens: list[int]) -> str:
+    return sha256_bytes(json.dumps(tokens, separators=(",", ":")).encode("utf-8"))
 
 
 def read_json(path: pathlib.Path) -> Any:
@@ -247,20 +259,32 @@ def validate_parameters(parameters: Any, errors: list[str]) -> None:
         "temperature": 0.0,
         "seed": 1,
         "step1_n_predict": 0,
-        "step2_n_predict": 32,
+        "step2_n_predict": N_PREDICT,
         "mincore_requested": True,
         "source_marker_schema": SOURCE_MARKER_SCHEMA,
+        "paged_block_size": PAGED_BLOCK_SIZE,
     }
     for key, expected in exact.items():
         if parameters.get(key) != expected:
             errors.append(f"manifest parameter {key} must be {expected!r}")
-    for key in ("paged_block_size", "ctx_size", "governor_target_bytes", "governor_max_blocks"):
+    ctx_size = parameters.get("ctx_size")
+    if (not isinstance(ctx_size, int) or isinstance(ctx_size, bool) or
+            ctx_size not in SUPPORTED_CTX_SIZES):
+        errors.append("manifest parameter ctx_size is unsupported")
+    target_prefix_tokens = parameters.get("target_prefix_tokens")
+    if (not isinstance(target_prefix_tokens, int) or isinstance(target_prefix_tokens, bool) or
+            target_prefix_tokens < MIN_PREFIX_TOKENS):
+        errors.append("manifest parameter target_prefix_tokens is invalid")
+    elif isinstance(ctx_size, int):
+        aligned_target = target_prefix_tokens // PAGED_BLOCK_SIZE * PAGED_BLOCK_SIZE
+        if aligned_target + 1 + N_PREDICT > ctx_size:
+            errors.append("manifest target_prefix_tokens cannot fit a strict P+Q workload in ctx_size")
+    for key in ("governor_target_bytes", "governor_max_blocks"):
         value = parameters.get(key)
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             errors.append(f"manifest parameter {key} is invalid")
-    for key in ("paged_block_size", "ctx_size", "governor_target_bytes"):
-        if isinstance(parameters.get(key), int) and parameters[key] <= 0:
-            errors.append(f"manifest parameter {key} must be positive")
+    if isinstance(parameters.get("governor_target_bytes"), int) and parameters["governor_target_bytes"] <= 0:
+        errors.append("manifest parameter governor_target_bytes must be positive")
     if isinstance(parameters.get("governor_max_blocks"), int) and parameters["governor_max_blocks"] < 2:
         errors.append("manifest governor_max_blocks is below two")
     for key in ("prefix_text_sha256", "query_text_sha256"):
@@ -363,6 +387,20 @@ def normalize_argv(value: Any) -> list[str] | None:
     return result
 
 
+def argv_option(
+        argv: list[str] | None,
+        option: str,
+        name: str,
+        errors: list[str]) -> str | None:
+    if argv is None:
+        return None
+    positions = [index for index, value in enumerate(argv) if value == option]
+    if len(positions) != 1 or positions[0] + 1 >= len(argv):
+        errors.append(f"{name}: execution argv must contain exactly one {option}")
+        return None
+    return argv[positions[0] + 1]
+
+
 def validate_server_identity(
         value: Any,
         expected_argv: list[str] | None,
@@ -383,6 +421,103 @@ def validate_server_identity(
     if expected_argv is None or cmdline != expected_argv:
         errors.append(f"{name}: server cmdline differs from recorded execution argv")
     return value
+
+
+def validate_workload(
+        case: pathlib.Path,
+        name: str,
+        result: dict[str, Any],
+        rows: dict[str, dict[str, Any]],
+        manifest: dict[str, Any],
+        errors: list[str]) -> dict[str, Any] | None:
+    try:
+        workload = read_json(case / "workload.json")
+    except Error as exc:
+        errors.append(str(exc))
+        return None
+    if not isinstance(workload, dict):
+        errors.append(f"{name}: workload schema is invalid")
+        return None
+
+    parameters = manifest.get("parameters")
+    if not isinstance(parameters, dict):
+        return workload
+    ctx_size = parameters.get("ctx_size")
+    target_prefix_tokens = parameters.get("target_prefix_tokens")
+    block_size = parameters.get("paged_block_size")
+    step1 = rows.get("step1")
+    step2 = rows.get("step2")
+    step1_request = step1.get("request") if isinstance(step1, dict) else None
+    step2_request = step2.get("request") if isinstance(step2, dict) else None
+    prompt_p = step1_request.get("prompt") if isinstance(step1_request, dict) else None
+    prompt_pq = step2_request.get("prompt") if isinstance(step2_request, dict) else None
+    if not isinstance(prompt_p, list) or not isinstance(prompt_pq, list):
+        return workload
+    if (not isinstance(ctx_size, int) or isinstance(ctx_size, bool) or
+            not isinstance(target_prefix_tokens, int) or isinstance(target_prefix_tokens, bool) or
+            not isinstance(block_size, int) or isinstance(block_size, bool) or block_size <= 0):
+        return workload
+
+    actual_p_tokens = len(prompt_p)
+    actual_pq_tokens = len(prompt_pq)
+    actual_p_blocks = actual_p_tokens // block_size
+    target_delta = target_prefix_tokens - actual_p_tokens
+    expected_result = {
+        "target_prefix_tokens": target_prefix_tokens,
+        "actual_p_token_count": actual_p_tokens,
+        "actual_pq_token_count": actual_pq_tokens,
+        "actual_p_block_count": actual_p_blocks,
+        "target_prefix_token_delta": target_delta,
+    }
+    if result.get("ctx_size") != ctx_size:
+        errors.append(f"{name}: result ctx_size differs from manifest")
+    if result.get("target_prefix_tokens") != target_prefix_tokens:
+        errors.append(f"{name}: result target_prefix_tokens differs from manifest")
+    result_workload = result.get("workload")
+    if not isinstance(result_workload, dict) or set(result_workload) != WORKLOAD_RESULT_FIELDS:
+        errors.append(f"{name}: result workload summary schema mismatch")
+    elif result_workload != expected_result:
+        errors.append(f"{name}: result workload summary differs from actual requests")
+
+    expected_workload = {
+        "ctx_size": ctx_size,
+        "target_prefix_tokens": target_prefix_tokens,
+        "actual_p_token_count": actual_p_tokens,
+        "actual_pq_token_count": actual_pq_tokens,
+        "actual_p_block_count": actual_p_blocks,
+        "target_prefix_token_delta": target_delta,
+        "prefix_token_count": actual_p_tokens,
+        "prefix_block_count": actual_p_blocks,
+        "continuation_prompt_token_count": actual_pq_tokens,
+        "n_predict": N_PREDICT,
+        "context_token_count": actual_pq_tokens + N_PREDICT,
+        "prefix_tokens_sha256": token_ids_sha256(prompt_p),
+        "continuation_prompt_tokens_sha256": token_ids_sha256(prompt_pq),
+    }
+    for key, expected in expected_workload.items():
+        if workload.get(key) != expected:
+            errors.append(f"{name}: workload {key} differs from actual request/manifest evidence")
+    if workload.get("status") != "ready" or workload.get("failure_reasons") != []:
+        errors.append(f"{name}: workload is not a successful fail-closed construction")
+    if workload.get("token_boundary_policy") != "largest_paged_block_boundary_within_tokenized_common_prefix":
+        errors.append(f"{name}: workload token-boundary policy mismatch")
+    if workload.get("strict_prefix") is not True or prompt_pq[:actual_p_tokens] != prompt_p:
+        errors.append(f"{name}: workload does not bind a strict P/P+Q token prefix")
+    if workload.get("target_prefix_satisfied") is not True:
+        errors.append(f"{name}: workload does not declare target satisfaction")
+    if actual_p_tokens % block_size != 0 or actual_p_blocks < 2:
+        errors.append(f"{name}: actual P is not a complete multi-block prefix")
+    if target_delta < 0 or target_delta >= block_size:
+        errors.append(f"{name}: target and actual P differ by at least one full block")
+    if actual_pq_tokens + N_PREDICT > ctx_size or workload.get("context_fits") is not True:
+        errors.append(f"{name}: actual P+Q workload exceeds ctx_size")
+    unit_count = workload.get("prefix_text_unit_count")
+    max_units = workload.get("prefix_text_max_units")
+    if (not isinstance(unit_count, int) or isinstance(unit_count, bool) or unit_count <= 0 or
+            not isinstance(max_units, int) or isinstance(max_units, bool) or max_units < unit_count or
+            not SHA256.fullmatch(str(workload.get("selected_prefix_text_sha256", "")))):
+        errors.append(f"{name}: scalable prefix construction evidence is invalid")
+    return workload
 
 
 def validate_cleanup(case: pathlib.Path, identity: dict[str, Any] | None, errors: list[str]) -> None:
@@ -593,101 +728,30 @@ def marker_selected_score(
     return matches[0]
 
 
-def validate_marker_reference(
-        case: pathlib.Path,
-        filename: str,
-        markers: list[dict[str, Any]],
+def validate_resident_sample(
+        fields: dict[str, Any],
+        prefix: str,
         name: str,
-        errors: list[str]) -> dict[str, Any] | None:
-    try:
-        evidence = read_json(case / filename)
-    except Error as exc:
-        errors.append(str(exc))
+        errors: list[str]) -> dict[str, int] | None:
+    result = {key: int(fields[f"{prefix}_{key}"]) for key in (
+        "object_id", "generation", "page_size", "total_bytes", "resident_bytes",
+        "total_pages", "resident_pages")}
+    if (
+            result["object_id"] == 0 or result["generation"] == 0 or
+            result["page_size"] == 0 or result["total_bytes"] == 0 or
+            result["total_pages"] == 0 or
+            result["resident_bytes"] > result["total_bytes"] or
+            result["resident_pages"] > result["total_pages"] or
+            result["total_bytes"] != result["total_pages"] * result["page_size"] or
+            result["resident_bytes"] != result["resident_pages"] * result["page_size"]):
+        errors.append(f"{name}: {prefix} resident sample accounting is invalid")
         return None
-    if not isinstance(evidence, dict) or set(evidence) != {"offset", "end", "fields"}:
-        errors.append(f"{name}: {filename} schema mismatch")
-        return None
-    for marker in markers:
-        fields = {key: marker[key] for key in MARKER_REQUIRED}
-        if evidence.get("offset") == marker["_offset"] and evidence.get("end") == marker["_end"] and evidence.get("fields") == fields:
-            return marker
-    errors.append(f"{name}: {filename} does not bind an exact raw marker")
-    return None
+    return result
 
 
-def validate_resident_evidence(
+def validate_resume_scope(
         case: pathlib.Path,
         raw: bytes,
-        identity: dict[str, Any] | None,
-        offload: dict[str, Any] | None,
-        name: str,
-        errors: list[str]) -> None:
-    if offload is None:
-        return
-    records = token_lines(
-        raw, RESIDENT_OBSERVATION_MARKER, parse_resident_observation,
-        f"{case}/server.stderr", errors)
-    try:
-        value = read_json(case / "resident.json")
-    except Error as exc:
-        errors.append(str(exc))
-        return
-    if not isinstance(value, dict) or set(value) != {"offset", "end", "fields"}:
-        errors.append(f"{name}: resident evidence schema mismatch")
-        return
-    record = next((item for item in records if
-        value.get("offset") == item["_offset"] and value.get("end") == item["_end"] and
-        value.get("fields") == {key: item[key] for key in RESIDENT_OBSERVATION_REQUIRED}), None)
-    if record is None:
-        errors.append(f"{name}: resident evidence does not bind an exact raw observation")
-        return
-
-    matching = [item for item in records if item["transaction_id"] == offload["transaction_id"]]
-    if len(matching) != 1 or matching[0] is not record:
-        errors.append(f"{name}: resident observation is missing or duplicated for the OFFLOAD transaction")
-    fields = record
-    if (fields["decision_id"] != offload["decision_id"] or
-            fields["seq_id"] != offload["selected_seq_id"] or
-            fields["transaction_id"] != offload["transaction_id"]):
-        errors.append(f"{name}: resident observation does not bind the OFFLOAD transaction")
-    if identity is None or int(fields["server_pid"]) != identity.get("pid"):
-        errors.append(f"{name}: resident observation does not bind the server PID")
-    if fields["before_available"] != "1" or fields["after_available"] != "1":
-        errors.append(f"{name}: resident observation sampling is unavailable")
-        return
-
-    def sample(prefix: str) -> dict[str, int] | None:
-        result = {key: int(fields[f"{prefix}_{key}"]) for key in (
-            "object_id", "generation", "page_size", "total_bytes", "resident_bytes",
-            "total_pages", "resident_pages")}
-        if (result["object_id"] == 0 or result["generation"] == 0 or result["page_size"] == 0 or
-                result["total_bytes"] == 0 or result["total_pages"] == 0 or
-                result["resident_bytes"] > result["total_bytes"] or
-                result["resident_pages"] > result["total_pages"] or
-                result["total_bytes"] != result["total_pages"] * result["page_size"] or
-                result["resident_bytes"] != result["resident_pages"] * result["page_size"]):
-            errors.append(f"{name}: {prefix} resident sample accounting is invalid")
-            return None
-        return result
-
-    before, after = sample("before"), sample("after")
-    if before is None or after is None:
-        return
-    for key in ("object_id", "generation", "page_size", "total_bytes", "total_pages"):
-        if before[key] != after[key]:
-            errors.append(f"{name}: resident samples do not bind one KV object/generation")
-            break
-    if before["resident_bytes"] <= after["resident_bytes"]:
-        errors.append(f"{name}: resident bytes did not decline across OFFLOAD")
-    if before["resident_pages"] <= after["resident_pages"]:
-        errors.append(f"{name}: resident pages did not decline across OFFLOAD")
-
-
-def validate_resume(
-        case: pathlib.Path,
-        raw: bytes,
-        offload: dict[str, Any] | None,
-        epoch: int | None,
         step2: dict[str, Any] | None,
         name: str,
         errors: list[str]) -> tuple[int | None, int | None]:
@@ -696,95 +760,330 @@ def validate_resume(
     except Error as exc:
         errors.append(str(exc))
         return None, None
-    required = {"start", "end", "request_label", "request_started_monotonic_ns", "request_finished_monotonic_ns"}
+    required = {
+        "start", "end", "request_label", "request_started_monotonic_ns",
+        "request_finished_monotonic_ns",
+    }
     if not isinstance(scope, dict) or set(scope) != required:
         errors.append(f"{name}: resume scope schema mismatch")
         return None, None
     start, end = scope.get("start"), scope.get("end")
-    if (not isinstance(start, int) or isinstance(start, bool) or not isinstance(end, int) or isinstance(end, bool) or
-            start < 0 or end < start or end > len(raw) or scope.get("request_label") != "step2"):
+    if (
+            not isinstance(start, int) or isinstance(start, bool) or
+            not isinstance(end, int) or isinstance(end, bool) or
+            start < 0 or end < start or end > len(raw) or
+            scope.get("request_label") != "step2"):
         errors.append(f"{name}: resume scope bounds are invalid")
         return None, None
     if not isinstance(step2, dict) or (
             scope.get("request_started_monotonic_ns") != step2.get("started_monotonic_ns") or
             scope.get("request_finished_monotonic_ns") != step2.get("finished_monotonic_ns")):
         errors.append(f"{name}: resume scope is not bound to the recorded step2 request")
-    if offload is not None and start < offload["_end"]:
-        errors.append(f"{name}: reaccess begins before OFFLOAD evidence completed")
-    events = token_lines(raw[start:end], RESUME_MARKER, parse_resume, f"{case}/server.stderr", errors)
+    return start, end
+
+
+def validate_resume(
+        case: pathlib.Path,
+        raw: bytes,
+        start: int | None,
+        end: int | None,
+        last_offload_end: int | None,
+        epoch: int | None,
+        name: str,
+        errors: list[str]) -> None:
+    if start is None or end is None:
+        return
+    if last_offload_end is not None and start < last_offload_end:
+        errors.append(f"{name}: reaccess begins before cumulative OFFLOAD evidence completed")
+    events = token_lines(
+        raw[start:end], RESUME_MARKER, parse_resume,
+        f"{case}/server.stderr", errors)
     for event in events:
         event["_offset"] += start
         event["_end"] += start
     if len(events) != 2:
         errors.append(f"{name}: PREFETCH/graph_gate pair is missing or duplicated")
-        return start, end
+        return
     prefetch, graph_gate = events
     if prefetch["phase"] != "prefetch" or graph_gate["phase"] != "graph_gate":
         errors.append(f"{name}: resume events are out of order")
-        return start, end
+        return
     expected = {key: prefetch[key] for key in RESUME_REQUIRED - {"phase"}}
     if {key: graph_gate[key] for key in RESUME_REQUIRED - {"phase"}} != expected:
         errors.append(f"{name}: graph_gate does not close the PREFETCH event")
-    if (prefetch["seq_id"] != "0" or epoch is None or prefetch["claimant_epoch"] != str(epoch) or
-            int(prefetch["transaction_id"]) <= 0 or prefetch["action"] != "prefetch" or
-            prefetch["outcome"] != "completed" or prefetch["graph_allowed"] != "1"):
+    if (
+            prefetch["seq_id"] != "0" or epoch is None or
+            prefetch["claimant_epoch"] != str(epoch) or
+            int(prefetch["transaction_id"]) <= 0 or
+            prefetch["action"] != "prefetch" or prefetch["outcome"] != "completed" or
+            prefetch["graph_allowed"] != "1"):
         errors.append(f"{name}: PREFETCH is not a completed same-session restore")
-    return start, end
 
 
-def validate_on_markers(
+def validate_on_transactions(
         case: pathlib.Path,
         raw: bytes,
+        identity: dict[str, Any] | None,
         post: dict[str, Any] | None,
         expected_blocks: int | None,
+        resume_start: int | None,
         name: str,
-        errors: list[str]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        errors: list[str]) -> tuple[int | None, int | None]:
     markers = token_lines(raw, MARKER, parse_marker, f"{case}/server.stderr", errors)
+    residents = token_lines(
+        raw, RESIDENT_OBSERVATION_MARKER, parse_resident_observation,
+        f"{case}/server.stderr", errors)
     if not markers:
         errors.append(f"{name}: missing governor markers")
         return None, None
-    offload = validate_marker_reference(case, "offload.json", markers, name, errors)
-    if offload is None:
+    try:
+        evidence = read_json(case / "offload.json")
+    except Error as exc:
+        errors.append(str(exc))
+        return None, None
+    required = {
+        "status", "scope_start", "scope_end", "expected_blocks", "selected_seq_id",
+        "selected_claimant_epoch", "transactions", "cumulative",
+    }
+    if not isinstance(evidence, dict) or set(evidence) != required:
+        errors.append(f"{name}: cumulative OFFLOAD evidence schema mismatch")
         return None, None
 
-    selected_seq_id = int(offload["selected_seq_id"])
-    candidate = marker_claimant(offload, f"{name}: OFFLOAD marker", errors)
-    selected_score = marker_selected_score(
-        offload, selected_seq_id, f"{name}: OFFLOAD marker", errors)
-    blocks = int(offload["blocks"])
-    if not (
-            offload["state"] in {"PRESSURE", "CRITICAL"} and offload["stale"] == "0" and
-            offload["evaluate_attempted"] == "1" and offload["offload_attempted"] == "1" and
-            offload["release_attempted"] == "0" and offload["offload_armed_before"] == "1" and
-            selected_seq_id == 0 and offload["outcome"] == "completed" and
-            offload["state_changed"] == "1" and int(offload["transaction_id"]) > 0 and
-            blocks >= 2 and int(offload["bytes"]) > 0 and int(offload["relieved_bytes"]) > 0 and
-            offload["io_failure"] == "0" and offload["idle"] == "1"):
-        errors.append(f"{name}: OFFLOAD does not satisfy the state-changing transaction contract")
-    if expected_blocks is not None and blocks != expected_blocks:
-        errors.append(f"{name}: OFFLOAD does not cover the complete step1 KV workload")
-    if selected_score is not None and (
-            not selected_score["eligible"] or selected_score["exclusion"] != "none"):
-        errors.append(f"{name}: selected claimant score is not eligible")
-    if candidate is not None:
-        if (candidate["seq_id"] != selected_seq_id or
-                offload["selected_claimant_epoch"] != str(candidate["epoch"]) or
-                candidate["active"] or candidate["exhausted"] or not candidate["valid"] or
-                candidate["eligible_resident_blocks"] != blocks or
-                candidate["swapped_blocks"] != 0 or candidate["shared_blocks"] != 0 or
-                candidate["blocked_blocks"] != 0):
-            errors.append(f"{name}: OFFLOAD marker does not bind one eligible pre-transaction claimant")
-        if expected_blocks is not None and candidate["target_blocks"] != expected_blocks:
-            errors.append(f"{name}: OFFLOAD claimant does not match the complete step1 KV workload")
-        if post is not None and (
-                post["seq_id"] != candidate["seq_id"] or post["epoch"] != candidate["epoch"] or
-                post["target_blocks"] != candidate["target_blocks"] or
-                candidate["eligible_resident_blocks"] - post["eligible_resident_blocks"] != blocks or
-                post["swapped_blocks"] - candidate["swapped_blocks"] != blocks or
-                post["shared_blocks"] != candidate["shared_blocks"] or
-                post["blocked_blocks"] != candidate["blocked_blocks"]):
-            errors.append(f"{name}: post claimant does not close the OFFLOAD block transition")
-    return offload, candidate
+    scope_start = evidence.get("scope_start")
+    scope_end = evidence.get("scope_end")
+    selected_seq_id = evidence.get("selected_seq_id")
+    selected_epoch = evidence.get("selected_claimant_epoch")
+    transactions = evidence.get("transactions")
+    cumulative = evidence.get("cumulative")
+    boundary = resume_start if resume_start is not None else len(raw)
+    if evidence.get("status") != "complete":
+        errors.append(f"{name}: cumulative OFFLOAD evidence is not complete")
+    if (
+            not isinstance(scope_start, int) or isinstance(scope_start, bool) or
+            not isinstance(scope_end, int) or isinstance(scope_end, bool) or
+            scope_start < 0 or scope_end < scope_start or scope_end > boundary):
+        errors.append(f"{name}: cumulative OFFLOAD scope is invalid")
+        return None, None
+    if (
+            not isinstance(selected_seq_id, int) or isinstance(selected_seq_id, bool) or
+            not isinstance(selected_epoch, int) or isinstance(selected_epoch, bool) or
+            selected_seq_id != 0 or selected_epoch <= 0):
+        errors.append(f"{name}: cumulative OFFLOAD seq/epoch identity is invalid")
+        return None, None
+    recorded_expected_blocks = evidence.get("expected_blocks")
+    if (
+            not isinstance(recorded_expected_blocks, int) or
+            isinstance(recorded_expected_blocks, bool) or recorded_expected_blocks <= 0 or
+            recorded_expected_blocks != expected_blocks):
+        errors.append(f"{name}: cumulative OFFLOAD expected_blocks differs from step1 workload")
+    if not isinstance(transactions, list) or not transactions:
+        errors.append(f"{name}: cumulative OFFLOAD transactions are missing")
+        return selected_epoch, None
+
+    pre_step2_markers = [
+        marker for marker in markers if marker["_end"] <= boundary
+    ]
+    for marker in pre_step2_markers:
+        if marker["offload_attempted"] == "1" and int(marker["transaction_id"]) == 0:
+            if (
+                    marker["state_changed"] != "0" or marker["outcome"] != "no_op" or
+                    any(int(marker[key]) != 0 for key in (
+                        "blocks", "bytes", "relieved_bytes"))):
+                errors.append(f"{name}: transaction=0 OFFLOAD marker is not a no-op")
+    changed_markers = [
+        marker for marker in pre_step2_markers
+        if marker["offload_attempted"] == "1" and
+        marker["state_changed"] == "1" and int(marker["transaction_id"]) > 0
+    ]
+
+    marker_spans: list[tuple[int, int]] = []
+    transaction_ids: set[int] = set()
+    resident_spans: set[tuple[int, int]] = set()
+    cumulative_blocks = 0
+    cumulative_bytes = 0
+    cumulative_relief = 0
+    first_resident_bytes: int | None = None
+    last_resident_bytes: int | None = None
+    previous_after: dict[str, int] | None = None
+    previous_marker_end = scope_start
+
+    transaction_required = {
+        "index", "offset", "end", "fields", "resident", "resident_drop_bytes",
+    }
+    resident_required = {"offset", "end", "fields"}
+    changed_spans = [(marker["_offset"], marker["_end"]) for marker in changed_markers]
+    for index, item in enumerate(transactions):
+        label = f"{name}: OFFLOAD transaction[{index}]"
+        if not isinstance(item, dict) or set(item) != transaction_required:
+            errors.append(f"{label} evidence schema mismatch")
+            continue
+        item_index = item.get("index")
+        if (
+                not isinstance(item_index, int) or isinstance(item_index, bool) or
+                item_index != index):
+            errors.append(f"{label} index is not ordered")
+        marker = next((record for record in markers if
+            item.get("offset") == record["_offset"] and item.get("end") == record["_end"] and
+            item.get("fields") == {key: record[key] for key in MARKER_REQUIRED}), None)
+        if marker is None:
+            errors.append(f"{label} does not bind an exact raw marker")
+            continue
+        span = (marker["_offset"], marker["_end"])
+        marker_spans.append(span)
+        if span not in changed_spans:
+            errors.append(f"{label} is not a pre-step2 state-changing OFFLOAD")
+        if marker["_offset"] < previous_marker_end:
+            errors.append(f"{label} marker order overlaps a prior transaction")
+        previous_marker_end = marker["_end"]
+
+        seq_id = int(marker["selected_seq_id"])
+        epoch = int(marker["selected_claimant_epoch"])
+        transaction_id = int(marker["transaction_id"])
+        blocks = int(marker["blocks"])
+        byte_count = int(marker["bytes"])
+        relieved_bytes = int(marker["relieved_bytes"])
+        if not (
+                marker["state"] in {"PRESSURE", "CRITICAL"} and marker["stale"] == "0" and
+                marker["evaluate_attempted"] == "1" and marker["offload_attempted"] == "1" and
+                marker["release_attempted"] == "0" and marker["offload_armed_before"] == "1" and
+                seq_id == selected_seq_id and epoch == selected_epoch and
+                marker["outcome"] == "completed" and marker["state_changed"] == "1" and
+                transaction_id > 0 and blocks > 0 and byte_count > 0 and relieved_bytes > 0 and
+                marker["io_failure"] == "0" and marker["idle"] == "1"):
+            errors.append(f"{label} violates the state-changing transaction contract")
+        if transaction_id in transaction_ids:
+            errors.append(f"{label} duplicates transaction_id")
+        transaction_ids.add(transaction_id)
+
+        candidate = marker_claimant(marker, f"{label} marker", errors)
+        selected_score = marker_selected_score(
+            marker, seq_id, f"{label} marker", errors)
+        if selected_score is not None and (
+                not selected_score["eligible"] or selected_score["exclusion"] != "none"):
+            errors.append(f"{label} selected claimant score is not eligible")
+        if candidate is not None and expected_blocks is not None:
+            if (
+                    candidate["seq_id"] != selected_seq_id or
+                    candidate["epoch"] != selected_epoch or candidate["active"] or
+                    candidate["exhausted"] or not candidate["valid"] or
+                    candidate["target_blocks"] != expected_blocks or
+                    candidate["eligible_resident_blocks"] != expected_blocks - cumulative_blocks or
+                    candidate["swapped_blocks"] != cumulative_blocks or
+                    candidate["shared_blocks"] != 0 or candidate["blocked_blocks"] != 0 or
+                    blocks > candidate["eligible_resident_blocks"]):
+                errors.append(f"{label} claimant does not bind the cumulative pre-transaction state")
+
+        resident_evidence = item.get("resident")
+        if not isinstance(resident_evidence, dict) or set(resident_evidence) != resident_required:
+            errors.append(f"{label} resident evidence schema mismatch")
+        else:
+            resident_record = next((record for record in residents if
+                resident_evidence.get("offset") == record["_offset"] and
+                resident_evidence.get("end") == record["_end"] and
+                resident_evidence.get("fields") == {
+                    key: record[key] for key in RESIDENT_OBSERVATION_REQUIRED}), None)
+            if resident_record is None:
+                errors.append(f"{label} resident evidence does not bind an exact raw observation")
+            else:
+                resident_span = (resident_record["_offset"], resident_record["_end"])
+                if resident_span in resident_spans:
+                    errors.append(f"{label} reuses a resident observation")
+                resident_spans.add(resident_span)
+                matching = [record for record in residents if
+                    record["decision_id"] == marker["decision_id"] and
+                    record["seq_id"] == marker["selected_seq_id"] and
+                    record["transaction_id"] == marker["transaction_id"]]
+                if len(matching) != 1 or matching[0] is not resident_record:
+                    errors.append(f"{label} resident observation is missing or duplicated")
+                if (
+                        resident_record["_offset"] < scope_start or
+                        resident_record["_end"] > marker["_offset"] or
+                        resident_record["_offset"] < (
+                            marker_spans[-2][1] if len(marker_spans) > 1 else scope_start)):
+                    errors.append(f"{label} resident observation is out of order")
+                if identity is None or int(resident_record["server_pid"]) != identity.get("pid"):
+                    errors.append(f"{label} resident observation does not bind the server PID")
+                if (
+                        resident_record["before_available"] != "1" or
+                        resident_record["after_available"] != "1"):
+                    errors.append(f"{label} resident observation sampling is unavailable")
+                else:
+                    before = validate_resident_sample(
+                        resident_record, "before", label, errors)
+                    after = validate_resident_sample(
+                        resident_record, "after", label, errors)
+                    if before is not None and after is not None:
+                        identity_keys = (
+                            "object_id", "generation", "page_size", "total_bytes", "total_pages")
+                        if any(before[key] != after[key] for key in identity_keys):
+                            errors.append(f"{label} resident samples do not bind one KV object/generation")
+                        if previous_after is not None and before != previous_after:
+                            errors.append(f"{label} resident observations are not contiguous")
+                        resident_drop = before["resident_bytes"] - after["resident_bytes"]
+                        if resident_drop <= 0 or before["resident_pages"] <= after["resident_pages"]:
+                            errors.append(f"{label} resident bytes/pages did not decline")
+                        if resident_drop != relieved_bytes:
+                            errors.append(f"{label} resident drop differs from relieved_bytes")
+                        recorded_drop = item.get("resident_drop_bytes")
+                        if (
+                                not isinstance(recorded_drop, int) or
+                                isinstance(recorded_drop, bool) or
+                                recorded_drop != resident_drop):
+                            errors.append(f"{label} recorded resident_drop_bytes is inconsistent")
+                        if first_resident_bytes is None:
+                            first_resident_bytes = before["resident_bytes"]
+                        last_resident_bytes = after["resident_bytes"]
+                        previous_after = after
+
+        cumulative_blocks += blocks
+        cumulative_bytes += byte_count
+        cumulative_relief += relieved_bytes
+        if expected_blocks is not None and cumulative_blocks > expected_blocks:
+            errors.append(f"{name}: cumulative OFFLOAD blocks exceed the step1 workload")
+
+    if marker_spans != changed_spans:
+        errors.append(
+            f"{name}: ordered transactions do not cover every pre-step2 state-changing OFFLOAD")
+    if marker_spans and scope_end != marker_spans[-1][1]:
+        errors.append(f"{name}: cumulative OFFLOAD scope_end differs from the final transaction")
+    if expected_blocks is not None and cumulative_blocks != expected_blocks:
+        errors.append(f"{name}: cumulative OFFLOAD blocks do not cover the complete step1 workload")
+
+    cumulative_required = {
+        "transaction_count", "blocks", "bytes", "relieved_bytes",
+        "first_resident_bytes", "last_resident_bytes", "resident_drop_bytes",
+    }
+    if not isinstance(cumulative, dict) or set(cumulative) != cumulative_required:
+        errors.append(f"{name}: cumulative OFFLOAD summary schema mismatch")
+    elif any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in cumulative.values()):
+        errors.append(f"{name}: cumulative OFFLOAD summary contains invalid counts")
+    elif first_resident_bytes is not None and last_resident_bytes is not None:
+        expected_cumulative = {
+            "transaction_count": len(transactions),
+            "blocks": cumulative_blocks,
+            "bytes": cumulative_bytes,
+            "relieved_bytes": cumulative_relief,
+            "first_resident_bytes": first_resident_bytes,
+            "last_resident_bytes": last_resident_bytes,
+            "resident_drop_bytes": first_resident_bytes - last_resident_bytes,
+        }
+        if cumulative != expected_cumulative:
+            errors.append(f"{name}: cumulative OFFLOAD summary differs from raw transactions")
+        if expected_cumulative["resident_drop_bytes"] != cumulative_relief:
+            errors.append(f"{name}: cumulative first-to-last resident drop differs from total relief")
+
+    if post is not None and expected_blocks is not None:
+        if (
+                post["seq_id"] != selected_seq_id or post["epoch"] != selected_epoch or
+                post["active"] or post["exhausted"] or not post["valid"] or
+                post["target_blocks"] != expected_blocks or
+                post["eligible_resident_blocks"] != 0 or
+                post["swapped_blocks"] != expected_blocks or
+                post["shared_blocks"] != 0 or post["blocked_blocks"] != 0):
+            errors.append(f"{name}: final claimant does not close the complete OFFLOAD workload")
+    return selected_epoch, marker_spans[-1][1] if marker_spans else None
 
 
 def load_case(case: pathlib.Path, name: str, manifest: dict[str, Any], errors: list[str]) -> dict[str, Any]:
@@ -806,8 +1105,8 @@ def load_case(case: pathlib.Path, name: str, manifest: dict[str, Any], errors: l
         return {"result": result, "upstream_failure": True}
 
     required = (
-        "execution.json", "environment.json", "capability.json", "requests.jsonl",
-        "server.stdout", "server.stderr", "cleanup.json")
+        "execution.json", "environment.json", "capability.json", "workload.json",
+        "requests.jsonl", "server.stdout", "server.stderr", "cleanup.json")
     for filename in required:
         if not (case / filename).is_file():
             errors.append(f"{name}: missing {filename}")
@@ -838,11 +1137,17 @@ def load_case(case: pathlib.Path, name: str, manifest: dict[str, Any], errors: l
         model_positions = [index for index, value in enumerate(raw_argv) if value == "--model"]
         if len(model_positions) != 1 or model_positions[0] + 1 >= len(raw_argv) or raw_argv[model_positions[0] + 1] != model_path:
             errors.append(f"{name}: execution argv is not bound to model identity")
+        parameters = manifest.get("parameters")
+        expected_ctx_size = parameters.get("ctx_size") if isinstance(parameters, dict) else None
+        argv_ctx_size = argv_option(raw_argv, "--ctx-size", name, errors)
+        if argv_ctx_size is not None and argv_ctx_size != str(expected_ctx_size):
+            errors.append(f"{name}: execution --ctx-size differs from manifest and CLI evidence")
     identity = validate_server_identity(execution.get("server_identity"), raw_argv, name, errors)
     raw = (case / "server.stderr").read_bytes() if (case / "server.stderr").is_file() else b""
     capability = validate_capability(case, raw, name, errors)
     rows = rows_by_label(read_rows(case / "requests.jsonl", errors), name, errors)
     validate_request_pair(rows, name, errors)
+    workload = validate_workload(case, name, result, rows, manifest, errors)
     validate_cleanup(case, identity, errors)
     return {
         "argv": argv,
@@ -852,6 +1157,7 @@ def load_case(case: pathlib.Path, name: str, manifest: dict[str, Any], errors: l
         "capability": capability,
         "rows": rows,
         "result": result,
+        "workload": workload,
     }
 
 
@@ -913,28 +1219,36 @@ def validate_on(case: pathlib.Path, data: dict[str, Any], manifest: dict[str, An
         else:
             expected_blocks = len(step1_prompt) // expected_block_size
 
+    resume_start, resume_end = validate_resume_scope(
+        case, raw, step2, "GOVERNOR_ON", errors)
     post, post_stderr_end, post_observed = validate_snapshot(
         case, "post_claimant.json", "GOVERNOR_ON", errors)
-    offload, candidate = validate_on_markers(
-        case, raw, post, expected_blocks, "GOVERNOR_ON", errors)
-    epoch = candidate.get("epoch") if candidate is not None else None
-    resume_start, _resume_end = validate_resume(
-        case, raw, offload, epoch, step2, "GOVERNOR_ON", errors)
-    if offload is not None and post_stderr_end is not None and post_stderr_end < offload["_end"]:
-        errors.append("GOVERNOR_ON: post-OFFLOAD snapshot predates completed OFFLOAD")
-    if resume_start is not None and post_stderr_end is not None and post_stderr_end > resume_start:
-        errors.append("GOVERNOR_ON: post-OFFLOAD snapshot crosses reaccess")
-    if isinstance(step2, dict) and post_observed is not None and post_observed >= step2.get("started_monotonic_ns", 0):
-        errors.append("GOVERNOR_ON: post-OFFLOAD snapshot is not before step2")
-    if post is not None and (post["active"] or not post["valid"]):
-        errors.append("GOVERNOR_ON: post-OFFLOAD claimant is not an idle valid same-session slot")
-    validate_resident_evidence(case, raw, identity, offload, "GOVERNOR_ON", errors)
+    epoch, last_offload_end = validate_on_transactions(
+        case, raw, identity, post, expected_blocks, resume_start,
+        "GOVERNOR_ON", errors)
+    validate_resume(
+        case, raw, resume_start, resume_end, last_offload_end, epoch,
+        "GOVERNOR_ON", errors)
+    if (
+            last_offload_end is not None and post_stderr_end is not None and
+            post_stderr_end < last_offload_end):
+        errors.append("GOVERNOR_ON: final claimant snapshot predates cumulative OFFLOAD")
+    if (
+            resume_start is not None and post_stderr_end is not None and
+            post_stderr_end != resume_start):
+        errors.append("GOVERNOR_ON: final claimant snapshot does not bind the step2 byte boundary")
+    if (
+            isinstance(step2, dict) and post_observed is not None and
+            post_observed >= step2.get("started_monotonic_ns", 0)):
+        errors.append("GOVERNOR_ON: final claimant snapshot is not before step2")
 
 
 def validate_pair(off: dict[str, Any], on: dict[str, Any], errors: list[str]) -> None:
     off_argv, on_argv = off.get("argv"), on.get("argv")
     if off_argv is None or on_argv is None or off_argv != on_argv:
         errors.append("OFF/GOVERNOR_ON argv differ")
+    if off.get("workload") is None or off.get("workload") != on.get("workload"):
+        errors.append("OFF/GOVERNOR_ON workload construction evidence differs")
     off_env, on_env = off.get("environment"), on.get("environment")
     governor_keys = {
         "LLAMA_KV_PRESSURE_UNIFIED_ACTION",

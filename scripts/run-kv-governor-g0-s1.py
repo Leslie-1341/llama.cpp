@@ -48,6 +48,7 @@ RESIDENT_FIELDS = {
 }
 
 CTX_SIZE = 2048
+SUPPORTED_CTX_SIZES = (1024, CTX_SIZE, 4096, 8064)
 PAGED_BLOCK_SIZE = 64
 MIN_PREFIX_BLOCKS = 2
 MIN_PREFIX_TOKENS = PAGED_BLOCK_SIZE * MIN_PREFIX_BLOCKS
@@ -63,8 +64,10 @@ REQUEST_TIMEOUT_SECONDS = 180.0
 SERVER_TERM_TIMEOUT_SECONDS = 10.0
 SERVER_KILL_TIMEOUT_SECONDS = 5.0
 BASE_ENV = {"HOME": "/tmp", "LANG": "C", "LC_ALL": "C", "PATH": os.environ.get("PATH", "")}
-PREFIX_TEXT = ("G0 S1 fixed long prefix token. " * 128).strip()
-QUERY_TEXT = "\nContinue with one deterministic concise answer."
+PREFIX_TEXT_UNIT = "G0 S1 deterministic scalable prefix token block.\n"
+MAX_PREFIX_TEXT_UNITS = 2048
+PREFIX_TEXT = PREFIX_TEXT_UNIT * MAX_PREFIX_TEXT_UNITS
+QUERY_TEXT = "Continue with one deterministic concise answer."
 
 
 class RunnerInterrupted(BaseException):
@@ -257,10 +260,14 @@ def capture_resume_timing(case: pathlib.Path, step2: dict[str, Any]) -> dict[str
     return value
 
 
-def server_argv(binary: pathlib.Path, model: pathlib.Path, port: int) -> list[str]:
+def server_argv(
+        binary: pathlib.Path,
+        model: pathlib.Path,
+        port: int,
+        ctx_size: int = CTX_SIZE) -> list[str]:
     return [
         str(binary), "--host", "127.0.0.1", "--port", str(port), "--model", str(model),
-        "--ctx-size", str(CTX_SIZE), "--parallel", "1", "--kv-unified", "--no-cache-idle-slots",
+        "--ctx-size", str(ctx_size), "--parallel", "1", "--kv-unified", "--no-cache-idle-slots",
         "--timeout", "300", "--threads", "4", "--n-gpu-layers", "0", "--cache-type-k", "f32",
         "--cache-type-v", "f32", "--no-warmup",
     ]
@@ -455,9 +462,12 @@ def governor_env(enabled: bool) -> dict[str, str]:
     return env
 
 
-def start(binary: pathlib.Path, model: pathlib.Path, case: pathlib.Path, port: int, env: dict[str, str]) -> subprocess.Popen[bytes]:
+def start(
+        case: pathlib.Path,
+        argv: list[str],
+        env: dict[str, str]) -> subprocess.Popen[bytes]:
     return subprocess.Popen(
-        server_argv(binary, model, port),
+        argv,
         cwd=case,
         stdout=(case / "server.stdout").open("wb"),
         stderr=(case / "server.stderr").open("wb"),
@@ -593,7 +603,7 @@ def resident_observation_records(
 
 def capture_resident_observation(
         case: pathlib.Path,
-        offload: dict[str, str]) -> dict[str, Any] | None:
+        offload: dict[str, str]) -> dict[str, Any]:
     matches = [
         record for record in resident_observation_records(case)
         if record[0] is not None and
@@ -601,13 +611,12 @@ def capture_resident_observation(
         record[0].get("seq_id") == offload.get("selected_seq_id") and
         record[0].get("transaction_id") == offload.get("transaction_id")
     ]
-    if not matches:
-        return None
+    if len(matches) != 1:
+        raise WorkloadFailure(
+            "OFFLOAD transaction does not have exactly one resident observation")
     fields, start, end = matches[0]
     assert fields is not None
-    value = {"offset": start, "end": end, "fields": fields}
-    dump(case / "resident.json", value)
-    return value
+    return {"offset": start, "end": end, "fields": fields}
 
 
 def marker_is_changed_offload(fields: dict[str, str]) -> bool:
@@ -620,17 +629,185 @@ def marker_is_changed_offload(fields: dict[str, str]) -> bool:
         return False
 
 
-def wait_changed_offload(case: pathlib.Path, proc: subprocess.Popen[bytes], start: int) -> tuple[dict[str, str], int, int]:
+def resident_sample(fields: dict[str, str], prefix: str) -> dict[str, int]:
+    if fields.get(f"{prefix}_available") != "1":
+        raise WorkloadFailure(
+            f"OFFLOAD {prefix} resident observation is unavailable")
+    keys = (
+        "object_id", "generation", "page_size", "total_bytes", "resident_bytes",
+        "total_pages", "resident_pages",
+    )
+    try:
+        sample = {key: int(fields[f"{prefix}_{key}"]) for key in keys}
+    except (KeyError, ValueError) as exc:
+        raise WorkloadFailure(
+            f"OFFLOAD {prefix} resident observation is malformed") from exc
+    if (
+            sample["object_id"] <= 0 or sample["generation"] <= 0 or
+            sample["page_size"] <= 0 or sample["total_bytes"] <= 0 or
+            sample["total_pages"] <= 0 or
+            sample["resident_bytes"] > sample["total_bytes"] or
+            sample["resident_pages"] > sample["total_pages"] or
+            sample["total_bytes"] != sample["total_pages"] * sample["page_size"] or
+            sample["resident_bytes"] != sample["resident_pages"] * sample["page_size"]):
+        raise WorkloadFailure(
+            f"OFFLOAD {prefix} resident observation accounting is inconsistent")
+    return sample
+
+
+def offload_collection_record(
+        scope_start: int,
+        expected_blocks: int,
+        selected_seq_id: int,
+        selected_claimant_epoch: int,
+        transactions: list[dict[str, Any]],
+        status: str) -> dict[str, Any]:
+    first_resident = int(
+        transactions[0]["resident"]["fields"]["before_resident_bytes"])
+    last_resident = int(
+        transactions[-1]["resident"]["fields"]["after_resident_bytes"])
+    cumulative = {
+        "transaction_count": len(transactions),
+        "blocks": sum(int(item["fields"]["blocks"]) for item in transactions),
+        "bytes": sum(int(item["fields"]["bytes"]) for item in transactions),
+        "relieved_bytes": sum(
+            int(item["fields"]["relieved_bytes"]) for item in transactions),
+        "first_resident_bytes": first_resident,
+        "last_resident_bytes": last_resident,
+        "resident_drop_bytes": first_resident - last_resident,
+    }
+    if cumulative["resident_drop_bytes"] != cumulative["relieved_bytes"]:
+        raise WorkloadFailure(
+            "cumulative OFFLOAD resident drop does not equal cumulative relieved_bytes")
+    return {
+        "status": status,
+        "scope_start": scope_start,
+        "scope_end": transactions[-1]["end"],
+        "expected_blocks": expected_blocks,
+        "selected_seq_id": selected_seq_id,
+        "selected_claimant_epoch": selected_claimant_epoch,
+        "transactions": transactions,
+        "cumulative": cumulative,
+    }
+
+
+def collect_offload_transactions(
+        case: pathlib.Path,
+        proc: subprocess.Popen[bytes],
+        port: int,
+        start: int,
+        expected_blocks: int) -> tuple[dict[str, Any], dict[str, Any]]:
+    if expected_blocks <= 0:
+        raise WorkloadFailure("OFFLOAD expected block count must be positive")
     deadline = time.monotonic() + MARKER_TIMEOUT_SECONDS
+    seen_offsets: set[tuple[int, int]] = set()
+    transaction_ids: set[int] = set()
+    transactions: list[dict[str, Any]] = []
+    selected_seq_id: int | None = None
+    selected_claimant_epoch: int | None = None
+    cumulative_blocks = 0
+    previous_after: dict[str, int] | None = None
+
     while time.monotonic() < deadline:
         records, _ = marker_records(case, start)
         for fields, begin, end in records:
-            if marker_is_changed_offload(fields):
-                return fields, begin, end
+            marker_span = (begin, end)
+            if marker_span in seen_offsets:
+                continue
+            seen_offsets.add(marker_span)
+            if not marker_is_changed_offload(fields):
+                continue
+            try:
+                seq_id = int(fields["selected_seq_id"])
+                epoch = int(fields["selected_claimant_epoch"])
+                transaction_id = int(fields["transaction_id"])
+                blocks = int(fields["blocks"])
+                byte_count = int(fields["bytes"])
+                relieved_bytes = int(fields["relieved_bytes"])
+            except (KeyError, ValueError) as exc:
+                raise WorkloadFailure(
+                    "state-changing OFFLOAD marker has malformed numeric fields") from exc
+            if (
+                    seq_id < 0 or epoch <= 0 or transaction_id <= 0 or blocks <= 0 or
+                    byte_count <= 0 or relieved_bytes <= 0 or
+                    fields.get("outcome") != "completed" or
+                    fields.get("release_attempted") != "0" or
+                    fields.get("io_failure") != "0" or fields.get("idle") != "1"):
+                raise WorkloadFailure(
+                    "state-changing OFFLOAD marker violates the transaction contract")
+            if selected_seq_id is None:
+                selected_seq_id = seq_id
+                selected_claimant_epoch = epoch
+            elif seq_id != selected_seq_id or epoch != selected_claimant_epoch:
+                raise WorkloadFailure(
+                    "state-changing OFFLOAD changed seq_id or claimant_epoch before closure")
+            if transaction_id in transaction_ids:
+                raise WorkloadFailure("duplicate state-changing OFFLOAD transaction_id")
+            if cumulative_blocks + blocks > expected_blocks:
+                raise WorkloadFailure(
+                    "cumulative OFFLOAD blocks exceed the complete step1 workload")
+
+            resident = capture_resident_observation(case, fields)
+            resident_fields = resident["fields"]
+            if resident_fields.get("server_pid") != str(proc.pid):
+                raise WorkloadFailure(
+                    "OFFLOAD resident observation does not bind the server PID")
+            before = resident_sample(resident_fields, "before")
+            after = resident_sample(resident_fields, "after")
+            identity_keys = (
+                "object_id", "generation", "page_size", "total_bytes", "total_pages")
+            if any(before[key] != after[key] for key in identity_keys):
+                raise WorkloadFailure(
+                    "OFFLOAD resident observation changed KV object or generation")
+            if previous_after is not None and before != previous_after:
+                raise WorkloadFailure(
+                    "ordered OFFLOAD resident observations are not contiguous")
+            resident_drop_bytes = before["resident_bytes"] - after["resident_bytes"]
+            if resident_drop_bytes <= 0 or resident_drop_bytes != relieved_bytes:
+                raise WorkloadFailure(
+                    "OFFLOAD resident drop does not equal relieved_bytes")
+
+            transaction_ids.add(transaction_id)
+            cumulative_blocks += blocks
+            transactions.append({
+                "index": len(transactions),
+                "offset": begin,
+                "end": end,
+                "fields": fields,
+                "resident": resident,
+                "resident_drop_bytes": resident_drop_bytes,
+            })
+            previous_after = after
+            assert selected_seq_id is not None and selected_claimant_epoch is not None
+            evidence = offload_collection_record(
+                start, expected_blocks, selected_seq_id, selected_claimant_epoch,
+                transactions, "blocks_complete" if cumulative_blocks == expected_blocks else "collecting")
+            dump(case / "offload.json", evidence)
+
+            if cumulative_blocks == expected_blocks:
+                post = capture_snapshot(case, port, "post_claimant")
+                claimant = post["claimant"]
+                if (
+                        claimant["seq_id"] != selected_seq_id or
+                        claimant["epoch"] != selected_claimant_epoch or
+                        claimant["active"] or claimant["exhausted"] or not claimant["valid"] or
+                        claimant["target_blocks"] != expected_blocks or
+                        claimant["eligible_resident_blocks"] != 0 or
+                        claimant["swapped_blocks"] != expected_blocks or
+                        claimant["shared_blocks"] != 0 or claimant["blocked_blocks"] != 0):
+                    raise WorkloadFailure(
+                        "final claimant does not close the complete OFFLOAD workload")
+                evidence["status"] = "complete"
+                dump(case / "offload.json", evidence)
+                return evidence, post
+
         if proc.poll() is not None:
-            raise WorkloadFailure(f"server exited while waiting for OFFLOAD (exit={proc.returncode})")
+            raise WorkloadFailure(
+                f"server exited while waiting for cumulative OFFLOAD (exit={proc.returncode})")
         time.sleep(0.05)
-    raise WorkloadFailure("timed out waiting for a state-changing OFFLOAD")
+    raise WorkloadFailure(
+        f"timed out waiting for cumulative OFFLOAD blocks "
+        f"({cumulative_blocks}/{expected_blocks})")
 
 
 def tokenize(port: int, content: str, add_special: bool) -> list[int]:
@@ -667,10 +844,50 @@ def common_token_prefix_count(left: list[int], right: list[int]) -> int:
     return count
 
 
-def build_token_workload(prefix_candidate: list[int], continuation_prompt: list[int]) -> tuple[list[int], dict[str, Any]]:
+def aligned_prefix_token_count(
+        prefix_candidate: list[int],
+        continuation_prompt: list[int],
+        target_prefix_tokens: int) -> int:
     common_prefix = common_token_prefix_count(prefix_candidate, continuation_prompt)
-    boundary_limit = min(common_prefix, max(0, len(continuation_prompt) - 1))
-    prefix_token_count = boundary_limit // PAGED_BLOCK_SIZE * PAGED_BLOCK_SIZE
+    shared_boundary_limit = min(common_prefix, max(0, len(continuation_prompt) - 1))
+    boundary_limit = min(shared_boundary_limit, target_prefix_tokens)
+    return boundary_limit // PAGED_BLOCK_SIZE * PAGED_BLOCK_SIZE
+
+
+def target_prefix_record(
+        target_prefix_tokens: int,
+        prompt_p: list[int],
+        continuation_prompt: list[int]) -> dict[str, Any]:
+    target_is_valid = (
+        isinstance(target_prefix_tokens, int) and
+        not isinstance(target_prefix_tokens, bool) and
+        target_prefix_tokens >= MIN_PREFIX_TOKENS)
+    return {
+        "target_prefix_tokens": target_prefix_tokens,
+        "actual_p_token_count": len(prompt_p),
+        "actual_pq_token_count": len(continuation_prompt),
+        "actual_p_block_count": len(prompt_p) // PAGED_BLOCK_SIZE,
+        "target_prefix_token_delta": (
+            target_prefix_tokens - len(prompt_p) if target_is_valid else None),
+    }
+
+
+def build_token_workload(
+        prefix_candidate: list[int],
+        continuation_prompt: list[int],
+        ctx_size: int,
+        target_prefix_tokens: int) -> tuple[list[int], dict[str, Any]]:
+    target_is_valid = (
+        isinstance(target_prefix_tokens, int) and
+        not isinstance(target_prefix_tokens, bool) and
+        target_prefix_tokens >= MIN_PREFIX_TOKENS)
+    ctx_is_valid = (
+        isinstance(ctx_size, int) and not isinstance(ctx_size, bool) and ctx_size > 0)
+    common_prefix = common_token_prefix_count(prefix_candidate, continuation_prompt)
+    prefix_token_count = (
+        aligned_prefix_token_count(
+            prefix_candidate, continuation_prompt, target_prefix_tokens)
+        if target_is_valid else 0)
     prompt_p = prefix_candidate[:prefix_token_count]
     strict_prefix = (
         bool(prompt_p) and len(prompt_p) < len(continuation_prompt) and
@@ -686,21 +903,36 @@ def build_token_workload(prefix_candidate: list[int], continuation_prompt: list[
             "continuation_prompt": continuation_prompt[first_mismatch],
         }
         if first_mismatch is not None else None)
+    selection = target_prefix_record(target_prefix_tokens, prompt_p, continuation_prompt)
+    target_delta = selection["target_prefix_token_delta"]
     failure_reasons: list[str] = []
+    if not target_is_valid:
+        failure_reasons.append(
+            f"target_prefix_tokens must be an integer at least {MIN_PREFIX_TOKENS}")
+    if not ctx_is_valid:
+        failure_reasons.append("ctx_size must be a positive integer")
     if len(prompt_p) < MIN_PREFIX_TOKENS:
         failure_reasons.append(
             f"selected P has {len(prompt_p)} tokens ({len(prompt_p) // PAGED_BLOCK_SIZE} full "
             f"{PAGED_BLOCK_SIZE}-token blocks); requires at least {MIN_PREFIX_TOKENS} tokens "
-            f"({MIN_PREFIX_BLOCKS} blocks); tokenize(P)={len(prefix_candidate)} "
-            f"tokenize(P+Q)={len(continuation_prompt)} common_prefix={common_prefix}")
+            f"({MIN_PREFIX_BLOCKS} blocks); target_prefix_tokens={target_prefix_tokens}; "
+            f"tokenize(P)={len(prefix_candidate)} tokenize(P+Q)={len(continuation_prompt)} "
+            f"common_prefix={common_prefix}")
+    if target_is_valid and (
+            not isinstance(target_delta, int) or target_delta < 0 or
+            target_delta >= PAGED_BLOCK_SIZE):
+        failure_reasons.append(
+            f"selected P misses target by {target_delta} tokens; requires "
+            f"0<=target-actual<{PAGED_BLOCK_SIZE} with target={target_prefix_tokens} "
+            f"actual={len(prompt_p)} common_prefix={common_prefix}")
     if not strict_prefix:
         failure_reasons.append(
             f"selected tokens(P) is not a strict prefix of tokens(P+Q): "
             f"P={len(prompt_p)} P+Q={len(continuation_prompt)} common_prefix={common_prefix}")
-    if context_token_count > CTX_SIZE:
+    if ctx_is_valid and context_token_count > ctx_size:
         failure_reasons.append(
             f"tokens(P+Q)+n_predict exceeds ctx_size: "
-            f"{len(continuation_prompt)}+{N_PREDICT}={context_token_count}>{CTX_SIZE}")
+            f"{len(continuation_prompt)}+{N_PREDICT}={context_token_count}>{ctx_size}")
     evidence = {
         "status": "ready" if not failure_reasons else "invalid",
         "token_boundary_policy": "largest_paged_block_boundary_within_tokenized_common_prefix",
@@ -714,28 +946,48 @@ def build_token_workload(prefix_candidate: list[int], continuation_prompt: list[
         "context_token_count": context_token_count,
         "minimum_prefix_blocks": MIN_PREFIX_BLOCKS,
         "minimum_prefix_token_count": MIN_PREFIX_TOKENS,
-        "ctx_size": CTX_SIZE,
+        "ctx_size": ctx_size,
         "prefix_covers_minimum_blocks": len(prompt_p) >= MIN_PREFIX_TOKENS,
+        "target_prefix_satisfied": (
+            isinstance(target_delta, int) and 0 <= target_delta < PAGED_BLOCK_SIZE),
         "strict_prefix": strict_prefix,
-        "context_fits": context_token_count <= CTX_SIZE,
+        "context_fits": ctx_is_valid and context_token_count <= ctx_size,
         "first_token_mismatch_index": first_mismatch,
         "first_token_mismatch": mismatch_tokens,
         "prefix_candidate_tokens_sha256": token_ids_sha256(prefix_candidate),
         "prefix_tokens_sha256": token_ids_sha256(prompt_p),
         "continuation_prompt_tokens_sha256": token_ids_sha256(continuation_prompt),
         "failure_reasons": failure_reasons,
+        **selection,
     }
     return prompt_p, evidence
+
+
+def scalable_prefix_text(unit_count: int) -> str:
+    if (not isinstance(unit_count, int) or isinstance(unit_count, bool) or
+            not 1 <= unit_count <= MAX_PREFIX_TEXT_UNITS):
+        raise ValueError("prefix text unit count is out of range")
+    return PREFIX_TEXT_UNIT * unit_count
 
 
 def tokenization_failure_evidence(
         stage: str,
         reason: str,
+        ctx_size: int,
+        target_prefix_tokens: int,
+        prefix_text_unit_count: int | None = None,
         prefix_candidate: list[int] | None = None) -> dict[str, Any]:
+    selected_text = (
+        scalable_prefix_text(prefix_text_unit_count)
+        if prefix_text_unit_count is not None else None)
     return {
         "status": "tokenization_failed",
         "token_boundary_policy": "largest_paged_block_boundary_within_tokenized_common_prefix",
         "tokenization_stage": stage,
+        "prefix_text_unit_count": prefix_text_unit_count,
+        "prefix_text_max_units": MAX_PREFIX_TEXT_UNITS,
+        "selected_prefix_text_sha256": (
+            sha_bytes(selected_text.encode("utf-8")) if selected_text is not None else None),
         "prefix_candidate_token_count": len(prefix_candidate) if prefix_candidate is not None else None,
         "continuation_prompt_token_count": None,
         "common_prefix_token_count": None,
@@ -746,8 +998,14 @@ def tokenization_failure_evidence(
         "context_token_count": None,
         "minimum_prefix_blocks": MIN_PREFIX_BLOCKS,
         "minimum_prefix_token_count": MIN_PREFIX_TOKENS,
-        "ctx_size": CTX_SIZE,
+        "ctx_size": ctx_size,
+        "target_prefix_tokens": target_prefix_tokens,
+        "actual_p_token_count": None,
+        "actual_pq_token_count": None,
+        "actual_p_block_count": None,
+        "target_prefix_token_delta": None,
         "prefix_covers_minimum_blocks": None,
+        "target_prefix_satisfied": False,
         "strict_prefix": None,
         "context_fits": None,
         "first_token_mismatch_index": None,
@@ -759,25 +1017,92 @@ def tokenization_failure_evidence(
     }
 
 
-def prepare_token_workload(case: pathlib.Path, port: int) -> tuple[list[int], list[int]]:
-    prefix_candidate: list[int] | None = None
-    try:
-        prefix_candidate = tokenize(port, PREFIX_TEXT, True)
-    except Exception as exc:
-        reason = f"tokenize(P) failed: {type(exc).__name__}: {exc}"
-        dump(case / "workload.json", tokenization_failure_evidence("P", reason))
-        raise WorkloadFailure(reason) from exc
-    try:
-        continuation_prompt = tokenize(port, PREFIX_TEXT + QUERY_TEXT, True)
-    except Exception as exc:
-        reason = f"tokenize(P+Q) failed: {type(exc).__name__}: {exc}"
-        dump(case / "workload.json", tokenization_failure_evidence("P+Q", reason, prefix_candidate))
-        raise WorkloadFailure(reason) from exc
-    prompt_p, evidence = build_token_workload(prefix_candidate, continuation_prompt)
+def prepare_token_workload(
+        case: pathlib.Path,
+        port: int,
+        ctx_size: int,
+        target_prefix_tokens: int) -> tuple[list[int], list[int]]:
+    if (not isinstance(target_prefix_tokens, int) or isinstance(target_prefix_tokens, bool) or
+            target_prefix_tokens < MIN_PREFIX_TOKENS):
+        reason = f"target_prefix_tokens must be an integer at least {MIN_PREFIX_TOKENS}"
+        dump(case / "workload.json", tokenization_failure_evidence(
+            "selection", reason, ctx_size, target_prefix_tokens))
+        raise WorkloadFailure(reason)
+
+    candidates: dict[int, tuple[str, list[int], list[int]]] = {}
+
+    def target_satisfied(
+            prefix_candidate: list[int],
+            continuation_prompt: list[int]) -> bool:
+        actual = aligned_prefix_token_count(
+            prefix_candidate, continuation_prompt, target_prefix_tokens)
+        return 0 <= target_prefix_tokens - actual < PAGED_BLOCK_SIZE
+
+    def tokenized(unit_count: int) -> tuple[str, list[int], list[int]]:
+        cached = candidates.get(unit_count)
+        if cached is not None:
+            return cached
+        prefix_text = scalable_prefix_text(unit_count)
+        try:
+            prefix_candidate = tokenize(port, prefix_text, True)
+        except Exception as exc:
+            reason = f"tokenize(P) failed: {type(exc).__name__}: {exc}"
+            dump(case / "workload.json", tokenization_failure_evidence(
+                "P", reason, ctx_size, target_prefix_tokens, unit_count))
+            raise WorkloadFailure(reason) from exc
+        try:
+            continuation_prompt = tokenize(port, prefix_text + QUERY_TEXT, True)
+        except Exception as exc:
+            reason = f"tokenize(P+Q) failed: {type(exc).__name__}: {exc}"
+            dump(case / "workload.json", tokenization_failure_evidence(
+                "P+Q", reason, ctx_size, target_prefix_tokens, unit_count, prefix_candidate))
+            raise WorkloadFailure(reason) from exc
+        value = (prefix_text, prefix_candidate, continuation_prompt)
+        candidates[unit_count] = value
+        return value
+
+    lower_units = 0
+    upper_units = 1
+    while True:
+        _text, prefix_candidate, continuation_prompt = tokenized(upper_units)
+        if target_satisfied(prefix_candidate, continuation_prompt):
+            break
+        if upper_units == MAX_PREFIX_TEXT_UNITS:
+            prompt_p, evidence = build_token_workload(
+                prefix_candidate, continuation_prompt, ctx_size, target_prefix_tokens)
+            evidence.update({
+                "prefix_text_unit_count": upper_units,
+                "prefix_text_max_units": MAX_PREFIX_TEXT_UNITS,
+                "selected_prefix_text_sha256": sha_bytes(_text.encode("utf-8")),
+            })
+            dump(case / "workload.json", evidence)
+            raise WorkloadFailure(
+                "scalable P/P+Q token workload contract failed: " +
+                "; ".join(evidence["failure_reasons"]))
+        lower_units = upper_units
+        upper_units = min(MAX_PREFIX_TEXT_UNITS, upper_units * 2)
+
+    while lower_units + 1 < upper_units:
+        middle_units = (lower_units + upper_units) // 2
+        _text, prefix_candidate, continuation_prompt = tokenized(middle_units)
+        if target_satisfied(prefix_candidate, continuation_prompt):
+            upper_units = middle_units
+        else:
+            lower_units = middle_units
+
+    prefix_text, prefix_candidate, continuation_prompt = tokenized(upper_units)
+    prompt_p, evidence = build_token_workload(
+        prefix_candidate, continuation_prompt, ctx_size, target_prefix_tokens)
+    evidence.update({
+        "prefix_text_unit_count": upper_units,
+        "prefix_text_max_units": MAX_PREFIX_TEXT_UNITS,
+        "selected_prefix_text_sha256": sha_bytes(prefix_text.encode("utf-8")),
+    })
     dump(case / "workload.json", evidence)
     if evidence["failure_reasons"]:
         raise WorkloadFailure(
-            "fixed P/P+Q token workload contract failed: " + "; ".join(evidence["failure_reasons"]))
+            "scalable P/P+Q token workload contract failed: " +
+            "; ".join(evidence["failure_reasons"]))
     return prompt_p, continuation_prompt
 
 
@@ -839,9 +1164,15 @@ def request_completion(port: int, body: dict[str, Any], label: str, record: path
     return item
 
 
-def write_execution(case: pathlib.Path, binary: pathlib.Path, model: pathlib.Path, port: int, env: dict[str, str], server_identity: dict[str, Any]) -> None:
+def write_execution(
+        case: pathlib.Path,
+        binary: pathlib.Path,
+        model: pathlib.Path,
+        argv: list[str],
+        env: dict[str, str],
+        server_identity: dict[str, Any]) -> None:
     dump(case / "execution.json", {
-        "argv": server_argv(binary, model, port),
+        "argv": argv,
         "cwd": str(case.resolve()),
         "environment": env,
         "binary": identity(binary),
@@ -859,7 +1190,12 @@ def verify_capability(capability: dict[str, str]) -> str | None:
     return None
 
 
-def run_physical_preflight(binary: pathlib.Path, model: pathlib.Path, root: pathlib.Path) -> tuple[str, str]:
+def run_physical_preflight(
+        binary: pathlib.Path,
+        model: pathlib.Path,
+        root: pathlib.Path,
+        ctx_size: int,
+        target_prefix_tokens: int) -> tuple[str, str]:
     case = root / "PREFLIGHT"
     case.mkdir()
     backing = prepare_backing(case)
@@ -867,14 +1203,21 @@ def run_physical_preflight(binary: pathlib.Path, model: pathlib.Path, root: path
     env["LLAMA_KV_G0_S1_RESIDENT_OBSERVATION"] = "preflight"
     dump(case / "environment.json", env)
     port = free_port()
-    result: dict[str, Any] = {"status": "startup_failed", "request_loop_started": False, "port": port}
+    argv = server_argv(binary, model, port, ctx_size)
+    result: dict[str, Any] = {
+        "status": "startup_failed",
+        "request_loop_started": False,
+        "port": port,
+        "ctx_size": ctx_size,
+        "target_prefix_tokens": target_prefix_tokens,
+    }
     proc: subprocess.Popen[bytes] | None = None
     try:
-        proc = start(binary, model, case, port, env)
+        proc = start(case, argv, env)
         server_identity = read_process_identity(proc.pid)
         if server_identity is None:
             return "failure", "could not bind server PID/starttime/cmdline identity"
-        write_execution(case, binary, model, port, env, server_identity)
+        write_execution(case, binary, model, argv, env, server_identity)
         if not wait_health(port, proc):
             return "failure", f"server listener was not healthy (exit={proc.poll()})"
         capability, evidence, capability_error = wait_capability(case, proc)
@@ -912,22 +1255,37 @@ def run_physical_preflight(binary: pathlib.Path, model: pathlib.Path, root: path
         dump(case / "result.json", result)
 
 
-def run_case(name: str, binary: pathlib.Path, model: pathlib.Path, enabled: bool, root: pathlib.Path) -> dict[str, Any]:
+def run_case(
+        name: str,
+        binary: pathlib.Path,
+        model: pathlib.Path,
+        enabled: bool,
+        root: pathlib.Path,
+        ctx_size: int,
+        target_prefix_tokens: int) -> dict[str, Any]:
     case = root / name
     case.mkdir()
     backing = prepare_backing(case)
     env = governor_env(enabled)
     dump(case / "environment.json", env)
     port = free_port()
-    result: dict[str, Any] = {"status": "startup_failed", "request_loop_started": False, "port": port}
+    argv = server_argv(binary, model, port, ctx_size)
+    result: dict[str, Any] = {
+        "status": "startup_failed",
+        "request_loop_started": False,
+        "port": port,
+        "ctx_size": ctx_size,
+        "target_prefix_tokens": target_prefix_tokens,
+    }
     proc: subprocess.Popen[bytes] | None = None
     step2: dict[str, Any] | None = None
+    resume_boundary: int | None = None
     try:
-        proc = start(binary, model, case, port, env)
+        proc = start(case, argv, env)
         server_identity = read_process_identity(proc.pid)
         if server_identity is None:
             raise WorkloadFailure("could not bind server PID/starttime/cmdline identity")
-        write_execution(case, binary, model, port, env, server_identity)
+        write_execution(case, binary, model, argv, env, server_identity)
         if not wait_health(port, proc):
             raise WorkloadFailure(f"server listener was not healthy (exit={proc.poll()})")
         capability, evidence, capability_error = wait_capability(case, proc)
@@ -939,7 +1297,10 @@ def run_case(name: str, binary: pathlib.Path, model: pathlib.Path, enabled: bool
         if capability_error:
             raise WorkloadFailure(capability_error)
 
-        prompt_p, prompt_pq = prepare_token_workload(case, port)
+        prompt_p, prompt_pq = prepare_token_workload(
+            case, port, ctx_size, target_prefix_tokens)
+        result["workload"] = target_prefix_record(
+            target_prefix_tokens, prompt_p, prompt_pq)
 
         records = case / "requests.jsonl"
         result["request_loop_started"] = True
@@ -949,17 +1310,14 @@ def run_case(name: str, binary: pathlib.Path, model: pathlib.Path, enabled: bool
             raise WorkloadFailure("step1 did not receive HTTP 200")
 
         if enabled:
-            offload_fields, offload_start, offload_end = wait_changed_offload(
-                case, proc, step1_stderr_start)
-            dump(case / "offload.json", {
-                "offset": offload_start,
-                "end": offload_end,
-                "fields": offload_fields,
-            })
-            capture_resident_observation(case, offload_fields)
-            capture_snapshot(case, port, "post_claimant")
+            _offload, post = collect_offload_transactions(
+                case, proc, port, step1_stderr_start,
+                len(prompt_p) // PAGED_BLOCK_SIZE)
+            resume_boundary = post["stderr_end"]
 
-        resume_start = (case / "server.stderr").stat().st_size
+        resume_start = (
+            resume_boundary if resume_boundary is not None else
+            (case / "server.stderr").stat().st_size)
         step2 = request_completion(port, completion_body(prompt_pq, N_PREDICT), "step2", records)
         resume_end = (case / "server.stderr").stat().st_size
         dump(case / "resume_scope.json", {
@@ -1009,7 +1367,12 @@ def run_case(name: str, binary: pathlib.Path, model: pathlib.Path, enabled: bool
     return result
 
 
-def base_manifest(binary: pathlib.Path, model: pathlib.Path | None, stamp: str) -> dict[str, Any]:
+def base_manifest(
+        binary: pathlib.Path,
+        model: pathlib.Path | None,
+        stamp: str,
+        ctx_size: int,
+        target_prefix_tokens: int) -> dict[str, Any]:
     dirty = git("status", "--porcelain").splitlines()
     return {
         "protocol": PROTOCOL,
@@ -1038,7 +1401,8 @@ def base_manifest(binary: pathlib.Path, model: pathlib.Path | None, stamp: str) 
             "mincore_requested": True,
             "source_marker_schema": SOURCE_MARKER_SCHEMA,
             "paged_block_size": PAGED_BLOCK_SIZE,
-            "ctx_size": CTX_SIZE,
+            "ctx_size": ctx_size,
+            "target_prefix_tokens": target_prefix_tokens,
             "governor_target_bytes": GOVERNOR_TARGET_BYTES,
             "governor_max_blocks": GOVERNOR_MAX_BLOCKS,
             "prefix_text_sha256": sha_bytes(PREFIX_TEXT.encode("utf-8")),
@@ -1063,7 +1427,11 @@ def main() -> None:
     ap.add_argument("--binary", default=os.environ.get("KV_GOVERNOR_BINARY", "build/bin/llama-server"))
     ap.add_argument("--model", default=os.environ.get("KV_GOVERNOR_MODEL"))
     ap.add_argument("--output-dir")
+    ap.add_argument("--ctx-size", type=int, choices=SUPPORTED_CTX_SIZES, default=CTX_SIZE)
+    ap.add_argument("--target-prefix-tokens", type=int, required=True)
     args = ap.parse_args()
+    if args.target_prefix_tokens < MIN_PREFIX_TOKENS:
+        ap.error(f"--target-prefix-tokens must be at least {MIN_PREFIX_TOKENS}")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     output = pathlib.Path(args.output_dir) if args.output_dir else pathlib.Path(
         f"/root/oscomp/kv_logs/{PROTOCOL}_{stamp}_{uuid.uuid4().hex[:10]}")
@@ -1072,7 +1440,8 @@ def main() -> None:
     output.mkdir(parents=True)
     binary = pathlib.Path(args.binary).resolve()
     model = pathlib.Path(args.model).resolve() if args.model else None
-    manifest = base_manifest(binary, model, stamp)
+    manifest = base_manifest(
+        binary, model, stamp, args.ctx_size, args.target_prefix_tokens)
     signal_seen: list[int] = []
 
     def handle_signal(signum: int, _frame: Any) -> None:
@@ -1095,7 +1464,8 @@ def main() -> None:
             })
         else:
             manifest.update({"binary": identity(binary), "model": identity(model)})
-            outcome, reason = run_physical_preflight(binary, model, output)
+            outcome, reason = run_physical_preflight(
+                binary, model, output, args.ctx_size, args.target_prefix_tokens)
             if outcome == "unsupported":
                 manifest.update({
                     "runner_status": "UNSUPPORTED",
@@ -1105,8 +1475,10 @@ def main() -> None:
             elif outcome == "failure":
                 manifest.update({"runner_status": "run_incomplete", "runner_error": reason})
             else:
-                manifest["OFF"] = run_case("OFF", binary, model, False, output)
-                manifest["GOVERNOR_ON"] = run_case("GOVERNOR_ON", binary, model, True, output)
+                manifest["OFF"] = run_case(
+                    "OFF", binary, model, False, output, args.ctx_size, args.target_prefix_tokens)
+                manifest["GOVERNOR_ON"] = run_case(
+                    "GOVERNOR_ON", binary, model, True, output, args.ctx_size, args.target_prefix_tokens)
                 manifest["runner_status"] = "run_complete"
     except RunnerInterrupted as exc:
         manifest.update({

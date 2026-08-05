@@ -137,6 +137,7 @@ public:
     uint64_t pressure_debt_bytes() const { return pressure_debt_bytes_; }
     uint64_t episode() const { return episode_; }
     bool offload_armed() const { return offload_armed_; }
+    bool idle_follow_up_pending() const { return idle_follow_up_pending_; }
     uint64_t next_action_sample() const { return next_action_sample_; }
 
 private:
@@ -152,6 +153,7 @@ private:
     uint64_t pressure_basis_generation_ = 0;
     uint64_t pressure_debt_bytes_ = 0;
     bool offload_armed_ = false;
+    bool idle_follow_up_pending_ = false;
     uint64_t next_action_sample_ = 0;
     std::map<llama_seq_id, uint64_t> claimant_epochs_;
     std::map<llama_seq_id, uint64_t> exhausted_claimants_;

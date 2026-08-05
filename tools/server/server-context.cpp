@@ -1812,6 +1812,12 @@ private:
         queue_tasks.on_wait_next_response([this]() {
             return should_wait_next_response();
         });
+#if defined(__linux__)
+        queue_tasks.on_idle_update_pending([this]() {
+            return kv_pressure_unified_action_config.enabled &&
+                kv_governor_state.idle_follow_up_pending();
+        });
+#endif
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
         });

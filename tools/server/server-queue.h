@@ -30,6 +30,7 @@ private:
     std::function<void(void)>           callback_update_slots;
     std::function<void(bool)>           callback_sleeping_state;
     std::function<bool(void)>           callback_wait_next_response;
+    std::function<bool(void)>           callback_idle_update_pending;
 
 public:
     // Add a new task to the end of the queue
@@ -101,6 +102,13 @@ public:
     // can join the next continuous batch before inference is kicked again.
     void on_wait_next_response(std::function<bool(void)> callback) {
         callback_wait_next_response = std::move(callback);
+    }
+
+    // Register a predicate for rate-limited maintenance updates while the queue is idle.
+    // A true result prevents model sleep and permits one update_slots() call after the
+    // queue's timed wait; no synthetic task is posted.
+    void on_idle_update_pending(std::function<bool(void)> callback) {
+        callback_idle_update_pending = std::move(callback);
     }
 
     // Register callback for sleeping state change; multiple callbacks are allowed
