@@ -14,11 +14,10 @@ IMPORTANT: Ensure you've thoroughly reviewed the [AGENTS.md](AGENTS.md) file bef
 ## 2. 事实优先级
 
 1. 当前源码、当前 diff、实际测试/实验原始证据
-2. 工程账本（PROJECT_STATE / ARCHITECTURE / DECISIONS / EXPERIMENTS）
-3. README、设计文档
-4. 历史对话
+2. 当前已跟踪的 README、设计文档和使用说明
+3. 历史对话
 
-冲突时以更高优先级为准，并明确指出哪个账本条目陈旧。不得将计划、理论推测或历史文档描述成已实现功能。
+冲突时以更高优先级为准。不得将计划、理论推测或历史文档描述成已实现功能。
 
 ## 3. 回答原则
 
@@ -65,28 +64,4 @@ KV Cache 侧重点：内存占用与碎片、分配/回收/复用策略、数据
 融合验证必须提供 baseline、KV-only、weight-only、combined 四组对照及必要消融实验。
 涉及压缩、量化或近似计算时必须增加正确性/精度对照实验。
 
-以上领域的详细审查清单见工程账本 DECISIONS.md 与 ARCHITECTURE.md。
-
-## 7. 工作入口
-
-所有任务通过 `/os-agent-task` 驱动，模式包括 contract / audit / implement / review / review-fix / script / memory。
-具体流程、交付物和停止条件由 Skill（`.claude/skills/os-agent-task/`）及其 references 定义。
-
-implement、review、review-fix、audit 四种模式完成后必须通过 gate 门禁：
-
-```bash
-bash scripts/os-agent/gate-runner <mode>
-```
-
-gate 输出 `OS_AGENT_GATE_RESULT verdict=PASS` 方可声明完成。
-
-## 8. 工程账本
-
-项目可变状态统一记录在仓库根目录四个文件中，CLAUDE.md 不再重复：
-
-- [PROJECT_STATE.md](PROJECT_STATE.md) — 当前快照（阶段、阻塞、门禁）
-- [ARCHITECTURE.md](ARCHITECTURE.md) — 稳定架构（模块职责、数据流、不变量、修改边界）
-- [DECISIONS.md](DECISIONS.md) — 追加式技术决策日志
-- [EXPERIMENTS.md](EXPERIMENTS.md) — 追加式实验协议与证据索引
-
-Task 执行时按需读取对应账本。普通任务不自动修改账本。账本与源码冲突时以源码为准。
+以上领域的详细审查以当前源码、任务边界和实际验证结果为准。

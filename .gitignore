@@ -161,6 +161,16 @@ a.out.*
 AGENTS.local.md
 .pi/SYSTEM.md
 
+# Local agent workflow
+/.claude/skills/os-agent-task/
+/.agents/skills/os-agent-task/
+/PROJECT_STATE.md
+/ARCHITECTURE.md
+/DECISIONS.md
+/EXPERIMENTS.md
+/CLAUDE.local.md
+/.claude/settings.local.json
+
 # KV cache experiment artifacts
 kv_logs/
 sharegpt_data/
@@ -175,6 +185,7 @@ trace_prompts/
 
 # CTest runtime artifacts
 /Testing/
+rss-stage-results/
 rss-stage-results/
 rss-stage-results/
 rss-stage-results/

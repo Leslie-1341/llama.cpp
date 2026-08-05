@@ -1,6 +1,0 @@
-interface:
-  display_name: "OS Agent Task v3"
-  short_description: "按需上下文、单节点实现与证据门禁"
-  default_prompt: "Use $os-agent-task with one mode and a concise goal/acceptance contract. Load PROJECT_STATE and current diff first; retrieve only matching ledger sections; expand lifecycle rules only for high-risk tasks."
-policy:
-  allow_implicit_invocation: false
