@@ -104,6 +104,31 @@ static void test_resume_events_bind_prefetch_to_graph_gate() {
     CHECK(graph_gate.find("phase=graph_gate") != std::string::npos);
 }
 
+static void test_resume_stage_timing_event() {
+    const server_kv_resume_stage_timing timing {
+        1151,
+        7,
+        91,
+        2,
+        4096,
+        100,
+        200,
+        300,
+        700,
+    };
+    const auto event = server_kv_resume_format_stage_timing(timing);
+    CHECK(event.find("kv_resume_stage_timing") != std::string::npos);
+    CHECK(event.find("decision_id=1151") != std::string::npos);
+    CHECK(event.find("seq_id=7") != std::string::npos);
+    CHECK(event.find("transaction_id=91") != std::string::npos);
+    CHECK(event.find("restored_blocks=2") != std::string::npos);
+    CHECK(event.find("restored_bytes=4096") != std::string::npos);
+    CHECK(event.find("queue_us=100") != std::string::npos);
+    CHECK(event.find("gate_us=200") != std::string::npos);
+    CHECK(event.find("graph_us=300") != std::string::npos);
+    CHECK(event.find("total_us=700") != std::string::npos);
+}
+
 static void test_first_block_failure_blocks_graph() {
     fake_core core;
     core.next.action = llama_kv_action::prefetch;
@@ -171,6 +196,7 @@ int main() {
     test_no_swap_noop_and_legacy_compatibility();
     test_success_keeps_protection_until_lifecycle_end();
     test_resume_events_bind_prefetch_to_graph_gate();
+    test_resume_stage_timing_event();
     test_first_block_failure_blocks_graph();
     test_partial_failure_preserves_result_and_blocks_graph();
     test_shortfall_fail_stop_and_context_invalid_block_graph();

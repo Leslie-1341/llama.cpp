@@ -25,6 +25,10 @@ SOURCE_MARKER_SCHEMA = "kv_governor_stage3c_1c_2b_1r/v6"
 CAPABILITY_MARKER = "KV_GOVERNOR_CAPABILITY"
 MARKER = "kv_pressure_unified_action"
 RESIDENT_OBSERVATION_MARKER = "kv_g0_s1_resident_observation"
+RESUME_TIMING_MARKER = "kv_resume_stage_timing"
+PREFETCH_BLOCK_PHASE_MARKER = "KV_PAGED_PREFETCH_BLOCK_PHASE"
+PREFETCH_PHASE_CALL_MARKER = "KV_PAGED_PREFETCH_PHASE_CALL"
+IO_STATS_MARKER = "KV_PAGED_IO_STATS"
 CAPABILITY_FIELDS = {
     "n_slots", "n_seq_max", "n_stream", "kv_unified", "paged_metadata",
     "ingraph_gather", "release_supported", "offload_supported", "prefetch_supported",
@@ -120,6 +124,137 @@ def fields_after_token(line: str, token: str) -> dict[str, str] | None:
             return None
         fields[key] = value
     return fields
+
+
+def token_records(raw: bytes, token: str, start: int = 0, end: int | None = None) -> list[dict[str, Any]]:
+    limit = len(raw) if end is None else end
+    if start < 0 or limit < start or limit > len(raw):
+        raise WorkloadFailure(f"invalid {token} byte scope")
+    records: list[dict[str, Any]] = []
+    offset = start
+    for line in raw[start:limit].splitlines(keepends=True):
+        line_end = offset + len(line)
+        if token.encode("utf-8") in line:
+            fields = fields_after_token(line.decode("utf-8", errors="replace"), token)
+            if fields is None:
+                raise WorkloadFailure(f"malformed {token} record")
+            records.append({"offset": offset, "end": line_end, "fields": fields})
+        offset = line_end
+    return records
+
+
+def unsigned_fields(fields: dict[str, str], required: set[str], label: str) -> dict[str, int]:
+    if set(fields) != required:
+        raise WorkloadFailure(
+            f"{label} schema mismatch missing={sorted(required-set(fields))} "
+            f"extra={sorted(set(fields)-required)}")
+    values: dict[str, int] = {}
+    for key, value in fields.items():
+        if not value.isdigit():
+            raise WorkloadFailure(f"{label}.{key} is not an unsigned integer")
+        values[key] = int(value)
+    return values
+
+
+def capture_resume_timing(case: pathlib.Path, step2: dict[str, Any]) -> dict[str, Any]:
+    scope = json.loads((case / "resume_scope.json").read_text(encoding="utf-8"))
+    start, end = scope.get("start"), scope.get("end")
+    if not isinstance(start, int) or isinstance(start, bool) or not isinstance(end, int) or isinstance(end, bool):
+        raise WorkloadFailure("resume timing scope is malformed")
+    raw = (case / "server.stderr").read_bytes()
+
+    stage_records = token_records(raw, RESUME_TIMING_MARKER, start, end)
+    if len(stage_records) != 1:
+        raise WorkloadFailure(f"expected one {RESUME_TIMING_MARKER} record, got {len(stage_records)}")
+    stage = unsigned_fields(stage_records[0]["fields"], {
+        "decision_id", "seq_id", "transaction_id", "restored_blocks", "restored_bytes",
+        "queue_us", "gate_us", "graph_us", "total_us",
+    }, RESUME_TIMING_MARKER)
+
+    call_records = token_records(raw, PREFETCH_PHASE_CALL_MARKER, start, end)
+    if len(call_records) != 1:
+        raise WorkloadFailure(f"expected one {PREFETCH_PHASE_CALL_MARKER} record, got {len(call_records)}")
+    prefetch_call = unsigned_fields(call_records[0]["fields"], {
+        "call", "seq_id", "requested_blocks", "restored_blocks", "phase_events",
+    }, PREFETCH_PHASE_CALL_MARKER)
+
+    block_records = token_records(raw, PREFETCH_BLOCK_PHASE_MARKER, start, end)
+    block_phases = [unsigned_fields(record["fields"], {
+        "call", "block_index", "physical_block", "validate_us", "read_us", "unpack_us",
+        "commit_us", "phase_sum_us",
+    }, PREFETCH_BLOCK_PHASE_MARKER) for record in block_records]
+    if prefetch_call["phase_events"] != len(block_phases):
+        raise WorkloadFailure("prefetch phase-event count does not match block records")
+    if prefetch_call["restored_blocks"] != stage["restored_blocks"]:
+        raise WorkloadFailure("prefetch call and server timing restored-block counts differ")
+    for index, block in enumerate(block_phases):
+        if block["call"] != prefetch_call["call"] or block["block_index"] != index:
+            raise WorkloadFailure("prefetch block phase order/correlation is invalid")
+        if block["phase_sum_us"] != block["validate_us"] + block["read_us"] + block["unpack_us"] + block["commit_us"]:
+            raise WorkloadFailure("prefetch block phase sum is inconsistent")
+
+    io_records = token_records(raw, IO_STATS_MARKER)
+    if not io_records:
+        raise WorkloadFailure(f"missing {IO_STATS_MARKER} record")
+    io_keys = {
+        "block_swap_out_calls", "block_swap_in_calls", "backing_read_syscalls", "backing_write_syscalls",
+        "bytes_read", "bytes_written", "avg_block_swap_in_latency_us", "max_block_swap_in_latency_us",
+        "block_in_validate_us", "block_in_read_us", "block_in_unpack_us", "block_in_commit_us",
+    }
+    io_candidates: list[tuple[dict[str, int], int]] = []
+    for record in io_records:
+        io_fields = record["fields"]
+        if not io_keys <= set(io_fields):
+            raise WorkloadFailure(f"{IO_STATS_MARKER} is missing required fields")
+        io_stats = {key: int(io_fields[key]) for key in sorted(io_keys) if io_fields[key].isdigit()}
+        if set(io_stats) != io_keys:
+            raise WorkloadFailure(f"{IO_STATS_MARKER} contains non-integer required fields")
+        io_candidates.append((io_stats, record["offset"]))
+    io_stats, _io_offset = max(io_candidates, key=lambda item: (
+        item[0]["bytes_read"], item[0]["bytes_written"], item[0]["block_swap_in_calls"], item[1]))
+
+    response_timings = step2.get("response_timings")
+    timing_keys = {"prompt_n", "prompt_ms", "predicted_n", "predicted_ms", "predicted_per_token_ms"}
+    if not isinstance(response_timings, dict) or not timing_keys <= set(response_timings):
+        raise WorkloadFailure("step2 response timings are unavailable")
+    if any(not isinstance(response_timings[key], (int, float)) or isinstance(response_timings[key], bool)
+           for key in timing_keys):
+        raise WorkloadFailure("step2 response timings are malformed")
+
+    read_us = sum(block["read_us"] for block in block_phases)
+    restore_us = sum(block["validate_us"] + block["unpack_us"] for block in block_phases)
+    commit_us = sum(block["commit_us"] for block in block_phases)
+    phase_us = read_us + restore_us + commit_us
+    explained_us = stage["queue_us"] + phase_us + stage["graph_us"]
+    derived = {
+        "server_ttft_ms": stage["total_us"] / 1000.0,
+        "server_prompt_ms": float(response_timings["prompt_ms"]),
+        "tpot_ms": float(response_timings["predicted_per_token_ms"]),
+        "queue_us": stage["queue_us"],
+        "read_us": read_us,
+        "restore_us": restore_us,
+        "commit_us": commit_us,
+        "graph_us": stage["graph_us"],
+        "gate_us": stage["gate_us"],
+        "gate_overhead_us": max(0, stage["gate_us"] - phase_us),
+        "residual_us": max(0, stage["total_us"] - explained_us),
+        "io_bytes": stage["restored_bytes"],
+        "io_syscalls": io_stats["backing_read_syscalls"],
+        "io_service_us": read_us,
+    }
+    value = {
+        "schema_version": 1,
+        "scope": scope,
+        "stage": stage,
+        "prefetch_call": prefetch_call,
+        "block_phases": block_phases,
+        "io_stats_record_count": len(io_records),
+        "io_stats": io_stats,
+        "response_timings": {key: response_timings[key] for key in sorted(timing_keys)},
+        "derived": derived,
+    }
+    dump(case / "timing.json", value)
+    return value
 
 
 def server_argv(binary: pathlib.Path, model: pathlib.Path, port: int) -> list[str]:
@@ -302,6 +437,9 @@ def governor_env(enabled: bool) -> dict[str, str]:
         "LLAMA_KV_PRESSURE_SAMPLER": "1",
         "LLAMA_KV_PRESSURE_GOVERNOR_CLAIMANT_TRACE": "1",
         "LLAMA_KV_G0_S1_RESIDENT_OBSERVATION": "1",
+        "LLAMA_KV_PAGED_IO_STATS": "1",
+        "LLAMA_KV_PAGED_PREFETCH_PHASE_TRACE": "1",
+        "LLAMA_KV_RESUME_STAGE_TIMING": "1",
         "LLAMA_KV_PRESSURE_SAMPLE_INTERVAL_MS": "100",
         "LLAMA_KV_PRESSURE_LOG_INTERVAL_MS": "1000",
         "LLAMA_KV_LOW_WATER_RSS_KB": "1",
@@ -687,11 +825,13 @@ def request_completion(port: int, body: dict[str, Any], label: str, record: path
         choice = value["choices"][0]
         if isinstance(choice, dict) and isinstance(choice.get("text"), str):
             text = choice["text"]
+    response_timings = value.get("timings") if isinstance(value, dict) else None
     item.update({
         "http_status": status,
         "response_raw": raw.decode("utf-8", errors="replace"),
         "response_text": text,
         "response_sha256": sha_bytes(text.encode("utf-8")),
+        "response_timings": response_timings,
         "finished_monotonic_ns": time.monotonic_ns(),
     })
     with record.open("a", encoding="utf-8") as f:
@@ -781,6 +921,7 @@ def run_case(name: str, binary: pathlib.Path, model: pathlib.Path, enabled: bool
     port = free_port()
     result: dict[str, Any] = {"status": "startup_failed", "request_loop_started": False, "port": port}
     proc: subprocess.Popen[bytes] | None = None
+    step2: dict[str, Any] | None = None
     try:
         proc = start(binary, model, case, port, env)
         server_identity = read_process_identity(proc.pid)
@@ -817,18 +958,17 @@ def run_case(name: str, binary: pathlib.Path, model: pathlib.Path, enabled: bool
             })
             capture_resident_observation(case, offload_fields)
             capture_snapshot(case, port, "post_claimant")
-            resume_start = (case / "server.stderr").stat().st_size
-            step2 = request_completion(port, completion_body(prompt_pq, N_PREDICT), "step2", records)
-            resume_end = (case / "server.stderr").stat().st_size
-            dump(case / "resume_scope.json", {
-                "start": resume_start,
-                "end": resume_end,
-                "request_label": "step2",
-                "request_started_monotonic_ns": step2["started_monotonic_ns"],
-                "request_finished_monotonic_ns": step2["finished_monotonic_ns"],
-            })
-        else:
-            step2 = request_completion(port, completion_body(prompt_pq, N_PREDICT), "step2", records)
+
+        resume_start = (case / "server.stderr").stat().st_size
+        step2 = request_completion(port, completion_body(prompt_pq, N_PREDICT), "step2", records)
+        resume_end = (case / "server.stderr").stat().st_size
+        dump(case / "resume_scope.json", {
+            "start": resume_start,
+            "end": resume_end,
+            "request_label": "step2",
+            "request_started_monotonic_ns": step2["started_monotonic_ns"],
+            "request_finished_monotonic_ns": step2["finished_monotonic_ns"],
+        })
 
         if step2["http_status"] != 200:
             raise WorkloadFailure("step2 did not receive HTTP 200")
@@ -848,6 +988,13 @@ def run_case(name: str, binary: pathlib.Path, model: pathlib.Path, enabled: bool
             "pid": None, "pgid": None, "exit_code": None,
             "term_timed_out": False, "kill_timed_out": False, "residual_process": False,
         }
+        if result.get("status") == "complete" and step2 is not None:
+            try:
+                timing = capture_resume_timing(case, step2)
+                result["timing"] = timing["derived"]
+            except (OSError, ValueError, json.JSONDecodeError, WorkloadFailure) as exc:
+                result["status"] = "request_failed"
+                result["timing_error"] = f"{type(exc).__name__}: {exc}"
         backing_cleanup = cleanup_backing(case, backing)
         result["process"] = server_cleanup
         result["backing"] = backing_cleanup

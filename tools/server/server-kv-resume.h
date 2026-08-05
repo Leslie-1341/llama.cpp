@@ -22,6 +22,18 @@ struct server_kv_resume_gate_result {
     bool graph_allowed = true;
 };
 
+struct server_kv_resume_stage_timing {
+    uint64_t decision_id = 0;
+    llama_seq_id seq_id = -1;
+    uint64_t transaction_id = 0;
+    uint32_t restored_blocks = 0;
+    uint64_t restored_bytes = 0;
+    uint64_t queue_us = 0;
+    uint64_t gate_us = 0;
+    uint64_t graph_us = 0;
+    uint64_t total_us = 0;
+};
+
 server_kv_resume_gate_result server_kv_resume_gate(
         const server_kv_resume_ops & ops,
         server_kv_resume_trigger trigger,
@@ -35,3 +47,6 @@ std::string server_kv_resume_format_event(
         llama_seq_id seq_id,
         uint64_t claimant_epoch,
         bool graph_gate);
+
+std::string server_kv_resume_format_stage_timing(
+        const server_kv_resume_stage_timing & timing);

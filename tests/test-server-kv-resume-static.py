@@ -7,6 +7,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 CONTEXT = (ROOT / "tools/server/server-context.cpp").read_text(encoding="utf-8")
 RESUME = (ROOT / "tools/server/server-kv-resume.cpp").read_text(encoding="utf-8")
 ACTION = (ROOT / "src/llama-kv-cache-action.h").read_text(encoding="utf-8")
+TASK = (ROOT / "tools/server/server-task.h").read_text(encoding="utf-8")
 
 
 def function_body(source: str, signature: str) -> str:
@@ -67,6 +68,18 @@ class ServerKvResumeStaticTest(unittest.TestCase):
         self.assertIn("clear_kv_resume_protection();", function_body(CONTEXT, "void prompt_clear(bool allow_processing)"))
         self.assertIn("clear_kv_resume_protection();", function_body(CONTEXT, "void release()"))
         self.assertNotIn("clear_kv_resume_protection", RESUME)
+
+    def test_stage_timing_is_opt_in_and_does_not_change_gate_result(self):
+        self.assertIn("int64_t t_queued_us = 0", TASK)
+        self.assertIn('std::getenv("LLAMA_KV_RESUME_STAGE_TIMING")', CONTEXT)
+        self.assertIn("task.t_queued_us = ctx_server.is_kv_resume_stage_timing_enabled() ? ggml_time_us() : 0;", CONTEXT)
+        update_slots = function_body(CONTEXT, "void update_slots()")
+        self.assertIn("const int64_t gate_start_us = kv_resume_stage_timing ? ggml_time_us() : 0;", update_slots)
+        self.assertIn("if (kv_resume_stage_timing && slot.task && slot.task->t_queued_us > 0)", update_slots)
+        self.assertIn("slot.kv_resume_timing.graph_us += graph_us;", update_slots)
+        self.assertIn("server_kv_resume_format_stage_timing(timing)", update_slots)
+        self.assertLess(update_slots.index("if (!result.graph_allowed)"), update_slots.index("slot.kv_resume_timing = {"))
+        self.assertIn("kv_resume_stage_timing", RESUME)
 
 
 if __name__ == "__main__":

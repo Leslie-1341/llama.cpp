@@ -96,6 +96,18 @@ enum server_state {
     SERVER_STATE_READY,          // Server is ready and model is loaded
 };
 
+struct server_kv_resume_timing_state {
+    bool pending = false;
+    uint64_t decision_id = 0;
+    uint64_t transaction_id = 0;
+    uint32_t restored_blocks = 0;
+    uint64_t restored_bytes = 0;
+    int64_t queued_us = 0;
+    int64_t gate_start_us = 0;
+    int64_t gate_end_us = 0;
+    uint64_t graph_us = 0;
+};
+
 struct server_slot {
     int id;
 
@@ -132,6 +144,7 @@ struct server_slot {
     int32_t n_prompt_tokens_processed = 0;
     int32_t kv_reuse_hint_tokens      = 0;
     bool kv_resume_protected = false;
+    server_kv_resume_timing_state kv_resume_timing;
 
     size_t last_nl_pos = 0;
 
@@ -250,6 +263,7 @@ struct server_slot {
             callback_on_claimant_epoch_invalidate(id);
         }
         n_prompt_tokens_cache = 0;
+        kv_resume_timing = {};
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -720,6 +734,10 @@ public:
         }
     }
 
+    bool is_kv_resume_stage_timing_enabled() const {
+        return kv_resume_stage_timing;
+    }
+
 private:
     // note: accessing these fields outside of this class is not thread-safe
     // use server_context methods instead
@@ -796,6 +814,7 @@ private:
     bool kv_governor_claimant_trace = false;
     bool kv_g0_s1_resident_observation = false;
     bool kv_g0_s1_resident_preflight = false;
+    bool kv_resume_stage_timing = false;
 
     void destroy() {
         spec.reset();
@@ -1774,6 +1793,8 @@ private:
         const char * resident_observation = std::getenv("LLAMA_KV_G0_S1_RESIDENT_OBSERVATION");
         kv_g0_s1_resident_observation = resident_observation && std::strcmp(resident_observation, "1") == 0;
         kv_g0_s1_resident_preflight = resident_observation && std::strcmp(resident_observation, "preflight") == 0;
+        const char * resume_stage_timing = std::getenv("LLAMA_KV_RESUME_STAGE_TIMING");
+        kv_resume_stage_timing = resume_stage_timing && std::strcmp(resume_stage_timing, "1") == 0;
 
 #if defined(__linux__)
         if (!init_kv_pressure_sampler()) {
@@ -3535,6 +3556,7 @@ private:
 
                         if (n_past > 0) {
                             auto * mem = llama_get_memory(ctx_tgt);
+                            const int64_t gate_start_us = kv_resume_stage_timing ? ggml_time_us() : 0;
                             const auto result = server_kv_resume_gate(
                                     mem ? server_kv_resume_ops {
                                         [&slot, mem](llama_seq_id seq_id, bool enabled) {
@@ -3548,6 +3570,7 @@ private:
                                     server_kv_resume_trigger::active_access,
                                     slot.id,
                                     ++kv_decision_next);
+                            const int64_t gate_end_us = kv_resume_stage_timing ? ggml_time_us() : 0;
                             const uint64_t claimant_epoch = kv_governor_state.claimant_epoch(slot.id);
                             SRV_INF("%s\n", server_kv_resume_format_event(
                                     result, slot.id, claimant_epoch, false).c_str());
@@ -3555,6 +3578,19 @@ private:
                                 send_error(slot, server_kv_resume_failure_message(result), ERROR_TYPE_SERVER);
                                 slot.release();
                                 continue;
+                            }
+                            if (kv_resume_stage_timing && slot.task && slot.task->t_queued_us > 0) {
+                                slot.kv_resume_timing = {
+                                    true,
+                                    result.decision_id,
+                                    result.action.core_transaction_id,
+                                    result.action.blocks,
+                                    result.action.bytes,
+                                    slot.task->t_queued_us,
+                                    gate_start_us,
+                                    gate_end_us,
+                                    0,
+                                };
                             }
                             SRV_INF("%s\n", server_kv_resume_format_event(
                                     result, slot.id, claimant_epoch, true).c_str());
@@ -3819,7 +3855,28 @@ private:
                 batch.logits   + i,
             };
 
+            const int64_t graph_start_us = kv_resume_stage_timing ? ggml_time_us() : 0;
             const int ret = llama_decode(ctx_tgt, batch_view);
+            if (kv_resume_stage_timing) {
+                const uint64_t graph_us = (uint64_t) std::max<int64_t>(0, ggml_time_us() - graph_start_us);
+                for (auto & slot : slots) {
+                    if (!slot.kv_resume_timing.pending) {
+                        continue;
+                    }
+                    bool included = false;
+                    for (int32_t token = 0; token < batch_view.n_tokens && !included; ++token) {
+                        for (int32_t seq = 0; seq < batch_view.n_seq_id[token]; ++seq) {
+                            if (batch_view.seq_id[token][seq] == slot.id) {
+                                included = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (included) {
+                        slot.kv_resume_timing.graph_us += graph_us;
+                    }
+                }
+            }
 
             metrics.on_decoded(slots);
 
@@ -4013,6 +4070,22 @@ private:
                 if (slot.n_decoded == 1) {
                     slot.t_start_generation = t_current;
                     slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
+                    if (slot.kv_resume_timing.pending) {
+                        const auto & state = slot.kv_resume_timing;
+                        const server_kv_resume_stage_timing timing {
+                            state.decision_id,
+                            slot.id,
+                            state.transaction_id,
+                            state.restored_blocks,
+                            state.restored_bytes,
+                            (uint64_t) std::max<int64_t>(0, slot.t_start_process_prompt - state.queued_us),
+                            (uint64_t) std::max<int64_t>(0, state.gate_end_us - state.gate_start_us),
+                            state.graph_us,
+                            (uint64_t) std::max<int64_t>(0, t_current - state.queued_us),
+                        };
+                        SRV_INF("%s\n", server_kv_resume_format_stage_timing(timing).c_str());
+                        slot.kv_resume_timing = {};
+                    }
                     metrics.on_prompt_eval(slot);
                 }
 
@@ -4319,6 +4392,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     meta->logit_bias_eog,
                     data);
             task.id_slot = json_value(data, "id_slot", -1);
+            task.t_queued_us = ctx_server.is_kv_resume_stage_timing_enabled() ? ggml_time_us() : 0;
 
             // OAI-compat
             task.params.res_type          = res_type;

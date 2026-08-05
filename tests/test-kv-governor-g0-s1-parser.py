@@ -219,6 +219,43 @@ def resume_line(phase: str) -> str:
     )
 
 
+def resume_timing_line() -> str:
+    return (
+        "kv_resume_stage_timing decision_id=4 seq_id=0 transaction_id=2 "
+        "restored_blocks=2 restored_bytes=4096 queue_us=100 gate_us=260 "
+        "graph_us=300 total_us=900\n"
+    )
+
+
+def prefetch_block_line(index: int, physical_block: int) -> str:
+    return (
+        f"KV_PAGED_PREFETCH_BLOCK_PHASE call=1 block_index={index} physical_block={physical_block} "
+        "validate_us=10 read_us=50 unpack_us=20 commit_us=5 phase_sum_us=85\n"
+    )
+
+
+def prefetch_call_line() -> str:
+    return "KV_PAGED_PREFETCH_PHASE_CALL call=1 seq_id=0 requested_blocks=0 restored_blocks=2 phase_events=2\n"
+
+
+def io_stats_line(active: bool = True) -> str:
+    values = {
+        "block_swap_out_calls": 2 if active else 0,
+        "block_swap_in_calls": 2 if active else 0,
+        "backing_read_syscalls": 2 if active else 0,
+        "backing_write_syscalls": 2 if active else 0,
+        "bytes_read": 4096 if active else 0,
+        "bytes_written": 4096 if active else 0,
+        "avg_block_swap_in_latency_us": 85 if active else 0,
+        "max_block_swap_in_latency_us": 90 if active else 0,
+        "block_in_validate_us": 20 if active else 0,
+        "block_in_read_us": 100 if active else 0,
+        "block_in_unpack_us": 40 if active else 0,
+        "block_in_commit_us": 10 if active else 0,
+    }
+    return "KV_PAGED_IO_STATS " + " ".join(f"{key}={value}" for key, value in values.items()) + "\n"
+
+
 def offsets(text: str, needle: str, occurrence: int = 0) -> tuple[int, int]:
     start = -1
     from_at = 0
@@ -227,6 +264,61 @@ def offsets(text: str, needle: str, occurrence: int = 0) -> tuple[int, int]:
         from_at = start + len(needle)
     end = text.index("\n", start) + 1
     return len(text[:start].encode("utf-8")), len(text[:end].encode("utf-8"))
+
+
+class RunnerTimingCaptureTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.case = pathlib.Path(tempfile.mkdtemp())
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.case)
+
+    def write_valid(self) -> dict:
+        prelude = io_stats_line(False)
+        body = resume_timing_line() + prefetch_block_line(0, 3) + prefetch_block_line(1, 4) + prefetch_call_line()
+        stderr = prelude + body + io_stats_line()
+        (self.case / "server.stderr").write_text(stderr, encoding="utf-8")
+        put(self.case / "resume_scope.json", {
+            "start": len(prelude.encode("utf-8")),
+            "end": len((prelude + body).encode("utf-8")),
+            "request_label": "step2",
+            "request_started_monotonic_ns": 100,
+            "request_finished_monotonic_ns": 200,
+        })
+        return {
+            "response_timings": {
+                "prompt_n": 1,
+                "prompt_ms": 0.9,
+                "predicted_n": 32,
+                "predicted_ms": 320.0,
+                "predicted_per_token_ms": 10.0,
+            },
+        }
+
+    def test_capture_closes_resume_stage_decomposition(self) -> None:
+        value = RUNNER.capture_resume_timing(self.case, self.write_valid())
+        self.assertEqual(value["derived"]["read_us"], 100)
+        self.assertEqual(value["derived"]["restore_us"], 60)
+        self.assertEqual(value["derived"]["commit_us"], 10)
+        self.assertEqual(value["derived"]["graph_us"], 300)
+        self.assertEqual(value["derived"]["gate_overhead_us"], 90)
+        self.assertEqual(value["derived"]["residual_us"], 330)
+        self.assertEqual(value["derived"]["io_bytes"], 4096)
+        self.assertEqual(value["derived"]["io_syscalls"], 2)
+        self.assertEqual(value["io_stats_record_count"], 2)
+        self.assertEqual(value["derived"]["tpot_ms"], 10.0)
+        self.assertTrue((self.case / "timing.json").is_file())
+
+    def test_capture_rejects_duplicate_stage_marker(self) -> None:
+        step2 = self.write_valid()
+        path = self.case / "server.stderr"
+        scope = json.loads((self.case / "resume_scope.json").read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
+        path.write_text(text[:scope["start"]] + resume_timing_line() + text[scope["start"]:], encoding="utf-8")
+        scope["end"] += len(resume_timing_line().encode("utf-8"))
+        put(self.case / "resume_scope.json", scope)
+        with self.assertRaises(RUNNER.WorkloadFailure):
+            RUNNER.capture_resume_timing(self.case, step2)
 
 
 class RawClaimantSchemaTest(unittest.TestCase):
@@ -828,6 +920,7 @@ class RunnerResidentObservationTest(unittest.TestCase):
                     mock.patch.object(RUNNER, "request_completion", side_effect=fake_request),
                     mock.patch.object(RUNNER, "query_slots_raw", return_value=(
                         200, post_raw, post_slots)),
+                    mock.patch.object(RUNNER, "capture_resume_timing", return_value={"derived": {}}),
                     mock.patch.object(RUNNER, "stop", return_value=clean_process)):
                 result = RUNNER.run_case(
                     "GOVERNOR_ON", binary, model, True, root)

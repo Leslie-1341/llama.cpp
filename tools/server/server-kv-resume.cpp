@@ -122,3 +122,19 @@ std::string server_kv_resume_format_event(
         << " graph_allowed=" << (result.graph_allowed ? 1 : 0);
     return out.str();
 }
+
+std::string server_kv_resume_format_stage_timing(
+        const server_kv_resume_stage_timing & timing) {
+    std::ostringstream out;
+    out << "kv_resume_stage_timing"
+        << " decision_id=" << timing.decision_id
+        << " seq_id=" << timing.seq_id
+        << " transaction_id=" << timing.transaction_id
+        << " restored_blocks=" << timing.restored_blocks
+        << " restored_bytes=" << timing.restored_bytes
+        << " queue_us=" << timing.queue_us
+        << " gate_us=" << timing.gate_us
+        << " graph_us=" << timing.graph_us
+        << " total_us=" << timing.total_us;
+    return out.str();
+}
