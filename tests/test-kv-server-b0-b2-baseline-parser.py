@@ -5,9 +5,13 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import pathlib
 import shutil
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -39,6 +43,37 @@ def ident(path: pathlib.Path) -> dict:
 
 def put(path: pathlib.Path, value: object) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+SAMPLE_HEADER = [
+    "elapsed_ms", "pid", "starttime_ticks", "vmrss_kb", "vmhwm_kb",
+    "cgroup_memory_current_bytes", "backing_logical_size", "backing_allocated_bytes",
+]
+
+
+def proc_starttime(pid: int) -> int:
+    text = pathlib.Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    return int(text.rsplit(")", 1)[1].split()[19])
+
+
+def proc_state(pid: int) -> str:
+    text = pathlib.Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    return text.rsplit(")", 1)[1].split()[0]
+
+
+def wait_for_path(path: pathlib.Path, timeout: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.is_file() and path.stat().st_size > 0:
+            return
+        time.sleep(0.005)
+    raise AssertionError(f"timed out waiting for {path}")
+
+
+def read_sample_rows(path: pathlib.Path) -> list[list[str]]:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert lines and lines[0].split("\t") == SAMPLE_HEADER
+    return [line.split("\t") for line in lines[1:]]
 
 
 def offset(text: str, needle: str, occurrence: int = 0) -> tuple[int, int]:
@@ -322,7 +357,7 @@ class BaselineFixture(unittest.TestCase):
         (case / "memory_sampler.stderr").write_bytes(b"")
         (case / "memory_samples.tsv").write_text(
             "elapsed_ms\tpid\tstarttime_ticks\tvmrss_kb\tvmhwm_kb\tcgroup_memory_current_bytes\tbacking_logical_size\tbacking_allocated_bytes\n"
-            f"0\t{pid}\t{starttime}\t100\t150\t{PARSER.NOT_APPLICABLE}\t{PARSER.NOT_APPLICABLE}\t{PARSER.NOT_APPLICABLE}\n",
+            f"0\t{pid}\t{starttime}\t100\t150\t{PARSER.SAMPLE_NOT_APPLICABLE}\t{PARSER.SAMPLE_NOT_APPLICABLE}\t{PARSER.SAMPLE_NOT_APPLICABLE}\n",
             encoding="utf-8")
 
     def write_execution(self, case: pathlib.Path, metadata: dict, name: str, pid: int, starttime: int) -> dict:
@@ -555,8 +590,15 @@ class BaselineFixture(unittest.TestCase):
             "exists_after_cleanup": False,
             "cleanup_error": None,
         } if PARSER.baseline_case_flags(name)["backing"] else {"status": PARSER.NOT_APPLICABLE})
-        process = {"pid": pid, "pgid": pid, "exit_code": 0, "term_timed_out": False, "kill_timed_out": False, "residual_process": False}
-        sampler = {"started": True, "pid": pid + 10_000, "exit_code": 0, "timed_out": False}
+        process = {
+            "pid": pid, "pgid": pid, "exit_code": 0, "stop_requested": True,
+            "stop_signal": "TERM", "term_timed_out": False, "kill_timed_out": False,
+            "residual_process": False,
+        }
+        sampler = {
+            "started": True, "pid": pid + 10_000, "stop_requested": True,
+            "stop_signal": "TERM", "exit_code": 0, "timed_out": False,
+        }
         result = {
             "status": "complete",
             "case": name,
@@ -695,7 +737,7 @@ class BaselineFixture(unittest.TestCase):
         path = self.root / "runs" / "round_1_order_01_CURRENT_E0" / "memory_samples.tsv"
         path.write_text(
             "elapsed_ms\tpid\tstarttime_ticks\tvmrss_kb\tvmhwm_kb\tcgroup_memory_current_bytes\tbacking_logical_size\tbacking_allocated_bytes\n"
-            "0\tNA\t5000\t100\t150\tNOT_APPLICABLE\tNOT_APPLICABLE\tNOT_APPLICABLE\n",
+            "0\tNA\t5000\t100\t150\tNA\tNA\tNA\n",
             encoding="utf-8")
         status, details = self.parse()
         self.assertEqual(status, "FAIL")
@@ -705,11 +747,287 @@ class BaselineFixture(unittest.TestCase):
         path = self.root / "runs" / "round_1_order_01_CURRENT_E0" / "memory_samples.tsv"
         path.write_text(
             "elapsed_ms\tpid\tstarttime_ticks\tvmrss_kb\tvmhwm_kb\tcgroup_memory_current_bytes\tbacking_logical_size\tbacking_allocated_bytes\n"
-            "0\t6001\t99999\t100\t150\tNOT_APPLICABLE\tNOT_APPLICABLE\tNOT_APPLICABLE\n",
+            "0\t6001\t99999\t100\t150\tNA\tNA\tNA\n",
             encoding="utf-8")
         status, details = self.parse()
         self.assertEqual(status, "FAIL")
         self.assertTrue(any("does not bind the server process identity" in detail for detail in details))
+
+    def test_manifest_extra_field_fails_closed(self) -> None:
+        path = self.root / "manifest.json"
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        manifest["unexpected"] = True
+        put(path, manifest)
+        status, details = self.parse()
+        self.assertEqual(status, "FAIL")
+        self.assertTrue(any("extra=['unexpected']" in detail for detail in details))
+
+    def test_memory_sample_missing_column_fails_closed(self) -> None:
+        path = self.root / "runs" / "round_1_order_01_CURRENT_E0" / "memory_samples.tsv"
+        path.write_text("\t".join(SAMPLE_HEADER) + "\n0\t1\t2\t100\t150\tNA\tNA\n", encoding="utf-8")
+        status, details = self.parse()
+        self.assertEqual(status, "FAIL")
+        self.assertTrue(any("has 7 columns; expected 8" in detail for detail in details))
+
+    def test_memory_sample_extra_column_fails_closed(self) -> None:
+        path = self.root / "runs" / "round_1_order_01_CURRENT_E0" / "memory_samples.tsv"
+        path.write_text("\t".join(SAMPLE_HEADER) + "\n0\t1\t2\t100\t150\tNA\tNA\tNA\textra\n", encoding="utf-8")
+        status, details = self.parse()
+        self.assertEqual(status, "FAIL")
+        self.assertTrue(any("has 9 columns; expected 8" in detail for detail in details))
+
+    def test_memory_sample_none_sentinel_fails_closed(self) -> None:
+        path = self.root / "runs" / "round_1_order_01_CURRENT_E0" / "memory_samples.tsv"
+        path.write_text("\t".join(SAMPLE_HEADER) + "\n0\t1\t2\t100\t150\tNA\tNone\tNA\n", encoding="utf-8")
+        status, details = self.parse()
+        self.assertEqual(status, "FAIL")
+        self.assertTrue(any("invalid sentinel" in detail for detail in details))
+
+    def test_two_failed_runs_are_all_reported_with_full_identity(self) -> None:
+        for round_no, order, name in PARSER.BASELINE_RUN_PLAN[:2]:
+            path = self.root / "runs" / f"round_{round_no}_order_{order:02d}_{name}" / "result.json"
+            result = json.loads(path.read_text(encoding="utf-8"))
+            result.update({"status": "request_failed", "workload_error": f"failure-{name}"})
+            put(path, result)
+        status, details = self.parse()
+        self.assertEqual(status, "FAIL")
+        self.assertTrue(any("round=1 order=1 case=CURRENT_E0" in detail for detail in details))
+        self.assertTrue(any("round=1 order=2 case=FLEXKV_RESIDENT" in detail for detail in details))
+
+    def test_server_exit_code_must_bind_active_stop(self) -> None:
+        path = self.root / "runs" / "round_1_order_01_CURRENT_E0" / "cleanup.json"
+        cleanup = json.loads(path.read_text(encoding="utf-8"))
+        cleanup["server"]["stop_requested"] = False
+        cleanup["server"]["stop_signal"] = PARSER.NOT_APPLICABLE
+        cleanup["server"]["exit_code"] = -15
+        put(path, cleanup)
+        result_path = path.parent / "result.json"
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        result["process"] = cleanup["server"]
+        put(result_path, result)
+        status, details = self.parse()
+        self.assertEqual(status, "FAIL")
+        self.assertTrue(any("exit_code binding" in detail for detail in details))
+
+
+class RealSamplerTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = pathlib.Path(tempfile.mkdtemp(prefix="kv-real-sampler-"))
+        self.processes: list[subprocess.Popen[bytes]] = []
+
+    def tearDown(self) -> None:
+        for proc in self.processes:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=2)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def target(self, duration: float = 2.0) -> subprocess.Popen[bytes]:
+        proc = subprocess.Popen([
+            sys.executable, "-c", f"import time; time.sleep({duration})",
+        ])
+        self.processes.append(proc)
+        return proc
+
+    def sampler(self, mode: str, pid: int, output: pathlib.Path, env: dict[str, str] | None = None) -> subprocess.Popen[bytes]:
+        return subprocess.Popen([
+            "bash", str(SAMPLER_PATH), mode, str(pid), str(output), "", "0.01", "",
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+
+    @staticmethod
+    def sampler_result(sampler: subprocess.Popen[bytes], timeout: float = 3.0) -> tuple[int, str]:
+        _stdout, stderr = sampler.communicate(timeout=timeout)
+        return sampler.returncode, stderr.decode("utf-8", errors="replace")
+
+    def test_direct_pid_binds_fixed_identity_and_finishes_after_exit(self) -> None:
+        target = self.target()
+        starttime = proc_starttime(target.pid)
+        output = self.tmp / "direct.tsv"
+        sampler = self.sampler("--sample-process", target.pid, output)
+        time.sleep(0.05)
+        target.terminate()
+        target.wait(timeout=2)
+        sampler_rc, sampler_stderr = self.sampler_result(sampler, 2)
+        self.assertEqual(sampler_rc, 0, sampler_stderr)
+        rows = read_sample_rows(output)
+        self.assertTrue(rows)
+        self.assertTrue(all(row[1] == str(target.pid) and row[2] == str(starttime) for row in rows))
+
+    def test_wrapper_child_is_bound_once(self) -> None:
+        wrapper = subprocess.Popen([
+            "timeout", "0.35", sys.executable, "-c", "import time; time.sleep(5)",
+        ])
+        self.processes.append(wrapper)
+        output = self.tmp / "wrapper.tsv"
+        sampler = self.sampler("--sample-wrapper", wrapper.pid, output)
+        sampler_rc, sampler_stderr = self.sampler_result(sampler)
+        self.assertEqual(sampler_rc, 0, sampler_stderr)
+        wrapper.wait(timeout=3)
+        rows = read_sample_rows(output)
+        self.assertTrue(rows)
+        self.assertNotEqual(rows[0][1], str(wrapper.pid))
+        self.assertTrue(all(row[1] == rows[0][1] and row[2] == rows[0][2] for row in rows))
+
+    def test_unwaited_zombie_is_a_normal_end(self) -> None:
+        child_path = self.tmp / "child.pid"
+        script = (
+            "import os, pathlib, time\n"
+            "pid = os.fork()\n"
+            f"if pid != 0: pathlib.Path({str(child_path)!r}).write_text(str(pid))\n"
+            "if pid == 0:\n"
+            "    time.sleep(0.15); os._exit(0)\n"
+            "time.sleep(1.5)\n"
+        )
+        parent = subprocess.Popen([sys.executable, "-c", script])
+        self.processes.append(parent)
+        wait_for_path(child_path)
+        child_pid = int(child_path.read_text(encoding="utf-8"))
+        output = self.tmp / "zombie.tsv"
+        sampler = self.sampler("--sample-process", child_pid, output)
+        sampler_rc, sampler_stderr = self.sampler_result(sampler)
+        self.assertEqual(sampler_rc, 0, sampler_stderr)
+        self.assertEqual(proc_state(child_pid), "Z")
+        parent.terminate()
+        parent.wait(timeout=2)
+
+    def test_active_sampler_stop_returns_zero_without_stopping_target(self) -> None:
+        target = self.target(3.0)
+        output = self.tmp / "stop.tsv"
+        sampler = self.sampler("--sample-process", target.pid, output)
+        time.sleep(0.05)
+        sampler.terminate()
+        sampler_rc, sampler_stderr = self.sampler_result(sampler, 2)
+        self.assertEqual(sampler_rc, 0, sampler_stderr)
+        self.assertIsNone(target.poll())
+
+    def test_live_read_failure_is_not_treated_as_process_exit(self) -> None:
+        target = self.target(3.0)
+        fake_bin = self.tmp / "fake-bin"
+        fake_bin.mkdir()
+        fake_awk = fake_bin / "awk"
+        fake_awk.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        fake_awk.chmod(0o755)
+        env = dict(os.environ)
+        env["PATH"] = f"{fake_bin}:{env['PATH']}"
+        output = self.tmp / "read-failure.tsv"
+        sampler = self.sampler("--sample-process", target.pid, output, env)
+        sampler_rc, sampler_stderr = self.sampler_result(sampler, 2)
+        self.assertEqual(sampler_rc, 8)
+        self.assertIn("live process RSS read failed", sampler_stderr)
+
+    def test_sleep_failure_propagates(self) -> None:
+        target = self.target(3.0)
+        fake_bin = self.tmp / "fake-sleep-bin"
+        fake_bin.mkdir()
+        fake_sleep = fake_bin / "sleep"
+        fake_sleep.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        fake_sleep.chmod(0o755)
+        env = dict(os.environ)
+        env["PATH"] = f"{fake_bin}:{env['PATH']}"
+        output = self.tmp / "sleep-failure.tsv"
+        sampler = self.sampler("--sample-process", target.pid, output, env)
+        sampler_rc, sampler_stderr = self.sampler_result(sampler, 2)
+        self.assertEqual(sampler_rc, 12)
+        self.assertIn("sleep failed", sampler_stderr)
+
+    def test_starttime_change_fails_closed(self) -> None:
+        target = self.target(3.0)
+        output = self.tmp / "starttime.tsv"
+        starttime = proc_starttime(target.pid)
+        shell = f"""
+source {str(SAMPLER_PATH)!r}
+calls=0
+kv_controlled_read_proc_stat() {{
+    calls=$((calls + 1))
+    KV_CONTROLLED_PROC_STATE=R
+    if (( calls == 1 )); then
+        KV_CONTROLLED_PROC_STARTTIME={starttime}
+    else
+        KV_CONTROLLED_PROC_STARTTIME=$(( {starttime} + 1 ))
+    fi
+}}
+kv_controlled_sample_bound_process {target.pid} {starttime} {str(output)!r} '' 0.01 ''
+exit $?
+"""
+        completed = subprocess.run(["bash", "-c", shell], text=True, capture_output=True, check=False)
+        self.assertEqual(completed.returncode, 9, completed.stderr)
+        self.assertIn("starttime changed", completed.stderr)
+
+    def test_output_write_failure_propagates(self) -> None:
+        target = self.target()
+        output_dir = self.tmp / "output-dir"
+        output_dir.mkdir()
+        sampler = self.sampler("--sample-process", target.pid, output_dir)
+        sampler_rc, sampler_stderr = self.sampler_result(sampler, 2)
+        self.assertEqual(sampler_rc, 10)
+        self.assertIn("cannot write output header", sampler_stderr)
+
+    def test_row_write_failure_propagates(self) -> None:
+        target = self.target(3.0)
+        fake_bin = self.tmp / "fake-awk-bin"
+        fake_bin.mkdir()
+        fake_awk = fake_bin / "awk"
+        real_awk = shutil.which("awk")
+        self.assertIsNotNone(real_awk)
+        fake_awk.write_text(
+            f"#!/bin/sh\n/usr/bin/sleep 0.2\nexec {real_awk} \"$@\"\n",
+            encoding="utf-8")
+        fake_awk.chmod(0o755)
+        env = dict(os.environ)
+        env["PATH"] = f"{fake_bin}:{env['PATH']}"
+        output = self.tmp / "row-failure.tsv"
+        sampler = self.sampler("--sample-process", target.pid, output, env)
+        wait_for_path(output)
+        output.unlink()
+        output.mkdir()
+        sampler_rc, sampler_stderr = self.sampler_result(sampler, 2)
+        self.assertEqual(sampler_rc, 11)
+        self.assertIn("cannot write sample row", sampler_stderr)
+
+    def test_one_hundred_short_lifetimes_leave_no_sampler_failure(self) -> None:
+        for index in range(100):
+            target = self.target(0.2)
+            output = self.tmp / f"short-{index}.tsv"
+            sampler = self.sampler("--sample-process", target.pid, output)
+            deadline = time.monotonic() + 1.0
+            while not output.exists() and sampler.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.001)
+            self.assertTrue(output.exists(), f"iteration {index}: sampler did not bind")
+            target.terminate()
+            target.wait(timeout=2)
+            sampler_rc, sampler_stderr = self.sampler_result(sampler, 2)
+            self.assertEqual(sampler_rc, 0, f"iteration {index}: {sampler_stderr}")
+
+    def test_runner_stop_reaps_process_group(self) -> None:
+        case = self.tmp / "runner-case"
+        case.mkdir()
+        command = (
+            "import subprocess, sys, time; "
+            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+            "time.sleep(30)"
+        )
+        proc = RUNNER.start(case, [sys.executable, "-c", command], dict(os.environ))
+        cleanup = RUNNER.stop(proc)
+        self.assertTrue(cleanup["stop_requested"])
+        self.assertEqual(cleanup["stop_signal"], "TERM")
+        self.assertFalse(cleanup["residual_process"])
+        self.assertFalse(cleanup["term_timed_out"])
+        self.assertFalse(cleanup["kill_timed_out"])
+        self.assertEqual(cleanup["exit_code"], -15)
+        members = []
+        for entry in pathlib.Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                if os.getpgid(int(entry.name)) == cleanup["pgid"]:
+                    members.append(int(entry.name))
+            except (OSError, ProcessLookupError):
+                pass
+        self.assertEqual(members, [])
 
 
 class RunnerContractTest(unittest.TestCase):

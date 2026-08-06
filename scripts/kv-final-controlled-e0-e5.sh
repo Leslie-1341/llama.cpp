@@ -444,13 +444,18 @@ PY
         env "${unset_args[@]}" "${env_values[@]}" "$BINARY" "${COMMON_ARGS[@]}" \
         > "$run_dir/stdout" 2> "$run_dir/stderr" &
     wrapper_pid=$!
-    kv_controlled_sample_process "$wrapper_pid" "$run_dir/memory_samples.tsv" "$swap_dir" "$SAMPLE_INTERVAL_SEC" "$CGROUP_CURRENT_FILE" &
+    kv_controlled_sample_wrapper "$wrapper_pid" "$run_dir/memory_samples.tsv" "$swap_dir" "$SAMPLE_INTERVAL_SEC" "$CGROUP_CURRENT_FILE" &
     sampler_pid=$!
     wait "$wrapper_pid"
     rc=$?
-    wait "$sampler_pid" 2>/dev/null || true
+    sampler_rc=0
+    wait "$sampler_pid" 2>/dev/null || sampler_rc=$?
+    if [[ "$rc" == "0" && "$sampler_rc" != "0" ]]; then
+        rc="$sampler_rc"
+    fi
     set -e
     printf '%s\n' "$rc" > "$run_dir/exit_code"
+    printf '%s\n' "$sampler_rc" > "$run_dir/sampler_exit_code"
     extract_section "$run_dir/stdout" '===SEQ0_RESUME_BEGIN===' '===SEQ0_RESUME_END===' "$run_dir/seq0"
     extract_section "$run_dir/stdout" '===SEQ1_ACTIVE_BEGIN===' '===SEQ1_ACTIVE_END===' "$run_dir/seq1"
     sha256sum "$run_dir/seq0" > "$run_dir/seq0.sha256"

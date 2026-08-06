@@ -14,8 +14,9 @@ from typing import Any, Callable
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 BASELINE_PROTOCOL = "kv_server_b0_b2_baseline"
-BASELINE_PROTOCOL_VERSION = 1
+BASELINE_PROTOCOL_VERSION = 2
 NOT_APPLICABLE = "NOT_APPLICABLE"
+SAMPLE_NOT_APPLICABLE = "NA"
 SOURCE_MARKER_SCHEMA = "kv_governor_stage3c_1c_2b_1r/v6"
 MARKER = "kv_pressure_unified_action"
 RESUME_MARKER = "kv_resume_order_event"
@@ -1212,8 +1213,10 @@ def baseline_validate_manifest(manifest: Any, errors: list[str]) -> bool:
         "case_names", "comparison_edges", "planned_runs", "run_results", "runner_status",
     }
     missing = required - set(manifest)
-    if missing:
-        errors.append(f"baseline manifest missing {sorted(missing)}")
+    extra = set(manifest) - required
+    if missing or extra:
+        errors.append(
+            f"baseline manifest schema mismatch missing={sorted(missing)} extra={sorted(extra)}")
     if manifest.get("protocol") != BASELINE_PROTOCOL or manifest.get("protocol_version") != BASELINE_PROTOCOL_VERSION:
         errors.append("baseline protocol mismatch")
     if manifest.get("source_marker_schema") != SOURCE_MARKER_SCHEMA:
@@ -1548,8 +1551,12 @@ def baseline_validate_memory(
             elif backing != NOT_APPLICABLE:
                 errors.append(f"{label} non-backing case reports backing evidence")
     sampler = result.get("memory_sampler")
-    if (not isinstance(sampler, dict) or sampler.get("started") is not True or
-            not is_positive_int(sampler.get("pid")) or sampler.get("exit_code") != 0 or sampler.get("timed_out") is not False):
+    sampler_required = {
+        "started", "pid", "stop_requested", "stop_signal", "exit_code", "timed_out",
+    }
+    if (not isinstance(sampler, dict) or set(sampler) != sampler_required or
+            sampler.get("started") is not True or not is_positive_int(sampler.get("pid")) or
+            sampler.get("exit_code") != 0 or sampler.get("timed_out") is not False):
         errors.append(f"{name}: memory sampler did not cleanly complete")
     stderr = case / "memory_sampler.stderr"
     if not stderr.is_file() or stderr.read_bytes():
@@ -1562,45 +1569,60 @@ def baseline_validate_memory(
     if not samples.is_file():
         errors.append(f"{name}: memory sampler output is missing")
         return
+    rows: list[dict[str, str]] = []
+    data_row_count = 0
     try:
         with samples.open(encoding="utf-8", newline="") as handle:
-            reader = csv.DictReader(handle, delimiter="\t")
-            rows = list(reader)
-            if reader.fieldnames != expected_header:
+            reader = csv.reader(handle, delimiter="\t")
+            header = next(reader, None)
+            if header != expected_header:
                 errors.append(f"{name}: memory sampler header differs from the shared schema")
-    except OSError as exc:
+            else:
+                for line_number, fields in enumerate(reader, 2):
+                    data_row_count += 1
+                    if len(fields) != len(expected_header):
+                        errors.append(
+                            f"{name}: memory sample line {line_number} has {len(fields)} columns; "
+                            f"expected {len(expected_header)}")
+                        continue
+                    if any(value == "None" or value == "" for value in fields):
+                        errors.append(f"{name}: memory sample line {line_number} contains an invalid sentinel or empty field")
+                        continue
+                    rows.append(dict(zip(expected_header, fields)))
+    except (OSError, UnicodeError, csv.Error) as exc:
         errors.append(f"{name}: cannot read memory sampler output: {exc}")
         return
-    if not rows:
+    if data_row_count == 0:
         errors.append(f"{name}: memory sampler captured zero samples")
         return
     for index, row in enumerate(rows):
         label = f"{name}: memory sample[{index}]"
         try:
-            elapsed = int(row.get("elapsed_ms", ""))
-            pid = int(row.get("pid", ""))
-            starttime = int(row.get("starttime_ticks", ""))
-            vmrss = int(row.get("vmrss_kb", ""))
-            vmhwm = int(row.get("vmhwm_kb", ""))
-        except ValueError:
+            elapsed = int(row["elapsed_ms"])
+            pid = int(row["pid"])
+            starttime = int(row["starttime_ticks"])
+            vmrss = int(row["vmrss_kb"])
+            vmhwm = int(row["vmhwm_kb"])
+        except (KeyError, ValueError):
             errors.append(f"{label} lacks numeric process identity/RSS")
             continue
         if (elapsed < 0 or pid != identity.get("pid") or starttime != identity.get("starttime_ticks") or
                 vmrss <= 0 or vmhwm < vmrss):
             errors.append(f"{label} does not bind the server process identity")
-        current = row.get("cgroup_memory_current_bytes")
+        current = row["cgroup_memory_current_bytes"]
         if cgroup.get("version") == "none":
-            if current != NOT_APPLICABLE:
+            if current != SAMPLE_NOT_APPLICABLE:
                 errors.append(f"{label} has invalid unavailable cgroup value")
-        elif current is None or not current.isdigit():
+        elif not current.isdigit():
             errors.append(f"{label} lacks cgroup memory.current")
-        for key in ("backing_logical_size", "backing_allocated_bytes"):
-            value = row.get(key)
-            if baseline_case_flags(name)["backing"]:
-                if value not in {NOT_APPLICABLE, "NA", None} and not str(value).isdigit():
-                    errors.append(f"{label} {key} is invalid")
-            elif value not in {NOT_APPLICABLE, "NA"}:
-                errors.append(f"{label} non-backing case has {key}")
+        backing_values = [row[key] for key in ("backing_logical_size", "backing_allocated_bytes")]
+        if baseline_case_flags(name)["backing"]:
+            if not all(value == SAMPLE_NOT_APPLICABLE or value.isdigit() for value in backing_values):
+                errors.append(f"{label} backing observation is invalid")
+            elif (backing_values[0] == SAMPLE_NOT_APPLICABLE) != (backing_values[1] == SAMPLE_NOT_APPLICABLE):
+                errors.append(f"{label} backing observation uses inconsistent sentinels")
+        elif any(value != SAMPLE_NOT_APPLICABLE for value in backing_values):
+            errors.append(f"{label} non-backing case has backing evidence")
 
 
 def baseline_validate_step2_metrics(
@@ -1900,15 +1922,50 @@ def baseline_validate_cleanup(
     for cleanup_key, result_key in result_keys.items():
         if result.get(result_key) != cleanup.get(cleanup_key):
             errors.append(f"{name}: result {result_key} does not bind cleanup {cleanup_key} evidence")
+
     server = cleanup.get("server")
     identity = execution.get("server_identity") if isinstance(execution, dict) else None
-    server_required = {"pid", "pgid", "exit_code", "term_timed_out", "kill_timed_out", "residual_process"}
+    server_required = {
+        "pid", "pgid", "exit_code", "stop_requested", "stop_signal",
+        "term_timed_out", "kill_timed_out", "residual_process",
+    }
     if not isinstance(server, dict) or set(server) != server_required:
         errors.append(f"{name}: server cleanup schema mismatch")
-    elif (not isinstance(identity, dict) or server.get("pid") != identity.get("pid") or
-            server.get("term_timed_out") is not False or server.get("kill_timed_out") is not False or
-            server.get("residual_process") is not False):
-        errors.append(f"{name}: server cleanup is incomplete or unbound")
+    else:
+        if (not isinstance(identity, dict) or server.get("pid") != identity.get("pid") or
+                not is_positive_int(server.get("pgid")) or
+                not isinstance(server.get("stop_requested"), bool) or
+                server.get("term_timed_out") is not False or
+                server.get("kill_timed_out") is not False or
+                server.get("residual_process") is not False):
+            errors.append(f"{name}: server cleanup is incomplete or unbound")
+        stop_requested = server.get("stop_requested")
+        stop_signal = server.get("stop_signal")
+        exit_code = server.get("exit_code")
+        valid_exit_code = isinstance(exit_code, int) and not isinstance(exit_code, bool)
+        if stop_requested:
+            if stop_signal != "TERM" or not valid_exit_code or exit_code not in {0, -15}:
+                errors.append(f"{name}: actively stopped server has an invalid exit_code binding")
+        elif stop_signal != NOT_APPLICABLE or not valid_exit_code or exit_code != 0:
+            errors.append(f"{name}: naturally completed server lacks a clean exit_code binding")
+
+    sampler = cleanup.get("memory_sampler")
+    sampler_required = {
+        "started", "pid", "stop_requested", "stop_signal", "exit_code", "timed_out",
+    }
+    if not isinstance(sampler, dict) or set(sampler) != sampler_required:
+        errors.append(f"{name}: memory sampler cleanup schema mismatch")
+    elif (sampler.get("started") is not True or not is_positive_int(sampler.get("pid")) or
+          not isinstance(sampler.get("stop_requested"), bool) or
+          sampler.get("timed_out") is not False):
+        errors.append(f"{name}: memory sampler cleanup is incomplete")
+    else:
+        sampler_exit_code = sampler.get("exit_code")
+        if (sampler.get("stop_signal") != ("TERM" if sampler.get("stop_requested") else NOT_APPLICABLE) or
+                not isinstance(sampler_exit_code, int) or isinstance(sampler_exit_code, bool) or
+                sampler_exit_code != 0):
+            errors.append(f"{name}: memory sampler exit does not bind its stop request")
+
     backing = cleanup.get("backing")
     if baseline_case_flags(name)["backing"]:
         expected_path = str((case / "backing").resolve())
@@ -1932,20 +1989,28 @@ def load_baseline_case(
         manifest: dict[str, Any],
         errors: list[str]) -> dict[str, Any]:
     name = metadata["case"]
+    run_label = (
+        f"round={metadata['round']} order={metadata['run_order']} case={name}")
+    local_errors: list[str] = []
+
+    def finish(value: dict[str, Any]) -> dict[str, Any]:
+        errors.extend(f"{run_label}: {detail}" for detail in local_errors)
+        return value
+
     try:
         result = read_json(case / "result.json")
     except Error as exc:
-        errors.append(str(exc))
-        return {"upstream_failure": True}
+        local_errors.append(str(exc))
+        return finish({"upstream_failure": True})
     if not isinstance(result, dict):
-        errors.append(f"{name}: result schema is invalid")
-        return {"upstream_failure": True}
+        local_errors.append(f"{name}: result schema is invalid")
+        return finish({"upstream_failure": True})
     if result.get("status") != "complete" or result.get("request_loop_started") is not True:
         reason = result.get("workload_error")
         if not is_nonempty_string(reason):
             reason = result.get("cleanup_error")
-        errors.append(f"{name}: {reason if is_nonempty_string(reason) else 'workload did not complete'}")
-        return {"upstream_failure": True, "result": result}
+        local_errors.append(f"{name}: {reason if is_nonempty_string(reason) else 'workload did not complete'}")
+        return finish({"upstream_failure": True, "result": result})
     required_files = {
         "execution.json", "environment.json", "requests.jsonl", "server.stdout", "server.stderr",
         "memory_sampler.stderr", "memory_samples.tsv", "memory_phases.json", "resume_scope.json",
@@ -1954,7 +2019,7 @@ def load_baseline_case(
     required_files |= {path for path in baseline_evidence_paths(name).values() if path != NOT_APPLICABLE}
     for filename in sorted(required_files):
         if not (case / filename).is_file():
-            errors.append(f"{name}: missing {filename}")
+            local_errors.append(f"{name}: missing {filename}")
     expected_result = {
         "status": "complete",
         "case": metadata["case"],
@@ -1967,60 +2032,60 @@ def load_baseline_case(
     }
     for key, value in expected_result.items():
         if result.get(key) != value:
-            errors.append(f"{name}: result {key} differs from the fixed case contract")
-    execution, _environment, argv = baseline_validate_execution(case, metadata, manifest, errors)
+            local_errors.append(f"{name}: result {key} differs from the fixed case contract")
+    execution, _environment, argv = baseline_validate_execution(case, metadata, manifest, local_errors)
     raw = (case / "server.stderr").read_bytes() if (case / "server.stderr").is_file() else b""
-    rows = rows_by_label(read_rows(case / "requests.jsonl", errors), name, errors)
-    validate_request_pair(rows, name, errors, step2_stream=True)
-    baseline_validate_stream_step2(rows.get("step2"), name, errors)
-    workload = validate_workload(case, name, result, rows, manifest, errors)
-    baseline_validate_step2_metrics(case, rows, errors)
-    baseline_validate_memory(case, name, execution, result, errors)
-    baseline_validate_cleanup(case, name, execution, result, errors)
-    scope = validate_resume_scope(case, raw, rows.get("step2"), name, errors)
+    rows = rows_by_label(read_rows(case / "requests.jsonl", local_errors), name, local_errors)
+    validate_request_pair(rows, name, local_errors, step2_stream=True)
+    baseline_validate_stream_step2(rows.get("step2"), name, local_errors)
+    workload = validate_workload(case, name, result, rows, manifest, local_errors)
+    baseline_validate_step2_metrics(case, rows, local_errors)
+    baseline_validate_memory(case, name, execution, result, local_errors)
+    baseline_validate_cleanup(case, name, execution, result, local_errors)
+    scope = validate_resume_scope(case, raw, rows.get("step2"), name, local_errors)
 
-    capability = baseline_validate_capability(case, raw, name, errors)
+    capability = baseline_validate_capability(case, raw, name, local_errors)
     if capability is not None and result.get("capability") != capability:
-        errors.append(f"{name}: result capability differs from raw marker")
-    markers = token_lines(raw, MARKER, parse_marker, f"{case}/server.stderr", errors)
+        local_errors.append(f"{name}: result capability differs from raw marker")
+    markers = token_lines(raw, MARKER, parse_marker, f"{case}/server.stderr", local_errors)
     if name in {"CURRENT_E0", "FLEXKV_RESIDENT"} and markers:
-        errors.append(f"{name}: Governor action marker is present while actions are disabled")
+        local_errors.append(f"{name}: Governor action marker is present while actions are disabled")
     if name == "CURRENT_E0":
         if result.get("offload") != NOT_APPLICABLE or result.get("timing") != NOT_APPLICABLE:
-            errors.append("CURRENT_E0: offload/restore evidence must be NOT_APPLICABLE")
+            local_errors.append("CURRENT_E0: offload/restore evidence must be NOT_APPLICABLE")
     elif name == "FLEXKV_RESIDENT":
         if result.get("offload") != NOT_APPLICABLE or result.get("timing") != NOT_APPLICABLE:
-            errors.append("FLEXKV_RESIDENT: offload/restore evidence must be NOT_APPLICABLE")
-        baseline_validate_resident(case, execution, errors)
+            local_errors.append("FLEXKV_RESIDENT: offload/restore evidence must be NOT_APPLICABLE")
+        baseline_validate_resident(case, execution, local_errors)
     else:
         pre, _pre_stderr_end, _pre_observed = validate_snapshot(
-            case, "pre_offload_claimant.json", "FLEXKV_K1_SYNC", errors)
+            case, "pre_offload_claimant.json", "FLEXKV_K1_SYNC", local_errors)
         step1 = rows.get("step1", {})
         prompt = step1.get("request", {}).get("prompt") if isinstance(step1, dict) else None
         expected_blocks = len(prompt) // PAGED_BLOCK_SIZE if isinstance(prompt, list) else None
         if pre is not None and expected_blocks is not None and (
                 pre["target_blocks"] != expected_blocks or pre["eligible_resident_blocks"] != expected_blocks or
                 pre["swapped_blocks"] != 0 or pre["active"] or pre["exhausted"] or not pre["valid"]):
-            errors.append("FLEXKV_K1_SYNC: pre-offload claimant is not a complete resident prefix")
+            local_errors.append("FLEXKV_K1_SYNC: pre-offload claimant is not a complete resident prefix")
         post, post_stderr_end, post_observed = validate_snapshot(
-            case, "post_claimant.json", "FLEXKV_K1_SYNC", errors)
+            case, "post_claimant.json", "FLEXKV_K1_SYNC", local_errors)
         epoch, last_offload_end = baseline_validate_k1_transactions(
             case, raw, execution.get("server_identity") if isinstance(execution, dict) else None,
-            post, expected_blocks, scope[0], "FLEXKV_K1_SYNC", errors)
-        validate_resume(case, raw, scope[0], scope[1], last_offload_end, epoch, "FLEXKV_K1_SYNC", errors)
+            post, expected_blocks, scope[0], "FLEXKV_K1_SYNC", local_errors)
+        validate_resume(case, raw, scope[0], scope[1], last_offload_end, epoch, "FLEXKV_K1_SYNC", local_errors)
         if last_offload_end is not None and post_stderr_end is not None and post_stderr_end != scope[0]:
-            errors.append("FLEXKV_K1_SYNC: post-offload claimant does not bind the step2 boundary")
+            local_errors.append("FLEXKV_K1_SYNC: post-offload claimant does not bind the step2 boundary")
         if isinstance(rows.get("step2"), dict) and post_observed is not None and post_observed >= rows["step2"].get("started_monotonic_ns", 0):
-            errors.append("FLEXKV_K1_SYNC: post-offload claimant is not before step2")
+            local_errors.append("FLEXKV_K1_SYNC: post-offload claimant is not before step2")
         try:
             offload = read_json(case / "offload.json")
         except Error as exc:
-            errors.append(str(exc))
+            local_errors.append(str(exc))
         else:
             if isinstance(offload, dict) and result.get("offload") != offload.get("cumulative"):
-                errors.append("FLEXKV_K1_SYNC: result offload summary differs from raw transactions")
-        baseline_validate_k1_timing(case, raw, scope, rows, errors)
-    return {
+                local_errors.append("FLEXKV_K1_SYNC: result offload summary differs from raw transactions")
+        baseline_validate_k1_timing(case, raw, scope, rows, local_errors)
+    return finish({
         "metadata": metadata,
         "case": case,
         "result": result,
@@ -2028,7 +2093,7 @@ def load_baseline_case(
         "argv": argv,
         "rows": rows,
         "workload": workload,
-    }
+    })
 
 
 def baseline_validate_comparisons(
@@ -2151,9 +2216,8 @@ def main_parse_baseline(root: pathlib.Path, manifest: dict[str, Any]) -> tuple[s
     runs: list[dict[str, Any]] = []
     for metadata, case in pairs:
         item = load_baseline_case(case, metadata, manifest, errors)
-        if item.get("upstream_failure"):
-            return "FAIL", errors
-        runs.append(item)
+        if not item.get("upstream_failure"):
+            runs.append(item)
     comparisons = baseline_validate_comparisons(runs, errors)
     if errors:
         return "FAIL", errors

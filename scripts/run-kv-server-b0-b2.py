@@ -21,7 +21,7 @@ from typing import Any
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 BASELINE_PROTOCOL = "kv_server_b0_b2_baseline"
-BASELINE_PROTOCOL_VERSION = 1
+BASELINE_PROTOCOL_VERSION = 2
 NOT_APPLICABLE = "NOT_APPLICABLE"
 MEMORY_SAMPLER = ROOT / "scripts/kv-controlled-memory-sampler.sh"
 SOURCE_MARKER_SCHEMA = "kv_governor_stage3c_1c_2b_1r/v6"
@@ -569,6 +569,8 @@ def cleanup_backing(case: pathlib.Path, backing: pathlib.Path) -> dict[str, Any]
 
 
 def stop(proc: subprocess.Popen[bytes]) -> dict[str, Any]:
+    stop_requested = proc.poll() is None
+    stop_signal = "TERM" if stop_requested else NOT_APPLICABLE
     try:
         pgid = os.getpgid(proc.pid)
     except ProcessLookupError:
@@ -615,6 +617,8 @@ def stop(proc: subprocess.Popen[bytes]) -> dict[str, Any]:
         "pid": proc.pid,
         "pgid": pgid,
         "exit_code": exit_code,
+        "stop_requested": stop_requested,
+        "stop_signal": stop_signal,
         "term_timed_out": term_timed_out,
         "kill_timed_out": kill_timed_out,
         "residual_process": residual,
@@ -774,28 +778,53 @@ def start_memory_sampler(
         cgroup: dict[str, Any]) -> subprocess.Popen[bytes]:
     if not MEMORY_SAMPLER.is_file():
         raise WorkloadFailure(f"shared memory sampler is unavailable: {MEMORY_SAMPLER}")
-    return subprocess.Popen(
-        memory_sampler_argv(case, proc.pid, backing, cgroup),
-        stdout=subprocess.DEVNULL,
-        stderr=(case / "memory_sampler.stderr").open("wb"),
-    )
+    stderr_path = case / "memory_sampler.stderr"
+    stderr_handle = stderr_path.open("wb")
+    try:
+        return subprocess.Popen(
+            memory_sampler_argv(case, proc.pid, backing, cgroup),
+            stdout=subprocess.DEVNULL,
+            stderr=stderr_handle,
+        )
+    finally:
+        stderr_handle.close()
 
 
 def stop_memory_sampler(proc: subprocess.Popen[bytes] | None) -> dict[str, Any]:
     if proc is None:
-        return {"started": False, "exit_code": NOT_APPLICABLE, "timed_out": False}
+        return {
+            "started": False,
+            "pid": None,
+            "stop_requested": False,
+            "stop_signal": NOT_APPLICABLE,
+            "exit_code": NOT_APPLICABLE,
+            "timed_out": False,
+        }
+    stop_requested = proc.poll() is None
+    stop_signal = "TERM" if stop_requested else NOT_APPLICABLE
     timed_out = False
+    if stop_requested:
+        try:
+            proc.send_signal(signal.SIGTERM)
+        except ProcessLookupError:
+            pass
     try:
         proc.wait(timeout=SERVER_TERM_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
         timed_out = True
-        proc.terminate()
+        proc.kill()
         try:
             proc.wait(timeout=SERVER_KILL_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=SERVER_KILL_TIMEOUT_SECONDS)
-    return {"started": True, "pid": proc.pid, "exit_code": proc.returncode, "timed_out": timed_out}
+            pass
+    return {
+        "started": True,
+        "pid": proc.pid,
+        "stop_requested": stop_requested,
+        "stop_signal": stop_signal,
+        "exit_code": proc.returncode,
+        "timed_out": timed_out,
+    }
 
 
 def capture_baseline_resident(
@@ -874,14 +903,24 @@ def start(
         case: pathlib.Path,
         argv: list[str],
         env: dict[str, str]) -> subprocess.Popen[bytes]:
-    return subprocess.Popen(
-        argv,
-        cwd=case,
-        stdout=(case / "server.stdout").open("wb"),
-        stderr=(case / "server.stderr").open("wb"),
-        env=env,
-        preexec_fn=os.setsid,
-    )
+    stdout_handle = (case / "server.stdout").open("wb")
+    try:
+        stderr_handle = (case / "server.stderr").open("wb")
+    except OSError:
+        stdout_handle.close()
+        raise
+    try:
+        return subprocess.Popen(
+            argv,
+            cwd=case,
+            stdout=stdout_handle,
+            stderr=stderr_handle,
+            env=env,
+            preexec_fn=os.setsid,
+        )
+    finally:
+        stdout_handle.close()
+        stderr_handle.close()
 
 
 def normalize_claimant(value: Any, slot_id: int, active: Any) -> dict[str, Any] | None:
@@ -1869,11 +1908,12 @@ def run_baseline_case(
     except Exception as exc:
         result.update({"status": "request_failed", "workload_error": f"{type(exc).__name__}: {exc}"})
     finally:
+        sampler_cleanup = stop_memory_sampler(sampler)
         server_cleanup = stop(proc) if proc is not None else {
             "pid": None, "pgid": None, "exit_code": None,
+            "stop_requested": False, "stop_signal": NOT_APPLICABLE,
             "term_timed_out": False, "kill_timed_out": False, "residual_process": False,
         }
-        sampler_cleanup = stop_memory_sampler(sampler)
         if result.get("status") == "complete" and flags["k1_sync"] and step2 is not None:
             try:
                 timing = capture_resume_timing(case, step2)
