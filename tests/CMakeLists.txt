@@ -218,8 +218,13 @@ if (UNIX)
             ARGS ${PROJECT_SOURCE_DIR}/tests/test-server-kv-resume-static.py LABEL python)
         llama_test_cmd(python3 NAME test-server-kv-pressure-action-static
             ARGS ${PROJECT_SOURCE_DIR}/tests/test-server-kv-pressure-action-static.py LABEL python)
+<<<<<<< HEAD
         llama_test_cmd(python3 NAME test-kv-governor-g0-s1-parser
             ARGS ${PROJECT_SOURCE_DIR}/tests/test-kv-governor-g0-s1-parser.py LABEL python)
+=======
+        llama_test_cmd(python3 NAME test-memory-governor-observe-static
+            ARGS ${PROJECT_SOURCE_DIR}/tests/test-memory-governor-observe-static.py LABEL python)
+>>>>>>> 1e05587a7 (feat(dense): update joint scheduling for weight streaming and cache management)
         llama_test_cmd(python3 NAME test-kv-bounded-release-stage3a-2c-parser
             ARGS ${PROJECT_SOURCE_DIR}/tests/test-kv-bounded-release-stage3a-2c-parser.py LABEL python)
         llama_test_cmd(python3 NAME test-runner-bounded-release-stage3a-2c

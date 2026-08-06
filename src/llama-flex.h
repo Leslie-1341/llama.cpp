@@ -60,6 +60,7 @@ struct llama_flex_stats {
     uint64_t total_wait_us   = 0;
     uint64_t demand_loads    = 0;  // layer was not already queued/loading when compute needed it
     uint64_t prefetch_queued = 0;
+    uint64_t prefetch_budget_dropped = 0;
     uint64_t queue_requeues  = 0;  // IO worker could not acquire a slot
     uint64_t evictions       = 0;
     uint64_t releases        = 0;
@@ -68,6 +69,7 @@ struct llama_flex_stats {
     uint64_t locked_tensors  = 0;
     uint64_t streamed_tensors = 0;
     size_t   ring_bytes      = 0;  // total bytes held by the ring
+    size_t   slot_bytes      = 0;  // bytes charged for one streamed layer slot
     size_t   locked_bytes    = 0;  // bytes pinned by balanced locking
     size_t   lock_budget_unused = 0;
     size_t   stream_per_token = 0; // unlocked bytes that must be read each token
@@ -80,6 +82,14 @@ struct llama_flex_stats {
     size_t   read_cost_bytes = 0;
     size_t   global_rebalance_bytes = 0;
     uint64_t global_rebalance_tensors = 0;
+    size_t   prefetch_budget_bytes = 0;
+    size_t   prefetch_budget_available_bytes = 0;
+};
+
+struct llama_flex_reclaim_result {
+    uint64_t released_bytes = 0;
+    uint32_t released_layers = 0;
+    bool target_satisfied = false;
 };
 
 struct ggml_tensor;
@@ -121,6 +131,20 @@ void * llama_flex_get_tensor(llama_flex_context & ctx, int layer_id, const std::
 void llama_flex_release_layer(llama_flex_context & ctx, int layer_id);
 
 const llama_flex_stats & llama_flex_get_stats(const llama_flex_context & ctx);
+
+// Set a per-tick speculative prefetch budget. A zero budget disables the gate.
+// Demand loads are never gated by this API.
+void llama_flex_set_prefetch_budget(
+        llama_flex_context & ctx,
+        uint64_t             budget_bytes);
+
+// Release already-consumed resident layer slots back to the OS with
+// MADV_DONTNEED. This never touches the current compute layer; it only reclaims
+// layers that were previously marked released by llama_flex_release_layer().
+llama_flex_reclaim_result llama_flex_reclaim_released(
+        llama_flex_context & ctx,
+        uint64_t             target_bytes,
+        uint32_t             max_layers);
 
 // --- compute-path integration ---------------------------------------------
 

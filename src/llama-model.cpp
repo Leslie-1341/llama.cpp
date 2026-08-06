@@ -90,6 +90,18 @@ static size_t llama_detect_available_memory() {
     return avail;
 }
 
+static bool llama_env_flag(const char * name, bool default_value = false) {
+    const char * value = std::getenv(name);
+    if (value == nullptr) {
+        return default_value;
+    }
+    return std::atoi(value) > 0;
+}
+
+static bool llama_env_is_set(const char * name) {
+    return std::getenv(name) != nullptr;
+}
+
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
         case LLM_ARCH_LLAMA:
@@ -1226,19 +1238,34 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const int n_gpu_layers = this->n_gpu_layers();
 
     const bool use_mmap_buffer = true;
+    const bool memory_governor_requested = llama_env_flag("LLAMA_MEMORY_GOVERNOR");
+    const bool memory_governor_auto_backends =
+            llama_env_flag("LLAMA_MEMORY_GOVERNOR_AUTO_BACKENDS", memory_governor_requested);
+    size_t model_weight_bytes = 0;
+    for (const auto & it : ml.weights_map) {
+        model_weight_bytes += ggml_nbytes(it.second.tensor);
+    }
+    const size_t detected_avail = memory_governor_auto_backends
+            ? llama_detect_available_memory()
+            : SIZE_MAX;
+    const size_t governor_backend_reserve = 512ull * 1024ull * 1024ull;
+    const bool governor_low_memory =
+            memory_governor_auto_backends &&
+            detected_avail != SIZE_MAX &&
+            detected_avail < model_weight_bytes + governor_backend_reserve;
+    const bool model_has_moe = hparams.n_expert > 0;
+
     const bool lazy_v2_requested =
-            std::getenv("LLAMA_LAZY_V2") != nullptr &&
-            std::atoi(std::getenv("LLAMA_LAZY_V2")) > 0;
+            llama_env_flag("LLAMA_LAZY_V2") ||
+            (governor_low_memory && model_has_moe && !llama_env_is_set("LLAMA_LAZY_V2"));
     const bool lazy_window_requested =
             lazy_v2_requested ||
-            (std::getenv("LLAMA_LAZY_LOADING") != nullptr &&
-             std::atoi(std::getenv("LLAMA_LAZY_LOADING")) > 0) ||
+            llama_env_flag("LLAMA_LAZY_LOADING") ||
             (params.vm_layer_schedule && params.vm_dontneed);
     // FlexInfer-style streaming (llama-flex): mutually exclusive with the mmap
     // window. Requires the same loader conditions (mmap home, no mlock/check).
-    const bool flex_requested =
-            std::getenv("LLAMA_FLEX") != nullptr &&
-            std::atoi(std::getenv("LLAMA_FLEX")) > 0;
+    const bool flex_requested = llama_env_flag("LLAMA_FLEX") ||
+            (governor_low_memory && !model_has_moe && !llama_env_is_set("LLAMA_FLEX"));
     const bool use_flex =
             flex_requested &&
             !use_mlock &&
@@ -1263,6 +1290,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 use_mlock ? 1 : 0,
                 ml.check_tensors ? 1 : 0,
                 params.vocab_only ? 1 : 0);
+    }
+    if (memory_governor_requested && governor_low_memory && (use_flex || use_lazy_window)) {
+        LLAMA_LOG_INFO("%s: memory governor auto backend: available=%.0f MiB weights=%.0f MiB "
+                "reserve=%.0f MiB flex=%d lazy_window=%d moe=%d\n",
+                __func__,
+                detected_avail / 1048576.0,
+                model_weight_bytes / 1048576.0,
+                governor_backend_reserve / 1048576.0,
+                use_flex ? 1 : 0,
+                use_lazy_window ? 1 : 0,
+                model_has_moe ? 1 : 0);
     }
 
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
@@ -1675,10 +1713,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // the mmap window: their data is repointed to anon buffers and only the
         // routed experts are streamed in. Requires LLAMA_LAZY_V2 (this block).
         const char * moe_buf_env = std::getenv("LLAMA_LAZY_MOE_BUFFER");
-        const bool   use_moe_buffer = moe_buf_env != nullptr && std::atoi(moe_buf_env) > 0;
+        const bool   use_moe_buffer =
+                (moe_buf_env != nullptr && std::atoi(moe_buf_env) > 0) ||
+                (governor_low_memory && model_has_moe && moe_buf_env == nullptr);
         const bool   moe_auto_budget =
-                std::getenv("LLAMA_LAZY_MOE_BUFFER_AUTO") != nullptr &&
-                std::atoi(std::getenv("LLAMA_LAZY_MOE_BUFFER_AUTO")) > 0;
+                llama_env_flag("LLAMA_LAZY_MOE_BUFFER_AUTO") ||
+                (governor_low_memory && model_has_moe &&
+                 !llama_env_is_set("LLAMA_LAZY_MOE_BUFFER_AUTO"));
         if (use_moe_buffer) {
             llama_moe_buffer_params mp;
             mp.enabled   = true;
@@ -1977,8 +2018,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     : 4;
             window_params.expert_dontneed = moe_evict != nullptr &&
                     std::atoi(moe_evict) != 0;
-            window_params.clg_predict = clg_env != nullptr &&
-                    std::atoi(clg_env) > 0;
+            window_params.clg_predict =
+                    (clg_env != nullptr && std::atoi(clg_env) > 0) ||
+                    (governor_low_memory && model_has_moe && clg_env == nullptr);
             window_params.clg_delta = clg_delta != nullptr
                     ? std::max(0, std::atoi(clg_delta)) : 1;
             window_params.clg_prefill_threshold = clg_pthr != nullptr
@@ -2043,10 +2085,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         const bool flex_threads_explicit = std::getenv("LLAMA_FLEX_THREADS") != nullptr;
         const bool flex_lock_explicit    = std::getenv("LLAMA_FLEX_LOCK_GB") != nullptr;
         const bool flex_pin_explicit     = std::getenv("LLAMA_FLEX_PIN_POLICY") != nullptr;
+        const bool flex_rebalance_explicit = std::getenv("LLAMA_FLEX_GLOBAL_REBALANCE") != nullptr;
+        const bool flex_sched_explicit   = std::getenv("LLAMA_FLEX_SCHED") != nullptr;
         const bool flex_auto             = std::getenv("LLAMA_FLEX_AUTO") &&
                 std::atoi(std::getenv("LLAMA_FLEX_AUTO")) > 0;
-        const bool flex_sched            = std::getenv("LLAMA_FLEX_SCHED") &&
-                std::atoi(std::getenv("LLAMA_FLEX_SCHED")) > 0;
+        const bool flex_sched            = flex_sched_explicit
+                ? std::atoi(std::getenv("LLAMA_FLEX_SCHED")) > 0
+                : (governor_low_memory && !model_has_moe && memory_governor_auto_backends);
 
         if (const char * v = std::getenv("LLAMA_FLEX_RING"))    { fp.ring_layers    = std::max(2, std::atoi(v)); }
         if (const char * v = std::getenv("LLAMA_FLEX_AHEAD"))   { fp.prefetch_ahead = std::max(1, std::atoi(v)); }
@@ -2107,7 +2152,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     fp.lock_bytes = (size_t)(lock_gb * 1024.0 * 1024.0 * 1024.0);
                 }
                 if (!flex_pin_explicit) {
-                    fp.pin_policy = "attn-first";
+                    fp.pin_policy = "cost-aware";
+                }
+                if (!flex_rebalance_explicit) {
+                    fp.global_rebalance = true;
                 }
                 fp.memory_budget_bytes = avail == SIZE_MAX ? 0 : avail;
                 fp.fixed_bytes = non_layer + reserve;

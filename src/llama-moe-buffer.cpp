@@ -669,6 +669,9 @@ struct llama_moe_buffer_context {
     std::priority_queue<moe_prefetch_task, std::vector<moe_prefetch_task>, moe_prefetch_task_less> queue;
     bool                    stop = false;
     uint64_t                next_task_seq = 0;
+    bool                    prefetch_budget_enabled = false; // guarded by qmtx
+    uint64_t                prefetch_budget_bytes = 0; // guarded by qmtx
+    uint64_t                prefetch_budget_available_bytes = 0; // guarded by qmtx
     std::unordered_map<uint64_t, uint64_t> group_prefetch_last_enqueue_token; // guarded by qmtx
     std::unordered_map<uint64_t, moe_admission_pair_record> admission_pairs; // guarded by mtx
     std::unordered_map<uint64_t, std::vector<uint64_t>> admission_pair_watchers; // guarded by mtx
@@ -9495,6 +9498,14 @@ void llama_moe_buffer_prefetch_ranked(
             for (int i = 0; i < n_experts; ++i) {
                 const int e = experts[i];
                 const float score = scores != nullptr ? scores[i] : 0.0f;
+                if (ctx->prefetch_budget_enabled) {
+                    const uint64_t charge = (uint64_t) m->stride;
+                    if (charge > ctx->prefetch_budget_available_bytes) {
+                        ctx->eam_prefetch_drop_budget.fetch_add(1, std::memory_order_relaxed);
+                        continue;
+                    }
+                    ctx->prefetch_budget_available_bytes -= charge;
+                }
                 n_enqueued += moe_enqueue_prefetch(*ctx, *m, e, i, score, true) ? 1 : 0;
             }
         }
@@ -9507,6 +9518,18 @@ void llama_moe_buffer_prefetch_ranked(
     if (ctx->profile) {
         ctx->prof_sidecar_submit_us.fetch_add((moe_profile_now_ns() - submit_t0) / 1000, std::memory_order_relaxed);
     }
+}
+
+void llama_moe_buffer_set_prefetch_budget(
+        llama_moe_buffer_context & ctx,
+        uint64_t                  budget_bytes) {
+    if (!llama_moe_buffer_enabled(&ctx)) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(ctx.qmtx);
+    ctx.prefetch_budget_enabled = budget_bytes > 0;
+    ctx.prefetch_budget_bytes = budget_bytes;
+    ctx.prefetch_budget_available_bytes = budget_bytes;
 }
 
 bool llama_moe_buffer_stream_callback(ggml_tensor * op, int ith, void * user_data) {
@@ -15279,4 +15302,59 @@ static void moe_print_stats_impl(const llama_moe_buffer_context & ctx, const cha
 
 void llama_moe_buffer_print_stats(const llama_moe_buffer_context & ctx) {
     moe_print_stats_impl(ctx, "llama_moe_buffer");
+}
+
+llama_moe_buffer_stats llama_moe_buffer_get_stats(llama_moe_buffer_context & ctx) {
+    llama_moe_buffer_stats stats;
+    {
+        std::lock_guard<std::mutex> lk(ctx.mtx);
+        stats.resident_bytes = ctx.resident_bytes;
+        stats.budget_bytes   = ctx.params.budget_bytes;
+        stats.expert_bytes   = ctx.expert_total;
+    }
+    stats.streams         = ctx.streams.load(std::memory_order_relaxed);
+    stats.hits            = ctx.hits.load(std::memory_order_relaxed);
+    stats.evictions       = ctx.evictions.load(std::memory_order_relaxed);
+    stats.bytes_read      = ctx.bytes_read.load(std::memory_order_relaxed);
+    stats.cache_hits      = ctx.cache_hits.load(std::memory_order_relaxed);
+    stats.cache_misses    = ctx.cache_misses.load(std::memory_order_relaxed);
+    stats.prefetch_hits   = ctx.eam_prefetch_hits.load(std::memory_order_relaxed);
+    stats.prefetch_late   = ctx.eam_prefetch_late.load(std::memory_order_relaxed);
+    stats.prefetch_unused = ctx.eam_prefetch_unused.load(std::memory_order_relaxed);
+    stats.prefetch_budget_dropped =
+        ctx.eam_prefetch_drop_budget.load(std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lk(ctx.qmtx);
+        stats.prefetch_budget_bytes =
+            (size_t) ctx.prefetch_budget_bytes;
+        stats.prefetch_budget_available_bytes =
+            (size_t) ctx.prefetch_budget_available_bytes;
+    }
+    return stats;
+}
+
+llama_moe_buffer_reclaim_result llama_moe_buffer_reclaim_clean(
+        llama_moe_buffer_context & ctx,
+        uint64_t                   target_bytes,
+        uint32_t                   max_groups) {
+    llama_moe_buffer_reclaim_result result;
+    if (!llama_moe_buffer_enabled(&ctx) || target_bytes == 0 || max_groups == 0) {
+        return result;
+    }
+
+    std::lock_guard<std::mutex> lk(ctx.mtx);
+    while (result.released_bytes < target_bytes && result.released_groups < max_groups) {
+        const size_t before = ctx.resident_bytes;
+        if (before == 0 || !moe_evict_lru(ctx, target_bytes - result.released_bytes)) {
+            break;
+        }
+        const size_t after = ctx.resident_bytes;
+        if (before <= after) {
+            break;
+        }
+        result.released_bytes += before - after;
+        result.released_groups++;
+    }
+    result.target_satisfied = result.released_bytes >= target_bytes;
+    return result;
 }

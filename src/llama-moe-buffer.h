@@ -80,6 +80,30 @@ struct llama_moe_buffer_params {
     std::string sidecar_path;        // optional exact low-bit/MWQ sidecar data source
 };
 
+struct llama_moe_buffer_stats {
+    size_t   resident_bytes = 0;
+    size_t   budget_bytes = 0;
+    size_t   expert_bytes = 0;
+    uint64_t streams = 0;
+    uint64_t hits = 0;
+    uint64_t evictions = 0;
+    uint64_t bytes_read = 0;
+    uint64_t cache_hits = 0;
+    uint64_t cache_misses = 0;
+    uint64_t prefetch_hits = 0;
+    uint64_t prefetch_late = 0;
+    uint64_t prefetch_unused = 0;
+    uint64_t prefetch_budget_dropped = 0;
+    size_t   prefetch_budget_bytes = 0;
+    size_t   prefetch_budget_available_bytes = 0;
+};
+
+struct llama_moe_buffer_reclaim_result {
+    uint64_t released_bytes = 0;
+    uint32_t released_groups = 0;
+    bool target_satisfied = false;
+};
+
 std::shared_ptr<llama_moe_buffer_context> llama_moe_buffer_create(const llama_moe_buffer_params & params);
 
 bool llama_moe_buffer_enabled(const llama_moe_buffer_context * ctx);
@@ -137,5 +161,21 @@ void llama_moe_buffer_prefetch_ranked(
         const int *                experts,
         const float *              scores,
         int                        n_experts);
+
+llama_moe_buffer_stats llama_moe_buffer_get_stats(llama_moe_buffer_context & ctx);
+
+// Reclaim cold resident expert groups using the buffer's existing victim
+// selection. This releases clean anonymous expert pages; the model file/sidecar
+// remains the authoritative source for future reloads.
+llama_moe_buffer_reclaim_result llama_moe_buffer_reclaim_clean(
+        llama_moe_buffer_context & ctx,
+        uint64_t                   target_bytes,
+        uint32_t                   max_groups);
+
+// Set a per-tick speculative prefetch budget. A zero budget disables the gate.
+// Demand loads are never gated by this API.
+void llama_moe_buffer_set_prefetch_budget(
+        llama_moe_buffer_context & ctx,
+        uint64_t                  budget_bytes);
 
 void llama_moe_buffer_print_stats(const llama_moe_buffer_context & ctx);

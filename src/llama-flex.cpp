@@ -18,6 +18,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <cstdlib>
 #endif
 
@@ -88,6 +89,10 @@ struct llama_flex_context {
     double   ewma_io_us = 0.0;
     double   ewma_compute_us = 0.0;
     double   ewma_wait_us = 0.0;
+
+    bool     prefetch_budget_enabled = false;
+    uint64_t prefetch_budget_bytes = 0;
+    uint64_t prefetch_budget_available_bytes = 0;
 
     ~llama_flex_context() {
         {
@@ -1158,6 +1163,7 @@ void llama_flex_finalize(llama_flex_context & ctx) {
         ctx.slots[s] = p;
     }
     ctx.stats.ring_bytes = ctx.slot_bytes * (size_t) k;
+    ctx.stats.slot_bytes = ctx.slot_bytes;
     ctx.stats.read_cost_bytes = ctx.params.read_cost_bytes;
     ctx.adaptive_ahead = std::max(1, std::min(ctx.params.prefetch_ahead, flex_ring_room_ahead(ctx)));
     ctx.stats.effective_ahead = flex_effective_ahead(ctx);
@@ -1218,6 +1224,18 @@ static void flex_request_layer(llama_flex_context & ctx, int layer_id, bool pref
     }
     if (L.state == layer_state::loading) {
         return;
+    }
+    if (prefetch && ctx.prefetch_budget_enabled) {
+        const uint64_t charge = (uint64_t) ctx.slot_bytes;
+        if (charge > ctx.prefetch_budget_available_bytes) {
+            ctx.stats.prefetch_budget_dropped++;
+            flex_trace_locked(ctx, "prefetch_budget_drop", layer_id, -1,
+                    charge, ctx.prefetch_budget_available_bytes, 0);
+            return;
+        }
+        ctx.prefetch_budget_available_bytes -= charge;
+        ctx.stats.prefetch_budget_available_bytes =
+            (size_t) ctx.prefetch_budget_available_bytes;
     }
     if (prefetch) {
         ctx.stats.prefetch_queued++;
@@ -1301,9 +1319,75 @@ const llama_flex_stats & llama_flex_get_stats(const llama_flex_context & ctx) {
     return ctx.stats;
 }
 
+void llama_flex_set_prefetch_budget(
+        llama_flex_context & ctx,
+        uint64_t             budget_bytes) {
+    if (!llama_flex_enabled(&ctx)) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(ctx.mutex);
+    ctx.prefetch_budget_enabled = budget_bytes > 0;
+    ctx.prefetch_budget_bytes = budget_bytes;
+    ctx.prefetch_budget_available_bytes = budget_bytes;
+    ctx.stats.prefetch_budget_bytes = (size_t) budget_bytes;
+    ctx.stats.prefetch_budget_available_bytes = (size_t) budget_bytes;
+}
+
+llama_flex_reclaim_result llama_flex_reclaim_released(
+        llama_flex_context & ctx,
+        uint64_t             target_bytes,
+        uint32_t             max_layers) {
+    llama_flex_reclaim_result result;
+    if (!llama_flex_enabled(&ctx) || target_bytes == 0 || max_layers == 0) {
+        return result;
+    }
+
+    std::lock_guard<std::mutex> lock(ctx.mutex);
+    while (result.released_bytes < target_bytes && result.released_layers < max_layers) {
+        int victim = -1;
+        uint64_t oldest = UINT64_MAX;
+        for (int l = 0; l < ctx.n_layers; ++l) {
+            const auto & L = ctx.layers[l];
+            if (l == ctx.cur_compute_layer || L.always_resident ||
+                    L.slot < 0 || !L.released || L.state != layer_state::resident) {
+                continue;
+            }
+            if (L.last_use < oldest) {
+                oldest = L.last_use;
+                victim = l;
+            }
+        }
+        if (victim < 0) {
+            break;
+        }
+
+        auto & L = ctx.layers[victim];
+        const int slot = L.slot;
+        if (slot >= 0 && slot < (int) ctx.slots.size() && ctx.slots[slot] != nullptr) {
+#if defined(MADV_DONTNEED)
+            madvise(ctx.slots[slot], ctx.slot_bytes, MADV_DONTNEED);
+#endif
+            ctx.slot_layer[slot] = -1;
+        }
+        L.slot = -1;
+        L.state = layer_state::not_resident;
+        L.released = true;
+        L.last_use = now_us();
+        ctx.stats.evictions++;
+        result.released_bytes += (uint64_t) ctx.slot_bytes;
+        result.released_layers++;
+        flex_trace_locked(ctx, "governor_reclaim", victim, slot, ctx.slot_bytes, 0, 0);
+    }
+    result.target_satisfied = result.released_bytes >= target_bytes;
+    return result;
+}
+
 void llama_flex_graph_begin(llama_flex_context & ctx) {
     if (!llama_flex_enabled(&ctx)) {
         return;
+    }
+    if (ctx.cur_compute_layer >= 0) {
+        llama_flex_release_layer(ctx, ctx.cur_compute_layer);
     }
     ctx.cur_compute_layer = -1;
     ctx.last_layer_enter_us = 0;
