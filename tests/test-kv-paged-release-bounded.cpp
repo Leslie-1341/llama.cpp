@@ -1761,6 +1761,9 @@ int main(int /*argc*/, char ** /*argv*/) {
             CHECK(p.kv->paged_release_bounded_test_read_block_state(0) == 3 &&
                     p.kv->paged_release_bounded_test_read_block_state(1) == 3,
                     "WT26b: setup has two SWAPPED blocks");
+            const size_t block_bytes = p.kv->paged_unified_action_test_read_block_bytes(0).size();
+            CHECK(block_bytes > 0, "WT26b: obtains one-block transfer cap");
+            p.kv->paged_unified_action_test_set_restore_group_byte_cap(block_bytes);
             const auto backing_before = p.kv->paged_unified_action_test_read_backing_stats();
             const auto fault_before = p.kv->paged_unified_action_test_read_io_fault();
 
@@ -2256,6 +2259,199 @@ int main(int /*argc*/, char ** /*argv*/) {
                     g.kv->paged_release_bounded_test_read_scan_cursor() == nb - 1,
                     "WT28h: release at old-tour end uses remaining budget in the fresh tour");
         }
+    }
+
+    // =========================================================================
+    // WT29: K1-TG1 Exact transfer groups coalesce only contiguous SWAPPED
+    // physical blocks, obey the internal byte cap, and publish atomically.
+    // =========================================================================
+    {
+        setenv("LLAMA_KV_PAGED_SWAP", "1", 1);
+
+        // WT29a: two contiguous blocks use one range read and restore byte-exactly.
+        {
+            ContextGuard g;
+            if (!g.init(model, cparams)) {
+                CHECK(false, "WT29a: context creation failed");
+            } else {
+                std::vector<llama_token> prompt(32, 126);
+                CHECK(decode_prompt(g.ctx, prompt) == 0, "WT29a: decode two blocks");
+                const auto before0 = g.kv->paged_unified_action_test_read_block_bytes(0);
+                const auto before1 = g.kv->paged_unified_action_test_read_block_bytes(1);
+                const auto offload = g.kv->execute_action({
+                    llama_kv_action::offload, 7601, 0, UINT64_MAX, 2, false });
+                CHECK(offload.state_changed && offload.blocks == 2,
+                        "WT29a: offload prepares two contiguous SWAPPED blocks");
+                const auto backing_before = g.kv->paged_unified_action_test_read_backing_stats();
+
+                const auto prefetch = g.kv->execute_action({
+                    llama_kv_action::prefetch, 7602, 0, 0, 0, true, true });
+                const auto backing_after = g.kv->paged_unified_action_test_read_backing_stats();
+                const uint64_t expected_bytes = before0.size() + before1.size();
+                CHECK(prefetch.outcome == llama_kv_action_outcome::completed &&
+                        prefetch.state_changed && prefetch.blocks == 2 &&
+                        prefetch.bytes == expected_bytes && prefetch.shortfall_bytes == 0 &&
+                        prefetch.core_transaction_id > offload.core_transaction_id,
+                        "WT29a: grouped prefetch reports one complete transaction");
+                CHECK(backing_after.read_calls == backing_before.read_calls + 1 &&
+                        backing_after.read_syscalls == backing_before.read_syscalls + 1 &&
+                        backing_after.bytes_read == backing_before.bytes_read + expected_bytes,
+                        "WT29a: contiguous blocks use one exact range read");
+                CHECK(g.kv->paged_unified_action_test_read_block_bytes(0) == before0 &&
+                        g.kv->paged_unified_action_test_read_block_bytes(1) == before1,
+                        "WT29a: grouped restore is byte-exact");
+                CHECK(g.kv->paged_release_bounded_test_read_block_state(0) == 1 &&
+                        g.kv->paged_release_bounded_test_read_block_state(1) == 1,
+                        "WT29a: complete group publishes both blocks RESIDENT");
+            }
+        }
+
+        // WT29b: a physical gap always creates two transfer groups.
+        {
+            ContextGuard g;
+            if (!g.init(model, cparams)) {
+                CHECK(false, "WT29b: context creation failed");
+            } else {
+                const uint32_t block_size = g.kv->paged_release_bounded_test_read_block_size();
+                CHECK(seed_owned_blocks(g.kv, 0, 1, block_size, 0),
+                        "WT29b: seed first owned block");
+                CHECK(seed_owned_blocks(g.kv, 2, 1, block_size, 0),
+                        "WT29b: seed non-contiguous owned block");
+                const auto before0 = g.kv->paged_unified_action_test_read_block_bytes(0);
+                const auto before2 = g.kv->paged_unified_action_test_read_block_bytes(2);
+                CHECK(g.kv->paged_unified_action_test_swap_out_block(0) &&
+                        g.kv->paged_unified_action_test_swap_out_block(2),
+                        "WT29b: swap out non-contiguous blocks");
+                const auto backing_before = g.kv->paged_unified_action_test_read_backing_stats();
+
+                const auto prefetch = g.kv->execute_action({
+                    llama_kv_action::prefetch, 7611, 0, 0, 0, true, true });
+                const auto backing_after = g.kv->paged_unified_action_test_read_backing_stats();
+                CHECK(prefetch.outcome == llama_kv_action_outcome::completed &&
+                        prefetch.blocks == 2 && prefetch.shortfall_bytes == 0,
+                        "WT29b: non-contiguous groups both complete");
+                CHECK(backing_after.read_calls == backing_before.read_calls + 2 &&
+                        backing_after.read_syscalls == backing_before.read_syscalls + 2,
+                        "WT29b: physical gap produces two range reads");
+                CHECK(g.kv->paged_unified_action_test_read_block_bytes(0) == before0 &&
+                        g.kv->paged_unified_action_test_read_block_bytes(2) == before2,
+                        "WT29b: non-contiguous groups restore byte-exactly");
+            }
+        }
+
+        // WT29c: the internal cap splits an otherwise contiguous run.
+        {
+            ContextGuard g;
+            if (!g.init(model, cparams)) {
+                CHECK(false, "WT29c: context creation failed");
+            } else {
+                std::vector<llama_token> prompt(48, 127);
+                CHECK(decode_prompt(g.ctx, prompt) == 0, "WT29c: decode three blocks");
+                std::vector<std::vector<uint8_t>> before;
+                for (uint32_t block = 0; block < 3; ++block) {
+                    before.push_back(g.kv->paged_unified_action_test_read_block_bytes(block));
+                }
+                const auto offload = g.kv->execute_action({
+                    llama_kv_action::offload, 7621, 0, UINT64_MAX, 3, false });
+                CHECK(offload.state_changed && offload.blocks == 3,
+                        "WT29c: offload prepares three contiguous blocks");
+                CHECK(!before[0].empty(), "WT29c: obtains one-block byte cap");
+                g.kv->paged_unified_action_test_set_restore_group_byte_cap(before[0].size());
+                const auto backing_before = g.kv->paged_unified_action_test_read_backing_stats();
+
+                const auto prefetch = g.kv->execute_action({
+                    llama_kv_action::prefetch, 7622, 0, 0, 0, true, true });
+                const auto backing_after = g.kv->paged_unified_action_test_read_backing_stats();
+                CHECK(prefetch.outcome == llama_kv_action_outcome::completed &&
+                        prefetch.blocks == 3 && prefetch.shortfall_bytes == 0,
+                        "WT29c: cap-split groups all complete");
+                CHECK(backing_after.read_calls == backing_before.read_calls + 3 &&
+                        backing_after.read_syscalls == backing_before.read_syscalls + 3,
+                        "WT29c: one-block cap creates three reads");
+                CHECK(g.kv->paged_unified_action_test_read_block_bytes(0) == before[0] &&
+                        g.kv->paged_unified_action_test_read_block_bytes(1) == before[1] &&
+                        g.kv->paged_unified_action_test_read_block_bytes(2) == before[2],
+                        "WT29c: cap-split restore remains byte-exact");
+            }
+        }
+
+        // WT29d: a grouped read failure writes no tensor and commits no block in the group.
+        setenv("LLAMA_KV_PAGED_TEST_IO_FAIL_SCOPE", "prefetch_swap_in", 1);
+        setenv("LLAMA_KV_PAGED_TEST_IO_FAIL_KIND", "read_eof_once", 1);
+        setenv("LLAMA_KV_PAGED_TEST_IO_FAIL_SEQ_ID", "0", 1);
+        setenv("LLAMA_KV_PAGED_TEST_IO_FAIL_BLOCK", "1", 1);
+        setenv("LLAMA_KV_PAGED_TEST_IO_FAIL_ONCE", "1", 1);
+        {
+            ContextGuard g;
+            if (!g.init(model, cparams)) {
+                CHECK(false, "WT29d: context creation failed");
+            } else {
+                std::vector<llama_token> prompt(32, 1);
+                CHECK(decode_prompt(g.ctx, prompt) == 0, "WT29d: decode two blocks");
+                const size_t block_bytes = g.kv->paged_unified_action_test_read_block_bytes(0).size();
+                CHECK(g.kv->paged_unified_action_test_read_restore_group_byte_cap() >= block_bytes * 2,
+                        "WT29d: default cap keeps both synthetic blocks in one group");
+                const auto offload = g.kv->execute_action({
+                    llama_kv_action::offload, 7631, 0, UINT64_MAX, 2, false });
+                CHECK(offload.state_changed && offload.blocks == 2,
+                        "WT29d: offload prepares one two-block group");
+                const auto backing_before = g.kv->paged_unified_action_test_read_backing_stats();
+
+                const auto failed = g.kv->execute_action({
+                    llama_kv_action::prefetch, 7632, 0, 0, 0, true, true });
+                const auto backing_after = g.kv->paged_unified_action_test_read_backing_stats();
+                CHECK(failed.outcome == llama_kv_action_outcome::failed && failed.io_failure &&
+                        failed.fail_stop && !failed.state_changed && failed.core_transaction_id == 0 &&
+                        failed.blocks == 0 && failed.bytes == 0 && failed.shortfall_bytes > 0,
+                        "WT29d: failed first group has no transaction or completion");
+                CHECK(backing_after.read_calls == backing_before.read_calls &&
+                        backing_after.read_syscalls == backing_before.read_syscalls + 1,
+                        "WT29d: failed group attempts one range read");
+                CHECK(g.kv->paged_release_bounded_test_read_block_state(0) == 3 &&
+                        g.kv->paged_release_bounded_test_read_block_state(1) == 3,
+                        "WT29d: failed group remains entirely SWAPPED");
+            }
+        }
+        unsetenv("LLAMA_KV_PAGED_TEST_IO_FAIL_SCOPE");
+        unsetenv("LLAMA_KV_PAGED_TEST_IO_FAIL_KIND");
+        unsetenv("LLAMA_KV_PAGED_TEST_IO_FAIL_SEQ_ID");
+        unsetenv("LLAMA_KV_PAGED_TEST_IO_FAIL_BLOCK");
+        unsetenv("LLAMA_KV_PAGED_TEST_IO_FAIL_ONCE");
+
+        // WT29e: stale task identity after restore prevents the group publication.
+        {
+            ContextGuard g;
+            if (!g.init(model, cparams)) {
+                CHECK(false, "WT29e: context creation failed");
+            } else {
+                std::vector<llama_token> prompt(32, 2);
+                CHECK(decode_prompt(g.ctx, prompt) == 0, "WT29e: decode two blocks");
+                const auto offload = g.kv->execute_action({
+                    llama_kv_action::offload, 7641, 0, UINT64_MAX, 2, false });
+                CHECK(offload.state_changed && offload.blocks == 2,
+                        "WT29e: offload prepares stale-check group");
+                const auto backing_before = g.kv->paged_unified_action_test_read_backing_stats();
+                const uint64_t stale_before =
+                    g.kv->paged_unified_action_test_read_restore_stale_triggers();
+                g.kv->paged_unified_action_test_arm_restore_stale_before_complete();
+
+                const auto failed = g.kv->execute_action({
+                    llama_kv_action::prefetch, 7642, 0, 0, 0, true, true });
+                const auto backing_after = g.kv->paged_unified_action_test_read_backing_stats();
+                CHECK(failed.outcome == llama_kv_action_outcome::failed && failed.io_failure &&
+                        failed.fail_stop && !failed.state_changed && failed.core_transaction_id == 0 &&
+                        failed.blocks == 0 && failed.bytes == 0 && failed.shortfall_bytes > 0,
+                        "WT29e: stale group cannot publish or create a transaction");
+                CHECK(backing_after.read_calls == backing_before.read_calls + 1 &&
+                        g.kv->paged_unified_action_test_read_restore_stale_triggers() == stale_before + 1,
+                        "WT29e: stale seam fires after one completed group read");
+                CHECK(g.kv->paged_release_bounded_test_read_block_state(0) == 3 &&
+                        g.kv->paged_release_bounded_test_read_block_state(1) == 3,
+                        "WT29e: generation mismatch leaves the whole group SWAPPED");
+            }
+        }
+
+        unsetenv("LLAMA_KV_PAGED_SWAP");
     }
 
     llama_model_free(model);

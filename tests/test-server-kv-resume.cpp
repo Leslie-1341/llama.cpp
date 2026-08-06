@@ -60,6 +60,8 @@ static void test_no_swap_noop_and_legacy_compatibility() {
     CHECK(core.request.seq_id == 7);
     CHECK(core.request.decision_id == 1001);
     CHECK(core.request.correctness_required && core.request.all_required);
+    CHECK(core.request.claimant == llama_kv_memory_claimant::kv);
+    CHECK(core.request.io_class == llama_kv_io_class::correctness_read);
     CHECK(core.request.max_blocks == 0 && core.request.target_bytes == 0);
     CHECK(core.protections.size() == 1 && core.protections[0]);
 

@@ -1361,6 +1361,7 @@ llama_kv_cache::llama_kv_cache(
                         store->get_n_slots(), store->get_cell_stride(),
                         (double) store->get_capacity() / 1024.0 / 1024.0);
 
+                kv_swap_cell_stride = cell_stride;
                 kv_swap_store = std::move(store);
 
                 if (kv_swap_want_exact) {
@@ -1975,6 +1976,495 @@ int32_t llama_kv_cache::prefetch_seq(llama_seq_id seq_id) {
     return this->prefetch_seq_step(seq_id, std::numeric_limits<uint32_t>::max());
 }
 
+size_t llama_kv_cache::paged_restore_group_byte_cap() const {
+    return paged_restore_group_byte_cap_override != 0
+        ? paged_restore_group_byte_cap_override
+        : PAGED_RESTORE_GROUP_BYTE_CAP;
+}
+
+bool llama_kv_cache::paged_restore_group_identity_valid(
+        const paged_restore_group_task & task,
+        bool require_swapped) const {
+    if (!kv_paged_enabled || !paged_swap_enabled || !kv_swap_store || v_trans || n_stream != 1 ||
+            paged_block_size == 0 || v_cells.empty() ||
+            task.object_id == 0 || task.object_id != paged_resident_object_id ||
+            task.generation == 0 || task.generation != paged_resident_generation ||
+            task.mapping_generation == 0 || task.mapping_generation != paged_mapping_generation ||
+            task.blocks.empty() || task.blocks.size() != task.block_bytes.size() ||
+            task.begin_block == UINT32_MAX || task.end_block <= task.begin_block ||
+            task.end_block > paged_n_blocks || task.blocks.size() != task.end_block - task.begin_block ||
+            task.begin_cell == UINT32_MAX || task.bytes_per_cell == 0 || task.total_bytes == 0) {
+        return false;
+    }
+
+    size_t expected_total = 0;
+    uint32_t expected_cells = 0;
+    for (size_t i = 0; i < task.blocks.size(); ++i) {
+        const uint32_t block = task.blocks[i];
+        if (block != task.begin_block + i || block >= paged_block_states.size() ||
+                (require_swapped && paged_block_states[block] != paged_block_state::SWAPPED)) {
+            return false;
+        }
+
+        const uint32_t begin = block * paged_block_size;
+        const uint32_t end = std::min<uint32_t>(begin + paged_block_size, paged_kv_size);
+        const uint32_t cells = end - begin;
+        if (cells == 0 || cells > std::numeric_limits<size_t>::max() / task.bytes_per_cell) {
+            return false;
+        }
+        const size_t bytes = (size_t) cells * task.bytes_per_cell;
+        if (task.block_bytes[i] != bytes || bytes > std::numeric_limits<size_t>::max() - expected_total ||
+                cells > std::numeric_limits<uint32_t>::max() - expected_cells) {
+            return false;
+        }
+        expected_total += bytes;
+        expected_cells += cells;
+    }
+
+    if (task.begin_cell != task.begin_block * paged_block_size ||
+            task.cell_count != expected_cells || task.total_bytes != expected_total ||
+            task.bytes_per_cell != kv_swap_cell_stride) {
+        return false;
+    }
+
+    uint64_t expected_offset = 0;
+    size_t expected_size = 0;
+    return llama_kv_fixed_slot_range_bounds(
+            task.begin_cell, task.cell_count, paged_kv_size,
+            task.bytes_per_cell, kv_swap_store->get_stats().bytes_capacity, expected_offset, expected_size) &&
+        task.backing_offset == expected_offset && task.total_bytes == expected_size;
+}
+
+bool llama_kv_cache::paged_restore_group_plan(
+        llama_seq_id seq_id,
+        const std::vector<uint32_t> & candidates,
+        std::vector<paged_restore_group_task> & tasks) const {
+    tasks.clear();
+    if (candidates.empty()) {
+        return true;
+    }
+    if (!kv_swap_store || paged_block_size == 0) {
+        return false;
+    }
+
+    const size_t bytes_per_cell = kv_swap_cell_stride;
+    const size_t byte_cap = paged_restore_group_byte_cap();
+    if (bytes_per_cell == 0 || byte_cap == 0) {
+        return false;
+    }
+
+    for (const uint32_t block : candidates) {
+        if (block >= paged_n_blocks || block >= paged_block_states.size() ||
+                paged_block_states[block] != paged_block_state::SWAPPED) {
+            return false;
+        }
+
+        const uint32_t begin = block * paged_block_size;
+        const uint32_t end = std::min<uint32_t>(begin + paged_block_size, paged_kv_size);
+        const uint32_t cell_count = end - begin;
+        if (cell_count == 0 || cell_count > std::numeric_limits<size_t>::max() / bytes_per_cell) {
+            return false;
+        }
+        const size_t block_bytes = (size_t) cell_count * bytes_per_cell;
+
+        const bool start_group = tasks.empty() ||
+            block != tasks.back().end_block ||
+            tasks.back().total_bytes > byte_cap ||
+            block_bytes > byte_cap - tasks.back().total_bytes;
+        if (start_group) {
+            paged_restore_group_task task;
+            task.seq_id = seq_id;
+            task.object_id = paged_resident_object_id;
+            task.generation = paged_resident_generation;
+            task.mapping_generation = paged_mapping_generation;
+            task.begin_block = block;
+            task.end_block = block;
+            task.begin_cell = begin;
+            task.bytes_per_cell = bytes_per_cell;
+            tasks.push_back(std::move(task));
+        }
+
+        auto & task = tasks.back();
+        if (task.total_bytes > std::numeric_limits<size_t>::max() - block_bytes ||
+                task.cell_count > std::numeric_limits<uint32_t>::max() - cell_count) {
+            return false;
+        }
+        task.blocks.push_back(block);
+        task.block_bytes.push_back(block_bytes);
+        task.end_block = block + 1;
+        task.cell_count += cell_count;
+        task.total_bytes += block_bytes;
+    }
+
+    for (auto & task : tasks) {
+        uint64_t offset = 0;
+        size_t total_size = 0;
+        if (!llama_kv_fixed_slot_range_bounds(
+                    task.begin_cell, task.cell_count, paged_kv_size,
+                    task.bytes_per_cell, kv_swap_store->get_stats().bytes_capacity, offset, total_size) ||
+                total_size != task.total_bytes) {
+            return false;
+        }
+        task.backing_offset = offset;
+    }
+    return true;
+}
+
+bool llama_kv_cache::paged_restore_group_prepare(paged_restore_group_task & task) const {
+    task.started_us = paged_io_stats_enabled ? llama_paged_timing_now_us() : 0;
+    if (!paged_restore_group_identity_valid(task, true)) {
+        paged_swap_in_fail_bad_size += 1;
+        paged_swap_backend_failures += 1;
+        task.read_status = llama_kv_backing_store_status::bad_slot;
+        task.failed_block = task.begin_block;
+        task.failed_cell = task.begin_cell;
+        return false;
+    }
+
+    if (paged_restore_layout_cache.object_id != paged_resident_object_id ||
+            paged_restore_layout_cache.rows.empty()) {
+        paged_restore_layout layout;
+        layout.object_id = paged_resident_object_id;
+        for (const auto & layer : layers) {
+            for (ggml_tensor * tensor : {
+                    layer.k_stream.empty() ? nullptr : layer.k_stream[0],
+                    (!layer.v || layer.v_stream.empty()) ? nullptr : layer.v_stream[0] }) {
+                if (!tensor) {
+                    continue;
+                }
+                const size_t row_size = tensor->nb[1];
+                if (row_size == 0 || row_size > std::numeric_limits<size_t>::max() - layout.bytes_per_cell) {
+                    paged_swap_in_fail_bad_size += 1;
+                    paged_swap_backend_failures += 1;
+                    task.read_status = llama_kv_backing_store_status::bad_slot;
+                    return false;
+                }
+                layout.rows.push_back({ tensor, row_size });
+                layout.bytes_per_cell += row_size;
+            }
+        }
+        paged_restore_layout_cache = std::move(layout);
+    }
+
+    size_t layout_bytes = 0;
+    for (const auto & row : paged_restore_layout_cache.rows) {
+        if (!row.tensor || row.row_size == 0 || row.tensor->nb[1] != row.row_size ||
+                row.row_size > std::numeric_limits<size_t>::max() - layout_bytes) {
+            paged_swap_in_fail_bad_size += 1;
+            paged_swap_backend_failures += 1;
+            task.read_status = llama_kv_backing_store_status::bad_slot;
+            return false;
+        }
+        layout_bytes += row.row_size;
+    }
+    if (paged_restore_layout_cache.object_id != task.object_id ||
+            layout_bytes != task.bytes_per_cell ||
+            paged_restore_layout_cache.bytes_per_cell != task.bytes_per_cell) {
+        paged_swap_in_fail_bad_size += 1;
+        paged_swap_backend_failures += 1;
+        task.read_status = llama_kv_backing_store_status::bad_slot;
+        return false;
+    }
+
+    const auto & cells = v_cells[0];
+    for (uint32_t cell = task.begin_cell; cell < task.begin_cell + task.cell_count; ++cell) {
+        if (cell >= cells.size() || cell >= paged_swap_offsets.size() || cell >= paged_swap_sizes.size() ||
+                paged_swap_sizes[cell] != task.bytes_per_cell) {
+            paged_swap_in_fail_bad_size += 1;
+            paged_swap_backend_failures += 1;
+            task.read_status = llama_kv_backing_store_status::bad_slot;
+            task.failed_cell = cell;
+            task.failed_block = cell / paged_block_size;
+            return false;
+        }
+        const uint64_t expected = task.backing_offset +
+            (uint64_t) (cell - task.begin_cell) * task.bytes_per_cell;
+        if (paged_swap_offsets[cell] != expected) {
+            paged_swap_in_fail_no_offset += 1;
+            paged_swap_backend_failures += 1;
+            task.read_status = llama_kv_backing_store_status::bad_slot;
+            task.failed_cell = cell;
+            task.failed_block = cell / paged_block_size;
+            return false;
+        }
+    }
+
+    task.layout = paged_restore_layout_cache.rows;
+    if (task.staging.size() < task.total_bytes) {
+        task.staging.resize(task.total_bytes);
+    }
+    if (paged_io_stats_enabled) {
+        task.validate_us = llama_paged_timing_now_us() - task.started_us;
+        paged_io_block_in_validate_us += task.validate_us;
+        paged_io_block_in_validate_calls += 1;
+        if (task.total_bytes > paged_io_staging_buffer_bytes) {
+            paged_io_staging_buffer_bytes = task.total_bytes;
+        }
+    }
+    task.prepared = true;
+    return true;
+}
+
+bool llama_kv_cache::paged_restore_group_execute(paged_restore_group_task & task) const {
+    if (!task.prepared || task.read_completed || task.restore_completed || task.committed ||
+            task.staging.size() < task.total_bytes || !paged_restore_group_identity_valid(task, true)) {
+        paged_swap_in_fail_bad_size += 1;
+        paged_swap_backend_failures += 1;
+        task.read_status = llama_kv_backing_store_status::bad_slot;
+        task.failed_block = task.begin_block;
+        task.failed_cell = task.begin_cell;
+        return false;
+    }
+
+    const bool test_fault_attempt =
+        paged_test_swapin_fault_.scope == paged_test_swapin_fail_scope::PREFETCH;
+    if (test_fault_attempt) {
+        paged_test_swapin_fault_.matching_attempts += 1;
+        LLAMA_LOG_INFO(
+                "TEST FAULT SWAPIN ATTEMPT attempt_id=%llu scope=prefetch physical_block=%u "
+                "block_begin=%u block_end=%u fail_after_cells=%llu fail_once=%d consumed=%d "
+                "block_state=%d paged_swap_in_calls_before=%llu\n",
+                (unsigned long long) paged_test_swapin_fault_.matching_attempts,
+                task.begin_block,
+                task.begin_cell,
+                task.begin_cell + task.cell_count,
+                (unsigned long long) paged_test_swapin_fault_.fail_after_cells,
+                paged_test_swapin_fault_.fail_once ? 1 : 0,
+                paged_test_swapin_fault_.consumed ? 1 : 0,
+                (int) paged_block_states[task.begin_block],
+                (unsigned long long) paged_swap_in_calls);
+    }
+    if (test_fault_attempt &&
+            paged_test_swapin_fault_.successful_cells >= paged_test_swapin_fault_.fail_after_cells &&
+            (!paged_test_swapin_fault_.fail_once || !paged_test_swapin_fault_.consumed)) {
+        if (paged_test_swapin_fault_.fail_once) {
+            paged_test_swapin_fault_.consumed = true;
+        }
+        paged_test_swapin_fault_.trigger_count += 1;
+        paged_test_swapin_fault_.prefetch_trigger_count += 1;
+        paged_swap_in_fail_read_cell += 1;
+        paged_swap_backend_failures += 1;
+        task.read_status = llama_kv_backing_store_status::io_error;
+        task.backend_errno = EIO;
+        task.failed_block = task.begin_block;
+        task.failed_cell = task.begin_cell;
+        LLAMA_LOG_ERROR(
+                "TEST FAULT INJECTION attempt_id=%llu scope=prefetch physical_block=%u physical_cell=%u "
+                "successful_cells_before_failure=%llu backend_status=io_error backend_errno=EIO(%d) "
+                "failure_reason=%s block_state=%d metadata_present_cells=%u "
+                "paged_swap_in_calls_before=%llu\n",
+                (unsigned long long) paged_test_swapin_fault_.matching_attempts,
+                task.begin_block,
+                task.begin_cell,
+                (unsigned long long) paged_test_swapin_fault_.successful_cells,
+                EIO,
+                llama_paged_swap_error_reason_name(llama_paged_swap_error_reason::SWAP_IN_IO_FAILURE),
+                (int) paged_block_states[task.begin_block],
+                task.cell_count,
+                (unsigned long long) paged_swap_in_calls);
+        return false;
+    }
+
+    bool io_fault_armed = false;
+    uint64_t io_fault_attempt_id = 0;
+    uint64_t io_fault_swap_in_before = paged_blocks_swapped_in;
+    uint64_t io_fault_syscalls_before = kv_swap_store->get_stats().syscall_attempts;
+    uint32_t io_fault_block = task.begin_block;
+    paged_block_state io_fault_state_before = paged_block_states[task.begin_block];
+    const bool io_fault_matches =
+        paged_test_io_fault_.scope == paged_test_io_fail_scope::PREFETCH_SWAP_IN &&
+        paged_test_io_fault_.kind == paged_test_io_fail_kind::READ_EOF_ONCE &&
+        paged_test_io_fault_.target_seq == task.seq_id &&
+        std::find(task.blocks.begin(), task.blocks.end(), paged_test_io_fault_.target_block) != task.blocks.end() &&
+        (!paged_test_io_fault_.fail_once || !paged_test_io_fault_.consumed);
+    if (io_fault_matches) {
+        io_fault_block = paged_test_io_fault_.target_block;
+        const uint32_t begin = io_fault_block * paged_block_size;
+        const uint32_t end = std::min<uint32_t>(begin + paged_block_size, paged_kv_size);
+        bool target_owned = false;
+        for (uint32_t cell = begin; cell < end; ++cell) {
+            if (cell < v_cells[0].size() && v_cells[0].seq_has(cell, task.seq_id)) {
+                target_owned = true;
+                break;
+            }
+        }
+        if (target_owned) {
+            if (auto * store_file = dynamic_cast<llama_kv_backing_store_file *>(kv_swap_store.get())) {
+                llama_kv_backing_store_faults faults = store_file->get_test_faults();
+                faults.read_eof_once = true;
+                store_file->set_test_faults(faults);
+                if (paged_test_io_fault_.fail_once) {
+                    paged_test_io_fault_.consumed = true;
+                }
+                paged_test_io_fault_.matching_attempts += 1;
+                paged_test_io_fault_.trigger_count += 1;
+                io_fault_attempt_id = paged_test_io_fault_.matching_attempts;
+                io_fault_swap_in_before = paged_blocks_swapped_in;
+                io_fault_syscalls_before = kv_swap_store->get_stats().syscall_attempts;
+                io_fault_state_before = paged_block_states[io_fault_block];
+                io_fault_armed = true;
+            }
+        }
+    }
+
+    const uint64_t read_start_us = paged_io_stats_enabled ? llama_paged_timing_now_us() : 0;
+    task.read_status = kv_swap_store->read_cells(
+            0, task.begin_cell, task.cell_count, task.backing_offset,
+            task.staging.data(), task.total_bytes);
+    task.read_completed = true;
+    if (paged_io_stats_enabled) {
+        task.read_us = llama_paged_timing_now_us() - read_start_us;
+        paged_io_block_in_read_us += task.read_us;
+        paged_io_block_in_read_calls += 1;
+    }
+    if (task.read_status != llama_kv_backing_store_status::ok) {
+        paged_swap_in_fail_read_cell += 1;
+        paged_swap_backend_failures += 1;
+        if (task.read_status == llama_kv_backing_store_status::io_error ||
+                task.read_status == llama_kv_backing_store_status::disabled) {
+            task.backend_errno = kv_swap_store->get_stats().last_errno;
+        }
+        task.failed_block = io_fault_armed ? io_fault_block : task.begin_block;
+        task.failed_cell = task.failed_block * paged_block_size;
+        if (io_fault_armed) {
+            const auto & stats = kv_swap_store->get_stats();
+            auto block_state_name = [](paged_block_state state) {
+                switch (state) {
+                    case paged_block_state::UNUSED:        return "UNUSED";
+                    case paged_block_state::RESIDENT:      return "RESIDENT";
+                    case paged_block_state::RELEASED:      return "RELEASED";
+                    case paged_block_state::SWAPPED:       return "SWAPPED";
+                    case paged_block_state::PENDING_WRITE: return "PENDING_WRITE";
+                    case paged_block_state::INVALID:       return "INVALID";
+                }
+                return "UNKNOWN";
+            };
+            LLAMA_LOG_ERROR(
+                    "KV_PAGED_IO_FAULT scope=prefetch_swap_in kind=read_eof_once target_seq=%d "
+                    "physical_block=%u physical_cell=%u state_before=%s state_after=%s "
+                    "swap_in_counter_before=%llu swap_in_counter_after=%llu "
+                    "backend_status=%s backend_errno=%d pread_attempts_before=%llu "
+                    "pread_attempts_after=%llu metadata_present_cells=%u "
+                    "failure_reason=%s trigger_count=%llu attempt_id=%llu\n",
+                    (int) task.seq_id,
+                    io_fault_block,
+                    task.failed_cell,
+                    block_state_name(io_fault_state_before),
+                    block_state_name(paged_block_states[io_fault_block]),
+                    (unsigned long long) io_fault_swap_in_before,
+                    (unsigned long long) paged_blocks_swapped_in,
+                    llama_kv_backing_store_status_name(stats.last_status),
+                    task.backend_errno,
+                    (unsigned long long) io_fault_syscalls_before,
+                    (unsigned long long) stats.syscall_attempts,
+                    task.cell_count,
+                    llama_paged_swap_error_reason_name(llama_paged_swap_error_reason::PAGED_SWAP_IN_IO_ERROR),
+                    (unsigned long long) paged_test_io_fault_.trigger_count,
+                    (unsigned long long) io_fault_attempt_id);
+            paged_test_io_fault_.failed_block = io_fault_block;
+            paged_test_io_fault_.failed_attempt_id = io_fault_attempt_id;
+        }
+        return false;
+    }
+
+    // An asynchronously submitted read may complete after clear/remap. Do not touch tensors unless
+    // the task still names the same cache generation and every block remains SWAPPED.
+    if (!paged_restore_group_identity_valid(task, true)) {
+        paged_swap_in_fail_bad_size += 1;
+        paged_swap_backend_failures += 1;
+        task.read_status = llama_kv_backing_store_status::bad_slot;
+        task.failed_block = task.begin_block;
+        task.failed_cell = task.begin_cell;
+        return false;
+    }
+
+    for (const uint32_t block : task.blocks) {
+        paged_refault_unprotect_block(block);
+    }
+
+    const uint64_t unpack_start_us = paged_io_stats_enabled ? llama_paged_timing_now_us() : 0;
+    for (uint32_t cell = task.begin_cell; cell < task.begin_cell + task.cell_count; ++cell) {
+        size_t cursor = (size_t) (cell - task.begin_cell) * task.bytes_per_cell;
+        for (const auto & row : task.layout) {
+            ggml_backend_tensor_set(
+                    row.tensor, task.staging.data() + cursor, (size_t) cell * row.row_size, row.row_size);
+            cursor += row.row_size;
+        }
+        GGML_ASSERT(cursor == (size_t) (cell - task.begin_cell + 1) * task.bytes_per_cell);
+    }
+    if (paged_io_stats_enabled) {
+        task.unpack_us = llama_paged_timing_now_us() - unpack_start_us;
+        paged_io_block_in_unpack_us += task.unpack_us;
+        paged_io_block_in_unpack_calls += 1;
+    }
+    task.restore_completed = true;
+    return true;
+}
+
+bool llama_kv_cache::paged_restore_group_complete(paged_restore_group_task & task) const {
+    if (!task.prepared || !task.read_completed || !task.restore_completed || task.committed ||
+            task.read_status != llama_kv_backing_store_status::ok ||
+            !paged_restore_group_identity_valid(task, true)) {
+        paged_swap_in_fail_bad_size += 1;
+        paged_swap_backend_failures += 1;
+        task.read_status = llama_kv_backing_store_status::bad_slot;
+        task.failed_block = task.begin_block;
+        task.failed_cell = task.begin_cell;
+        return false;
+    }
+
+    const uint64_t commit_start_us = paged_io_stats_enabled ? llama_paged_timing_now_us() : 0;
+    for (const uint32_t block : task.blocks) {
+        paged_block_states[block] = paged_block_state::RESIDENT;
+    }
+    paged_swap_in_calls += task.blocks.size();
+    paged_blocks_swapped_in += task.blocks.size();
+    paged_swap_bytes_in += task.total_bytes;
+    paged_swap_in_last_block = task.blocks.back();
+    if (paged_io_stats_enabled) {
+        task.commit_us = llama_paged_timing_now_us() - commit_start_us;
+        paged_io_block_in_commit_us += task.commit_us;
+        paged_io_block_in_commit_calls += 1;
+        const uint64_t elapsed_us = llama_paged_timing_now_us() - task.started_us;
+        paged_io_swap_in_latency_us += elapsed_us;
+        paged_io_swap_in_timed_calls += 1;
+        if (elapsed_us > paged_io_swap_in_latency_max_us) {
+            paged_io_swap_in_latency_max_us = elapsed_us;
+        }
+    }
+    task.committed = true;
+
+    if (paged_test_swapin_fault_.scope == paged_test_swapin_fail_scope::PREFETCH) {
+        paged_test_swapin_fault_.successful_cells += task.cell_count;
+        LLAMA_LOG_INFO(
+                "TEST FAULT SWAPIN COMPLETE attempt_id=%llu scope=prefetch physical_block=%u "
+                "restored_cells=%u block_state=%d paged_swap_in_calls_after=%llu\n",
+                (unsigned long long) paged_test_swapin_fault_.matching_attempts,
+                task.begin_block,
+                task.cell_count,
+                (int) paged_block_states[task.begin_block],
+                (unsigned long long) paged_swap_in_calls);
+    }
+    return true;
+}
+
+bool llama_kv_cache::paged_restore_group_sync(paged_restore_group_task & task) const {
+    task.staging.swap(paged_io_staging);
+    bool ok = paged_restore_group_prepare(task) && paged_restore_group_execute(task);
+    if (ok && paged_restore_test_stale_before_complete) {
+        paged_restore_test_stale_before_complete = false;
+        paged_restore_test_stale_triggers += 1;
+        task.generation = task.generation == std::numeric_limits<uint64_t>::max()
+            ? 1
+            : task.generation + 1;
+    }
+    if (ok) {
+        ok = paged_restore_group_complete(task);
+    }
+    paged_io_staging.swap(task.staging);
+    return ok;
+}
+
 llama_kv_cache::paged_prefetch_step_result llama_kv_cache::prefetch_seq_step_impl(
         llama_seq_id seq_id,
         uint32_t max_blocks,
@@ -2026,14 +2516,12 @@ llama_kv_cache::paged_prefetch_step_result llama_kv_cache::prefetch_seq_step_imp
     }
     paged_prefetch_seq_last_owned_blocks = blocks.size();
 
-    uint64_t bytes_per_cell = 0;
-    for (const auto & layer : layers) {
-        if (!layer.k_stream.empty() && layer.k_stream[0]) {
-            bytes_per_cell += layer.k_stream[0]->nb[1];
-        }
-        if (layer.v && !layer.v_stream.empty() && layer.v_stream[0]) {
-            bytes_per_cell += layer.v_stream[0]->nb[1];
-        }
+    const uint64_t bytes_per_cell = kv_swap_cell_stride;
+    if (bytes_per_cell == 0) {
+        paged_prefetch_seq_last_failures += 1;
+        paged_prefetch_seq_failures += 1;
+        result.failed = true;
+        return result;
     }
 
     for (const uint32_t physical_block : blocks) {
@@ -2066,50 +2554,55 @@ llama_kv_cache::paged_prefetch_step_result llama_kv_cache::prefetch_seq_step_imp
         result.candidate_bytes += bytes_per_cell * (end - begin);
     }
 
+    std::vector<paged_restore_group_task> restore_tasks;
+    if (!paged_restore_group_plan(seq_id, candidates, restore_tasks)) {
+        paged_prefetch_seq_last_failures += 1;
+        paged_prefetch_seq_failures += 1;
+        result.failed = true;
+        LLAMA_LOG_ERROR("%s: paged KV prefetch transfer-group planning failed\n", __func__);
+        return result;
+    }
+
     const bool phase_trace = paged_prefetch_phase_trace_enabled;
     const uint64_t phase_call = phase_trace ? ++paged_prefetch_phase_trace_calls : 0;
     uint32_t phase_events = 0;
-    for (const uint32_t physical_block : candidates) {
-        const uint32_t begin = physical_block * paged_block_size;
-        const uint32_t end = std::min<uint32_t>(begin + paged_block_size, paged_kv_size);
-        const uint64_t block_bytes = bytes_per_cell * (end - begin);
-
-        const uint64_t validate_before = phase_trace ? paged_io_block_in_validate_us : 0;
-        const uint64_t read_before = phase_trace ? paged_io_block_in_read_us : 0;
-        const uint64_t unpack_before = phase_trace ? paged_io_block_in_unpack_us : 0;
-        const uint64_t commit_before = phase_trace ? paged_io_block_in_commit_us : 0;
-        if (!paged_swap_in_block(
-                    physical_block,
-                    false,
-                    llama_paged_swap_error_reason::SWAP_IN_IO_FAILURE)) {
+    const auto phase_share = [](uint64_t total, size_t count, size_t index) {
+        return count == 0 ? uint64_t(0) : total / count + (index < total % count ? 1 : 0);
+    };
+    for (auto & task : restore_tasks) {
+        if (!paged_restore_group_sync(task)) {
             paged_prefetch_seq_last_failures += 1;
             paged_prefetch_seq_failures += 1;
             result.failed = true;
-            LLAMA_LOG_ERROR("%s: paged KV prefetch swap-in failed for physical_block=%u\n", __func__, physical_block);
+            LLAMA_LOG_ERROR(
+                    "%s: paged KV prefetch transfer-group failed for blocks=[%u,%u) bytes=%zu\n",
+                    __func__, task.begin_block, task.end_block, task.total_bytes);
             return result;
         }
 
-        result.restored_blocks += 1;
-        result.restored_bytes += block_bytes;
-        paged_prefetch_seq_blocks += 1;
-        paged_prefetch_seq_bytes += block_bytes;
+        result.restored_blocks += task.blocks.size();
+        result.restored_bytes += task.total_bytes;
+        paged_prefetch_seq_blocks += task.blocks.size();
+        paged_prefetch_seq_bytes += task.total_bytes;
         if (phase_trace) {
-            const uint64_t validate_us = paged_io_block_in_validate_us - validate_before;
-            const uint64_t read_us = paged_io_block_in_read_us - read_before;
-            const uint64_t unpack_us = paged_io_block_in_unpack_us - unpack_before;
-            const uint64_t commit_us = paged_io_block_in_commit_us - commit_before;
-            fprintf(stderr,
-                    "KV_PAGED_PREFETCH_BLOCK_PHASE call=%llu block_index=%u physical_block=%u "
-                    "validate_us=%llu read_us=%llu unpack_us=%llu commit_us=%llu phase_sum_us=%llu\n",
-                    (unsigned long long) phase_call,
-                    phase_events,
-                    physical_block,
-                    (unsigned long long) validate_us,
-                    (unsigned long long) read_us,
-                    (unsigned long long) unpack_us,
-                    (unsigned long long) commit_us,
-                    (unsigned long long) (validate_us + read_us + unpack_us + commit_us));
-            phase_events += 1;
+            for (size_t i = 0; i < task.blocks.size(); ++i) {
+                const uint64_t validate_us = phase_share(task.validate_us, task.blocks.size(), i);
+                const uint64_t read_us = phase_share(task.read_us, task.blocks.size(), i);
+                const uint64_t unpack_us = phase_share(task.unpack_us, task.blocks.size(), i);
+                const uint64_t commit_us = phase_share(task.commit_us, task.blocks.size(), i);
+                fprintf(stderr,
+                        "KV_PAGED_PREFETCH_BLOCK_PHASE call=%llu block_index=%u physical_block=%u "
+                        "validate_us=%llu read_us=%llu unpack_us=%llu commit_us=%llu phase_sum_us=%llu\n",
+                        (unsigned long long) phase_call,
+                        phase_events,
+                        task.blocks[i],
+                        (unsigned long long) validate_us,
+                        (unsigned long long) read_us,
+                        (unsigned long long) unpack_us,
+                        (unsigned long long) commit_us,
+                        (unsigned long long) (validate_us + read_us + unpack_us + commit_us));
+                phase_events += 1;
+            }
         }
     }
 

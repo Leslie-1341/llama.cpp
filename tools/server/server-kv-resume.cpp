@@ -57,15 +57,17 @@ server_kv_resume_gate_result server_kv_resume_gate(
     }
 
     ops.set_protected(seq_id, true);
-    result.action = ops.execute({
-            llama_kv_action::prefetch,
-            decision_id,
-            seq_id,
-            0,
-            0,
-            true,
-            true,
-    });
+    llama_kv_action_request request;
+    request.action = llama_kv_action::prefetch;
+    request.decision_id = decision_id;
+    request.seq_id = seq_id;
+    request.target_bytes = 0;
+    request.max_blocks = 0;
+    request.correctness_required = true;
+    request.all_required = true;
+    request.claimant = llama_kv_memory_claimant::kv;
+    request.io_class = llama_kv_io_class::correctness_read;
+    result.action = ops.execute(request);
 
     const bool outcome_ok =
         result.action.outcome == llama_kv_action_outcome::completed ||

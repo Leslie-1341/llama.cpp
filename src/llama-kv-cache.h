@@ -617,6 +617,18 @@ public:
     }
     std::vector<uint8_t> paged_unified_action_test_read_block_bytes(uint32_t block) const;
     bool paged_unified_action_test_swap_out_block(uint32_t block);
+    void paged_unified_action_test_set_restore_group_byte_cap(size_t bytes) {
+        paged_restore_group_byte_cap_override = bytes;
+    }
+    size_t paged_unified_action_test_read_restore_group_byte_cap() const {
+        return paged_restore_group_byte_cap();
+    }
+    void paged_unified_action_test_arm_restore_stale_before_complete() {
+        paged_restore_test_stale_before_complete = true;
+    }
+    uint64_t paged_unified_action_test_read_restore_stale_triggers() const {
+        return paged_restore_test_stale_triggers;
+    }
     struct paged_unified_action_test_io_fault_stats {
         uint64_t matching_attempts = 0;
         uint64_t trigger_count = 0;
@@ -791,6 +803,7 @@ private:
     };
 
     std::unique_ptr<llama_kv_backing_store_i> kv_swap_store;
+    size_t kv_swap_cell_stride = 0;
     bool kv_swap_enabled = false;
     kv_swap_mode kv_swap_mode_ = kv_swap_mode::off;
     uint64_t kv_swap_out_calls = 0;
@@ -866,6 +879,62 @@ private:
             uint32_t physical_block,
             bool fatal_on_failure,
             llama_paged_swap_error_reason failure_reason) const;
+
+    struct paged_restore_row {
+        ggml_tensor * tensor = nullptr;
+        size_t row_size = 0;
+    };
+
+    struct paged_restore_layout {
+        uint64_t object_id = 0;
+        size_t bytes_per_cell = 0;
+        std::vector<paged_restore_row> rows;
+    };
+
+    struct paged_restore_group_task {
+        llama_seq_id seq_id = -1;
+        uint64_t object_id = 0;
+        uint64_t generation = 0;
+        uint64_t mapping_generation = 0;
+        uint32_t begin_block = UINT32_MAX;
+        uint32_t end_block = UINT32_MAX;
+        uint32_t begin_cell = UINT32_MAX;
+        uint32_t cell_count = 0;
+        uint64_t backing_offset = 0;
+        size_t bytes_per_cell = 0;
+        size_t total_bytes = 0;
+        std::vector<uint32_t> blocks;
+        std::vector<size_t> block_bytes;
+        std::vector<paged_restore_row> layout;
+        std::vector<uint8_t> staging;
+        llama_kv_backing_store_status read_status = llama_kv_backing_store_status::disabled;
+        int backend_errno = 0;
+        uint32_t failed_block = UINT32_MAX;
+        uint32_t failed_cell = UINT32_MAX;
+        bool prepared = false;
+        bool read_completed = false;
+        bool restore_completed = false;
+        bool committed = false;
+        uint64_t started_us = 0;
+        uint64_t validate_us = 0;
+        uint64_t read_us = 0;
+        uint64_t unpack_us = 0;
+        uint64_t commit_us = 0;
+    };
+
+    size_t paged_restore_group_byte_cap() const;
+    bool paged_restore_group_identity_valid(
+            const paged_restore_group_task & task,
+            bool require_swapped) const;
+    bool paged_restore_group_plan(
+            llama_seq_id seq_id,
+            const std::vector<uint32_t> & candidates,
+            std::vector<paged_restore_group_task> & tasks) const;
+    bool paged_restore_group_prepare(paged_restore_group_task & task) const;
+    bool paged_restore_group_execute(paged_restore_group_task & task) const;
+    bool paged_restore_group_complete(paged_restore_group_task & task) const;
+    bool paged_restore_group_sync(paged_restore_group_task & task) const;
+
     struct paged_prefetch_step_result {
         uint32_t candidate_blocks = 0;
         uint32_t restored_blocks = 0;
@@ -981,6 +1050,8 @@ private:
     bool     paged_nonidentity_probe_requested = false;
     bool     paged_identity_fast_path_enabled = false;
     uint32_t paged_identity_fast_path_layers = 0;
+    static constexpr size_t PAGED_RESTORE_GROUP_BYTE_CAP = 64u * 1024u * 1024u;
+    size_t paged_restore_group_byte_cap_override = 0;
     llama_kv_paged_identity_fast_path_reject paged_identity_fast_path_reject =
         llama_kv_paged_identity_fast_path_reject::NOT_REQUESTED;
     uint32_t paged_block_size  = 16;
@@ -1211,9 +1282,12 @@ private:
     mutable uint64_t paged_io_block_in_unpack_calls = 0;
     mutable uint64_t paged_io_block_in_commit_us = 0;
     mutable uint64_t paged_io_block_in_commit_calls = 0;
-    // The paged paths execute synchronously. Keep grow-only cell-major staging so a normal
-    // 16-cell swap does not allocate/free 4 MiB per operation.
+    // The synchronous wrapper lends this grow-only buffer to one self-contained restore task.
+    // Transfer groups are byte-capped; an individually oversized block remains a one-block task.
     mutable std::vector<uint8_t> paged_io_staging;
+    mutable paged_restore_layout paged_restore_layout_cache;
+    mutable bool paged_restore_test_stale_before_complete = false;
+    mutable uint64_t paged_restore_test_stale_triggers = 0;
 
     enum class paged_test_swapin_fail_scope : uint8_t {
         OFF,

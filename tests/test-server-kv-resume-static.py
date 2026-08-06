@@ -27,7 +27,10 @@ def function_body(source: str, signature: str) -> str:
 class ServerKvResumeStaticTest(unittest.TestCase):
     def test_action_has_explicit_all_required_semantics(self):
         self.assertIn("bool all_required = false", ACTION)
-        self.assertIn("true,\n            true", RESUME)
+        self.assertIn("request.correctness_required = true;", RESUME)
+        self.assertIn("request.all_required = true;", RESUME)
+        self.assertIn("request.claimant = llama_kv_memory_claimant::kv;", RESUME)
+        self.assertIn("request.io_class = llama_kv_io_class::correctness_read;", RESUME)
 
     def test_resume_gate_is_after_n_past_and_before_batch_setup(self):
         update_slots = function_body(CONTEXT, "void update_slots()")
@@ -39,10 +42,13 @@ class ServerKvResumeStaticTest(unittest.TestCase):
 
     def test_server_only_passes_logical_intent(self):
         gate = function_body(RESUME, "server_kv_resume_gate_result server_kv_resume_gate(")
-        self.assertIn("llama_kv_action::prefetch", gate)
-        self.assertIn("decision_id", gate)
-        self.assertIn("seq_id", gate)
-        self.assertIn("true,\n            true", gate)
+        self.assertIn("request.action = llama_kv_action::prefetch;", gate)
+        self.assertIn("request.decision_id = decision_id;", gate)
+        self.assertIn("request.seq_id = seq_id;", gate)
+        self.assertIn("request.correctness_required = true;", gate)
+        self.assertIn("request.all_required = true;", gate)
+        self.assertIn("request.claimant = llama_kv_memory_claimant::kv;", gate)
+        self.assertIn("request.io_class = llama_kv_io_class::correctness_read;", gate)
         for forbidden in ("physical", "free_list", "backing", "paged_block"):
             self.assertNotIn(forbidden, gate)
 
