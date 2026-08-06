@@ -11,8 +11,8 @@ import tempfile
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-RUNNER_PATH = ROOT / "scripts/run-kv-governor-g0-s1.py"
-PARSER_PATH = ROOT / "scripts/parse-kv-governor-g0-s1.py"
+RUNNER_PATH = ROOT / "scripts/run-kv-server-b0-b2.py"
+PARSER_PATH = ROOT / "scripts/parse-kv-server-b0-b2.py"
 SAMPLER_PATH = ROOT / "scripts/kv-controlled-memory-sampler.sh"
 
 
@@ -682,7 +682,7 @@ class BaselineFixture(unittest.TestCase):
     def test_dirty_formal_capture_requires_explicit_opt_in(self) -> None:
         path = self.root / "manifest.json"
         manifest = json.loads(path.read_text(encoding="utf-8"))
-        manifest["dirty_status"] = [" M scripts/run-kv-governor-g0-s1.py"]
+        manifest["dirty_status"] = [" M scripts/run-kv-server-b0-b2.py"]
         manifest["capture_mode"] = "diagnostic_dirty"
         manifest["execution"]["allow_dirty"] = False
         put(path, manifest)
@@ -693,7 +693,7 @@ class BaselineFixture(unittest.TestCase):
     def test_dirty_diagnostic_capture_never_returns_formal_pass(self) -> None:
         path = self.root / "manifest.json"
         manifest = json.loads(path.read_text(encoding="utf-8"))
-        manifest["dirty_status"] = [" M scripts/run-kv-governor-g0-s1.py"]
+        manifest["dirty_status"] = [" M scripts/run-kv-server-b0-b2.py"]
         manifest["capture_mode"] = "diagnostic_dirty"
         manifest["execution"]["allow_dirty"] = True
         put(path, manifest)
