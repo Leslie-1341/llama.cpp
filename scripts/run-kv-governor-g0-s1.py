@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real-server runner for the G0-S1 single-session KV roundtrip gate."""
+"""Real-server runner for the G0-S1 gate and the B0-B2 server baseline matrix."""
 from __future__ import annotations
 
 import argparse
@@ -8,6 +8,7 @@ import http.client
 import json
 import os
 import pathlib
+import re
 import shutil
 import signal
 import socket
@@ -21,6 +22,12 @@ from typing import Any
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PROTOCOL = "kv_governor_g0_s1"
 PROTOCOL_VERSION = 1
+BASELINE_PROTOCOL = "kv_server_b0_b2_baseline"
+BASELINE_PROTOCOL_VERSION = 1
+NATIVE_PROVENANCE_SCHEMA_VERSION = 1
+NATIVE_UPSTREAM_REPOSITORY = "https://github.com/ggml-org/llama.cpp"
+NOT_APPLICABLE = "NOT_APPLICABLE"
+MEMORY_SAMPLER = ROOT / "scripts/kv-controlled-memory-sampler.sh"
 SOURCE_MARKER_SCHEMA = "kv_governor_stage3c_1c_2b_1r/v6"
 CAPABILITY_MARKER = "KV_GOVERNOR_CAPABILITY"
 MARKER = "kv_pressure_unified_action"
@@ -68,6 +75,119 @@ PREFIX_TEXT_UNIT = "G0 S1 deterministic scalable prefix token block.\n"
 MAX_PREFIX_TEXT_UNITS = 2048
 PREFIX_TEXT = PREFIX_TEXT_UNIT * MAX_PREFIX_TEXT_UNITS
 QUERY_TEXT = "Continue with one deterministic concise answer."
+
+BASELINE_CASES = (
+    "NATIVE_UPSTREAM",
+    "CURRENT_E0",
+    "FLEXKV_RESIDENT",
+    "FLEXKV_K1_SYNC",
+)
+BASELINE_CASE_LABELS = {
+    "NATIVE_UPSTREAM": "upstream llama-server without FlexKV evidence requirements",
+    "CURRENT_E0": "current server with all experimental KV mechanisms explicitly disabled",
+    "FLEXKV_RESIDENT": "current server with paged runtime resident and Governor actions disabled",
+    "FLEXKV_K1_SYNC": "current server with Governor OFFLOAD and synchronous K1 restore",
+}
+BASELINE_RUN_PLAN = (
+    (1, 1, "NATIVE_UPSTREAM"),
+    (1, 2, "CURRENT_E0"),
+    (1, 3, "FLEXKV_RESIDENT"),
+    (1, 4, "FLEXKV_K1_SYNC"),
+    (2, 1, "FLEXKV_K1_SYNC"),
+    (2, 2, "FLEXKV_RESIDENT"),
+    (2, 3, "CURRENT_E0"),
+    (2, 4, "NATIVE_UPSTREAM"),
+    (3, 1, "FLEXKV_RESIDENT"),
+    (3, 2, "NATIVE_UPSTREAM"),
+    (3, 3, "FLEXKV_K1_SYNC"),
+    (3, 4, "CURRENT_E0"),
+)
+BASELINE_COMPARISON_EDGES = {
+    "B0": {
+        "left": "NATIVE_UPSTREAM",
+        "right": "CURRENT_E0",
+        "purpose": "native upstream versus current E0 compatibility baseline",
+    },
+    "B1": {
+        "left": "CURRENT_E0",
+        "right": "FLEXKV_RESIDENT",
+        "purpose": "current E0 versus resident FlexKV runtime baseline",
+    },
+    "B2": {
+        "left": "FLEXKV_RESIDENT",
+        "right": "FLEXKV_K1_SYNC",
+        "purpose": "resident FlexKV versus synchronous K1 offload/restore baseline",
+    },
+}
+BASELINE_SAMPLE_INTERVAL_SECONDS = 0.10
+
+# The runner starts servers with this explicit, non-inherited environment.  The
+# E0 map closes every experiment switch that can affect the controlled workload.
+KV_EXPERIMENTAL_DISABLED_ENV = {
+    "LLAMA_KV_ACTIVE_TOKEN_STATS": "1",
+    "LLAMA_KV_PAGED_IO_STATS": "1",
+    "LLAMA_KV_PAGED_IDENTITY_FAST_PATH": "0",
+    "LLAMA_KV_IDLE_NUM_IDLE_SEQS": "2",
+    "LLAMA_KV_IDLE_SEQ0_WARMUP_TOKENS": "256",
+    "LLAMA_KV_CACHE_DEBUG": "0",
+    "LLAMA_KV_PAGED_BLOCK_SIZE": "16",
+    "LLAMA_KV_PAGED_SHIFT": "0",
+    "LLAMA_KV_LAZY_CLEAR": "0",
+    "LLAMA_KV_LAZY_TAIL": "0",
+    "LLAMA_KV_PAGED": "0",
+    "LLAMA_KV_PAGED_INGRAPH": "0",
+    "LLAMA_KV_PAGED_GATHER_NONIDENTITY": "0",
+    "LLAMA_KV_PAGED_SWAP": "0",
+    "LLAMA_KV_PAGED_SWAP_EXPLICIT_ONLY": "0",
+    "LLAMA_KV_PAGED_MINCORE": "0",
+    "LLAMA_KV_PAGED_RELEASE": "0",
+    "LLAMA_KV_PAGED_IDLE_SWAP": "0",
+    "LLAMA_KV_PAGED_IDLE_SWAP_MADVISE": "0",
+    "LLAMA_KV_PAGED_IDLE_SWAP_EVERY_TOKENS": "0",
+    "LLAMA_KV_PAGED_IDLE_SWAP_MAX_BLOCKS_PER_STEP": "0",
+    "LLAMA_KV_PAGED_IDLE_SWAP_MIN_IDLE_STEPS": "0",
+    "LLAMA_KV_PAGED_IDLE_SWAP_DEBUG_PROBES": "0",
+    "LLAMA_KV_PAGED_SHADOW_VALIDATE": "0",
+    "LLAMA_KV_PAGED_TRACE": "0",
+    "LLAMA_KV_PAGED_IDLE_TRACE": "0",
+    "LLAMA_KV_PAGED_REFAULT_TRACE": "0",
+    "LLAMA_KV_PAGED_REFAULT_TRACE_BACKTRACE": "0",
+    "LLAMA_KV_PAGED_REFAULT_TRACE_MAX": "0",
+    "LLAMA_KV_PAGED_TIMING": "0",
+    "LLAMA_KV_PAGED_PREFETCH_DURING_ACTIVE": "0",
+    "LLAMA_KV_PAGED_PREFETCH_AUTO_DELAYED": "0",
+    "LLAMA_KV_PAGED_PREFETCH_AFTER_ACTIVE_TOKENS": "0",
+    "LLAMA_KV_PAGED_PREFETCH_EVERY_TOKENS": "0",
+    "LLAMA_KV_PAGED_PREFETCH_BLOCKS_PER_STEP": "0",
+    "LLAMA_KV_PAGED_PREFETCH_AUTO_EVERY_TOKENS": "0",
+    "LLAMA_KV_PAGED_PREFETCH_AUTO_BLOCKS_PER_STEP": "0",
+    "LLAMA_KV_PAGED_PREFETCH_AUTO_SAFETY_TOKENS": "0",
+    "LLAMA_KV_PAGED_PREFETCH_FINAL_SYNC_BLOCKS": "0",
+    "LLAMA_KV_PAGED_PREFETCH_PRESSURE_MODE": "off",
+    "LLAMA_KV_PAGED_RESUME_PENDING_TOKEN": "96",
+    "LLAMA_KV_PAGED_DEFER_SWAPOUT_ON_RESUME": "0",
+    "LLAMA_KV_PAGED_RESUME_PREFETCH": "0",
+    "LLAMA_KV_PAGED_RESUME_TIMING": "0",
+    "LLAMA_KV_PAGED_RESUME_TIMING_STEP": "0",
+    "LLAMA_KV_PRESSURE_SAMPLER": "0",
+    "LLAMA_KV_PRESSURE_DRY_RUN": "0",
+    "LLAMA_KV_PRESSURE_BOUNDED_RELEASE": "0",
+    "LLAMA_KV_PRESSURE_UNIFIED_ACTION": "0",
+    "LLAMA_KV_PRESSURE_UNIFIED_ACTION_TARGET_BYTES": "0",
+    "LLAMA_KV_PRESSURE_UNIFIED_ACTION_MAX_BLOCKS": "0",
+    "LLAMA_KV_PRESSURE_GOVERNOR_CLAIMANT_TRACE": "0",
+    "LLAMA_KV_G0_S1_RESIDENT_OBSERVATION": "0",
+    "LLAMA_KV_PAGED_PREFETCH_PHASE_TRACE": "0",
+    "LLAMA_KV_RESUME_STAGE_TIMING": "0",
+    "LLAMA_KV_SWAP": "0",
+    "LLAMA_KV_SWAP_MODE": "exact",
+    "LLAMA_KV_SWAP_WINDOW": "0",
+    "LLAMA_KV_SWAP_SINK": "0",
+    "LLAMA_KV_SWAP_RSS_SAMPLE": "0",
+    "LLAMA_KV_SWAP_MADVISE": "0",
+    "LLAMA_KV_SWAP_BACKEND_SELFTEST": "0",
+    "LLAMA_KV_SWAP_ROUNDTRIP_SELFTEST": "0",
+}
 
 
 class RunnerInterrupted(BaseException):
@@ -460,6 +580,381 @@ def governor_env(enabled: bool) -> dict[str, str]:
             "LLAMA_KV_PRESSURE_UNIFIED_ACTION_MAX_BLOCKS": str(GOVERNOR_MAX_BLOCKS),
         })
     return env
+
+
+def baseline_case_flags(name: str) -> dict[str, bool]:
+    if name not in BASELINE_CASES:
+        raise ValueError(f"unknown baseline case: {name}")
+    return {
+        "native": name == "NATIVE_UPSTREAM",
+        "current": name != "NATIVE_UPSTREAM",
+        "flex_runtime": name in {"FLEXKV_RESIDENT", "FLEXKV_K1_SYNC"},
+        "backing": name in {"FLEXKV_RESIDENT", "FLEXKV_K1_SYNC"},
+        "resident": name in {"FLEXKV_RESIDENT", "FLEXKV_K1_SYNC"},
+        "k1_sync": name == "FLEXKV_K1_SYNC",
+    }
+
+
+def baseline_env(name: str) -> dict[str, str]:
+    flags = baseline_case_flags(name)
+    if flags["native"]:
+        return dict(BASE_ENV)
+
+    env = dict(BASE_ENV)
+    env.update(KV_EXPERIMENTAL_DISABLED_ENV)
+    if name == "CURRENT_E0":
+        return env
+
+    env.update({
+        "LLAMA_KV_PAGED": "1",
+        "LLAMA_KV_PAGED_INGRAPH": "1",
+        "LLAMA_KV_PAGED_SWAP": "1",
+        "LLAMA_KV_PAGED_SWAP_EXPLICIT_ONLY": "1",
+        "LLAMA_KV_PAGED_MINCORE": "1",
+        "LLAMA_KV_PAGED_BLOCK_SIZE": str(PAGED_BLOCK_SIZE),
+        "LLAMA_KV_SWAP_DIR": "backing",
+        "LLAMA_KV_G0_S1_RESIDENT_OBSERVATION": (
+            "1" if flags["k1_sync"] else "preflight"),
+        "LLAMA_KV_PAGED_IO_STATS": "1",
+        "LLAMA_KV_PAGED_PREFETCH_PHASE_TRACE": "1",
+        "LLAMA_KV_RESUME_STAGE_TIMING": "1",
+        "LLAMA_KV_PRESSURE_SAMPLE_INTERVAL_MS": "100",
+        "LLAMA_KV_PRESSURE_LOG_INTERVAL_MS": "1000",
+        "LLAMA_KV_LOW_WATER_RSS_KB": "1",
+        "LLAMA_KV_PRESSURE_RSS_KB": "2",
+        "LLAMA_KV_CRITICAL_RSS_KB": "3",
+    })
+    if flags["k1_sync"]:
+        env.update({
+            "LLAMA_KV_PRESSURE_SAMPLER": "1",
+            "LLAMA_KV_PRESSURE_GOVERNOR_CLAIMANT_TRACE": "1",
+            "LLAMA_KV_PRESSURE_UNIFIED_ACTION": "1",
+            "LLAMA_KV_PRESSURE_UNIFIED_ACTION_TARGET_BYTES": str(GOVERNOR_TARGET_BYTES),
+            "LLAMA_KV_PRESSURE_UNIFIED_ACTION_MAX_BLOCKS": str(GOVERNOR_MAX_BLOCKS),
+        })
+    return env
+
+
+def baseline_server_argv(
+        binary: pathlib.Path,
+        model: pathlib.Path,
+        port: int,
+        name: str,
+        ctx_size: int) -> list[str]:
+    argv = [
+        str(binary), "--host", "127.0.0.1", "--port", str(port), "--model", str(model),
+        "--ctx-size", str(ctx_size), "--parallel", "1", "--timeout", "300",
+        "--threads", "4", "--n-gpu-layers", "0", "--cache-type-k", "f32",
+        "--cache-type-v", "f32", "--no-warmup",
+    ]
+    if not baseline_case_flags(name)["native"]:
+        argv.extend(("--kv-unified", "--no-cache-idle-slots"))
+    return argv
+
+
+def baseline_capability_error(name: str, capability: dict[str, str]) -> str | None:
+    if any(capability[key] != "1" for key in ("n_slots", "n_seq_max", "n_stream")):
+        return "production capability does not describe a single-session server"
+    if name == "CURRENT_E0":
+        if capability.get("kv_unified") != "1":
+            return "CURRENT_E0 must retain the current binary's unified KV mode"
+        enabled = {
+            key: capability[key]
+            for key in REQUIRED_CAPABILITY - {"kv_unified"}
+            if capability[key] != "0"
+        }
+        if enabled:
+            return f"CURRENT_E0 has experimental KV capability enabled: {enabled}"
+        return None
+    return verify_capability(capability)
+
+
+def optional_identity(path: pathlib.Path | None) -> dict[str, Any] | None:
+    return identity(path) if path is not None and path.is_file() else None
+
+
+def capture_native_provenance(
+        source: pathlib.Path,
+        binary_identity: dict[str, Any],
+        output: pathlib.Path) -> dict[str, Any]:
+    if not source.is_file():
+        raise WorkloadFailure(f"native provenance sidecar is unavailable: {source}")
+    try:
+        raw = source.read_bytes()
+        record = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise WorkloadFailure(f"native provenance sidecar is invalid: {type(exc).__name__}: {exc}") from exc
+    required = {"schema_version", "upstream_repository", "upstream_commit", "binary", "build"}
+    if not isinstance(record, dict) or set(record) != required:
+        raise WorkloadFailure("native provenance sidecar schema mismatch")
+    if (record.get("schema_version") != NATIVE_PROVENANCE_SCHEMA_VERSION or
+            record.get("upstream_repository") != NATIVE_UPSTREAM_REPOSITORY or
+            not isinstance(record.get("upstream_commit"), str) or
+            not re.fullmatch(r"[0-9a-f]{40}", record["upstream_commit"])):
+        raise WorkloadFailure("native provenance upstream identity is invalid")
+    if record.get("binary") != binary_identity:
+        raise WorkloadFailure("native provenance binary identity does not match --native-binary")
+    build = record.get("build")
+    if (not isinstance(build, dict) or set(build) != {"cmake_build_type", "compiler"} or
+            not all(isinstance(value, str) and value for value in build.values())):
+        raise WorkloadFailure("native provenance build record is invalid")
+    artifact = output / "native_provenance.json"
+    artifact.write_bytes(raw)
+    return {
+        "source": identity(source),
+        "artifact": identity(artifact),
+        "record": record,
+    }
+
+
+def read_text_or_not_applicable(path: pathlib.Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8").strip() or NOT_APPLICABLE
+    except OSError:
+        return NOT_APPLICABLE
+
+
+def cgroup_identity() -> dict[str, Any]:
+    current_file: pathlib.Path | None = None
+    max_file: pathlib.Path | None = None
+    peak_file: pathlib.Path | None = None
+    version = "none"
+    path = NOT_APPLICABLE
+    try:
+        if pathlib.Path("/sys/fs/cgroup/cgroup.controllers").is_file():
+            rel = ""
+            for line in pathlib.Path("/proc/self/cgroup").read_text(encoding="utf-8").splitlines():
+                parts = line.split(":", 2)
+                if len(parts) == 3 and parts[0] == "0":
+                    rel = parts[2]
+                    break
+            if rel:
+                root = pathlib.Path("/sys/fs/cgroup") / rel.lstrip("/")
+                version = "v2"
+                path = str(root)
+                current_file = root / "memory.current"
+                max_file = root / "memory.max"
+                peak_file = root / "memory.peak"
+        else:
+            rel = ""
+            for line in pathlib.Path("/proc/self/cgroup").read_text(encoding="utf-8").splitlines():
+                parts = line.split(":", 2)
+                if len(parts) == 3 and "memory" in parts[1].split(","):
+                    rel = parts[2]
+                    break
+            if rel:
+                root = pathlib.Path("/sys/fs/cgroup/memory") / rel.lstrip("/")
+                version = "v1"
+                path = str(root)
+                current_file = root / "memory.usage_in_bytes"
+                max_file = root / "memory.limit_in_bytes"
+                peak_file = root / "memory.max_usage_in_bytes"
+    except OSError:
+        pass
+    return {
+        "version": version,
+        "path": path,
+        "memory_current_file": str(current_file) if current_file else NOT_APPLICABLE,
+        "memory_max_file": str(max_file) if max_file else NOT_APPLICABLE,
+        "memory_peak_file": str(peak_file) if peak_file else NOT_APPLICABLE,
+        "memory_current": read_text_or_not_applicable(current_file) if current_file else NOT_APPLICABLE,
+        "memory_max": read_text_or_not_applicable(max_file) if max_file else NOT_APPLICABLE,
+        "memory_peak_snapshot": read_text_or_not_applicable(peak_file) if peak_file else NOT_APPLICABLE,
+    }
+
+
+def host_identity() -> dict[str, str]:
+    try:
+        os_release = pathlib.Path("/etc/os-release").read_text(encoding="utf-8").replace("\n", " ").strip()
+    except OSError:
+        os_release = NOT_APPLICABLE
+    return {
+        "hostname": socket.gethostname(),
+        "kernel": " ".join(os.uname()),
+        "os_release": os_release or NOT_APPLICABLE,
+    }
+
+
+def cgroup_current(cgroup: dict[str, Any]) -> str:
+    path = cgroup.get("memory_current_file")
+    return read_text_or_not_applicable(pathlib.Path(path)) if isinstance(path, str) and path != NOT_APPLICABLE else NOT_APPLICABLE
+
+
+def process_status_value(pid: int, key: str) -> int | str:
+    try:
+        for line in pathlib.Path(f"/proc/{pid}/status").read_text(encoding="utf-8").splitlines():
+            if line.startswith(f"{key}:"):
+                value = line.split()[1]
+                return int(value) if value.isdigit() else NOT_APPLICABLE
+    except OSError:
+        pass
+    return NOT_APPLICABLE
+
+
+def backing_fd_observation(pid: int, backing: pathlib.Path | None) -> dict[str, Any] | str:
+    if backing is None:
+        return NOT_APPLICABLE
+    try:
+        for fd in pathlib.Path(f"/proc/{pid}/fd").iterdir():
+            try:
+                target = os.readlink(fd)
+                if not (target.startswith(str(backing) + "/") or f"/{backing.name}/" in target):
+                    continue
+                stat = fd.stat()
+                return {
+                    "status": "open_fd_observed",
+                    "path": target,
+                    "logical_size": stat.st_size,
+                    "allocated_bytes": stat.st_blocks * 512,
+                }
+            except OSError:
+                continue
+    except OSError:
+        return {"status": "unavailable"}
+    return {"status": "not_observed"}
+
+
+def capture_memory_phase(
+        phases: list[dict[str, Any]],
+        label: str,
+        pid: int,
+        cgroup: dict[str, Any],
+        backing: pathlib.Path | None) -> None:
+    phases.append({
+        "phase": label,
+        "monotonic_ns": time.monotonic_ns(),
+        "server_pid": pid,
+        "vmrss_kb": process_status_value(pid, "VmRSS"),
+        "vmhwm_kb": process_status_value(pid, "VmHWM"),
+        "cgroup_memory_current_bytes": cgroup_current(cgroup),
+        "backing": backing_fd_observation(pid, backing),
+    })
+
+
+def process_cgroup_membership(pid: int) -> list[str] | str:
+    try:
+        return pathlib.Path(f"/proc/{pid}/cgroup").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return NOT_APPLICABLE
+
+
+def memory_sampler_argv(
+        case: pathlib.Path,
+        pid: int,
+        backing: pathlib.Path | None,
+        cgroup: dict[str, Any]) -> list[str]:
+    current_file = cgroup.get("memory_current_file")
+    if not isinstance(current_file, str) or current_file == NOT_APPLICABLE:
+        current_file = ""
+    return [
+        "bash", str(MEMORY_SAMPLER), "--sample-process", str(pid),
+        str(case / "memory_samples.tsv"), str(backing) if backing else "",
+        f"{BASELINE_SAMPLE_INTERVAL_SECONDS:.2f}", current_file,
+    ]
+
+
+def start_memory_sampler(
+        case: pathlib.Path,
+        proc: subprocess.Popen[bytes],
+        backing: pathlib.Path | None,
+        cgroup: dict[str, Any]) -> subprocess.Popen[bytes]:
+    if not MEMORY_SAMPLER.is_file():
+        raise WorkloadFailure(f"shared memory sampler is unavailable: {MEMORY_SAMPLER}")
+    return subprocess.Popen(
+        memory_sampler_argv(case, proc.pid, backing, cgroup),
+        stdout=subprocess.DEVNULL,
+        stderr=(case / "memory_sampler.stderr").open("wb"),
+    )
+
+
+def stop_memory_sampler(proc: subprocess.Popen[bytes] | None) -> dict[str, Any]:
+    if proc is None:
+        return {"started": False, "exit_code": NOT_APPLICABLE, "timed_out": False}
+    timed_out = False
+    try:
+        proc.wait(timeout=SERVER_TERM_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        proc.terminate()
+        try:
+            proc.wait(timeout=SERVER_KILL_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=SERVER_KILL_TIMEOUT_SECONDS)
+    return {"started": True, "pid": proc.pid, "exit_code": proc.returncode, "timed_out": timed_out}
+
+
+def capture_baseline_resident(
+        case: pathlib.Path,
+        port: int,
+        label: str,
+        server_identity: dict[str, Any]) -> dict[str, Any]:
+    status, raw, slots = query_slots_raw(port)
+    raw_path = case / f"{label}.raw.json"
+    raw_path.write_bytes(raw)
+    if status != 200 or not isinstance(slots, list) or len(slots) != 1 or not isinstance(slots[0], dict):
+        raise WorkloadFailure(f"{label}: GET /slots did not return exactly one slot")
+    slot = slots[0]
+    if slot.get("id") != 0 or not isinstance(slot.get("is_processing"), bool):
+        raise WorkloadFailure(f"{label}: GET /slots has an invalid slot identity")
+    claimant = normalize_claimant(slot.get("kv_claimant"), 0, slot["is_processing"])
+    if claimant is None:
+        raise WorkloadFailure(f"{label}: GET /slots has an invalid KV claimant")
+    probe = physical_probe(slots, raw, server_identity)
+    if not probe["physical_resident_sample_available"]:
+        raise WorkloadFailure(f"{label}: {probe['reason']}")
+    resident = probe["resident"]
+    assert isinstance(resident, dict)
+    if resident["resident_bytes"] <= 0 or resident["resident_pages"] <= 0:
+        raise WorkloadFailure(f"{label}: physical mincore sample has no resident KV pages")
+    value = {
+        "raw_path": raw_path.name,
+        "raw_sha256": sha_bytes(raw),
+        "observed_monotonic_ns": time.monotonic_ns(),
+        "stderr_end": (case / "server.stderr").stat().st_size,
+        "slots_http_status": status,
+        "claimant": claimant,
+        "physical_probe": probe,
+        "resident_scope": "whole_kv_mincore_sample_not_per_prefix_proof",
+    }
+    dump(case / f"{label}.json", value)
+    return value
+
+
+def write_baseline_execution(
+        case: pathlib.Path,
+        name: str,
+        round_no: int,
+        run_order: int,
+        binary: pathlib.Path,
+        model: pathlib.Path,
+        argv: list[str],
+        env: dict[str, str],
+        server_identity: dict[str, Any],
+        cgroup: dict[str, Any]) -> None:
+    dump(case / "execution.json", {
+        "case": name,
+        "round": round_no,
+        "run_order": run_order,
+        "host": "127.0.0.1",
+        "argv": argv,
+        "cwd": str(case.resolve()),
+        "environment": env,
+        "environment_closure": {
+            "inherits_parent_environment": False,
+            "base_environment_keys": sorted(BASE_ENV),
+        },
+        "binary": identity(binary),
+        "model": identity(model),
+        "server_identity": server_identity,
+        "server_cgroup": process_cgroup_membership(server_identity["pid"]),
+        "cgroup": cgroup,
+        "memory_sampler": identity(MEMORY_SAMPLER),
+        "memory_sampler_argv": memory_sampler_argv(
+            case, server_identity["pid"],
+            case / "backing" if baseline_case_flags(name)["backing"] else None,
+            cgroup),
+    })
 
 
 def start(
@@ -1106,7 +1601,10 @@ def prepare_token_workload(
     return prompt_p, continuation_prompt
 
 
-def completion_body(prompt: list[int], n_predict: int) -> dict[str, Any]:
+def completion_body(
+        prompt: list[int],
+        n_predict: int,
+        stream: bool = False) -> dict[str, Any]:
     return {
         "prompt": prompt,
         "n_predict": n_predict,
@@ -1114,7 +1612,7 @@ def completion_body(prompt: list[int], n_predict: int) -> dict[str, Any]:
         "seed": SEED,
         "cache_prompt": True,
         "id_slot": 0,
-        "stream": False,
+        "stream": stream,
     }
 
 
@@ -1162,6 +1660,147 @@ def request_completion(port: int, body: dict[str, Any], label: str, record: path
     with record.open("a", encoding="utf-8") as f:
         f.write(json.dumps(item, sort_keys=True) + "\n")
     return item
+
+
+def request_stream_completion(
+        port: int,
+        body: dict[str, Any],
+        label: str,
+        record: pathlib.Path) -> dict[str, Any]:
+    encoded = json.dumps(body, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    item: dict[str, Any] = {
+        "label": label,
+        "request": body,
+        "request_sha256": sha_bytes(encoded),
+        "started_monotonic_ns": time.monotonic_ns(),
+        "streaming": True,
+    }
+    con: http.client.HTTPConnection | None = None
+    status = 0
+    raw_parts: list[bytes] = []
+    content_parts: list[str] = []
+    first_content_monotonic_ns: int | None = None
+    response_timings: Any = None
+    event_count = 0
+    terminal_received = False
+    stream_error: str | None = None
+    try:
+        con = http.client.HTTPConnection("127.0.0.1", port, timeout=REQUEST_TIMEOUT_SECONDS)
+        con.request("POST", "/completion", encoded, {"Content-Type": "application/json"})
+        response = con.getresponse()
+        status = response.status
+        item["content_type"] = response.getheader("Content-Type")
+        if status == 200:
+            while True:
+                line = response.readline()
+                if not line:
+                    break
+                raw_parts.append(line)
+                if not line.startswith(b"data:"):
+                    continue
+                payload = line[len(b"data:"):].strip()
+                if not payload or payload == b"[DONE]":
+                    continue
+                try:
+                    event = json.loads(payload)
+                except json.JSONDecodeError as exc:
+                    stream_error = f"invalid SSE JSON: {exc}"
+                    break
+                if not isinstance(event, dict):
+                    stream_error = "SSE event is not an object"
+                    break
+                event_count += 1
+                content = event.get("content")
+                if content is not None and not isinstance(content, str):
+                    stream_error = "SSE content is not a string"
+                    break
+                if isinstance(content, str):
+                    content_parts.append(content)
+                    if content and first_content_monotonic_ns is None:
+                        first_content_monotonic_ns = time.monotonic_ns()
+                if event.get("stop") is True:
+                    terminal_received = True
+                    response_timings = event.get("timings")
+            if stream_error is None and not terminal_received:
+                stream_error = "stream terminated without a stop=true event"
+        else:
+            raw_parts.append(response.read())
+    except OSError as exc:
+        stream_error = f"{type(exc).__name__}: {exc}"
+    finally:
+        if con is not None:
+            try:
+                con.close()
+            except OSError:
+                pass
+    text = "".join(content_parts)
+    item.update({
+        "http_status": status,
+        "response_raw": b"".join(raw_parts).decode("utf-8", errors="replace"),
+        "response_text": text,
+        "response_sha256": sha_bytes(text.encode("utf-8")),
+        "response_timings": response_timings,
+        "first_content_monotonic_ns": first_content_monotonic_ns,
+        "stream_event_count": event_count,
+        "stream_terminal_received": terminal_received,
+        "stream_error": stream_error,
+        "finished_monotonic_ns": time.monotonic_ns(),
+    })
+    with record.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(item, sort_keys=True) + "\n")
+    return item
+
+
+def capture_step2_stream_metrics(
+        case: pathlib.Path,
+        step2: dict[str, Any]) -> dict[str, Any]:
+    def number(value: Any, label: str, positive: bool = False) -> float:
+        if (not isinstance(value, (int, float)) or isinstance(value, bool) or
+                value < 0 or (positive and value <= 0)):
+            raise WorkloadFailure(f"step2 {label} is unavailable or invalid")
+        return float(value)
+
+    started = step2.get("started_monotonic_ns")
+    first_content = step2.get("first_content_monotonic_ns")
+    finished = step2.get("finished_monotonic_ns")
+    if (
+            not isinstance(started, int) or isinstance(started, bool) or started <= 0 or
+            not isinstance(first_content, int) or isinstance(first_content, bool) or
+            first_content < started or
+            not isinstance(finished, int) or isinstance(finished, bool) or finished < first_content):
+        raise WorkloadFailure("step2 stream does not bind first content and completion timestamps")
+    if step2.get("http_status") != 200 or step2.get("streaming") is not True:
+        raise WorkloadFailure("step2 is not a successful streaming completion")
+    if step2.get("stream_terminal_received") is not True or step2.get("stream_error") is not None:
+        raise WorkloadFailure("step2 streaming completion did not close cleanly")
+    if not isinstance(step2.get("response_text"), str) or not step2["response_text"]:
+        raise WorkloadFailure("step2 streaming completion is empty")
+    timings = step2.get("response_timings")
+    if not isinstance(timings, dict):
+        raise WorkloadFailure("step2 terminal timings are unavailable")
+    predicted_n = timings.get("predicted_n")
+    if predicted_n != N_PREDICT:
+        raise WorkloadFailure("step2 terminal predicted_n does not match the fixed workload")
+    tpot_ms = number(timings.get("predicted_per_token_ms"), "predicted_per_token_ms", positive=True)
+    ttft_ms = (first_content - started) / 1_000_000.0
+    total_duration_ms = (finished - started) / 1_000_000.0
+    if total_duration_ms <= 0:
+        raise WorkloadFailure("step2 total duration is not positive")
+    value = {
+        "schema_version": 1,
+        "request_label": "step2",
+        "ttft_source": "http_stream_first_nonempty_content",
+        "tpot_source": "response.timings.predicted_per_token_ms",
+        "total_duration_source": "http_stream_wall",
+        "tps_source": "n_predict/http_stream_wall",
+        "ttft_ms": ttft_ms,
+        "tpot_ms": tpot_ms,
+        "total_duration_ms": total_duration_ms,
+        "tps": N_PREDICT * 1000.0 / total_duration_ms,
+        "response_timings": timings,
+    }
+    dump(case / "step2_metrics.json", value)
+    return value
 
 
 def write_execution(
@@ -1367,6 +2006,210 @@ def run_case(
     return result
 
 
+def baseline_run_metadata(round_no: int, run_order: int, name: str) -> dict[str, Any]:
+    return {
+        "round": round_no,
+        "run_order": run_order,
+        "case": name,
+        "label": BASELINE_CASE_LABELS[name],
+    }
+
+
+def baseline_evidence_paths(name: str) -> dict[str, str]:
+    flags = baseline_case_flags(name)
+    resident = (
+        "offload.json" if flags["k1_sync"] else
+        "resident_after_step1.json" if flags["resident"] else NOT_APPLICABLE)
+    timing = "timing.json" if flags["k1_sync"] else NOT_APPLICABLE
+    return {
+        "capability": "capability.json" if flags["current"] else NOT_APPLICABLE,
+        "resident": resident,
+        "backing": "memory_phases.json" if flags["backing"] else NOT_APPLICABLE,
+        "staging": NOT_APPLICABLE,
+        "offload": "offload.json" if flags["k1_sync"] else NOT_APPLICABLE,
+        "restore": timing,
+        "read": timing,
+        "gate": timing,
+        "io": timing,
+    }
+
+
+def run_baseline_case(
+        name: str,
+        round_no: int,
+        run_order: int,
+        binary: pathlib.Path,
+        model: pathlib.Path,
+        root: pathlib.Path,
+        ctx_size: int,
+        target_prefix_tokens: int) -> dict[str, Any]:
+    flags = baseline_case_flags(name)
+    case = root / "runs" / f"round_{round_no}_order_{run_order:02d}_{name}"
+    case.mkdir(parents=True)
+    dump(case / "run.json", baseline_run_metadata(round_no, run_order, name))
+    backing = prepare_backing(case) if flags["backing"] else None
+    env = baseline_env(name)
+    dump(case / "environment.json", env)
+    port = free_port()
+    argv = baseline_server_argv(binary, model, port, name, ctx_size)
+    cgroup = cgroup_identity()
+    result: dict[str, Any] = {
+        "status": "startup_failed",
+        "case": name,
+        "round": round_no,
+        "run_order": run_order,
+        "request_loop_started": False,
+        "port": port,
+        "ctx_size": ctx_size,
+        "target_prefix_tokens": target_prefix_tokens,
+        "evidence": baseline_evidence_paths(name),
+    }
+    phases: list[dict[str, Any]] = []
+    proc: subprocess.Popen[bytes] | None = None
+    sampler: subprocess.Popen[bytes] | None = None
+    step2: dict[str, Any] | None = None
+    try:
+        proc = start(case, argv, env)
+        server_identity = read_process_identity(proc.pid)
+        if server_identity is None:
+            raise WorkloadFailure("could not bind server PID/starttime/cmdline identity")
+        write_baseline_execution(
+            case, name, round_no, run_order, binary, model, argv, env, server_identity, cgroup)
+        sampler = start_memory_sampler(case, proc, backing, cgroup)
+        if not wait_health(port, proc):
+            raise WorkloadFailure(f"server listener was not healthy (exit={proc.poll()})")
+        capture_memory_phase(phases, "server_ready", proc.pid, cgroup, backing)
+
+        if flags["current"]:
+            capability, evidence, capability_error = wait_capability(case, proc)
+            if capability_error:
+                raise WorkloadFailure(capability_error)
+            assert capability is not None and evidence is not None
+            dump(case / "capability.json", evidence)
+            capability_error = baseline_capability_error(name, capability)
+            if capability_error:
+                raise WorkloadFailure(capability_error)
+            result["capability"] = capability
+        else:
+            result["capability"] = NOT_APPLICABLE
+
+        prompt_p, prompt_pq = prepare_token_workload(
+            case, port, ctx_size, target_prefix_tokens)
+        result["workload"] = target_prefix_record(
+            target_prefix_tokens, prompt_p, prompt_pq)
+
+        records = case / "requests.jsonl"
+        result["request_loop_started"] = True
+        step1_stderr_start = (case / "server.stderr").stat().st_size
+        step1 = request_completion(port, completion_body(prompt_p, 0), "step1", records)
+        if step1["http_status"] != 200:
+            raise WorkloadFailure("step1 did not receive HTTP 200")
+        capture_memory_phase(phases, "after_step1", proc.pid, cgroup, backing)
+
+        resume_boundary: int | None = None
+        if flags["k1_sync"]:
+            claimant = capture_snapshot(case, port, "pre_offload_claimant")["claimant"]
+        elif flags["resident"]:
+            claimant = capture_baseline_resident(
+                case, port, "resident_after_step1", server_identity)["claimant"]
+        else:
+            claimant = None
+        if claimant is not None:
+            expected_blocks = len(prompt_p) // PAGED_BLOCK_SIZE
+            if (
+                    claimant["target_blocks"] != expected_blocks or claimant["active"] or
+                    claimant["exhausted"] or not claimant["valid"]):
+                raise WorkloadFailure("resident observation does not bind the completed step1 prefix")
+            if not flags["k1_sync"] and (
+                    claimant["eligible_resident_blocks"] != expected_blocks or
+                    claimant["swapped_blocks"] != 0 or claimant["shared_blocks"] != 0 or
+                    claimant["blocked_blocks"] != 0):
+                raise WorkloadFailure("FLEXKV_RESIDENT does not retain all P blocks in logical resident state")
+
+        if flags["k1_sync"]:
+            offload, post = collect_offload_transactions(
+                case, proc, port, step1_stderr_start, len(prompt_p) // PAGED_BLOCK_SIZE)
+            result["offload"] = offload["cumulative"]
+            resume_boundary = post["stderr_end"]
+            capture_memory_phase(phases, "after_offload", proc.pid, cgroup, backing)
+        else:
+            result["offload"] = NOT_APPLICABLE
+
+        resume_start = (
+            resume_boundary if resume_boundary is not None else
+            (case / "server.stderr").stat().st_size)
+        step2 = request_stream_completion(
+            port, completion_body(prompt_pq, N_PREDICT, stream=True), "step2", records)
+        resume_end = (case / "server.stderr").stat().st_size
+        dump(case / "resume_scope.json", {
+            "start": resume_start,
+            "end": resume_end,
+            "request_label": "step2",
+            "request_started_monotonic_ns": step2["started_monotonic_ns"],
+            "request_finished_monotonic_ns": step2["finished_monotonic_ns"],
+        })
+        if step2["http_status"] != 200:
+            raise WorkloadFailure("step2 did not receive HTTP 200")
+        result["step2_metrics"] = capture_step2_stream_metrics(case, step2)
+        capture_memory_phase(phases, "after_step2", proc.pid, cgroup, backing)
+        result.update({
+            "status": "complete",
+            "http_statuses": {"step1": step1["http_status"], "step2": step2["http_status"]},
+        })
+    except RunnerInterrupted:
+        raise
+    except (OSError, WorkloadFailure) as exc:
+        result.update({"status": "request_failed", "workload_error": f"{type(exc).__name__}: {exc}"})
+    except Exception as exc:
+        result.update({"status": "request_failed", "workload_error": f"{type(exc).__name__}: {exc}"})
+    finally:
+        server_cleanup = stop(proc) if proc is not None else {
+            "pid": None, "pgid": None, "exit_code": None,
+            "term_timed_out": False, "kill_timed_out": False, "residual_process": False,
+        }
+        sampler_cleanup = stop_memory_sampler(sampler)
+        if result.get("status") == "complete" and flags["k1_sync"] and step2 is not None:
+            try:
+                timing = capture_resume_timing(case, step2)
+                result["timing"] = timing["derived"]
+            except (OSError, ValueError, json.JSONDecodeError, WorkloadFailure) as exc:
+                result["status"] = "request_failed"
+                result["timing_error"] = f"{type(exc).__name__}: {exc}"
+        elif not flags["k1_sync"]:
+            result["timing"] = NOT_APPLICABLE
+        backing_cleanup = cleanup_backing(case, backing) if backing is not None else {
+            "status": NOT_APPLICABLE,
+        }
+        result["process"] = server_cleanup
+        result["memory_sampler"] = sampler_cleanup
+        result["backing"] = backing_cleanup
+        if server_cleanup["residual_process"] or server_cleanup["term_timed_out"] or server_cleanup["kill_timed_out"]:
+            result["status"] = "request_failed"
+            result["cleanup_error"] = "server cleanup incomplete"
+        if sampler_cleanup["started"] and (
+                sampler_cleanup["timed_out"] or sampler_cleanup["exit_code"] != 0):
+            result["status"] = "request_failed"
+            result["cleanup_error"] = "memory sampler cleanup incomplete"
+        if backing is not None and (
+                backing_cleanup.get("exists_after_cleanup") or
+                backing_cleanup.get("cleanup_error") is not None):
+            result["status"] = "request_failed"
+            result["cleanup_error"] = "backing cleanup incomplete"
+        dump(case / "memory_phases.json", {
+            "schema_version": 1,
+            "sample_interval_seconds": BASELINE_SAMPLE_INTERVAL_SECONDS,
+            "cgroup": cgroup,
+            "phases": phases,
+        })
+        dump(case / "cleanup.json", {
+            "server": server_cleanup,
+            "memory_sampler": sampler_cleanup,
+            "backing": backing_cleanup,
+        })
+        dump(case / "result.json", result)
+    return result
+
+
 def base_manifest(
         binary: pathlib.Path,
         model: pathlib.Path | None,
@@ -1413,6 +2256,190 @@ def base_manifest(
     }
 
 
+def baseline_manifest(
+        current_binary: pathlib.Path,
+        native_binary: pathlib.Path,
+        model: pathlib.Path,
+        stamp: str,
+        ctx_size: int,
+        target_prefix_tokens: int,
+        dry_run: bool,
+        allow_dirty: bool,
+        native_provenance_requested: str | None) -> dict[str, Any]:
+    dirty = git("status", "--porcelain").splitlines()
+    return {
+        "protocol": BASELINE_PROTOCOL,
+        "protocol_version": BASELINE_PROTOCOL_VERSION,
+        "source_marker_schema": SOURCE_MARKER_SCHEMA,
+        "timestamp_utc": stamp,
+        "finished_timestamp_utc": stamp,
+        "branch": git("branch", "--show-current"),
+        "head": git("rev-parse", "HEAD"),
+        "dirty_status": dirty,
+        "tracked_diff_fingerprint": tracked_diff_fingerprint(),
+        "capture_mode": "diagnostic_dirty" if dirty else "archival_clean",
+        "runner": identity(pathlib.Path(__file__)),
+        "parser": identity(ROOT / "scripts/parse-kv-governor-g0-s1.py"),
+        "memory_sampler": optional_identity(MEMORY_SAMPLER),
+        "current_binary_requested": str(current_binary),
+        "native_binary_requested": str(native_binary),
+        "native_provenance_requested": native_provenance_requested or NOT_APPLICABLE,
+        "native_provenance": NOT_APPLICABLE,
+        "model_requested": str(model),
+        "current_binary": optional_identity(current_binary),
+        "native_binary": optional_identity(native_binary),
+        "model": optional_identity(model),
+        "host": host_identity(),
+        "cgroup": cgroup_identity(),
+        "execution": {"dry_run": dry_run, "allow_dirty": allow_dirty},
+        "parameters": {
+            "parallel": 1,
+            "n_stream": 1,
+            "id_slot": 0,
+            "cache_prompt": True,
+            "temperature": TEMPERATURE,
+            "seed": SEED,
+            "step1_n_predict": 0,
+            "step2_n_predict": N_PREDICT,
+            "step2_stream": True,
+            "mincore_requested": True,
+            "source_marker_schema": SOURCE_MARKER_SCHEMA,
+            "paged_block_size": PAGED_BLOCK_SIZE,
+            "ctx_size": ctx_size,
+            "target_prefix_tokens": target_prefix_tokens,
+            "governor_target_bytes": GOVERNOR_TARGET_BYTES,
+            "governor_max_blocks": GOVERNOR_MAX_BLOCKS,
+            "sample_interval_seconds": BASELINE_SAMPLE_INTERVAL_SECONDS,
+            "rounds": 3,
+            "prefix_text_sha256": sha_bytes(PREFIX_TEXT.encode("utf-8")),
+            "query_text_sha256": sha_bytes(QUERY_TEXT.encode("utf-8")),
+        },
+        "case_names": list(BASELINE_CASES),
+        "comparison_edges": BASELINE_COMPARISON_EDGES,
+        "planned_runs": [
+            baseline_run_metadata(round_no, run_order, name)
+            for round_no, run_order, name in BASELINE_RUN_PLAN
+        ],
+        "run_results": [],
+        "runner_status": "run_in_progress",
+    }
+
+
+def materialize_baseline_dry_run(root: pathlib.Path) -> None:
+    for round_no, run_order, name in BASELINE_RUN_PLAN:
+        case = root / "runs" / f"round_{round_no}_order_{run_order:02d}_{name}"
+        case.mkdir(parents=True)
+        dump(case / "run.json", baseline_run_metadata(round_no, run_order, name))
+        dump(case / "plan.json", {
+            **baseline_run_metadata(round_no, run_order, name),
+            "dry_run": True,
+            "evidence": baseline_evidence_paths(name),
+            "environment": baseline_env(name),
+        })
+
+
+def run_baseline_main(args: argparse.Namespace) -> None:
+    if not args.native_binary:
+        raise SystemExit("--native-binary is required with --baseline-mode")
+    if not args.model:
+        raise SystemExit("--model is required with --baseline-mode")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    output = pathlib.Path(args.output_dir) if args.output_dir else pathlib.Path(
+        f"/root/oscomp/kv_logs/{BASELINE_PROTOCOL}_{stamp}_{uuid.uuid4().hex[:10]}")
+    if output.exists():
+        raise SystemExit(f"refusing existing artifact directory: {output}")
+    output.mkdir(parents=True)
+    current_binary = pathlib.Path(args.binary).resolve()
+    native_binary = pathlib.Path(args.native_binary).resolve()
+    model = pathlib.Path(args.model).resolve()
+    manifest = baseline_manifest(
+        current_binary, native_binary, model, stamp, args.ctx_size, args.target_prefix_tokens,
+        args.dry_run, args.allow_dirty, args.native_provenance)
+    signal_seen: list[int] = []
+
+    def handle_signal(signum: int, _frame: Any) -> None:
+        if not signal_seen:
+            signal_seen.append(signum)
+            raise RunnerInterrupted(signum)
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+    try:
+        if args.dry_run:
+            materialize_baseline_dry_run(output)
+            manifest["runner_status"] = "DRY_RUN"
+        elif manifest["dirty_status"] and not args.allow_dirty:
+            manifest.update({
+                "runner_status": "run_incomplete",
+                "runner_error": "three-round baseline requires a clean worktree; use --allow-dirty only for recorded diagnostic capture",
+            })
+        elif current_binary == native_binary:
+            manifest.update({
+                "runner_status": "run_incomplete",
+                "runner_error": "--native-binary must not resolve to the current binary path",
+            })
+        elif (
+                not current_binary.is_file() or not os.access(current_binary, os.X_OK) or
+                not native_binary.is_file() or not os.access(native_binary, os.X_OK) or
+                not model.is_file()):
+            manifest.update({
+                "runner_status": "run_incomplete",
+                "runner_error": "current binary, native upstream binary, or model is unavailable",
+            })
+        elif not args.native_provenance:
+            manifest.update({
+                "runner_status": "run_incomplete",
+                "runner_error": "--native-provenance is required for a non-dry upstream baseline",
+            })
+        else:
+            current_identity = identity(current_binary)
+            native_identity = identity(native_binary)
+            if current_identity["sha256"] == native_identity["sha256"]:
+                manifest.update({
+                    "runner_status": "run_incomplete",
+                    "runner_error": "NATIVE_UPSTREAM binary SHA-256 must differ from the current binary",
+                })
+            else:
+                try:
+                    provenance = capture_native_provenance(
+                        pathlib.Path(args.native_provenance).resolve(), native_identity, output)
+                except WorkloadFailure as exc:
+                    manifest.update({"runner_status": "run_incomplete", "runner_error": str(exc)})
+                else:
+                    manifest.update({
+                        "current_binary": current_identity,
+                        "native_binary": native_identity,
+                        "native_provenance": provenance,
+                        "model": identity(model),
+                    })
+                    for round_no, run_order, name in BASELINE_RUN_PLAN:
+                        selected_binary = native_binary if name == "NATIVE_UPSTREAM" else current_binary
+                        result = run_baseline_case(
+                            name, round_no, run_order, selected_binary, model, output,
+                            args.ctx_size, args.target_prefix_tokens)
+                        manifest["run_results"].append({
+                            **baseline_run_metadata(round_no, run_order, name),
+                            "status": result.get("status"),
+                        })
+                    manifest["runner_status"] = "run_complete"
+    except RunnerInterrupted as exc:
+        manifest.update({
+            "runner_status": "run_interrupted",
+            "interruption": {"signal": exc.signum, "message": str(exc)},
+        })
+    except Exception as exc:
+        manifest.update({
+            "runner_status": "run_incomplete",
+            "runner_error": f"{type(exc).__name__}: {exc}",
+        })
+    finally:
+        manifest["finished_timestamp_utc"] = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        dump(output / "manifest.json", manifest)
+    if manifest["runner_status"] == "run_interrupted":
+        raise SystemExit(128 + int(manifest["interruption"]["signal"]))
+    raise SystemExit(invoke_parser(output))
+
+
 def invoke_parser(root: pathlib.Path) -> int:
     parser = ROOT / "scripts/parse-kv-governor-g0-s1.py"
     return subprocess.run(
@@ -1429,9 +2456,19 @@ def main() -> None:
     ap.add_argument("--output-dir")
     ap.add_argument("--ctx-size", type=int, choices=SUPPORTED_CTX_SIZES, default=CTX_SIZE)
     ap.add_argument("--target-prefix-tokens", type=int, required=True)
+    ap.add_argument("--baseline-mode", action="store_true", help="run the B0-B2 four-case server baseline matrix")
+    ap.add_argument("--native-binary", help="upstream llama-server binary for NATIVE_UPSTREAM")
+    ap.add_argument("--native-provenance", help="upstream build provenance, for example llama.cpp commit and build record")
+    ap.add_argument("--dry-run", action="store_true", help="materialize the B0-B2 plan without starting a model")
+    ap.add_argument("--allow-dirty", action="store_true", help="record a dirty baseline as diagnostic-only")
     args = ap.parse_args()
     if args.target_prefix_tokens < MIN_PREFIX_TOKENS:
         ap.error(f"--target-prefix-tokens must be at least {MIN_PREFIX_TOKENS}")
+    if args.baseline_mode:
+        run_baseline_main(args)
+        return
+    if args.dry_run or args.native_binary or args.native_provenance or args.allow_dirty:
+        ap.error("--dry-run, --native-binary, --native-provenance, and --allow-dirty require --baseline-mode")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     output = pathlib.Path(args.output_dir) if args.output_dir else pathlib.Path(
         f"/root/oscomp/kv_logs/{PROTOCOL}_{stamp}_{uuid.uuid4().hex[:10]}")

@@ -14,6 +14,7 @@ OUTPUT_ROOT="${OUTPUT_ROOT:-/root/oscomp/kv_logs/kv_final_controlled_e0_e5_${TIM
 RUNNER_FILE="$ROOT/scripts/kv-final-controlled-e0-e5.sh"
 PARSER="$ROOT/scripts/parse-kv-final-controlled-e0-e5.py"
 PROTOCOL_FILE="$ROOT/docs/kv_final_controlled_e0_e5_protocol.md"
+MEMORY_SAMPLER="$ROOT/scripts/kv-controlled-memory-sampler.sh"
 
 DEFAULT_BINARY_CANDIDATES=(
     "$ROOT/build/bin/llama-kv-idle-swap-resume"
@@ -33,7 +34,11 @@ die() {
 [[ -f "$RUNNER_FILE" ]] || die "runner not found: $RUNNER_FILE"
 [[ -f "$PARSER" ]] || die "parser not found: $PARSER"
 [[ -f "$PROTOCOL_FILE" ]] || die "protocol not found: $PROTOCOL_FILE"
+[[ -f "$MEMORY_SAMPLER" ]] || die "memory sampler not found: $MEMORY_SAMPLER"
 [[ ! -e "$OUTPUT_ROOT" ]] || die "output path already exists: $OUTPUT_ROOT"
+
+# shellcheck source=scripts/kv-controlled-memory-sampler.sh
+source "$MEMORY_SAMPLER"
 
 if [[ -n "${BINARY:-}" ]]; then
     BINARY="$BINARY"
@@ -230,11 +235,6 @@ sha256_or_na() {
     sha256sum "$1" 2>/dev/null | awk '{ print $1 }' || printf 'NA'
 }
 
-read_first() {
-    local file="$1"
-    [[ -r "$file" ]] && head -n 1 "$file" || printf 'NA'
-}
-
 CGROUP_VERSION="none"
 CGROUP_PATH="NA"
 CGROUP_CURRENT_FILE=""
@@ -276,9 +276,11 @@ model_size="$(stat -Lc %s "$MODEL")"
 runner_sha="$(sha256_or_na "$RUNNER_FILE")"
 parser_sha="$(sha256_or_na "$PARSER")"
 protocol_sha="$(sha256_or_na "$PROTOCOL_FILE")"
+sampler_sha="$(sha256_or_na "$MEMORY_SAMPLER")"
 runner_size="$(stat -Lc %s "$RUNNER_FILE")"
 parser_size="$(stat -Lc %s "$PARSER")"
 protocol_size="$(stat -Lc %s "$PROTOCOL_FILE")"
+sampler_size="$(stat -Lc %s "$MEMORY_SAMPLER")"
 compiler_info="NA"
 cmake_cache="$(dirname "$(dirname "$BINARY")")/CMakeCache.txt"
 if [[ -r "$cmake_cache" ]]; then
@@ -303,13 +305,14 @@ os_info="$(tr '\n' ' ' < /etc/os-release 2>/dev/null || true)"
     printf 'runner=%s\nrunner_size=%s\nrunner_sha256=%s\n' "$RUNNER_FILE" "$runner_size" "$runner_sha"
     printf 'parser=%s\nparser_size=%s\nparser_sha256=%s\n' "$PARSER" "$parser_size" "$parser_sha"
     printf 'protocol_file=%s\nprotocol_size=%s\nprotocol_sha256=%s\n' "$PROTOCOL_FILE" "$protocol_size" "$protocol_sha"
+    printf 'memory_sampler=%s\nmemory_sampler_size=%s\nmemory_sampler_sha256=%s\n' "$MEMORY_SAMPLER" "$sampler_size" "$sampler_sha"
     printf 'prompt_source=compiled driver prompts in examples/kv-idle-swap-resume/idle-swap-resume.cpp\n'
     printf 'trace_source=none (compiled controlled workload)\n'
     printf 'runs=%s\ndry_run=%s\ntimeout_sec=%s\nsample_interval_sec=%s\n' "$RUNS" "$DRY_RUN" "$CASE_TIMEOUT_SEC" "$SAMPLE_INTERVAL_SEC"
     printf 'hostname=%s\ndate=%s\nkernel=%s\nos=%s\n' "$(hostname)" "$(date --iso-8601=seconds)" "$(uname -srvm)" "${os_info:-NA}"
     printf 'compiler_build=%s\ncpu_model=%s\nlogical_cpus=%s\nnuma=%s\nmemory_total_kb=%s\n' "${compiler_info:-NA}" "${cpu_model:-NA}" "${logical_cpus:-NA}" "${numa_info:-NA}" "${memory_total_kb:-NA}"
     printf 'cgroup_version=%s\ncgroup_path=%s\nmemory_current=%s\nmemory_max=%s\nmemory_peak_snapshot=%s\n' \
-        "$CGROUP_VERSION" "$CGROUP_PATH" "$(read_first "$CGROUP_CURRENT_FILE")" "$(read_first "$CGROUP_MAX_FILE")" "$(read_first "$CGROUP_PEAK_FILE")"
+        "$CGROUP_VERSION" "$CGROUP_PATH" "$(kv_controlled_read_first "$CGROUP_CURRENT_FILE")" "$(kv_controlled_read_first "$CGROUP_MAX_FILE")" "$(kv_controlled_read_first "$CGROUP_PEAK_FILE")"
     printf 'swap_dir=%s\nswap_fs_type=%s\nswap_available_bytes=%s\n' "$SWAP_BASE" "${swap_fs_type:-NA}" "${swap_available_bytes:-NA}"
     printf 'run_plan_begin\n'
     for ((i = 0; i < ${#RUN_PLAN[@]}; i += 3)); do
@@ -320,9 +323,10 @@ os_info="$(tr '\n' ' ' < /etc/os-release 2>/dev/null || true)"
 
 python3 - "$OUTPUT_ROOT" "$ROOT" "$branch" "$head_sha" "$upstream" "$BINARY" "$binary_sha" "$binary_size" \
         "$MODEL" "$model_sha" "$model_size" "$RUNS" "$DRY_RUN" "$ALLOW_DIRTY" "$CGROUP_VERSION" "$CGROUP_PATH" \
-        "$(read_first "$CGROUP_CURRENT_FILE")" "$(read_first "$CGROUP_MAX_FILE")" "$SWAP_BASE" "${swap_fs_type:-NA}" \
+        "$(kv_controlled_read_first "$CGROUP_CURRENT_FILE")" "$(kv_controlled_read_first "$CGROUP_MAX_FILE")" "$SWAP_BASE" "${swap_fs_type:-NA}" \
         "${swap_available_bytes:-NA}" "$RUNNER_FILE" "$runner_sha" "$runner_size" \
-        "$PARSER" "$parser_sha" "$parser_size" "$PROTOCOL_FILE" "$protocol_sha" "$protocol_size" <<'PY'
+        "$PARSER" "$parser_sha" "$parser_size" "$PROTOCOL_FILE" "$protocol_sha" "$protocol_size" \
+        "$MEMORY_SAMPLER" "$sampler_sha" "$sampler_size" <<'PY'
 import json
 import pathlib
 import sys
@@ -330,7 +334,8 @@ import sys
 (out, repo, branch, head, upstream, binary, binary_sha, binary_size, model, model_sha,
  model_size, runs, dry_run, allow_dirty, cgroup_version, cgroup_path, memory_current,
  memory_max, swap_dir, swap_fs, swap_available, runner, runner_sha, runner_size,
- parser, parser_sha, parser_size, protocol_file, protocol_sha, protocol_size) = sys.argv[1:]
+ parser, parser_sha, parser_size, protocol_file, protocol_sha, protocol_size,
+ sampler, sampler_sha, sampler_size) = sys.argv[1:]
 root = pathlib.Path(out)
 status = (root / "git_status.txt").read_text()
 diff_stat = (root / "dirty_diff_stat.txt").read_text()
@@ -344,6 +349,7 @@ manifest = {
         "runner": {"path": runner, "sha256": runner_sha, "size": int(runner_size)},
         "parser": {"path": parser, "sha256": parser_sha, "size": int(parser_size)},
         "protocol": {"path": protocol_file, "sha256": protocol_sha, "size": int(protocol_size)},
+        "memory_sampler": {"path": sampler, "sha256": sampler_sha, "size": int(sampler_size)},
     },
     "workload": {"prompt_source": "compiled driver prompts", "trace_source": "none", "runs": int(runs)},
     "execution": {"dry_run": dry_run == "1", "allow_dirty": allow_dirty == "1"},
@@ -399,52 +405,6 @@ extract_section() {
     ' "$input" > "$output"
 }
 
-descendant_pid() {
-    local pid="$1" child
-    while [[ -r "/proc/$pid/task/$pid/children" ]]; do
-        read -r child _ < "/proc/$pid/task/$pid/children" || true
-        [[ -n "${child:-}" ]] || break
-        pid="$child"
-    done
-    printf '%s' "$pid"
-}
-
-sample_process() {
-    local wrapper_pid="$1" output="$2" swap_dir="$3"
-    local start now pid vmrss vmhwm cgroup_current logical allocated fd target stat_values
-    start="$(date +%s%N)"
-    printf 'elapsed_ms\tpid\tvmrss_kb\tvmhwm_kb\tcgroup_memory_current_bytes\tbacking_logical_size\tbacking_allocated_bytes\n' > "$output"
-    while kill -0 "$wrapper_pid" 2>/dev/null; do
-        pid="$(descendant_pid "$wrapper_pid")"
-        now="$(date +%s%N)"
-        vmrss="NA"
-        vmhwm="NA"
-        if [[ -r "/proc/$pid/status" ]]; then
-            vmrss="$(awk '/^VmRSS:/ { print $2 }' "/proc/$pid/status")"
-            vmhwm="$(awk '/^VmHWM:/ { print $2 }' "/proc/$pid/status")"
-        fi
-        cgroup_current="$(read_first "$CGROUP_CURRENT_FILE")"
-        logical="NA"
-        allocated="NA"
-        if [[ -d "/proc/$pid/fd" ]]; then
-            for fd in /proc/"$pid"/fd/*; do
-                target="$(readlink "$fd" 2>/dev/null || true)"
-                [[ "$target" == "$swap_dir"/* || "$target" == *"/$(basename "$swap_dir")/"* ]] || continue
-                stat_values="$(stat -Lc '%s %b' "$fd" 2>/dev/null || true)"
-                if [[ -n "$stat_values" ]]; then
-                    read -r logical blocks <<< "$stat_values"
-                    allocated=$((blocks * 512))
-                    break
-                fi
-            done
-        fi
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-            "$(( (now - start) / 1000000 ))" "$pid" "${vmrss:-NA}" "${vmhwm:-NA}" \
-            "${cgroup_current:-NA}" "$logical" "$allocated" >> "$output"
-        sleep "$SAMPLE_INTERVAL_SEC"
-    done
-}
-
 run_once() {
     local round="$1" order="$2" case_id="$3"
     local run_dir="$OUTPUT_ROOT/runs/round_${round}_order_$(printf '%02d' "$order")_${case_id}"
@@ -474,7 +434,7 @@ PY
         : > "$run_dir/seq1"
         printf 'NA  %s\n' "$run_dir/seq0" > "$run_dir/seq0.sha256"
         printf 'NA  %s\n' "$run_dir/seq1" > "$run_dir/seq1.sha256"
-        printf 'elapsed_ms\tpid\tvmrss_kb\tvmhwm_kb\tcgroup_memory_current_bytes\tbacking_logical_size\tbacking_allocated_bytes\n' > "$run_dir/memory_samples.tsv"
+        printf 'elapsed_ms\tpid\tstarttime_ticks\tvmrss_kb\tvmhwm_kb\tcgroup_memory_current_bytes\tbacking_logical_size\tbacking_allocated_bytes\n' > "$run_dir/memory_samples.tsv"
         return
     fi
 
@@ -484,7 +444,7 @@ PY
         env "${unset_args[@]}" "${env_values[@]}" "$BINARY" "${COMMON_ARGS[@]}" \
         > "$run_dir/stdout" 2> "$run_dir/stderr" &
     wrapper_pid=$!
-    sample_process "$wrapper_pid" "$run_dir/memory_samples.tsv" "$swap_dir" &
+    kv_controlled_sample_process "$wrapper_pid" "$run_dir/memory_samples.tsv" "$swap_dir" "$SAMPLE_INTERVAL_SEC" "$CGROUP_CURRENT_FILE" &
     sampler_pid=$!
     wait "$wrapper_pid"
     rc=$?

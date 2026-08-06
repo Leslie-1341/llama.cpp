@@ -247,6 +247,7 @@ def refresh_framework_manifest(root: Path, manifest: dict[str, Any]) -> dict[str
         "runner": repo / "scripts/kv-final-controlled-e0-e5.sh",
         "parser": repo / "scripts/parse-kv-final-controlled-e0-e5.py",
         "protocol": repo / "docs/kv_final_controlled_e0_e5_protocol.md",
+        "memory_sampler": repo / "scripts/kv-controlled-memory-sampler.sh",
     }
     manifest["framework"] = {name: file_identity(path) for name, path in paths.items()}
     (root / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
