@@ -229,10 +229,8 @@ class BaselineFixture(unittest.TestCase):
         self.root = self.tmp / "artifact"
         self.root.mkdir()
         self.current_binary = self.tmp / "current-llama-server"
-        self.native_binary = self.tmp / "native-llama-server"
         self.model = self.tmp / "model.gguf"
         self.current_binary.write_bytes(b"current")
-        self.native_binary.write_bytes(b"native")
         self.model.write_bytes(b"model")
         self.cgroup = {
             "version": "none",
@@ -328,8 +326,7 @@ class BaselineFixture(unittest.TestCase):
             encoding="utf-8")
 
     def write_execution(self, case: pathlib.Path, metadata: dict, name: str, pid: int, starttime: int) -> dict:
-        binary = self.native_binary if name == "NATIVE_UPSTREAM" else self.current_binary
-        argv = PARSER.baseline_expected_argv(str(binary), str(self.model), 2048, name)
+        argv = PARSER.baseline_expected_argv(str(self.current_binary), str(self.model), 2048, name)
         argv[argv.index("<port>")] = str(9000 + pid)
         identity = {
             "pid": pid,
@@ -353,7 +350,7 @@ class BaselineFixture(unittest.TestCase):
             "cwd": str(case.resolve()),
             "environment": environment,
             "environment_closure": {"inherits_parent_environment": False, "base_environment_keys": ["HOME", "LANG", "LC_ALL", "PATH"]},
-            "binary": ident(binary),
+            "binary": ident(self.current_binary),
             "model": ident(self.model),
             "server_identity": identity,
             "server_cgroup": PARSER.NOT_APPLICABLE,
@@ -526,8 +523,6 @@ class BaselineFixture(unittest.TestCase):
         elif name == "FLEXKV_K1_SYNC":
             offload, cap = self.write_k1_evidence(case, pid, rows)
             timing = json.loads((case / "timing.json").read_text(encoding="utf-8"))["derived"]
-        else:
-            (case / "server.stderr").write_text("", encoding="utf-8")
         if name != "FLEXKV_K1_SYNC":
             boundary = len(stderr.encode("utf-8"))
             put(case / "resume_scope.json", {
@@ -602,16 +597,13 @@ class BaselineFixture(unittest.TestCase):
             "runner": ident(RUNNER_PATH),
             "parser": ident(PARSER_PATH),
             "memory_sampler": ident(SAMPLER_PATH),
-            "current_binary_requested": str(self.current_binary),
-            "native_binary_requested": str(self.native_binary),
-            "native_provenance": "upstream llama.cpp fixture commit 0123456789abcdef",
+            "binary_requested": str(self.current_binary),
             "model_requested": str(self.model),
-            "current_binary": ident(self.current_binary),
-            "native_binary": ident(self.native_binary),
+            "binary": ident(self.current_binary),
             "model": ident(self.model),
             "host": {"hostname": "fixture", "kernel": "fixture kernel", "os_release": "fixture os"},
             "cgroup": self.cgroup,
-            "execution": {"dry_run": False, "allow_dirty": False},
+            "execution": {"dry_run": False, "allow_dirty": False, "smoke": False},
             "parameters": {
                 "parallel": 1,
                 "n_stream": 1,
@@ -651,7 +643,7 @@ class BaselineFixture(unittest.TestCase):
         self.assertTrue((self.root / "comparison.json").is_file())
 
     def test_exact_output_difference_fails_on_b0_edge(self) -> None:
-        path = self.root / "runs" / "round_1_order_02_CURRENT_E0" / "requests.jsonl"
+        path = self.root / "runs" / "round_1_order_01_CURRENT_E0" / "requests.jsonl"
         rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
         rows[1]["response_text"] = "different"
         rows[1]["response_sha256"] = sha_bytes(b"different")
@@ -661,23 +653,16 @@ class BaselineFixture(unittest.TestCase):
         self.assertTrue(any("B0: step2 output is not Exact" in detail for detail in details))
 
     def test_k1_missing_timing_fails_closed(self) -> None:
-        (self.root / "runs" / "round_1_order_04_FLEXKV_K1_SYNC" / "timing.json").unlink()
+        (self.root / "runs" / "round_1_order_03_FLEXKV_K1_SYNC" / "timing.json").unlink()
         status, details = self.parse()
         self.assertEqual(status, "FAIL")
         self.assertTrue(any("timing.json" in detail for detail in details))
 
     def test_resident_raw_evidence_missing_fails_closed(self) -> None:
-        (self.root / "runs" / "round_1_order_03_FLEXKV_RESIDENT" / "resident_after_step1.raw.json").unlink()
+        (self.root / "runs" / "round_1_order_02_FLEXKV_RESIDENT" / "resident_after_step1.raw.json").unlink()
         status, details = self.parse()
         self.assertEqual(status, "FAIL")
         self.assertTrue(any("resident" in detail and "raw file is missing" in detail for detail in details))
-
-    def test_zero_memory_samples_fail_closed(self) -> None:
-        path = self.root / "runs" / "round_1_order_01_NATIVE_UPSTREAM" / "memory_samples.tsv"
-        path.write_text(path.read_text(encoding="utf-8").splitlines()[0] + "\n", encoding="utf-8")
-        status, details = self.parse()
-        self.assertEqual(status, "FAIL")
-        self.assertTrue(any("captured zero samples" in detail for detail in details))
 
     def test_dirty_formal_capture_requires_explicit_opt_in(self) -> None:
         path = self.root / "manifest.json"
@@ -699,20 +684,10 @@ class BaselineFixture(unittest.TestCase):
         put(path, manifest)
         self.assertEqual(self.parse()[0], "DIAGNOSTIC")
 
-    def test_identical_native_binary_sha_fails_closed(self) -> None:
-        self.native_binary.write_bytes(self.current_binary.read_bytes())
-        path = self.root / "manifest.json"
-        manifest = json.loads(path.read_text(encoding="utf-8"))
-        manifest["native_binary"] = ident(self.native_binary)
-        put(path, manifest)
-        status, details = self.parse()
-        self.assertEqual(status, "FAIL")
-        self.assertTrue(any("SHA-256 are identical" in detail for detail in details))
-
 
 class RunnerContractTest(unittest.TestCase):
-    def test_fixed_three_round_plan_and_b0_b2_edges(self) -> None:
-        self.assertEqual(len(RUNNER.BASELINE_RUN_PLAN), 12)
+    def test_fixed_three_round_plan_and_b0_b1_edges(self) -> None:
+        self.assertEqual(len(RUNNER.BASELINE_RUN_PLAN), 9)
         self.assertEqual(
             [RUNNER.baseline_run_metadata(*item) for item in RUNNER.BASELINE_RUN_PLAN],
             PARSER.baseline_plan())
@@ -720,15 +695,6 @@ class RunnerContractTest(unittest.TestCase):
         for round_no in range(1, 4):
             cases = [name for current_round, _order, name in RUNNER.BASELINE_RUN_PLAN if current_round == round_no]
             self.assertEqual(set(cases), set(RUNNER.BASELINE_CASES))
-
-    def test_native_argv_and_environment_have_no_flexkv_contract(self) -> None:
-        binary = pathlib.Path("/tmp/upstream-llama-server")
-        model = pathlib.Path("/tmp/model.gguf")
-        env = RUNNER.baseline_env("NATIVE_UPSTREAM")
-        argv = RUNNER.baseline_server_argv(binary, model, 12345, "NATIVE_UPSTREAM", 2048)
-        self.assertFalse(any(key.startswith("LLAMA_KV_") for key in env))
-        self.assertNotIn("--kv-unified", argv)
-        self.assertNotIn("--no-cache-idle-slots", argv)
 
     def test_current_e0_explicitly_closes_every_experimental_switch(self) -> None:
         env = RUNNER.baseline_env("CURRENT_E0")

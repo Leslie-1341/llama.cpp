@@ -22,8 +22,6 @@ from typing import Any
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 BASELINE_PROTOCOL = "kv_server_b0_b2_baseline"
 BASELINE_PROTOCOL_VERSION = 1
-NATIVE_PROVENANCE_SCHEMA_VERSION = 1
-NATIVE_UPSTREAM_REPOSITORY = "https://github.com/ggml-org/llama.cpp"
 NOT_APPLICABLE = "NOT_APPLICABLE"
 MEMORY_SAMPLER = ROOT / "scripts/kv-controlled-memory-sampler.sh"
 SOURCE_MARKER_SCHEMA = "kv_governor_stage3c_1c_2b_1r/v6"
@@ -75,43 +73,34 @@ PREFIX_TEXT = PREFIX_TEXT_UNIT * MAX_PREFIX_TEXT_UNITS
 QUERY_TEXT = "Continue with one deterministic concise answer."
 
 BASELINE_CASES = (
-    "NATIVE_UPSTREAM",
     "CURRENT_E0",
     "FLEXKV_RESIDENT",
     "FLEXKV_K1_SYNC",
 )
 BASELINE_CASE_LABELS = {
-    "NATIVE_UPSTREAM": "upstream llama-server without FlexKV evidence requirements",
     "CURRENT_E0": "current server with all experimental KV mechanisms explicitly disabled",
     "FLEXKV_RESIDENT": "current server with paged runtime resident and Governor actions disabled",
     "FLEXKV_K1_SYNC": "current server with Governor OFFLOAD and synchronous K1 restore",
 }
+# 3 rounds × 3 cases, interleaved (original relative order preserved, NATIVE_UPSTREAM removed)
 BASELINE_RUN_PLAN = (
-    (1, 1, "NATIVE_UPSTREAM"),
-    (1, 2, "CURRENT_E0"),
-    (1, 3, "FLEXKV_RESIDENT"),
-    (1, 4, "FLEXKV_K1_SYNC"),
+    (1, 1, "CURRENT_E0"),
+    (1, 2, "FLEXKV_RESIDENT"),
+    (1, 3, "FLEXKV_K1_SYNC"),
     (2, 1, "FLEXKV_K1_SYNC"),
     (2, 2, "FLEXKV_RESIDENT"),
     (2, 3, "CURRENT_E0"),
-    (2, 4, "NATIVE_UPSTREAM"),
     (3, 1, "FLEXKV_RESIDENT"),
-    (3, 2, "NATIVE_UPSTREAM"),
-    (3, 3, "FLEXKV_K1_SYNC"),
-    (3, 4, "CURRENT_E0"),
+    (3, 2, "FLEXKV_K1_SYNC"),
+    (3, 3, "CURRENT_E0"),
 )
 BASELINE_COMPARISON_EDGES = {
     "B0": {
-        "left": "NATIVE_UPSTREAM",
-        "right": "CURRENT_E0",
-        "purpose": "native upstream versus current E0 compatibility baseline",
-    },
-    "B1": {
         "left": "CURRENT_E0",
         "right": "FLEXKV_RESIDENT",
         "purpose": "current E0 versus resident FlexKV runtime baseline",
     },
-    "B2": {
+    "B1": {
         "left": "FLEXKV_RESIDENT",
         "right": "FLEXKV_K1_SYNC",
         "purpose": "resident FlexKV versus synchronous K1 offload/restore baseline",
@@ -380,8 +369,6 @@ def baseline_case_flags(name: str) -> dict[str, bool]:
     if name not in BASELINE_CASES:
         raise ValueError(f"unknown baseline case: {name}")
     return {
-        "native": name == "NATIVE_UPSTREAM",
-        "current": name != "NATIVE_UPSTREAM",
         "flex_runtime": name in {"FLEXKV_RESIDENT", "FLEXKV_K1_SYNC"},
         "backing": name in {"FLEXKV_RESIDENT", "FLEXKV_K1_SYNC"},
         "resident": name in {"FLEXKV_RESIDENT", "FLEXKV_K1_SYNC"},
@@ -391,9 +378,6 @@ def baseline_case_flags(name: str) -> dict[str, bool]:
 
 def baseline_env(name: str) -> dict[str, str]:
     flags = baseline_case_flags(name)
-    if flags["native"]:
-        return dict(BASE_ENV)
-
     env = dict(BASE_ENV)
     env.update(KV_EXPERIMENTAL_DISABLED_ENV)
     if name == "CURRENT_E0":
@@ -441,8 +425,7 @@ def baseline_server_argv(
         "--threads", "4", "--n-gpu-layers", "0", "--cache-type-k", "f32",
         "--cache-type-v", "f32", "--no-warmup",
     ]
-    if not baseline_case_flags(name)["native"]:
-        argv.extend(("--kv-unified", "--no-cache-idle-slots"))
+    argv.extend(("--kv-unified", "--no-cache-idle-slots"))
     return argv
 
 
@@ -467,37 +450,174 @@ def optional_identity(path: pathlib.Path | None) -> dict[str, Any] | None:
     return identity(path) if path is not None and path.is_file() else None
 
 
-def capture_native_provenance(
-        source: pathlib.Path,
-        binary_identity: dict[str, Any],
-        output: pathlib.Path) -> dict[str, Any]:
-    if not source.is_file():
-        raise WorkloadFailure(f"native provenance sidecar is unavailable: {source}")
+def verify_capability(capability: dict[str, str]) -> str | None:
+    unavailable = {key: capability[key] for key in REQUIRED_CAPABILITY if capability[key] != "1"}
+    if unavailable:
+        return f"required production capability unavailable: {unavailable}"
+    if any(capability[key] != "1" for key in ("n_slots", "n_seq_max", "n_stream")):
+        return "production capability does not describe a single-session server"
+    return None
+
+
+def wait_capability(case: pathlib.Path, proc: subprocess.Popen[bytes]) -> tuple[dict[str, str] | None, dict[str, Any] | None, str | None]:
+    deadline = time.monotonic() + CAPABILITY_TIMEOUT_SECONDS
+    stderr = case / "server.stderr"
+    while time.monotonic() < deadline:
+        raw = stderr.read_bytes() if stderr.is_file() else b""
+        records: list[tuple[dict[str, str] | None, int, int]] = []
+        offset = 0
+        for line in raw.splitlines(keepends=True):
+            end = offset + len(line)
+            if CAPABILITY_MARKER.encode("utf-8") in line:
+                records.append((fields_after_token(line.decode("utf-8", errors="replace"), CAPABILITY_MARKER), offset, end))
+            offset = end
+        if len(records) > 1:
+            return None, None, "duplicate production capability records"
+        if len(records) == 1:
+            fields, start, end = records[0]
+            if fields is None or set(fields) != CAPABILITY_FIELDS:
+                return None, None, "malformed production capability record"
+            return fields, {"offset": start, "end": end, "fields": fields}, None
+        if proc.poll() is not None:
+            return None, None, f"server exited before capability marker (exit={proc.returncode})"
+        time.sleep(0.1)
+    return None, None, "timed out waiting for production capability marker"
+
+
+def wait_health(port: int, proc: subprocess.Popen[bytes]) -> bool:
+    deadline = time.monotonic() + HEALTH_TIMEOUT_SECONDS
+    while time.monotonic() < deadline and proc.poll() is None:
+        con: http.client.HTTPConnection | None = None
+        try:
+            con = http.client.HTTPConnection("127.0.0.1", port, timeout=1)
+            con.request("GET", "/health")
+            response = con.getresponse()
+            response.read()
+            if response.status == 200:
+                return True
+        except OSError:
+            pass
+        finally:
+            if con is not None:
+                try:
+                    con.close()
+                except OSError:
+                    pass
+        time.sleep(0.1)
+    return False
+
+
+def query_slots_raw(port: int) -> tuple[int, bytes, list[dict[str, Any]] | None]:
+    con: http.client.HTTPConnection | None = None
     try:
-        raw = source.read_bytes()
-        record = json.loads(raw)
-    except (OSError, json.JSONDecodeError) as exc:
-        raise WorkloadFailure(f"native provenance sidecar is invalid: {type(exc).__name__}: {exc}") from exc
-    required = {"schema_version", "upstream_repository", "upstream_commit", "binary", "build"}
-    if not isinstance(record, dict) or set(record) != required:
-        raise WorkloadFailure("native provenance sidecar schema mismatch")
-    if (record.get("schema_version") != NATIVE_PROVENANCE_SCHEMA_VERSION or
-            record.get("upstream_repository") != NATIVE_UPSTREAM_REPOSITORY or
-            not isinstance(record.get("upstream_commit"), str) or
-            not re.fullmatch(r"[0-9a-f]{40}", record["upstream_commit"])):
-        raise WorkloadFailure("native provenance upstream identity is invalid")
-    if record.get("binary") != binary_identity:
-        raise WorkloadFailure("native provenance binary identity does not match --native-binary")
-    build = record.get("build")
-    if (not isinstance(build, dict) or set(build) != {"cmake_build_type", "compiler"} or
-            not all(isinstance(value, str) and value for value in build.values())):
-        raise WorkloadFailure("native provenance build record is invalid")
-    artifact = output / "native_provenance.json"
-    artifact.write_bytes(raw)
+        con = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        con.request("GET", "/slots")
+        response = con.getresponse()
+        raw = response.read()
+        value = json.loads(raw) if response.status == 200 and raw else None
+        return response.status, raw, value if isinstance(value, list) else None
+    except (OSError, json.JSONDecodeError):
+        return 0, b"", None
+    finally:
+        if con is not None:
+            try:
+                con.close()
+            except OSError:
+                pass
+
+
+def read_process_identity(pid: int) -> dict[str, Any] | None:
+    try:
+        stat_text = pathlib.Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        tail = stat_text.rsplit(")", 1)[1].split()
+        starttime = int(tail[19])
+        cmdline = [part.decode("utf-8", errors="replace") for part in pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0") if part]
+        if starttime <= 0 or not cmdline:
+            return None
+        return {
+            "pid": pid,
+            "starttime_ticks": starttime,
+            "cmdline": cmdline,
+            "cmdline_sha256": sha_bytes(b"\0".join(item.encode("utf-8") for item in cmdline)),
+        }
+    except (IndexError, OSError, ValueError):
+        return None
+
+
+def prepare_backing(case: pathlib.Path) -> pathlib.Path:
+    backing = case / "backing"
+    backing.mkdir()
+    return backing
+
+
+def cleanup_backing(case: pathlib.Path, backing: pathlib.Path) -> dict[str, Any]:
+    error: str | None = None
+    try:
+        shutil.rmtree(backing)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        error = f"{type(exc).__name__}: {exc}"
     return {
-        "source": identity(source),
-        "artifact": identity(artifact),
-        "record": record,
+        "path": str(backing.resolve()),
+        "environment_value": "backing",
+        "created": True,
+        "cleanup_attempted": True,
+        "exists_after_cleanup": backing.exists(),
+        "cleanup_error": error,
+    }
+
+
+def stop(proc: subprocess.Popen[bytes]) -> dict[str, Any]:
+    try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        pgid = proc.pid
+
+    def group_exists() -> bool:
+        try:
+            os.killpg(pgid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+
+    term_timed_out = False
+    kill_timed_out = False
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(timeout=SERVER_TERM_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        term_timed_out = True
+    if group_exists():
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            proc.wait(timeout=SERVER_KILL_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+        deadline = time.monotonic() + SERVER_KILL_TIMEOUT_SECONDS
+        while group_exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        kill_timed_out = group_exists()
+
+    residual = False
+    try:
+        proc.wait(timeout=0.0)
+    except subprocess.TimeoutExpired:
+        residual = True
+    exit_code = proc.returncode if not residual else None
+    return {
+        "pid": proc.pid,
+        "pgid": pgid,
+        "exit_code": exit_code,
+        "term_timed_out": term_timed_out,
+        "kill_timed_out": kill_timed_out,
+        "residual_process": residual,
     }
 
 
@@ -1611,7 +1731,7 @@ def baseline_evidence_paths(name: str) -> dict[str, str]:
         "resident_after_step1.json" if flags["resident"] else NOT_APPLICABLE)
     timing = "timing.json" if flags["k1_sync"] else NOT_APPLICABLE
     return {
-        "capability": "capability.json" if flags["current"] else NOT_APPLICABLE,
+        "capability": "capability.json",
         "resident": resident,
         "backing": "memory_phases.json" if flags["backing"] else NOT_APPLICABLE,
         "staging": NOT_APPLICABLE,
@@ -1669,18 +1789,15 @@ def run_baseline_case(
             raise WorkloadFailure(f"server listener was not healthy (exit={proc.poll()})")
         capture_memory_phase(phases, "server_ready", proc.pid, cgroup, backing)
 
-        if flags["current"]:
-            capability, evidence, capability_error = wait_capability(case, proc)
-            if capability_error:
-                raise WorkloadFailure(capability_error)
-            assert capability is not None and evidence is not None
-            dump(case / "capability.json", evidence)
-            capability_error = baseline_capability_error(name, capability)
-            if capability_error:
-                raise WorkloadFailure(capability_error)
-            result["capability"] = capability
-        else:
-            result["capability"] = NOT_APPLICABLE
+        capability, evidence, capability_error = wait_capability(case, proc)
+        if capability_error:
+            raise WorkloadFailure(capability_error)
+        assert capability is not None and evidence is not None
+        dump(case / "capability.json", evidence)
+        capability_error = baseline_capability_error(name, capability)
+        if capability_error:
+            raise WorkloadFailure(capability_error)
+        result["capability"] = capability
 
         prompt_p, prompt_pq = prepare_token_workload(
             case, port, ctx_size, target_prefix_tokens)
@@ -1846,15 +1963,14 @@ def base_manifest(
 
 
 def baseline_manifest(
-        current_binary: pathlib.Path,
-        native_binary: pathlib.Path,
+        binary: pathlib.Path,
         model: pathlib.Path,
         stamp: str,
         ctx_size: int,
         target_prefix_tokens: int,
         dry_run: bool,
         allow_dirty: bool,
-        native_provenance_requested: str | None) -> dict[str, Any]:
+        smoke: bool) -> dict[str, Any]:
     dirty = git("status", "--porcelain").splitlines()
     return {
         "protocol": BASELINE_PROTOCOL,
@@ -1866,21 +1982,17 @@ def baseline_manifest(
         "head": git("rev-parse", "HEAD"),
         "dirty_status": dirty,
         "tracked_diff_fingerprint": tracked_diff_fingerprint(),
-        "capture_mode": "diagnostic_dirty" if dirty else "archival_clean",
+        "capture_mode": "diagnostic_smoke" if smoke else ("diagnostic_dirty" if dirty else "archival_clean"),
         "runner": identity(pathlib.Path(__file__)),
         "parser": identity(ROOT / "scripts/parse-kv-server-b0-b2.py"),
         "memory_sampler": optional_identity(MEMORY_SAMPLER),
-        "current_binary_requested": str(current_binary),
-        "native_binary_requested": str(native_binary),
-        "native_provenance_requested": native_provenance_requested or NOT_APPLICABLE,
-        "native_provenance": NOT_APPLICABLE,
+        "binary_requested": str(binary),
         "model_requested": str(model),
-        "current_binary": optional_identity(current_binary),
-        "native_binary": optional_identity(native_binary),
+        "binary": optional_identity(binary),
         "model": optional_identity(model),
         "host": host_identity(),
         "cgroup": cgroup_identity(),
-        "execution": {"dry_run": dry_run, "allow_dirty": allow_dirty},
+        "execution": {"dry_run": dry_run, "allow_dirty": allow_dirty, "smoke": smoke},
         "parameters": {
             "parallel": 1,
             "n_stream": 1,
@@ -1899,7 +2011,7 @@ def baseline_manifest(
             "governor_target_bytes": GOVERNOR_TARGET_BYTES,
             "governor_max_blocks": GOVERNOR_MAX_BLOCKS,
             "sample_interval_seconds": BASELINE_SAMPLE_INTERVAL_SECONDS,
-            "rounds": 3,
+            "rounds": 1 if smoke else 3,
             "prefix_text_sha256": sha_bytes(PREFIX_TEXT.encode("utf-8")),
             "query_text_sha256": sha_bytes(QUERY_TEXT.encode("utf-8")),
         },
@@ -1907,15 +2019,19 @@ def baseline_manifest(
         "comparison_edges": BASELINE_COMPARISON_EDGES,
         "planned_runs": [
             baseline_run_metadata(round_no, run_order, name)
-            for round_no, run_order, name in BASELINE_RUN_PLAN
+            for round_no, run_order, name in (BASELINE_RUN_PLAN if not smoke else tuple(
+                (1, idx + 1, name) for idx, name in enumerate(BASELINE_CASES)))
         ],
         "run_results": [],
         "runner_status": "run_in_progress",
     }
 
 
-def materialize_baseline_dry_run(root: pathlib.Path) -> None:
-    for round_no, run_order, name in BASELINE_RUN_PLAN:
+def materialize_baseline_dry_run(root: pathlib.Path, smoke: bool = False) -> None:
+    plan = (
+        tuple((1, idx + 1, name) for idx, name in enumerate(BASELINE_CASES))
+        if smoke else BASELINE_RUN_PLAN)
+    for round_no, run_order, name in plan:
         case = root / "runs" / f"round_{round_no}_order_{run_order:02d}_{name}"
         case.mkdir(parents=True)
         dump(case / "run.json", baseline_run_metadata(round_no, run_order, name))
@@ -1928,8 +2044,6 @@ def materialize_baseline_dry_run(root: pathlib.Path) -> None:
 
 
 def run_baseline_main(args: argparse.Namespace) -> None:
-    if not args.native_binary:
-        raise SystemExit("--native-binary is required")
     if not args.model:
         raise SystemExit("--model is required")
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -1938,12 +2052,11 @@ def run_baseline_main(args: argparse.Namespace) -> None:
     if output.exists():
         raise SystemExit(f"refusing existing artifact directory: {output}")
     output.mkdir(parents=True)
-    current_binary = pathlib.Path(args.binary).resolve()
-    native_binary = pathlib.Path(args.native_binary).resolve()
+    binary = pathlib.Path(args.binary).resolve()
     model = pathlib.Path(args.model).resolve()
     manifest = baseline_manifest(
-        current_binary, native_binary, model, stamp, args.ctx_size, args.target_prefix_tokens,
-        args.dry_run, args.allow_dirty, args.native_provenance)
+        binary, model, stamp, args.ctx_size, args.target_prefix_tokens,
+        args.dry_run, args.allow_dirty, args.smoke)
     signal_seen: list[int] = []
 
     def handle_signal(signum: int, _frame: Any) -> None:
@@ -1955,62 +2068,39 @@ def run_baseline_main(args: argparse.Namespace) -> None:
     signal.signal(signal.SIGTERM, handle_signal)
     try:
         if args.dry_run:
-            materialize_baseline_dry_run(output)
+            materialize_baseline_dry_run(output, args.smoke)
             manifest["runner_status"] = "DRY_RUN"
         elif manifest["dirty_status"] and not args.allow_dirty:
             manifest.update({
                 "runner_status": "run_incomplete",
-                "runner_error": "three-round baseline requires a clean worktree; use --allow-dirty only for recorded diagnostic capture",
+                "runner_error": "baseline requires a clean worktree; use --allow-dirty only for recorded diagnostic capture",
             })
-        elif current_binary == native_binary:
+        elif (not binary.is_file() or not os.access(binary, os.X_OK) or not model.is_file()):
             manifest.update({
                 "runner_status": "run_incomplete",
-                "runner_error": "--native-binary must not resolve to the current binary path",
-            })
-        elif (
-                not current_binary.is_file() or not os.access(current_binary, os.X_OK) or
-                not native_binary.is_file() or not os.access(native_binary, os.X_OK) or
-                not model.is_file()):
-            manifest.update({
-                "runner_status": "run_incomplete",
-                "runner_error": "current binary, native upstream binary, or model is unavailable",
-            })
-        elif not args.native_provenance:
-            manifest.update({
-                "runner_status": "run_incomplete",
-                "runner_error": "--native-provenance is required for a non-dry upstream baseline",
+                "runner_error": "binary or model is unavailable",
             })
         else:
-            current_identity = identity(current_binary)
-            native_identity = identity(native_binary)
-            if current_identity["sha256"] == native_identity["sha256"]:
-                manifest.update({
-                    "runner_status": "run_incomplete",
-                    "runner_error": "NATIVE_UPSTREAM binary SHA-256 must differ from the current binary",
+            binary_identity = identity(binary)
+            manifest.update({
+                "binary": binary_identity,
+                "model": identity(model),
+            })
+            run_plan = BASELINE_RUN_PLAN
+            if args.smoke:
+                run_plan = tuple(
+                    (1, idx + 1, name)
+                    for idx, name in enumerate(BASELINE_CASES)
+                )
+            for round_no, run_order, name in run_plan:
+                result = run_baseline_case(
+                    name, round_no, run_order, binary, model, output,
+                    args.ctx_size, args.target_prefix_tokens)
+                manifest["run_results"].append({
+                    **baseline_run_metadata(round_no, run_order, name),
+                    "status": result.get("status"),
                 })
-            else:
-                try:
-                    provenance = capture_native_provenance(
-                        pathlib.Path(args.native_provenance).resolve(), native_identity, output)
-                except WorkloadFailure as exc:
-                    manifest.update({"runner_status": "run_incomplete", "runner_error": str(exc)})
-                else:
-                    manifest.update({
-                        "current_binary": current_identity,
-                        "native_binary": native_identity,
-                        "native_provenance": provenance,
-                        "model": identity(model),
-                    })
-                    for round_no, run_order, name in BASELINE_RUN_PLAN:
-                        selected_binary = native_binary if name == "NATIVE_UPSTREAM" else current_binary
-                        result = run_baseline_case(
-                            name, round_no, run_order, selected_binary, model, output,
-                            args.ctx_size, args.target_prefix_tokens)
-                        manifest["run_results"].append({
-                            **baseline_run_metadata(round_no, run_order, name),
-                            "status": result.get("status"),
-                        })
-                    manifest["runner_status"] = "run_complete"
+            manifest["runner_status"] = "run_complete"
     except RunnerInterrupted as exc:
         manifest.update({
             "runner_status": "run_interrupted",
@@ -2041,14 +2131,13 @@ def invoke_parser(root: pathlib.Path) -> int:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--binary", default=os.environ.get("KV_GOVERNOR_BINARY", "build/bin/llama-server"))
-    ap.add_argument("--native-binary", help="upstream llama-server binary for NATIVE_UPSTREAM")
-    ap.add_argument("--native-provenance", help="upstream build provenance, for example llama.cpp commit and build record")
     ap.add_argument("--model", default=os.environ.get("KV_GOVERNOR_MODEL"))
     ap.add_argument("--output-dir")
     ap.add_argument("--ctx-size", type=int, choices=SUPPORTED_CTX_SIZES, default=CTX_SIZE)
     ap.add_argument("--target-prefix-tokens", type=int, required=True)
-    ap.add_argument("--dry-run", action="store_true", help="materialize the B0-B2 plan without starting a model")
+    ap.add_argument("--dry-run", action="store_true", help="materialize the B0-B1 plan without starting a model")
     ap.add_argument("--allow-dirty", action="store_true", help="record a dirty baseline as diagnostic-only")
+    ap.add_argument("--smoke", action="store_true", help="single-round diagnostic smoke (CURRENT_E0→FLEXKV_RESIDENT→FLEXKV_K1_SYNC)")
     args = ap.parse_args()
     if args.target_prefix_tokens < MIN_PREFIX_TOKENS:
         ap.error(f"--target-prefix-tokens must be at least {MIN_PREFIX_TOKENS}")

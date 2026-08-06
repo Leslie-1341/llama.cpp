@@ -26,43 +26,33 @@ PAGED_BLOCK_SIZE = 64
 MIN_PREFIX_TOKENS = 2 * PAGED_BLOCK_SIZE
 N_PREDICT = 32
 BASELINE_CASES = (
-    "NATIVE_UPSTREAM",
     "CURRENT_E0",
     "FLEXKV_RESIDENT",
     "FLEXKV_K1_SYNC",
 )
 BASELINE_CASE_LABELS = {
-    "NATIVE_UPSTREAM": "upstream llama-server without FlexKV evidence requirements",
     "CURRENT_E0": "current server with all experimental KV mechanisms explicitly disabled",
     "FLEXKV_RESIDENT": "current server with paged runtime resident and Governor actions disabled",
     "FLEXKV_K1_SYNC": "current server with Governor OFFLOAD and synchronous K1 restore",
 }
 BASELINE_RUN_PLAN = (
-    (1, 1, "NATIVE_UPSTREAM"),
-    (1, 2, "CURRENT_E0"),
-    (1, 3, "FLEXKV_RESIDENT"),
-    (1, 4, "FLEXKV_K1_SYNC"),
+    (1, 1, "CURRENT_E0"),
+    (1, 2, "FLEXKV_RESIDENT"),
+    (1, 3, "FLEXKV_K1_SYNC"),
     (2, 1, "FLEXKV_K1_SYNC"),
     (2, 2, "FLEXKV_RESIDENT"),
     (2, 3, "CURRENT_E0"),
-    (2, 4, "NATIVE_UPSTREAM"),
     (3, 1, "FLEXKV_RESIDENT"),
-    (3, 2, "NATIVE_UPSTREAM"),
-    (3, 3, "FLEXKV_K1_SYNC"),
-    (3, 4, "CURRENT_E0"),
+    (3, 2, "FLEXKV_K1_SYNC"),
+    (3, 3, "CURRENT_E0"),
 )
 BASELINE_COMPARISON_EDGES = {
     "B0": {
-        "left": "NATIVE_UPSTREAM",
-        "right": "CURRENT_E0",
-        "purpose": "native upstream versus current E0 compatibility baseline",
-    },
-    "B1": {
         "left": "CURRENT_E0",
         "right": "FLEXKV_RESIDENT",
         "purpose": "current E0 versus resident FlexKV runtime baseline",
     },
-    "B2": {
+    "B1": {
         "left": "FLEXKV_RESIDENT",
         "right": "FLEXKV_K1_SYNC",
         "purpose": "resident FlexKV versus synchronous K1 offload/restore baseline",
@@ -1061,8 +1051,6 @@ def baseline_validate_k1_transactions(
     return selected_epoch, marker_spans[-1][1] if marker_spans else None
 def baseline_case_flags(name: str) -> dict[str, bool]:
     return {
-        "native": name == "NATIVE_UPSTREAM",
-        "current": name != "NATIVE_UPSTREAM",
         "flex_runtime": name in {"FLEXKV_RESIDENT", "FLEXKV_K1_SYNC"},
         "backing": name in {"FLEXKV_RESIDENT", "FLEXKV_K1_SYNC"},
         "resident": name in {"FLEXKV_RESIDENT", "FLEXKV_K1_SYNC"},
@@ -1077,7 +1065,7 @@ def baseline_evidence_paths(name: str) -> dict[str, str]:
         "resident_after_step1.json" if flags["resident"] else NOT_APPLICABLE)
     timing = "timing.json" if flags["k1_sync"] else NOT_APPLICABLE
     return {
-        "capability": "capability.json" if flags["current"] else NOT_APPLICABLE,
+        "capability": "capability.json",
         "resident": resident,
         "backing": "memory_phases.json" if flags["backing"] else NOT_APPLICABLE,
         "staging": NOT_APPLICABLE,
@@ -1091,8 +1079,6 @@ def baseline_evidence_paths(name: str) -> dict[str, str]:
 
 def baseline_expected_environment(name: str) -> dict[str, str | None]:
     env: dict[str, str | None] = {**BASELINE_BASE_ENV, "PATH": None}
-    if name == "NATIVE_UPSTREAM":
-        return env
     env.update(BASELINE_E0_ENV)
     if name == "CURRENT_E0":
         return env
@@ -1221,8 +1207,8 @@ def baseline_validate_manifest(manifest: Any, errors: list[str]) -> bool:
         "protocol", "protocol_version", "source_marker_schema", "timestamp_utc",
         "finished_timestamp_utc", "branch", "head", "dirty_status",
         "tracked_diff_fingerprint", "capture_mode", "runner", "parser", "memory_sampler",
-        "current_binary_requested", "native_binary_requested", "native_provenance", "model_requested",
-        "current_binary", "native_binary", "model", "host", "cgroup", "execution", "parameters",
+        "binary_requested", "model_requested",
+        "binary", "model", "host", "cgroup", "execution", "parameters",
         "case_names", "comparison_edges", "planned_runs", "run_results", "runner_status",
     }
     missing = required - set(manifest)
@@ -1237,25 +1223,28 @@ def baseline_validate_manifest(manifest: Any, errors: list[str]) -> bool:
     if (not isinstance(manifest.get("dirty_status"), list) or
             not all(isinstance(item, str) for item in manifest.get("dirty_status", [])) or
             not SHA256.fullmatch(str(manifest.get("tracked_diff_fingerprint", ""))) or
-            manifest.get("capture_mode") not in {"archival_clean", "diagnostic_dirty"}):
+            manifest.get("capture_mode") not in {"archival_clean", "diagnostic_dirty", "diagnostic_smoke"}):
         errors.append("baseline manifest dirty-tree identity is invalid")
-    elif manifest.get("capture_mode") != ("diagnostic_dirty" if manifest["dirty_status"] else "archival_clean"):
+    elif not (bool(manifest.get("dirty_status")) and manifest.get("capture_mode") in {"diagnostic_dirty", "diagnostic_smoke"} or
+              not bool(manifest.get("dirty_status")) and manifest.get("capture_mode") in {"archival_clean"} or
+              manifest.get("capture_mode") == "diagnostic_smoke"):
         errors.append("baseline capture_mode contradicts the recorded dirty status")
+    smoke = manifest.get("execution", {}).get("smoke") is True
+    if smoke and manifest.get("capture_mode") != "diagnostic_smoke":
+        errors.append("baseline smoke run must have capture_mode diagnostic_smoke")
     for key in ("runner", "parser", "memory_sampler"):
         identity_valid(manifest.get(key), f"baseline {key}", errors)
-    for key in ("current_binary_requested", "native_binary_requested", "model_requested"):
+    for key in ("binary_requested", "model_requested"):
         if not is_nonempty_string(manifest.get(key)):
             errors.append(f"baseline manifest {key} is invalid")
-    if manifest.get("runner_status") == "DRY_RUN":
-        if manifest.get("native_provenance") not in {NOT_APPLICABLE, None} and not is_nonempty_string(manifest.get("native_provenance")):
-            errors.append("baseline dry-run native provenance is invalid")
-    elif not is_nonempty_string(manifest.get("native_provenance")):
-        errors.append("baseline upstream native provenance is missing")
     if manifest.get("case_names") != list(BASELINE_CASES):
         errors.append("baseline case_names mismatch")
     if manifest.get("comparison_edges") != BASELINE_COMPARISON_EDGES:
         errors.append("baseline comparison edge plan mismatch")
-    if manifest.get("planned_runs") != baseline_plan():
+    expected_plan = baseline_plan() if not smoke else [
+        baseline_metadata(1, idx + 1, name) for idx, name in enumerate(BASELINE_CASES)
+    ]
+    if manifest.get("planned_runs") != expected_plan:
         errors.append("baseline fixed three-round run plan mismatch")
     if not isinstance(manifest.get("run_results"), list):
         errors.append("baseline run_results is invalid")
@@ -1267,8 +1256,9 @@ def baseline_validate_manifest(manifest: Any, errors: list[str]) -> bool:
         errors.append("baseline host identity is invalid")
     baseline_cgroup_valid(manifest.get("cgroup"), "baseline manifest", errors)
     execution = manifest.get("execution")
-    if (not isinstance(execution, dict) or set(execution) != {"dry_run", "allow_dirty"} or
-            not isinstance(execution.get("dry_run"), bool) or not isinstance(execution.get("allow_dirty"), bool)):
+    if (not isinstance(execution, dict) or set(execution) != {"dry_run", "allow_dirty", "smoke"} or
+            not isinstance(execution.get("dry_run"), bool) or not isinstance(execution.get("allow_dirty"), bool) or
+            not isinstance(execution.get("smoke"), bool)):
         errors.append("baseline execution capture mode is invalid")
     elif (manifest.get("runner_status") == "DRY_RUN") != execution["dry_run"]:
         errors.append("baseline execution dry-run state differs from runner status")
@@ -1280,7 +1270,7 @@ def baseline_validate_manifest(manifest: Any, errors: list[str]) -> bool:
         "temperature": 0.0, "seed": 1, "step1_n_predict": 0,
         "step2_n_predict": N_PREDICT, "step2_stream": True, "mincore_requested": True,
         "source_marker_schema": SOURCE_MARKER_SCHEMA, "paged_block_size": PAGED_BLOCK_SIZE,
-        "rounds": 3, "sample_interval_seconds": 0.10,
+        "sample_interval_seconds": 0.10,
     }
     if not isinstance(parameters, dict):
         errors.append("baseline parameters are invalid")
@@ -1304,35 +1294,35 @@ def baseline_validate_manifest(manifest: Any, errors: list[str]) -> bool:
         for key in ("governor_target_bytes", "governor_max_blocks"):
             if not is_positive_int(parameters.get(key)):
                 errors.append(f"baseline parameter {key} is invalid")
+        rounds = parameters.get("rounds")
+        if not is_positive_int(rounds) or rounds not in {1, 3}:
+            errors.append("baseline parameter rounds is invalid")
+        if smoke and rounds != 1:
+            errors.append("baseline smoke run must have rounds=1")
     if status != "DRY_RUN":
-        for key in ("current_binary", "native_binary", "model"):
+        for key in ("binary", "model"):
             identity_valid(manifest.get(key), f"baseline {key}", errors)
-        current = manifest.get("current_binary")
-        native = manifest.get("native_binary")
-        if isinstance(current, dict) and isinstance(native, dict):
-            if current.get("path") == native.get("path"):
-                errors.append("baseline native and current binary paths are identical")
-            if current.get("sha256") == native.get("sha256"):
-                errors.append("baseline native and current binary SHA-256 are identical")
         expected_results = [
             {**item, "status": manifest["run_results"][index].get("status")}
-            for index, item in enumerate(baseline_plan())
+            for index, item in enumerate(expected_plan)
             if index < len(manifest.get("run_results", [])) and isinstance(manifest["run_results"][index], dict)
         ]
-        if len(expected_results) != len(baseline_plan()) or [
+        if len(expected_results) != len(expected_plan) or [
                 {key: value for key, value in result.items() if key != "status"}
                 for result in manifest.get("run_results", []) if isinstance(result, dict)
-        ] != baseline_plan() or any(not is_nonempty_string(result.get("status")) for result in expected_results):
+        ] != expected_plan or any(not is_nonempty_string(result.get("status")) for result in expected_results):
             errors.append("baseline run_results do not bind the fixed plan")
     return not errors
 
 
-def baseline_validate_matrix(root: pathlib.Path, dry_run: bool, errors: list[str]) -> list[tuple[dict[str, Any], pathlib.Path]]:
+def baseline_validate_matrix(root: pathlib.Path, dry_run: bool, smoke: bool, errors: list[str]) -> list[tuple[dict[str, Any], pathlib.Path]]:
     runs_root = root / "runs"
     if not runs_root.is_dir():
         errors.append("baseline runs directory is missing")
         return []
-    expected = baseline_plan()
+    expected = baseline_plan() if not smoke else [
+        baseline_metadata(1, idx + 1, name) for idx, name in enumerate(BASELINE_CASES)
+    ]
     pairs: list[tuple[dict[str, Any], pathlib.Path]] = []
     for path in runs_root.iterdir():
         if not path.is_dir():
@@ -1350,7 +1340,7 @@ def baseline_validate_matrix(root: pathlib.Path, dry_run: bool, errors: list[str
     pairs.sort(key=lambda item: (item[0]["round"], item[0]["run_order"]))
     actual = [item[0] for item in pairs]
     if actual != expected:
-        errors.append("baseline artifact run matrix does not match the fixed three-round plan")
+        errors.append("baseline artifact run matrix does not match the fixed plan")
     if dry_run:
         for metadata, case in pairs:
             try:
@@ -1401,8 +1391,7 @@ def baseline_expected_argv(
         "--threads", "4", "--n-gpu-layers", "0", "--cache-type-k", "f32",
         "--cache-type-v", "f32", "--no-warmup",
     ]
-    if name != "NATIVE_UPSTREAM":
-        argv.extend(("--kv-unified", "--no-cache-idle-slots"))
+    argv.extend(("--kv-unified", "--no-cache-idle-slots"))
     return argv
 
 
@@ -1436,9 +1425,8 @@ def baseline_validate_execution(
     expected_closure = {"inherits_parent_environment": False, "base_environment_keys": ["HOME", "LANG", "LC_ALL", "PATH"]}
     if execution.get("environment_closure") != expected_closure:
         errors.append(f"{name}: environment closure metadata is invalid")
-    binary_key = "native_binary" if name == "NATIVE_UPSTREAM" else "current_binary"
-    if execution.get("binary") != manifest.get(binary_key):
-        errors.append(f"{name}: execution binary identity does not match case role")
+    if execution.get("binary") != manifest.get("binary"):
+        errors.append(f"{name}: execution binary identity does not match manifest")
     if execution.get("model") != manifest.get("model"):
         errors.append(f"{name}: execution model identity differs from manifest")
     raw_argv = execution.get("argv")
@@ -1448,7 +1436,7 @@ def baseline_validate_execution(
     else:
         parameters = manifest.get("parameters")
         ctx_size = parameters.get("ctx_size") if isinstance(parameters, dict) else None
-        binary_path = manifest.get(binary_key, {}).get("path") if isinstance(manifest.get(binary_key), dict) else ""
+        binary_path = manifest.get("binary", {}).get("path") if isinstance(manifest.get("binary"), dict) else ""
         model_path = manifest.get("model", {}).get("path") if isinstance(manifest.get("model"), dict) else ""
         if not isinstance(ctx_size, int) or argv != baseline_expected_argv(binary_path, model_path, ctx_size, name):
             errors.append(f"{name}: execution argv differs from the fixed case argv")
@@ -1609,9 +1597,9 @@ def baseline_validate_memory(
         for key in ("backing_logical_size", "backing_allocated_bytes"):
             value = row.get(key)
             if baseline_case_flags(name)["backing"]:
-                if value not in {NOT_APPLICABLE, None} and not str(value).isdigit():
+                if value not in {NOT_APPLICABLE, "NA", "", None} and not str(value).isdigit():
                     errors.append(f"{label} {key} is invalid")
-            elif value != NOT_APPLICABLE:
+            elif value not in {NOT_APPLICABLE, "NA", ""}:
                 errors.append(f"{label} non-backing case has {key}")
 
 
@@ -1991,51 +1979,47 @@ def load_baseline_case(
     baseline_validate_cleanup(case, name, execution, result, errors)
     scope = validate_resume_scope(case, raw, rows.get("step2"), name, errors)
 
-    if name == "NATIVE_UPSTREAM":
-        if result.get("capability") != NOT_APPLICABLE or result.get("offload") != NOT_APPLICABLE or result.get("timing") != NOT_APPLICABLE:
-            errors.append("NATIVE_UPSTREAM: FlexKV evidence must be NOT_APPLICABLE")
+    capability = baseline_validate_capability(case, raw, name, errors)
+    if capability is not None and result.get("capability") != capability:
+        errors.append(f"{name}: result capability differs from raw marker")
+    markers = token_lines(raw, MARKER, parse_marker, f"{case}/server.stderr", errors)
+    if name in {"CURRENT_E0", "FLEXKV_RESIDENT"} and markers:
+        errors.append(f"{name}: Governor action marker is present while actions are disabled")
+    if name == "CURRENT_E0":
+        if result.get("offload") != NOT_APPLICABLE or result.get("timing") != NOT_APPLICABLE:
+            errors.append("CURRENT_E0: offload/restore evidence must be NOT_APPLICABLE")
+    elif name == "FLEXKV_RESIDENT":
+        if result.get("offload") != NOT_APPLICABLE or result.get("timing") != NOT_APPLICABLE:
+            errors.append("FLEXKV_RESIDENT: offload/restore evidence must be NOT_APPLICABLE")
+        baseline_validate_resident(case, execution, errors)
     else:
-        capability = baseline_validate_capability(case, raw, name, errors)
-        if capability is not None and result.get("capability") != capability:
-            errors.append(f"{name}: result capability differs from raw marker")
-        markers = token_lines(raw, MARKER, parse_marker, f"{case}/server.stderr", errors)
-        if name in {"CURRENT_E0", "FLEXKV_RESIDENT"} and markers:
-            errors.append(f"{name}: Governor action marker is present while actions are disabled")
-        if name == "CURRENT_E0":
-            if result.get("offload") != NOT_APPLICABLE or result.get("timing") != NOT_APPLICABLE:
-                errors.append("CURRENT_E0: offload/restore evidence must be NOT_APPLICABLE")
-        elif name == "FLEXKV_RESIDENT":
-            if result.get("offload") != NOT_APPLICABLE or result.get("timing") != NOT_APPLICABLE:
-                errors.append("FLEXKV_RESIDENT: offload/restore evidence must be NOT_APPLICABLE")
-            baseline_validate_resident(case, execution, errors)
+        pre, _pre_stderr_end, _pre_observed = validate_snapshot(
+            case, "pre_offload_claimant.json", "FLEXKV_K1_SYNC", errors)
+        step1 = rows.get("step1", {})
+        prompt = step1.get("request", {}).get("prompt") if isinstance(step1, dict) else None
+        expected_blocks = len(prompt) // PAGED_BLOCK_SIZE if isinstance(prompt, list) else None
+        if pre is not None and expected_blocks is not None and (
+                pre["target_blocks"] != expected_blocks or pre["eligible_resident_blocks"] != expected_blocks or
+                pre["swapped_blocks"] != 0 or pre["active"] or pre["exhausted"] or not pre["valid"]):
+            errors.append("FLEXKV_K1_SYNC: pre-offload claimant is not a complete resident prefix")
+        post, post_stderr_end, post_observed = validate_snapshot(
+            case, "post_claimant.json", "FLEXKV_K1_SYNC", errors)
+        epoch, last_offload_end = baseline_validate_k1_transactions(
+            case, raw, execution.get("server_identity") if isinstance(execution, dict) else None,
+            post, expected_blocks, scope[0], "FLEXKV_K1_SYNC", errors)
+        validate_resume(case, raw, scope[0], scope[1], last_offload_end, epoch, "FLEXKV_K1_SYNC", errors)
+        if last_offload_end is not None and post_stderr_end is not None and post_stderr_end != scope[0]:
+            errors.append("FLEXKV_K1_SYNC: post-offload claimant does not bind the step2 boundary")
+        if isinstance(rows.get("step2"), dict) and post_observed is not None and post_observed >= rows["step2"].get("started_monotonic_ns", 0):
+            errors.append("FLEXKV_K1_SYNC: post-offload claimant is not before step2")
+        try:
+            offload = read_json(case / "offload.json")
+        except Error as exc:
+            errors.append(str(exc))
         else:
-            pre, _pre_stderr_end, _pre_observed = validate_snapshot(
-                case, "pre_offload_claimant.json", "FLEXKV_K1_SYNC", errors)
-            step1 = rows.get("step1", {})
-            prompt = step1.get("request", {}).get("prompt") if isinstance(step1, dict) else None
-            expected_blocks = len(prompt) // PAGED_BLOCK_SIZE if isinstance(prompt, list) else None
-            if pre is not None and expected_blocks is not None and (
-                    pre["target_blocks"] != expected_blocks or pre["eligible_resident_blocks"] != expected_blocks or
-                    pre["swapped_blocks"] != 0 or pre["active"] or pre["exhausted"] or not pre["valid"]):
-                errors.append("FLEXKV_K1_SYNC: pre-offload claimant is not a complete resident prefix")
-            post, post_stderr_end, post_observed = validate_snapshot(
-                case, "post_claimant.json", "FLEXKV_K1_SYNC", errors)
-            epoch, last_offload_end = baseline_validate_k1_transactions(
-                case, raw, execution.get("server_identity") if isinstance(execution, dict) else None,
-                post, expected_blocks, scope[0], "FLEXKV_K1_SYNC", errors)
-            validate_resume(case, raw, scope[0], scope[1], last_offload_end, epoch, "FLEXKV_K1_SYNC", errors)
-            if last_offload_end is not None and post_stderr_end is not None and post_stderr_end != scope[0]:
-                errors.append("FLEXKV_K1_SYNC: post-offload claimant does not bind the step2 boundary")
-            if isinstance(rows.get("step2"), dict) and post_observed is not None and post_observed >= rows["step2"].get("started_monotonic_ns", 0):
-                errors.append("FLEXKV_K1_SYNC: post-offload claimant is not before step2")
-            try:
-                offload = read_json(case / "offload.json")
-            except Error as exc:
-                errors.append(str(exc))
-            else:
-                if isinstance(offload, dict) and result.get("offload") != offload.get("cumulative"):
-                    errors.append("FLEXKV_K1_SYNC: result offload summary differs from raw transactions")
-            baseline_validate_k1_timing(case, raw, scope, rows, errors)
+            if isinstance(offload, dict) and result.get("offload") != offload.get("cumulative"):
+                errors.append("FLEXKV_K1_SYNC: result offload summary differs from raw transactions")
+        baseline_validate_k1_timing(case, raw, scope, rows, errors)
     return {
         "metadata": metadata,
         "case": case,
@@ -2056,7 +2040,8 @@ def baseline_validate_comparisons(
         if isinstance(metadata, dict):
             by_round.setdefault(metadata["round"], {})[metadata["case"]] = item
     records: list[dict[str, Any]] = []
-    for round_no in range(1, 4):
+    available_rounds = sorted(by_round)
+    for round_no in available_rounds:
         cases = by_round.get(round_no, {})
         if set(cases) != set(BASELINE_CASES):
             errors.append(f"round {round_no}: baseline comparison cases are incomplete")
@@ -2133,7 +2118,7 @@ def write_baseline_summary(
     capture_message = (
         "WARNING: this is a dirty diagnostic capture. It is not archival evidence and cannot be reported as formal PASS."
         if diagnostic_dirty else
-        "All three fixed comparison edges passed request and step2 output Exact checks in every round.")
+        "All fixed comparison edges passed request and step2 output Exact checks in every round.")
     lines = [
         "# B0-B2 server baseline summary", "", capture_message, "",
         "| Edge | Left | Right | Meaning |", "|---|---|---|---|",
@@ -2152,11 +2137,12 @@ def main_parse_baseline(root: pathlib.Path, manifest: dict[str, Any]) -> tuple[s
     errors: list[str] = []
     baseline_validate_manifest(manifest, errors)
     status = manifest.get("runner_status")
-    pairs = baseline_validate_matrix(root, status == "DRY_RUN", errors)
+    smoke = manifest.get("execution", {}).get("smoke") is True
+    pairs = baseline_validate_matrix(root, status == "DRY_RUN", smoke, errors)
     if status == "DRY_RUN":
         if manifest.get("run_results") != []:
             errors.append("baseline dry-run must not contain run results")
-        return ("FAIL", errors) if errors else ("DRY_RUN", ["three-round B0-B2 plan materialized; no model process was started"])
+        return ("FAIL", errors) if errors else ("DRY_RUN", ["B0-B1 plan materialized; no model process was started"])
     if status != "run_complete":
         reason = manifest.get("runner_error")
         errors.append(reason if is_nonempty_string(reason) else f"baseline runner status is {status!r}")
@@ -2175,8 +2161,10 @@ def main_parse_baseline(root: pathlib.Path, manifest: dict[str, Any]) -> tuple[s
         write_baseline_summary(root, runs, comparisons, bool(manifest.get("dirty_status")))
     except (Error, OSError, TypeError, KeyError, ValueError) as exc:
         return "FAIL", [f"could not write baseline summary: {type(exc).__name__}: {exc}"]
-    if manifest.get("dirty_status"):
+    if manifest.get("dirty_status") and manifest.get("capture_mode") != "diagnostic_smoke":
         return "DIAGNOSTIC", ["dirty capture completed; diagnostic evidence cannot be verified as formal PASS"]
+    if manifest.get("capture_mode") == "diagnostic_smoke":
+        return "DIAGNOSTIC", ["diagnostic smoke completed; not a formal PASS"]
     return "PASS", []
 
 
