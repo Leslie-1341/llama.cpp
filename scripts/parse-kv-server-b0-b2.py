@@ -1597,9 +1597,9 @@ def baseline_validate_memory(
         for key in ("backing_logical_size", "backing_allocated_bytes"):
             value = row.get(key)
             if baseline_case_flags(name)["backing"]:
-                if value not in {NOT_APPLICABLE, "NA", "", None} and not str(value).isdigit():
+                if value not in {NOT_APPLICABLE, "NA", None} and not str(value).isdigit():
                     errors.append(f"{label} {key} is invalid")
-            elif value not in {NOT_APPLICABLE, "NA", ""}:
+            elif value not in {NOT_APPLICABLE, "NA"}:
                 errors.append(f"{label} non-backing case has {key}")
 
 

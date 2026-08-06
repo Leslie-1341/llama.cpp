@@ -684,6 +684,33 @@ class BaselineFixture(unittest.TestCase):
         put(path, manifest)
         self.assertEqual(self.parse()[0], "DIAGNOSTIC")
 
+    def test_zero_memory_samples_fail_closed(self) -> None:
+        path = self.root / "runs" / "round_1_order_01_CURRENT_E0" / "memory_samples.tsv"
+        path.write_text(path.read_text(encoding="utf-8").splitlines()[0] + "\n", encoding="utf-8")
+        status, details = self.parse()
+        self.assertEqual(status, "FAIL")
+        self.assertTrue(any("captured zero samples" in detail for detail in details))
+
+    def test_malformed_memory_sample_non_numeric_identity_fail_closed(self) -> None:
+        path = self.root / "runs" / "round_1_order_01_CURRENT_E0" / "memory_samples.tsv"
+        path.write_text(
+            "elapsed_ms\tpid\tstarttime_ticks\tvmrss_kb\tvmhwm_kb\tcgroup_memory_current_bytes\tbacking_logical_size\tbacking_allocated_bytes\n"
+            "0\tNA\t5000\t100\t150\tNOT_APPLICABLE\tNOT_APPLICABLE\tNOT_APPLICABLE\n",
+            encoding="utf-8")
+        status, details = self.parse()
+        self.assertEqual(status, "FAIL")
+        self.assertTrue(any("lacks numeric process identity/RSS" in detail for detail in details))
+
+    def test_malformed_memory_sample_wrong_starttime_fail_closed(self) -> None:
+        path = self.root / "runs" / "round_1_order_01_CURRENT_E0" / "memory_samples.tsv"
+        path.write_text(
+            "elapsed_ms\tpid\tstarttime_ticks\tvmrss_kb\tvmhwm_kb\tcgroup_memory_current_bytes\tbacking_logical_size\tbacking_allocated_bytes\n"
+            "0\t6001\t99999\t100\t150\tNOT_APPLICABLE\tNOT_APPLICABLE\tNOT_APPLICABLE\n",
+            encoding="utf-8")
+        status, details = self.parse()
+        self.assertEqual(status, "FAIL")
+        self.assertTrue(any("does not bind the server process identity" in detail for detail in details))
+
 
 class RunnerContractTest(unittest.TestCase):
     def test_fixed_three_round_plan_and_b0_b1_edges(self) -> None:
