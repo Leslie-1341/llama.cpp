@@ -14,10 +14,12 @@
 #include <cstdio>
 #include <cstdint>
 #include <array>
+#include <atomic>
 #include <bitset>
 #include <memory>
 #include <set>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -231,6 +233,9 @@ public:
 
     void set_test_faults(const llama_kv_backing_store_faults & faults);
     void clear_test_faults();
+    void arm_test_read_gate();
+    bool test_read_gate_entered() const;
+    void release_test_read_gate();
     const llama_kv_backing_store_faults & get_test_faults() const {
         return faults;
     }
@@ -251,6 +256,9 @@ private:
     bool     used_o_tmpfile_ = false;
     llama_kv_backing_store_stats stats;
     llama_kv_backing_store_faults faults;
+    std::atomic<bool> read_gate_armed = false;
+    std::atomic<bool> read_gate_entered_flag = false;
+    std::atomic<bool> read_gate_released = true;
 
     int64_t pwrite_once(const char * data, size_t size, uint64_t offset);
     int64_t pread_once(char * data, size_t size, uint64_t offset);
@@ -629,6 +637,52 @@ public:
     uint64_t paged_unified_action_test_read_restore_stale_triggers() const {
         return paged_restore_test_stale_triggers;
     }
+    void paged_unified_action_test_arm_restore_mapping_stale_before_complete() {
+        paged_restore_test_mapping_stale_before_complete = true;
+    }
+    uint64_t paged_unified_action_test_read_restore_mapping_stale_triggers() const {
+        return paged_restore_test_mapping_stale_triggers;
+    }
+    uint64_t paged_unified_action_test_read_restore_scatter_groups() const {
+        return paged_restore_test_scatter_groups;
+    }
+    bool paged_unified_action_test_k2_enabled() const {
+        return paged_restore_k2_enabled;
+    }
+    uint64_t paged_unified_action_test_read_k1_sync_staging_reuses() const {
+        return paged_restore_k1_sync_staging_reuses;
+    }
+    uint64_t paged_unified_action_test_read_k2_read_ahead() const {
+        return paged_restore_k2_read_ahead_observed;
+    }
+    uint32_t paged_unified_action_test_read_k2_peak_staging_groups() const {
+        return paged_restore_k2_peak_staging_groups;
+    }
+    uint64_t paged_unified_action_test_read_k2_peak_staging_bytes() const {
+        return paged_restore_k2_peak_staging_bytes;
+    }
+    uint64_t paged_unified_action_test_read_k2_staging_bound_bytes() const {
+        return paged_restore_k2_staging_bound_bytes;
+    }
+    uint64_t paged_unified_action_test_read_k2_staging_reuses() const {
+        return paged_restore_k2_staging_reuses;
+    }
+    uint64_t paged_unified_action_test_read_k2_exposed_read_wait_us() const {
+        return paged_restore_k2_exposed_read_wait_us;
+    }
+    uint64_t paged_unified_action_test_read_k2_pipeline_stall_us() const {
+        return paged_restore_k2_pipeline_stall_us;
+    }
+    uint64_t paged_unified_action_test_read_k2_pipeline_wall_us() const {
+        return paged_restore_k2_pipeline_wall_us;
+    }
+    uint64_t paged_unified_action_test_read_k2_completed_ahead() const {
+        return paged_restore_k2_read_completed_before_restore_complete;
+    }
+    void paged_unified_action_test_arm_read_gate();
+    bool paged_unified_action_test_read_gate_entered() const;
+    void paged_unified_action_test_release_read_gate();
+    bool paged_unified_action_test_start_pending_restore_read(uint32_t block);
     struct paged_unified_action_test_io_fault_stats {
         uint64_t matching_attempts = 0;
         uint64_t trigger_count = 0;
@@ -912,10 +966,25 @@ private:
         uint32_t failed_block = UINT32_MAX;
         uint32_t failed_cell = UINT32_MAX;
         bool prepared = false;
+        bool read_submitted = false;
         bool read_completed = false;
+        bool read_result_accounted = false;
         bool restore_completed = false;
         bool committed = false;
+        bool io_fault_armed = false;
+        uint8_t io_fault_state_before = 0;
+        uint32_t io_fault_block = UINT32_MAX;
+        uint64_t io_fault_attempt_id = 0;
+        uint64_t io_fault_swap_in_before = 0;
+        uint64_t io_fault_syscalls_before = 0;
+        uint32_t pipeline_index = UINT32_MAX;
         uint64_t started_us = 0;
+        uint64_t read_submit_us = 0;
+        uint64_t read_complete_us = 0;
+        uint64_t restore_start_us = 0;
+        uint64_t restore_complete_us = 0;
+        uint64_t exposed_read_wait_us = 0;
+        uint64_t pipeline_stall_us = 0;
         uint64_t validate_us = 0;
         uint64_t read_us = 0;
         uint64_t unpack_us = 0;
@@ -931,9 +1000,21 @@ private:
             const std::vector<uint32_t> & candidates,
             std::vector<paged_restore_group_task> & tasks) const;
     bool paged_restore_group_prepare(paged_restore_group_task & task) const;
+    static void paged_restore_group_read_cells(
+            llama_kv_backing_store_i * store,
+            paged_restore_group_task & task);
+    bool paged_restore_group_read_prepare(paged_restore_group_task & task) const;
+    bool paged_restore_group_read_finish(paged_restore_group_task & task) const;
+    bool paged_restore_group_read(paged_restore_group_task & task) const;
+    bool paged_restore_group_post_read(paged_restore_group_task & task) const;
     bool paged_restore_group_execute(paged_restore_group_task & task) const;
     bool paged_restore_group_complete(paged_restore_group_task & task) const;
     bool paged_restore_group_sync(paged_restore_group_task & task) const;
+    bool paged_restore_group_start_async(
+            const std::shared_ptr<paged_restore_group_task> & task) const;
+    bool paged_restore_group_wait_async(paged_restore_group_task & task) const;
+    void paged_restore_worker_stop_and_join() const;
+    void paged_restore_test_invalidate_before_scatter(paged_restore_group_task & task) const;
 
     struct paged_prefetch_step_result {
         uint32_t candidate_blocks = 0;
@@ -1052,6 +1133,7 @@ private:
     uint32_t paged_identity_fast_path_layers = 0;
     static constexpr size_t PAGED_RESTORE_GROUP_BYTE_CAP = 64u * 1024u * 1024u;
     size_t paged_restore_group_byte_cap_override = 0;
+    bool paged_restore_k2_enabled = false;
     llama_kv_paged_identity_fast_path_reject paged_identity_fast_path_reject =
         llama_kv_paged_identity_fast_path_reject::NOT_REQUESTED;
     uint32_t paged_block_size  = 16;
@@ -1083,7 +1165,7 @@ private:
     uint32_t paged_release_scan_n_blocks = 0;
     uint32_t paged_release_scan_kv_size = 0;
     uint64_t paged_release_scan_mapping_generation = 0;
-    uint64_t paged_mapping_generation = 0;
+    mutable uint64_t paged_mapping_generation = 0;
     uint64_t paged_alloc_calls     = 0;
     uint64_t paged_blocks_in_use   = 0;
     uint64_t paged_identity_checks = 0;
@@ -1282,12 +1364,29 @@ private:
     mutable uint64_t paged_io_block_in_unpack_calls = 0;
     mutable uint64_t paged_io_block_in_commit_us = 0;
     mutable uint64_t paged_io_block_in_commit_calls = 0;
-    // The synchronous wrapper lends this grow-only buffer to one self-contained restore task.
-    // Transfer groups are byte-capped; an individually oversized block remains a one-block task.
+    // Synchronous block/group paths retain this cache-level staging buffer. Asynchronous restore
+    // tasks own their staging directly so a worker never borrows this synchronous scratch storage.
     mutable std::vector<uint8_t> paged_io_staging;
     mutable paged_restore_layout paged_restore_layout_cache;
     mutable bool paged_restore_test_stale_before_complete = false;
     mutable uint64_t paged_restore_test_stale_triggers = 0;
+    mutable bool paged_restore_test_mapping_stale_before_complete = false;
+    mutable uint64_t paged_restore_test_mapping_stale_triggers = 0;
+    mutable uint64_t paged_restore_test_scatter_groups = 0;
+    mutable std::thread paged_restore_worker_thread;
+    mutable std::shared_ptr<paged_restore_group_task> paged_restore_worker_task;
+    mutable std::atomic<bool> paged_restore_worker_stop_requested = false;
+    mutable uint64_t paged_restore_k1_sync_staging_reuses = 0;
+    mutable uint64_t paged_restore_k2_read_ahead_observed = 0;
+    mutable uint32_t paged_restore_k2_peak_staging_groups = 0;
+    mutable uint64_t paged_restore_k2_peak_staging_bytes = 0;
+    // The two-slot logical staging bound is 2 * max(group cap, largest single block).
+    mutable uint64_t paged_restore_k2_staging_bound_bytes = 0;
+    mutable uint64_t paged_restore_k2_staging_reuses = 0;
+    mutable uint64_t paged_restore_k2_exposed_read_wait_us = 0;
+    mutable uint64_t paged_restore_k2_pipeline_stall_us = 0;
+    mutable uint64_t paged_restore_k2_pipeline_wall_us = 0;
+    mutable uint64_t paged_restore_k2_read_completed_before_restore_complete = 0;
 
     enum class paged_test_swapin_fail_scope : uint8_t {
         OFF,
@@ -1812,8 +1911,8 @@ public:
 private:
     llama_memory_status status;
 
-    llama_kv_cache * kv;
-    llama_context * lctx;
+    llama_kv_cache * kv = nullptr;
+    llama_context * lctx = nullptr;
 
     //
     // update context

@@ -38,6 +38,7 @@
 #include "../src/llama-kv-cache.h"
 #include "../src/llama-kv-cache-release.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cinttypes>
 #include <cstdint>
@@ -46,6 +47,7 @@
 #include <cstring>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 static int failures = 0;
@@ -2451,6 +2453,319 @@ int main(int /*argc*/, char ** /*argv*/) {
             }
         }
 
+        // =========================================================================
+        // WT30: K2-V1 fixed-depth=1 producer/consumer pipeline.
+        // =========================================================================
+        unsetenv("LLAMA_KV_PAGED_RESTORE_K2");
+        unsetenv("LLAMA_KV_PAGED_IO_STATS");
+        std::vector<std::vector<uint8_t>> sync_restore;
+        {
+            ContextGuard g;
+            if (!g.init(model, cparams)) {
+                CHECK(false, "WT30a: synchronous fallback context creation failed");
+            } else {
+                std::vector<llama_token> prompt(48, 7);
+                CHECK(decode_prompt(g.ctx, prompt) == 0, "WT30a: synchronous fallback decode three blocks");
+                std::vector<std::vector<uint8_t>> before;
+                for (uint32_t block = 0; block < 3; ++block) {
+                    before.push_back(g.kv->paged_unified_action_test_read_block_bytes(block));
+                }
+                const auto offload = g.kv->execute_action({
+                    llama_kv_action::offload, 7651, 0, UINT64_MAX, 3, false });
+                g.kv->paged_unified_action_test_set_restore_group_byte_cap(before[0].size());
+                const auto prefetch = g.kv->execute_action({
+                    llama_kv_action::prefetch, 7652, 0, 0, 0, true, true });
+                CHECK(!g.kv->paged_unified_action_test_k2_enabled() &&
+                        g.kv->paged_unified_action_test_read_k1_sync_staging_reuses() == 3 &&
+                        offload.state_changed && offload.blocks == 3 &&
+                        prefetch.outcome == llama_kv_action_outcome::completed &&
+                        prefetch.blocks == 3,
+                        "WT30a: synchronous K1 fallback reuses cache staging for three groups");
+                for (uint32_t block = 0; block < 3; ++block) {
+                    sync_restore.push_back(g.kv->paged_unified_action_test_read_block_bytes(block));
+                    CHECK(sync_restore.back() == before[block],
+                            "WT30a: synchronous fallback remains byte-exact");
+                }
+            }
+        }
+
+        setenv("LLAMA_KV_PAGED_RESTORE_K2", "1", 1);
+        setenv("LLAMA_KV_PAGED_IO_STATS", "1", 1);
+        {
+            ContextGuard g;
+            if (!g.init(model, cparams)) {
+                CHECK(false, "WT30b: K2 context creation failed");
+            } else {
+                std::vector<llama_token> prompt(48, 7);
+                CHECK(decode_prompt(g.ctx, prompt) == 0, "WT30b: K2 decode three blocks");
+                std::vector<std::vector<uint8_t>> before;
+                for (uint32_t block = 0; block < 3; ++block) {
+                    before.push_back(g.kv->paged_unified_action_test_read_block_bytes(block));
+                }
+                const auto offload = g.kv->execute_action({
+                    llama_kv_action::offload, 7661, 0, UINT64_MAX, 3, false });
+                g.kv->paged_unified_action_test_set_restore_group_byte_cap(before[0].size());
+                const auto prefetch = g.kv->execute_action({
+                    llama_kv_action::prefetch, 7662, 0, 0, 0, true, true });
+                const uint64_t group_cap = g.kv->paged_unified_action_test_read_restore_group_byte_cap();
+                const uint64_t staging_bound =
+                    g.kv->paged_unified_action_test_read_k2_staging_bound_bytes();
+                CHECK(g.kv->paged_unified_action_test_k2_enabled() &&
+                        offload.state_changed && offload.blocks == 3 &&
+                        prefetch.outcome == llama_kv_action_outcome::completed &&
+                        prefetch.blocks == 3 && prefetch.bytes == before[0].size() * 3,
+                        "WT30b: K2 restores three contiguous groups");
+                CHECK(g.kv->paged_unified_action_test_read_k2_read_ahead() == 2 &&
+                        g.kv->paged_unified_action_test_read_k2_peak_staging_groups() == 2 &&
+                        g.kv->paged_unified_action_test_read_k2_staging_reuses() >= 1 &&
+                        g.kv->paged_unified_action_test_read_k1_sync_staging_reuses() == 0 &&
+                        staging_bound == group_cap * 2 &&
+                        g.kv->paged_unified_action_test_read_k2_peak_staging_bytes() <= staging_bound,
+                        "WT30b: K2 reuses two task slots under the double-buffer bound");
+                CHECK(g.kv->paged_unified_action_test_read_restore_scatter_groups() == 3 &&
+                        g.kv->paged_unified_action_test_read_k2_pipeline_wall_us() > 0,
+                        "WT30b: K2 owner scatter and pipeline wall telemetry are recorded");
+                for (uint32_t block = 0; block < 3; ++block) {
+                    const auto after = g.kv->paged_unified_action_test_read_block_bytes(block);
+                    CHECK(after == before[block] && after == sync_restore[block],
+                            "WT30b: K2 and K1 fallback bytes are identical");
+                }
+                std::fprintf(stderr,
+                        "WT30b K2 order: read_ahead=%llu peak_groups=%u peak_bytes=%llu "
+                        "staging_bound=%llu staging_reuses=%llu completed_ahead=%llu "
+                        "exposed_wait_us=%llu stall_us=%llu wall_us=%llu\n",
+                        (unsigned long long) g.kv->paged_unified_action_test_read_k2_read_ahead(),
+                        g.kv->paged_unified_action_test_read_k2_peak_staging_groups(),
+                        (unsigned long long) g.kv->paged_unified_action_test_read_k2_peak_staging_bytes(),
+                        (unsigned long long) g.kv->paged_unified_action_test_read_k2_staging_bound_bytes(),
+                        (unsigned long long) g.kv->paged_unified_action_test_read_k2_staging_reuses(),
+                        (unsigned long long) g.kv->paged_unified_action_test_read_k2_completed_ahead(),
+                        (unsigned long long) g.kv->paged_unified_action_test_read_k2_exposed_read_wait_us(),
+                        (unsigned long long) g.kv->paged_unified_action_test_read_k2_pipeline_stall_us(),
+                        (unsigned long long) g.kv->paged_unified_action_test_read_k2_pipeline_wall_us());
+            }
+        }
+
+        // WT30c: a physical gap remains two producer/consumer groups.
+        {
+            ContextGuard g;
+            if (!g.init(model, cparams)) {
+                CHECK(false, "WT30c: non-contiguous context creation failed");
+            } else {
+                const uint32_t block_size = g.kv->paged_release_bounded_test_read_block_size();
+                CHECK(seed_owned_blocks(g.kv, 0, 1, block_size, 0) &&
+                        seed_owned_blocks(g.kv, 2, 1, block_size, 0),
+                        "WT30c: seed non-contiguous K2 blocks");
+                const auto before0 = g.kv->paged_unified_action_test_read_block_bytes(0);
+                const auto before2 = g.kv->paged_unified_action_test_read_block_bytes(2);
+                CHECK(g.kv->paged_unified_action_test_swap_out_block(0) &&
+                        g.kv->paged_unified_action_test_swap_out_block(2),
+                        "WT30c: swap out non-contiguous K2 blocks");
+                const auto backing_before = g.kv->paged_unified_action_test_read_backing_stats();
+                const auto prefetch = g.kv->execute_action({
+                    llama_kv_action::prefetch, 7671, 0, 0, 0, true, true });
+                const auto backing_after = g.kv->paged_unified_action_test_read_backing_stats();
+                CHECK(prefetch.outcome == llama_kv_action_outcome::completed &&
+                        prefetch.blocks == 2 && backing_after.read_calls == backing_before.read_calls + 2 &&
+                        g.kv->paged_unified_action_test_read_k2_read_ahead() == 1,
+                        "WT30c: K2 preserves non-contiguous grouping and depth-one lookahead");
+                CHECK(g.kv->paged_unified_action_test_read_block_bytes(0) == before0 &&
+                        g.kv->paged_unified_action_test_read_block_bytes(2) == before2,
+                        "WT30c: K2 non-contiguous restore is byte-exact");
+            }
+        }
+
+        // WT30d: an undersized cap creates oversized single-block groups; the bound uses max(cap, block).
+        {
+            ContextGuard g;
+            if (!g.init(model, cparams)) {
+                CHECK(false, "WT30d: byte-cap context creation failed");
+            } else {
+                std::vector<llama_token> prompt(48, 8);
+                CHECK(decode_prompt(g.ctx, prompt) == 0, "WT30d: byte-cap decode three blocks");
+                std::vector<std::vector<uint8_t>> before;
+                for (uint32_t block = 0; block < 3; ++block) {
+                    before.push_back(g.kv->paged_unified_action_test_read_block_bytes(block));
+                }
+                const auto offload = g.kv->execute_action({
+                    llama_kv_action::offload, 7681, 0, UINT64_MAX, 3, false });
+                const size_t group_cap = std::max<size_t>(1, before[0].size() / 2);
+                g.kv->paged_unified_action_test_set_restore_group_byte_cap(group_cap);
+                const auto backing_before = g.kv->paged_unified_action_test_read_backing_stats();
+                const auto prefetch = g.kv->execute_action({
+                    llama_kv_action::prefetch, 7682, 0, 0, 0, true, true });
+                const auto backing_after = g.kv->paged_unified_action_test_read_backing_stats();
+                const uint64_t staging_bound =
+                    g.kv->paged_unified_action_test_read_k2_staging_bound_bytes();
+                CHECK(offload.state_changed && prefetch.outcome == llama_kv_action_outcome::completed &&
+                        prefetch.blocks == 3 && backing_after.read_calls == backing_before.read_calls + 3 &&
+                        g.kv->paged_unified_action_test_read_k2_peak_staging_groups() == 2 &&
+                        g.kv->paged_unified_action_test_read_k2_staging_reuses() >= 1 &&
+                        staging_bound == before[0].size() * 2 &&
+                        g.kv->paged_unified_action_test_read_k2_peak_staging_bytes() <= staging_bound,
+                        "WT30d: oversized single-block groups use the corrected double-buffer bound");
+                for (uint32_t block = 0; block < 3; ++block) {
+                    CHECK(g.kv->paged_unified_action_test_read_block_bytes(block) == before[block],
+                            "WT30d: K2 byte-cap restore is byte-exact");
+                }
+            }
+        }
+
+        // WT30e: first-group backing failure has zero completion and never submits group 1.
+        setenv("LLAMA_KV_PAGED_TEST_IO_FAIL_SCOPE", "prefetch_swap_in", 1);
+        setenv("LLAMA_KV_PAGED_TEST_IO_FAIL_KIND", "read_eof_once", 1);
+        setenv("LLAMA_KV_PAGED_TEST_IO_FAIL_SEQ_ID", "0", 1);
+        setenv("LLAMA_KV_PAGED_TEST_IO_FAIL_BLOCK", "0", 1);
+        setenv("LLAMA_KV_PAGED_TEST_IO_FAIL_ONCE", "1", 1);
+        {
+            ContextGuard g;
+            if (!g.init(model, cparams)) {
+                CHECK(false, "WT30e: first-failure context creation failed");
+            } else {
+                std::vector<llama_token> prompt(32, 9);
+                CHECK(decode_prompt(g.ctx, prompt) == 0, "WT30e: first-failure decode");
+                const auto offload = g.kv->execute_action({
+                    llama_kv_action::offload, 7691, 0, UINT64_MAX, 2, false });
+                const auto failed = g.kv->execute_action({
+                    llama_kv_action::prefetch, 7692, 0, 0, 0, true, true });
+                CHECK(offload.state_changed && failed.outcome == llama_kv_action_outcome::failed &&
+                        failed.io_failure && failed.fail_stop && failed.blocks == 0 &&
+                        failed.core_transaction_id == 0 &&
+                        g.kv->paged_unified_action_test_read_k2_read_ahead() == 0 &&
+                        g.kv->paged_release_bounded_test_read_block_state(0) == 3 &&
+                        g.kv->paged_release_bounded_test_read_block_state(1) == 3,
+                        "WT30e: first K2 read failure is fail-stop with zero completion");
+            }
+        }
+        unsetenv("LLAMA_KV_PAGED_TEST_IO_FAIL_SCOPE");
+        unsetenv("LLAMA_KV_PAGED_TEST_IO_FAIL_KIND");
+        unsetenv("LLAMA_KV_PAGED_TEST_IO_FAIL_SEQ_ID");
+        unsetenv("LLAMA_KV_PAGED_TEST_IO_FAIL_BLOCK");
+        unsetenv("LLAMA_KV_PAGED_TEST_IO_FAIL_ONCE");
+
+        // WT30f: later-group read failure preserves the completed prefix as partial_failure.
+        setenv("LLAMA_KV_PAGED_TEST_IO_FAIL_SCOPE", "prefetch_swap_in", 1);
+        setenv("LLAMA_KV_PAGED_TEST_IO_FAIL_KIND", "read_eof_once", 1);
+        setenv("LLAMA_KV_PAGED_TEST_IO_FAIL_SEQ_ID", "0", 1);
+        setenv("LLAMA_KV_PAGED_TEST_IO_FAIL_BLOCK", "1", 1);
+        setenv("LLAMA_KV_PAGED_TEST_IO_FAIL_ONCE", "1", 1);
+        {
+            ContextGuard g;
+            if (!g.init(model, cparams)) {
+                CHECK(false, "WT30f: partial-failure context creation failed");
+            } else {
+                std::vector<llama_token> prompt(32, 10);
+                CHECK(decode_prompt(g.ctx, prompt) == 0, "WT30f: partial-failure decode");
+                const auto before0 = g.kv->paged_unified_action_test_read_block_bytes(0);
+                const size_t block_bytes = before0.size();
+                const auto offload = g.kv->execute_action({
+                    llama_kv_action::offload, 7701, 0, UINT64_MAX, 2, false });
+                g.kv->paged_unified_action_test_set_restore_group_byte_cap(block_bytes);
+                const auto failed = g.kv->execute_action({
+                    llama_kv_action::prefetch, 7702, 0, 0, 0, true, true });
+                CHECK(offload.state_changed && failed.outcome == llama_kv_action_outcome::partial_failure &&
+                        failed.io_failure && failed.fail_stop && failed.blocks == 1 &&
+                        failed.core_transaction_id > offload.core_transaction_id &&
+                        g.kv->paged_unified_action_test_read_k2_read_ahead() == 1 &&
+                        g.kv->paged_release_bounded_test_read_block_state(0) == 1 &&
+                        g.kv->paged_release_bounded_test_read_block_state(1) == 3 &&
+                        g.kv->paged_unified_action_test_read_block_bytes(0) == before0,
+                        "WT30f: later K2 read failure reports partial prefix exactly");
+            }
+        }
+        unsetenv("LLAMA_KV_PAGED_TEST_IO_FAIL_SCOPE");
+        unsetenv("LLAMA_KV_PAGED_TEST_IO_FAIL_KIND");
+        unsetenv("LLAMA_KV_PAGED_TEST_IO_FAIL_SEQ_ID");
+        unsetenv("LLAMA_KV_PAGED_TEST_IO_FAIL_BLOCK");
+        unsetenv("LLAMA_KV_PAGED_TEST_IO_FAIL_ONCE");
+
+        // WT30g: generation and mapping invalidation after read prevent scatter and commit.
+        {
+            ContextGuard g;
+            if (!g.init(model, cparams)) {
+                CHECK(false, "WT30g: generation-stale context creation failed");
+            } else {
+                std::vector<llama_token> prompt(32, 11);
+                CHECK(decode_prompt(g.ctx, prompt) == 0, "WT30g: generation-stale decode");
+                const size_t block_bytes = g.kv->paged_unified_action_test_read_block_bytes(0).size();
+                const auto offload = g.kv->execute_action({
+                    llama_kv_action::offload, 7711, 0, UINT64_MAX, 2, false });
+                g.kv->paged_unified_action_test_set_restore_group_byte_cap(block_bytes);
+                const uint64_t scatter_before =
+                    g.kv->paged_unified_action_test_read_restore_scatter_groups();
+                const uint64_t stale_before =
+                    g.kv->paged_unified_action_test_read_restore_stale_triggers();
+                g.kv->paged_unified_action_test_arm_restore_stale_before_complete();
+                const auto failed = g.kv->execute_action({
+                    llama_kv_action::prefetch, 7712, 0, 0, 0, true, true });
+                CHECK(offload.state_changed && failed.outcome == llama_kv_action_outcome::failed &&
+                        failed.blocks == 0 && failed.core_transaction_id == 0 &&
+                        g.kv->paged_unified_action_test_read_restore_stale_triggers() == stale_before + 1 &&
+                        g.kv->paged_unified_action_test_read_restore_scatter_groups() == scatter_before &&
+                        g.kv->paged_release_bounded_test_read_block_state(0) == 3 &&
+                        g.kv->paged_release_bounded_test_read_block_state(1) == 3,
+                        "WT30g: generation-stale K2 result is discarded before scatter");
+            }
+        }
+        {
+            ContextGuard g;
+            if (!g.init(model, cparams)) {
+                CHECK(false, "WT30g: mapping-stale context creation failed");
+            } else {
+                std::vector<llama_token> prompt(32, 12);
+                CHECK(decode_prompt(g.ctx, prompt) == 0, "WT30g: mapping-stale decode");
+                const size_t block_bytes = g.kv->paged_unified_action_test_read_block_bytes(0).size();
+                const auto offload = g.kv->execute_action({
+                    llama_kv_action::offload, 7721, 0, UINT64_MAX, 2, false });
+                g.kv->paged_unified_action_test_set_restore_group_byte_cap(block_bytes);
+                const uint64_t scatter_before =
+                    g.kv->paged_unified_action_test_read_restore_scatter_groups();
+                const uint64_t mapping_before =
+                    g.kv->paged_unified_action_test_read_restore_mapping_stale_triggers();
+                g.kv->paged_unified_action_test_arm_restore_mapping_stale_before_complete();
+                const auto failed = g.kv->execute_action({
+                    llama_kv_action::prefetch, 7722, 0, 0, 0, true, true });
+                CHECK(offload.state_changed && failed.outcome == llama_kv_action_outcome::failed &&
+                        failed.blocks == 0 && failed.core_transaction_id == 0 &&
+                        g.kv->paged_unified_action_test_read_restore_mapping_stale_triggers() == mapping_before + 1 &&
+                        g.kv->paged_unified_action_test_read_restore_scatter_groups() == scatter_before &&
+                        g.kv->paged_release_bounded_test_read_block_state(0) == 3 &&
+                        g.kv->paged_release_bounded_test_read_block_state(1) == 3,
+                        "WT30g: mapping-stale K2 result is discarded before scatter");
+            }
+        }
+
+        // WT30h: a gated pending read is released and joined by context/cache destruction.
+        {
+            ContextGuard g;
+            if (!g.init(model, cparams)) {
+                CHECK(false, "WT30h: pending-read context creation failed");
+            } else {
+                std::vector<llama_token> prompt(16, 13);
+                CHECK(decode_prompt(g.ctx, prompt) == 0, "WT30h: pending-read decode");
+                const auto offload = g.kv->execute_action({
+                    llama_kv_action::offload, 7731, 0, UINT64_MAX, 1, false });
+                g.kv->paged_unified_action_test_arm_read_gate();
+                const bool started = g.kv->paged_unified_action_test_start_pending_restore_read(0);
+                bool entered = false;
+                for (uint32_t spin = 0; spin < 100000 && !(entered =
+                        g.kv->paged_unified_action_test_read_gate_entered()); ++spin) {
+                    std::this_thread::yield();
+                }
+                CHECK(offload.state_changed && started && entered,
+                        "WT30h: pending read reaches deterministic backing gate");
+                g.kv->paged_unified_action_test_release_read_gate();
+                llama_context * pending_ctx = g.ctx;
+                g.ctx = nullptr;
+                g.mem = nullptr;
+                g.kv = nullptr;
+                llama_free(pending_ctx);
+                CHECK(true, "WT30h: context destruction joins pending K2 worker safely");
+            }
+        }
+
+        unsetenv("LLAMA_KV_PAGED_RESTORE_K2");
+        unsetenv("LLAMA_KV_PAGED_IO_STATS");
         unsetenv("LLAMA_KV_PAGED_SWAP");
     }
 
