@@ -32,6 +32,13 @@
 
 #if defined(__linux__) && defined(__GLIBC__)
 #include <execinfo.h>
+#include <sys/resource.h>
+#if defined(RUSAGE_THREAD)
+#define LLAMA_KV_RESTORE_FAULT_STATS_SUPPORTED 1
+#endif
+#if defined(MADV_POPULATE_WRITE)
+#define LLAMA_KV_RESTORE_PREFAULT_SUPPORTED 1
+#endif
 #define LLAMA_KV_REFAULT_TRACE_SUPPORTED 1
 #endif
 
@@ -50,6 +57,20 @@ static uint64_t llama_paged_timing_now_us() {
     return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
             clock::now().time_since_epoch()).count();
 }
+
+#if defined(LLAMA_KV_RESTORE_FAULT_STATS_SUPPORTED)
+static bool llama_paged_restore_read_thread_faults(
+        uint64_t & minor_faults,
+        uint64_t & major_faults) {
+    struct rusage usage = {};
+    if (getrusage(RUSAGE_THREAD, &usage) != 0 || usage.ru_minflt < 0 || usage.ru_majflt < 0) {
+        return false;
+    }
+    minor_faults = (uint64_t) usage.ru_minflt;
+    major_faults = (uint64_t) usage.ru_majflt;
+    return true;
+}
+#endif
 
 static uint64_t llama_paged_restore_staging_bound_bytes(
         size_t group_byte_cap, size_t max_single_block_bytes) {
@@ -1013,6 +1034,12 @@ llama_kv_cache::llama_kv_cache(
         const char * LLAMA_KV_PAGED_REFAULT_TRACE_BACKTRACE = std::getenv("LLAMA_KV_PAGED_REFAULT_TRACE_BACKTRACE");
         const char * LLAMA_KV_PAGED_REFAULT_TRACE_ONCE      = std::getenv("LLAMA_KV_PAGED_REFAULT_TRACE_ONCE");
         const char * LLAMA_KV_PAGED_IO_STATS                = std::getenv("LLAMA_KV_PAGED_IO_STATS");
+#if defined(LLAMA_KV_RESTORE_FAULT_STATS_SUPPORTED)
+        const char * LLAMA_KV_PAGED_RESTORE_FAULT_STATS     = std::getenv("LLAMA_KV_PAGED_RESTORE_FAULT_STATS");
+#endif
+#if defined(LLAMA_KV_RESTORE_PREFAULT_SUPPORTED)
+        const char * LLAMA_KV_PAGED_RESTORE_PREFAULT_PROBE  = std::getenv("LLAMA_KV_PAGED_RESTORE_PREFAULT_PROBE");
+#endif
         const char * LLAMA_KV_PAGED_PREFETCH_PHASE_TRACE    = std::getenv("LLAMA_KV_PAGED_PREFETCH_PHASE_TRACE");
         const char * LLAMA_KV_PAGED_RESTORE_K2              = std::getenv("LLAMA_KV_PAGED_RESTORE_K2");
         const char * LLAMA_KV_PAGED_TEST_FORCE_ACTIVE_RELEASE =
@@ -1096,6 +1123,16 @@ llama_kv_cache::llama_kv_cache(
             paged_io_stats_enabled =
                 LLAMA_KV_PAGED_IO_STATS &&
                 std::strcmp(LLAMA_KV_PAGED_IO_STATS, "1") == 0;
+#if defined(LLAMA_KV_RESTORE_FAULT_STATS_SUPPORTED)
+            paged_restore_fault_stats_enabled =
+                LLAMA_KV_PAGED_RESTORE_FAULT_STATS &&
+                std::strcmp(LLAMA_KV_PAGED_RESTORE_FAULT_STATS, "1") == 0;
+#endif
+#if defined(LLAMA_KV_RESTORE_PREFAULT_SUPPORTED)
+            paged_restore_prefault_probe_enabled =
+                LLAMA_KV_PAGED_RESTORE_PREFAULT_PROBE &&
+                std::strcmp(LLAMA_KV_PAGED_RESTORE_PREFAULT_PROBE, "1") == 0;
+#endif
             paged_prefetch_phase_trace_enabled =
                 LLAMA_KV_PAGED_PREFETCH_PHASE_TRACE &&
                 std::strcmp(LLAMA_KV_PAGED_PREFETCH_PHASE_TRACE, "1") == 0;
@@ -1164,6 +1201,17 @@ llama_kv_cache::llama_kv_cache(
             if (paged_io_stats_enabled) {
                 LLAMA_LOG_INFO("%s: KV paged block I/O stats enabled (telemetry only)\n", __func__);
             }
+#if defined(LLAMA_KV_RESTORE_FAULT_STATS_SUPPORTED)
+            if (paged_restore_fault_stats_enabled) {
+                LLAMA_LOG_INFO("%s: KV paged restore scatter page-fault stats enabled (owner thread only)\n",
+                        __func__);
+            }
+#endif
+#if defined(LLAMA_KV_RESTORE_PREFAULT_SUPPORTED)
+            if (paged_restore_prefault_probe_enabled) {
+                LLAMA_LOG_INFO("%s: KV paged restore prefault probe enabled (owner thread only)\n", __func__);
+            }
+#endif
             if (paged_prefetch_phase_trace_enabled) {
                 LLAMA_LOG_INFO("%s: KV paged prefetch phase trace enabled (diagnostic only)\n", __func__);
             }
@@ -2291,6 +2339,11 @@ bool llama_kv_cache::paged_restore_group_read_prepare(paged_restore_group_task &
     task.restore_complete_us = 0;
     task.exposed_read_wait_us = 0;
     task.pipeline_stall_us = 0;
+    task.prefault_us = 0;
+    task.prefault_calls = 0;
+    task.prefault_minor_faults = 0;
+    task.prefault_major_faults = 0;
+    task.scatter_us = 0;
     task.io_fault_armed = false;
     task.io_fault_block = task.begin_block;
     task.io_fault_attempt_id = 0;
@@ -2469,6 +2522,94 @@ bool llama_kv_cache::paged_restore_group_read(paged_restore_group_task & task) c
     return paged_restore_group_read_finish(task);
 }
 
+bool llama_kv_cache::paged_restore_group_prefault(paged_restore_group_task & task) const {
+#if defined(LLAMA_KV_RESTORE_PREFAULT_SUPPORTED)
+    if (!paged_restore_prefault_probe_enabled) {
+        return true;
+    }
+
+    uint64_t fault_minor_before = 0;
+    uint64_t fault_major_before = 0;
+    const bool fault_stats_sampled =
+#if defined(LLAMA_KV_RESTORE_FAULT_STATS_SUPPORTED)
+        llama_paged_restore_read_thread_faults(fault_minor_before, fault_major_before);
+#else
+        false;
+#endif
+
+    const long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) {
+        return false;
+    }
+
+    const uint64_t prefault_start_us = llama_paged_timing_now_us();
+    bool ok = true;
+    uint32_t failed_block = UINT32_MAX;
+    int failed_errno = 0;
+    for (const uint32_t block : task.blocks) {
+        for (const auto & row : task.layout) {
+            if (!row.tensor || !row.tensor->data || row.row_size == 0) {
+                ok = false;
+                failed_block = block;
+                failed_errno = EINVAL;
+                break;
+            }
+
+            paged_block_page_range page_range;
+            if (!paged_compute_block_page_range(
+                    row.tensor, block, row.row_size, (uintptr_t) page, page_range)) {
+                continue;
+            }
+
+            task.prefault_calls += 1;
+            if (madvise(
+                    (void *) page_range.page_begin,
+                    (size_t) (page_range.page_end - page_range.page_begin),
+                    MADV_POPULATE_WRITE) != 0) {
+                ok = false;
+                failed_block = block;
+                failed_errno = errno;
+                break;
+            }
+        }
+        if (!ok) {
+            break;
+        }
+    }
+    task.prefault_us = llama_paged_timing_now_us() - prefault_start_us;
+
+#if defined(LLAMA_KV_RESTORE_FAULT_STATS_SUPPORTED)
+    if (fault_stats_sampled) {
+        uint64_t fault_minor_after = 0;
+        uint64_t fault_major_after = 0;
+        if (llama_paged_restore_read_thread_faults(fault_minor_after, fault_major_after) &&
+                fault_minor_after >= fault_minor_before && fault_major_after >= fault_major_before) {
+            task.prefault_minor_faults = fault_minor_after - fault_minor_before;
+            task.prefault_major_faults = fault_major_after - fault_major_before;
+        }
+    }
+#endif
+
+    paged_restore_prefault_calls += task.prefault_calls;
+    paged_restore_prefault_us += task.prefault_us;
+    paged_restore_prefault_minor += task.prefault_minor_faults;
+    paged_restore_prefault_major += task.prefault_major_faults;
+    if (!ok) {
+        LLAMA_LOG_ERROR(
+                "%s: MADV_POPULATE_WRITE failed for restore group blocks=[%u,%u) "
+                "block=%u errno=%d (%s)\n",
+                __func__, task.begin_block, task.end_block, failed_block, failed_errno, std::strerror(failed_errno));
+        return false;
+    }
+
+    paged_restore_prefault_groups += 1;
+    return true;
+#else
+    (void) task;
+    return true;
+#endif
+}
+
 bool llama_kv_cache::paged_restore_group_post_read(paged_restore_group_task & task) const {
     if (!task.prepared || !task.read_completed || task.restore_completed || task.committed ||
             task.read_status != llama_kv_backing_store_status::ok) {
@@ -2496,8 +2637,27 @@ bool llama_kv_cache::paged_restore_group_post_read(paged_restore_group_task & ta
         paged_refault_unprotect_block(block);
     }
 
+    if (!paged_restore_group_prefault(task)) {
+        for (const uint32_t block : task.blocks) {
+            paged_refault_protect_block(block);
+        }
+        paged_swap_in_fail_bad_size += 1;
+        paged_swap_backend_failures += 1;
+        task.read_status = llama_kv_backing_store_status::bad_slot;
+        task.failed_block = task.begin_block;
+        task.failed_cell = task.begin_cell;
+        return false;
+    }
+
     paged_restore_test_scatter_groups += 1;
     const uint64_t unpack_start_us = paged_io_stats_enabled ? llama_paged_timing_now_us() : 0;
+#if defined(LLAMA_KV_RESTORE_FAULT_STATS_SUPPORTED)
+    uint64_t fault_minor_before = 0;
+    uint64_t fault_major_before = 0;
+    const bool fault_stats_sampled = paged_restore_fault_stats_enabled &&
+        llama_paged_restore_read_thread_faults(fault_minor_before, fault_major_before);
+#endif
+    const uint64_t scatter_start_us = paged_io_stats_enabled ? llama_paged_timing_now_us() : 0;
     for (uint32_t cell = task.begin_cell; cell < task.begin_cell + task.cell_count; ++cell) {
         size_t cursor = (size_t) (cell - task.begin_cell) * task.bytes_per_cell;
         for (const auto & row : task.layout) {
@@ -2507,6 +2667,22 @@ bool llama_kv_cache::paged_restore_group_post_read(paged_restore_group_task & ta
         }
         GGML_ASSERT(cursor == (size_t) (cell - task.begin_cell + 1) * task.bytes_per_cell);
     }
+    if (paged_io_stats_enabled) {
+        task.scatter_us = llama_paged_timing_now_us() - scatter_start_us;
+        paged_restore_scatter_us += task.scatter_us;
+    }
+#if defined(LLAMA_KV_RESTORE_FAULT_STATS_SUPPORTED)
+    if (fault_stats_sampled) {
+        uint64_t fault_minor_after = 0;
+        uint64_t fault_major_after = 0;
+        if (llama_paged_restore_read_thread_faults(fault_minor_after, fault_major_after) &&
+                fault_minor_after >= fault_minor_before && fault_major_after >= fault_major_before) {
+            paged_restore_fault_stats_groups += 1;
+            paged_restore_fault_stats_minor += fault_minor_after - fault_minor_before;
+            paged_restore_fault_stats_major += fault_major_after - fault_major_before;
+        }
+    }
+#endif
     if (paged_io_stats_enabled) {
         task.unpack_us = llama_paged_timing_now_us() - unpack_start_us;
         paged_io_block_in_unpack_us += task.unpack_us;
@@ -5466,6 +5642,40 @@ bool llama_kv_cache::paged_swap_in_block(
     return true;
 }
 
+bool llama_kv_cache::paged_compute_block_page_range(
+        const ggml_tensor * tensor,
+        uint32_t physical_block,
+        uint64_t row_size,
+        uintptr_t page_size,
+        paged_block_page_range & range) const {
+    range = {};
+    if (!tensor || !tensor->data || row_size == 0 || page_size == 0 ||
+            physical_block >= paged_n_blocks || paged_block_size == 0) {
+        return false;
+    }
+
+    const uint64_t lo_cell = (uint64_t) physical_block * paged_block_size;
+    const uint64_t hi_cell = std::min<uint64_t>(lo_cell + paged_block_size, paged_kv_size);
+    const uintptr_t lo_a = (uintptr_t) tensor->data + (uintptr_t) lo_cell * row_size;
+    const uintptr_t hi_a = (uintptr_t) tensor->data + (uintptr_t) hi_cell * row_size;
+    if (hi_a <= lo_a) {
+        return false;
+    }
+
+    const uintptr_t pg = page_size;
+    const uintptr_t a_start = (lo_a + pg - 1) & ~(pg - 1);
+    const uintptr_t a_end   = hi_a & ~(pg - 1);
+    if (a_end <= a_start) {
+        return false;
+    }
+
+    range.byte_begin = lo_a;
+    range.byte_end = hi_a;
+    range.page_begin = a_start;
+    range.page_end = a_end;
+    return true;
+}
+
 uint64_t llama_kv_cache::paged_madvise_block(
         uint32_t physical_block,
         const std::vector<uint8_t> * active,
@@ -5509,38 +5719,27 @@ uint64_t llama_kv_cache::paged_madvise_block(
                 return;
             }
 
-            char * base = (char *) t->data;
-            const uint64_t lo_cell = (uint64_t) physical_block * paged_block_size;
-            const uint64_t hi_cell = std::min<uint64_t>(lo_cell + paged_block_size, paged_kv_size);
-            const uintptr_t lo_a = (uintptr_t) base + (uintptr_t) lo_cell * row;
-            const uintptr_t hi_a = (uintptr_t) base + (uintptr_t) hi_cell * row;
-            if (hi_a <= lo_a) {
+            paged_block_page_range page_range;
+            if (!paged_compute_block_page_range(t, physical_block, row, pg, page_range)) {
                 skipped += 1;
                 return;
             }
 
-            const uintptr_t a_start = (lo_a + pg - 1) & ~(uintptr_t) (pg - 1);
-            const uintptr_t a_end   = hi_a & ~(uintptr_t) (pg - 1);
-            if (a_end <= a_start) {
-                skipped += 1;
-                return;
-            }
-
-            if ((lo_a & (uintptr_t) (pg - 1)) != 0 && physical_block > 0 &&
+            if ((page_range.byte_begin & (uintptr_t) (pg - 1)) != 0 && physical_block > 0 &&
                     protected_neighbor(physical_block - 1)) {
                 skip_live += 1;
             }
-            if ((hi_a & (uintptr_t) (pg - 1)) != 0 && physical_block + 1 < paged_n_blocks &&
+            if ((page_range.byte_end & (uintptr_t) (pg - 1)) != 0 && physical_block + 1 < paged_n_blocks &&
                     protected_neighbor(physical_block + 1)) {
                 skip_live += 1;
             }
 
-            const size_t len = (size_t) (a_end - a_start);
-            paged_release_range range { (void *) a_start, len, 0, physical_block };
+            const size_t len = (size_t) (page_range.page_end - page_range.page_begin);
+            paged_release_range range { (void *) page_range.page_begin, len, 0, physical_block };
             if (advised_ranges) {
                 range.before_resident = paged_sample_release_ranges({ range });
             }
-            const int rc = madvise((void *) a_start, len, MADV_DONTNEED);
+            const int rc = madvise((void *) page_range.page_begin, len, MADV_DONTNEED);
             if (rc != 0) {
                 failures += 1;
             } else {
@@ -6229,28 +6428,17 @@ void llama_kv_cache::paged_refault_protect_block(uint32_t physical_block) const 
                 ggml_tensor * k = layer.k_stream.empty() ? nullptr : layer.k_stream[0];
                 ggml_tensor * v = layer.v_stream.empty() ? nullptr : layer.v_stream[0];
                 auto add = [&](ggml_tensor * t, uint8_t is_v) {
-                    if (!t || !t->data || idx >= cap) {
+                    if (!t || idx >= cap) {
                         return;
                     }
-                    const uint64_t row = (uint64_t) t->nb[1];
-                    if (row == 0) {
-                        return;
-                    }
-                    const uint64_t lo_cell = (uint64_t) b * paged_block_size;
-                    const uint64_t hi_cell = std::min<uint64_t>(lo_cell + paged_block_size, paged_kv_size);
-                    const uintptr_t lo_a = (uintptr_t) t->data + (uintptr_t) lo_cell * row;
-                    const uintptr_t hi_a = (uintptr_t) t->data + (uintptr_t) hi_cell * row;
-                    if (hi_a <= lo_a) {
-                        return;
-                    }
-                    const uintptr_t a_start = (lo_a + pg - 1) & ~(pg - 1);
-                    const uintptr_t a_end   = hi_a & ~(pg - 1);
-                    if (a_end <= a_start) {
+                    paged_block_page_range page_range;
+                    if (!paged_compute_block_page_range(
+                            t, b, (uint64_t) t->nb[1], pg, page_range)) {
                         return;
                     }
                     refault_trap & tr = traps[idx++];
-                    tr.lo = a_start;
-                    tr.hi = a_end;
+                    tr.lo = page_range.page_begin;
+                    tr.hi = page_range.page_end;
                     tr.block = b;
                     tr.layer_il = layer.il;
                     tr.is_v = is_v;
@@ -7036,7 +7224,13 @@ void llama_kv_cache::paged_log_stats() const {
                 "block_in_validate_us=%llu avg_block_in_validate_us=%llu "
                 "block_in_read_us=%llu avg_block_in_read_us=%llu "
                 "block_in_unpack_us=%llu avg_block_in_unpack_us=%llu "
-                "block_in_commit_us=%llu avg_block_in_commit_us=%llu\n",
+                "block_in_commit_us=%llu avg_block_in_commit_us=%llu "
+                "restore_prefault_enabled=%d restore_prefault_groups=%llu "
+                "restore_prefault_calls=%llu restore_prefault_us=%llu "
+                "restore_prefault_minor_faults=%llu restore_prefault_major_faults=%llu "
+                "restore_scatter_groups=%llu restore_scatter_us=%llu "
+                "restore_scatter_fault_groups=%llu restore_scatter_minor_faults=%llu "
+                "restore_scatter_major_faults=%llu\n",
                 (unsigned long long) paged_swap_out_calls,
                 (unsigned long long) paged_swap_in_calls,
                 (unsigned long long) backing_stats.read_syscalls,
@@ -7074,7 +7268,18 @@ void llama_kv_cache::paged_log_stats() const {
                 (unsigned long long) paged_io_block_in_unpack_us,
                 (unsigned long long) avg_phase(paged_io_block_in_unpack_us, paged_io_block_in_unpack_calls),
                 (unsigned long long) paged_io_block_in_commit_us,
-                (unsigned long long) avg_phase(paged_io_block_in_commit_us, paged_io_block_in_commit_calls));
+                (unsigned long long) avg_phase(paged_io_block_in_commit_us, paged_io_block_in_commit_calls),
+                paged_restore_prefault_probe_enabled ? 1 : 0,
+                (unsigned long long) paged_restore_prefault_groups,
+                (unsigned long long) paged_restore_prefault_calls,
+                (unsigned long long) paged_restore_prefault_us,
+                (unsigned long long) paged_restore_prefault_minor,
+                (unsigned long long) paged_restore_prefault_major,
+                (unsigned long long) paged_restore_test_scatter_groups,
+                (unsigned long long) paged_restore_scatter_us,
+                (unsigned long long) paged_restore_fault_stats_groups,
+                (unsigned long long) paged_restore_fault_stats_minor,
+                (unsigned long long) paged_restore_fault_stats_major);
     }
 }
 

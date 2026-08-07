@@ -646,6 +646,34 @@ public:
     uint64_t paged_unified_action_test_read_restore_scatter_groups() const {
         return paged_restore_test_scatter_groups;
     }
+    struct paged_unified_action_test_restore_fault_stats {
+        bool enabled = false;
+        uint64_t groups = 0;
+        uint64_t minor_faults = 0;
+        uint64_t major_faults = 0;
+        bool prefault_enabled = false;
+        uint64_t prefault_groups = 0;
+        uint64_t prefault_calls = 0;
+        uint64_t prefault_us = 0;
+        uint64_t prefault_minor_faults = 0;
+        uint64_t prefault_major_faults = 0;
+        uint64_t scatter_us = 0;
+    };
+    paged_unified_action_test_restore_fault_stats paged_unified_action_test_read_restore_fault_stats() const {
+        return {
+            paged_restore_fault_stats_enabled,
+            paged_restore_fault_stats_groups,
+            paged_restore_fault_stats_minor,
+            paged_restore_fault_stats_major,
+            paged_restore_prefault_probe_enabled,
+            paged_restore_prefault_groups,
+            paged_restore_prefault_calls,
+            paged_restore_prefault_us,
+            paged_restore_prefault_minor,
+            paged_restore_prefault_major,
+            paged_restore_scatter_us,
+        };
+    }
     bool paged_unified_action_test_k2_enabled() const {
         return paged_restore_k2_enabled;
     }
@@ -989,6 +1017,18 @@ private:
         uint64_t read_us = 0;
         uint64_t unpack_us = 0;
         uint64_t commit_us = 0;
+        uint64_t prefault_us = 0;
+        uint64_t prefault_calls = 0;
+        uint64_t prefault_minor_faults = 0;
+        uint64_t prefault_major_faults = 0;
+        uint64_t scatter_us = 0;
+    };
+
+    struct paged_block_page_range {
+        uintptr_t byte_begin = 0;
+        uintptr_t byte_end = 0;
+        uintptr_t page_begin = 0;
+        uintptr_t page_end = 0;
     };
 
     size_t paged_restore_group_byte_cap() const;
@@ -1006,6 +1046,7 @@ private:
     bool paged_restore_group_read_prepare(paged_restore_group_task & task) const;
     bool paged_restore_group_read_finish(paged_restore_group_task & task) const;
     bool paged_restore_group_read(paged_restore_group_task & task) const;
+    bool paged_restore_group_prefault(paged_restore_group_task & task) const;
     bool paged_restore_group_post_read(paged_restore_group_task & task) const;
     bool paged_restore_group_execute(paged_restore_group_task & task) const;
     bool paged_restore_group_complete(paged_restore_group_task & task) const;
@@ -1053,6 +1094,12 @@ private:
             int backend_errno = 0) const;
     bool has_paged_swap_error() const;
     llama_paged_swap_error get_paged_swap_error() const;
+    bool paged_compute_block_page_range(
+            const ggml_tensor * tensor,
+            uint32_t physical_block,
+            uint64_t row_size,
+            uintptr_t page_size,
+            paged_block_page_range & range) const;
     uint64_t paged_madvise_block(
             uint32_t physical_block,
             const std::vector<uint8_t> * active,
@@ -1335,6 +1382,17 @@ private:
     mutable uint64_t paged_prefetch_seq_last_invalid_cells = 0;
     mutable uint64_t paged_prefetch_seq_last_failures = 0;
     bool     paged_io_stats_enabled = false;
+    bool     paged_restore_fault_stats_enabled = false;
+    mutable uint64_t paged_restore_fault_stats_groups = 0;
+    mutable uint64_t paged_restore_fault_stats_minor = 0;
+    mutable uint64_t paged_restore_fault_stats_major = 0;
+    bool     paged_restore_prefault_probe_enabled = false;
+    mutable uint64_t paged_restore_prefault_groups = 0;
+    mutable uint64_t paged_restore_prefault_calls = 0;
+    mutable uint64_t paged_restore_prefault_us = 0;
+    mutable uint64_t paged_restore_prefault_minor = 0;
+    mutable uint64_t paged_restore_prefault_major = 0;
+    mutable uint64_t paged_restore_scatter_us = 0;
     // Diagnostic-only per-prefetch-call/block phase events. Off unless
     // LLAMA_KV_PAGED_PREFETCH_PHASE_TRACE=1; the default path emits nothing.
     bool     paged_prefetch_phase_trace_enabled = false;

@@ -2458,6 +2458,8 @@ int main(int /*argc*/, char ** /*argv*/) {
         // =========================================================================
         unsetenv("LLAMA_KV_PAGED_RESTORE_K2");
         unsetenv("LLAMA_KV_PAGED_IO_STATS");
+        unsetenv("LLAMA_KV_PAGED_RESTORE_FAULT_STATS");
+        unsetenv("LLAMA_KV_PAGED_RESTORE_PREFAULT_PROBE");
         std::vector<std::vector<uint8_t>> sync_restore;
         {
             ContextGuard g;
@@ -2475,12 +2477,18 @@ int main(int /*argc*/, char ** /*argv*/) {
                 g.kv->paged_unified_action_test_set_restore_group_byte_cap(before[0].size());
                 const auto prefetch = g.kv->execute_action({
                     llama_kv_action::prefetch, 7652, 0, 0, 0, true, true });
+                const auto fault_stats = g.kv->paged_unified_action_test_read_restore_fault_stats();
                 CHECK(!g.kv->paged_unified_action_test_k2_enabled() &&
                         g.kv->paged_unified_action_test_read_k1_sync_staging_reuses() == 3 &&
                         offload.state_changed && offload.blocks == 3 &&
                         prefetch.outcome == llama_kv_action_outcome::completed &&
-                        prefetch.blocks == 3,
-                        "WT30a: synchronous K1 fallback reuses cache staging for three groups");
+                        prefetch.blocks == 3 && !fault_stats.enabled && fault_stats.groups == 0 &&
+                        fault_stats.minor_faults == 0 && fault_stats.major_faults == 0 &&
+                        !fault_stats.prefault_enabled && fault_stats.prefault_groups == 0 &&
+                        fault_stats.prefault_calls == 0 && fault_stats.prefault_us == 0 &&
+                        fault_stats.prefault_minor_faults == 0 && fault_stats.prefault_major_faults == 0 &&
+                        fault_stats.scatter_us == 0,
+                        "WT30a: K1 fallback restores three groups with probe off and zero telemetry");
                 for (uint32_t block = 0; block < 3; ++block) {
                     sync_restore.push_back(g.kv->paged_unified_action_test_read_block_bytes(block));
                     CHECK(sync_restore.back() == before[block],
@@ -2491,6 +2499,8 @@ int main(int /*argc*/, char ** /*argv*/) {
 
         setenv("LLAMA_KV_PAGED_RESTORE_K2", "1", 1);
         setenv("LLAMA_KV_PAGED_IO_STATS", "1", 1);
+        setenv("LLAMA_KV_PAGED_RESTORE_FAULT_STATS", "1", 1);
+        setenv("LLAMA_KV_PAGED_RESTORE_PREFAULT_PROBE", "1", 1);
         {
             ContextGuard g;
             if (!g.init(model, cparams)) {
@@ -2505,16 +2515,31 @@ int main(int /*argc*/, char ** /*argv*/) {
                 const auto offload = g.kv->execute_action({
                     llama_kv_action::offload, 7661, 0, UINT64_MAX, 3, false });
                 g.kv->paged_unified_action_test_set_restore_group_byte_cap(before[0].size());
+                const auto fault_stats_before =
+                    g.kv->paged_unified_action_test_read_restore_fault_stats();
                 const auto prefetch = g.kv->execute_action({
                     llama_kv_action::prefetch, 7662, 0, 0, 0, true, true });
+                const auto fault_stats_after =
+                    g.kv->paged_unified_action_test_read_restore_fault_stats();
                 const uint64_t group_cap = g.kv->paged_unified_action_test_read_restore_group_byte_cap();
                 const uint64_t staging_bound =
                     g.kv->paged_unified_action_test_read_k2_staging_bound_bytes();
                 CHECK(g.kv->paged_unified_action_test_k2_enabled() &&
                         offload.state_changed && offload.blocks == 3 &&
                         prefetch.outcome == llama_kv_action_outcome::completed &&
-                        prefetch.blocks == 3 && prefetch.bytes == before[0].size() * 3,
-                        "WT30b: K2 restores three contiguous groups");
+                        prefetch.blocks == 3 && prefetch.bytes == before[0].size() * 3 &&
+                        fault_stats_before.enabled && fault_stats_before.groups == 0 &&
+                        fault_stats_before.prefault_enabled && fault_stats_before.prefault_groups == 0 &&
+                        fault_stats_after.enabled && fault_stats_after.groups == 3 &&
+                        fault_stats_after.prefault_enabled && fault_stats_after.prefault_groups == 3 &&
+                        fault_stats_after.prefault_calls > 0 &&
+                        fault_stats_after.prefault_calls >= fault_stats_before.prefault_calls &&
+                        fault_stats_after.prefault_us >= fault_stats_before.prefault_us &&
+                        fault_stats_after.prefault_minor_faults >= fault_stats_before.prefault_minor_faults &&
+                        fault_stats_after.prefault_major_faults >= fault_stats_before.prefault_major_faults &&
+                        fault_stats_after.minor_faults >= fault_stats_before.minor_faults &&
+                        fault_stats_after.major_faults >= fault_stats_before.major_faults,
+                        "WT30b: K2 prefault probe succeeds for three groups with monotonic telemetry");
                 CHECK(g.kv->paged_unified_action_test_read_k2_read_ahead() == 2 &&
                         g.kv->paged_unified_action_test_read_k2_peak_staging_groups() == 2 &&
                         g.kv->paged_unified_action_test_read_k2_staging_reuses() >= 1 &&
@@ -2523,8 +2548,13 @@ int main(int /*argc*/, char ** /*argv*/) {
                         g.kv->paged_unified_action_test_read_k2_peak_staging_bytes() <= staging_bound,
                         "WT30b: K2 reuses two task slots under the double-buffer bound");
                 CHECK(g.kv->paged_unified_action_test_read_restore_scatter_groups() == 3 &&
+                        fault_stats_after.groups ==
+                            g.kv->paged_unified_action_test_read_restore_scatter_groups() &&
+                        fault_stats_after.prefault_groups ==
+                            g.kv->paged_unified_action_test_read_restore_scatter_groups() &&
+                        fault_stats_after.scatter_us >= fault_stats_before.scatter_us &&
                         g.kv->paged_unified_action_test_read_k2_pipeline_wall_us() > 0,
-                        "WT30b: K2 owner scatter and pipeline wall telemetry are recorded");
+                        "WT30b: K2 owner scatter and prefault groups are recorded separately");
                 for (uint32_t block = 0; block < 3; ++block) {
                     const auto after = g.kv->paged_unified_action_test_read_block_bytes(block);
                     CHECK(after == before[block] && after == sync_restore[block],
@@ -2628,13 +2658,19 @@ int main(int /*argc*/, char ** /*argv*/) {
                     llama_kv_action::offload, 7691, 0, UINT64_MAX, 2, false });
                 const auto failed = g.kv->execute_action({
                     llama_kv_action::prefetch, 7692, 0, 0, 0, true, true });
+                const auto fault_stats = g.kv->paged_unified_action_test_read_restore_fault_stats();
                 CHECK(offload.state_changed && failed.outcome == llama_kv_action_outcome::failed &&
                         failed.io_failure && failed.fail_stop && failed.blocks == 0 &&
                         failed.core_transaction_id == 0 &&
                         g.kv->paged_unified_action_test_read_k2_read_ahead() == 0 &&
+                        g.kv->paged_unified_action_test_read_restore_scatter_groups() == 0 &&
+                        fault_stats.groups == 0 && fault_stats.minor_faults == 0 &&
+                        fault_stats.major_faults == 0 && fault_stats.prefault_groups == 0 &&
+                        fault_stats.prefault_calls == 0 && fault_stats.prefault_us == 0 &&
+                        fault_stats.prefault_minor_faults == 0 && fault_stats.prefault_major_faults == 0 &&
                         g.kv->paged_release_bounded_test_read_block_state(0) == 3 &&
                         g.kv->paged_release_bounded_test_read_block_state(1) == 3,
-                        "WT30e: first K2 read failure is fail-stop with zero completion");
+                        "WT30e: first K2 read failure is fail-stop with zero scatter faults");
             }
         }
         unsetenv("LLAMA_KV_PAGED_TEST_IO_FAIL_SCOPE");
@@ -2663,14 +2699,18 @@ int main(int /*argc*/, char ** /*argv*/) {
                 g.kv->paged_unified_action_test_set_restore_group_byte_cap(block_bytes);
                 const auto failed = g.kv->execute_action({
                     llama_kv_action::prefetch, 7702, 0, 0, 0, true, true });
+                const auto fault_stats = g.kv->paged_unified_action_test_read_restore_fault_stats();
                 CHECK(offload.state_changed && failed.outcome == llama_kv_action_outcome::partial_failure &&
                         failed.io_failure && failed.fail_stop && failed.blocks == 1 &&
                         failed.core_transaction_id > offload.core_transaction_id &&
                         g.kv->paged_unified_action_test_read_k2_read_ahead() == 1 &&
+                        g.kv->paged_unified_action_test_read_restore_scatter_groups() == 1 &&
+                        fault_stats.groups == 1 && fault_stats.prefault_groups == 1 &&
+                        fault_stats.prefault_calls > 0 &&
                         g.kv->paged_release_bounded_test_read_block_state(0) == 1 &&
                         g.kv->paged_release_bounded_test_read_block_state(1) == 3 &&
                         g.kv->paged_unified_action_test_read_block_bytes(0) == before0,
-                        "WT30f: later K2 read failure reports partial prefix exactly");
+                        "WT30f: later K2 read failure counts only the completed scatter prefix");
             }
         }
         unsetenv("LLAMA_KV_PAGED_TEST_IO_FAIL_SCOPE");
@@ -2695,16 +2735,28 @@ int main(int /*argc*/, char ** /*argv*/) {
                     g.kv->paged_unified_action_test_read_restore_scatter_groups();
                 const uint64_t stale_before =
                     g.kv->paged_unified_action_test_read_restore_stale_triggers();
+                const auto fault_before =
+                    g.kv->paged_unified_action_test_read_restore_fault_stats();
                 g.kv->paged_unified_action_test_arm_restore_stale_before_complete();
                 const auto failed = g.kv->execute_action({
                     llama_kv_action::prefetch, 7712, 0, 0, 0, true, true });
+                const auto fault_after =
+                    g.kv->paged_unified_action_test_read_restore_fault_stats();
                 CHECK(offload.state_changed && failed.outcome == llama_kv_action_outcome::failed &&
                         failed.blocks == 0 && failed.core_transaction_id == 0 &&
                         g.kv->paged_unified_action_test_read_restore_stale_triggers() == stale_before + 1 &&
                         g.kv->paged_unified_action_test_read_restore_scatter_groups() == scatter_before &&
+                        fault_after.groups == fault_before.groups &&
+                        fault_after.minor_faults == fault_before.minor_faults &&
+                        fault_after.major_faults == fault_before.major_faults &&
+                        fault_after.prefault_groups == fault_before.prefault_groups &&
+                        fault_after.prefault_calls == fault_before.prefault_calls &&
+                        fault_after.prefault_us == fault_before.prefault_us &&
+                        fault_after.prefault_minor_faults == fault_before.prefault_minor_faults &&
+                        fault_after.prefault_major_faults == fault_before.prefault_major_faults &&
                         g.kv->paged_release_bounded_test_read_block_state(0) == 3 &&
                         g.kv->paged_release_bounded_test_read_block_state(1) == 3,
-                        "WT30g: generation-stale K2 result is discarded before scatter");
+                        "WT30g: generation-stale K2 result is discarded before scatter faults");
             }
         }
         {
@@ -2722,16 +2774,28 @@ int main(int /*argc*/, char ** /*argv*/) {
                     g.kv->paged_unified_action_test_read_restore_scatter_groups();
                 const uint64_t mapping_before =
                     g.kv->paged_unified_action_test_read_restore_mapping_stale_triggers();
+                const auto fault_before =
+                    g.kv->paged_unified_action_test_read_restore_fault_stats();
                 g.kv->paged_unified_action_test_arm_restore_mapping_stale_before_complete();
                 const auto failed = g.kv->execute_action({
                     llama_kv_action::prefetch, 7722, 0, 0, 0, true, true });
+                const auto fault_after =
+                    g.kv->paged_unified_action_test_read_restore_fault_stats();
                 CHECK(offload.state_changed && failed.outcome == llama_kv_action_outcome::failed &&
                         failed.blocks == 0 && failed.core_transaction_id == 0 &&
                         g.kv->paged_unified_action_test_read_restore_mapping_stale_triggers() == mapping_before + 1 &&
                         g.kv->paged_unified_action_test_read_restore_scatter_groups() == scatter_before &&
+                        fault_after.groups == fault_before.groups &&
+                        fault_after.minor_faults == fault_before.minor_faults &&
+                        fault_after.major_faults == fault_before.major_faults &&
+                        fault_after.prefault_groups == fault_before.prefault_groups &&
+                        fault_after.prefault_calls == fault_before.prefault_calls &&
+                        fault_after.prefault_us == fault_before.prefault_us &&
+                        fault_after.prefault_minor_faults == fault_before.prefault_minor_faults &&
+                        fault_after.prefault_major_faults == fault_before.prefault_major_faults &&
                         g.kv->paged_release_bounded_test_read_block_state(0) == 3 &&
                         g.kv->paged_release_bounded_test_read_block_state(1) == 3,
-                        "WT30g: mapping-stale K2 result is discarded before scatter");
+                        "WT30g: mapping-stale K2 result is discarded before scatter faults");
             }
         }
 
@@ -2766,6 +2830,8 @@ int main(int /*argc*/, char ** /*argv*/) {
 
         unsetenv("LLAMA_KV_PAGED_RESTORE_K2");
         unsetenv("LLAMA_KV_PAGED_IO_STATS");
+        unsetenv("LLAMA_KV_PAGED_RESTORE_FAULT_STATS");
+        unsetenv("LLAMA_KV_PAGED_RESTORE_PREFAULT_PROBE");
         unsetenv("LLAMA_KV_PAGED_SWAP");
     }
 
