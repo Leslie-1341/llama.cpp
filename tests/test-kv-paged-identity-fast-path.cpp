@@ -56,6 +56,11 @@ int main() {
     config = eligible_config(); config.swap = true;
     expect_reject(config, llama_kv_paged_identity_fast_path_reject::SWAP);
     config = eligible_config(); config.release = true;
+    // Cleanup-C2: identity fast-path `.release` is now driven by the
+    // authoritative bounded_release_can_enable() capability.  The reject
+    // enum value RELEASE and its telemetry token are preserved so external
+    // tooling still distinguishes this fast-path disqualifier; only the
+    // producer (what feeds .release) has migrated.
     expect_reject(config, llama_kv_paged_identity_fast_path_reject::RELEASE);
     config = eligible_config(); config.madvise = true;
     expect_reject(config, llama_kv_paged_identity_fast_path_reject::MADVISE);

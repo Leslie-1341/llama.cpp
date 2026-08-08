@@ -119,7 +119,6 @@ class ServerKvPressureStaticTest(unittest.TestCase):
             '"no_row_idx"',
             '"swap_enabled"',
             '"dry_run_active"',
-            '"legacy_active"',
             '"structurally_disabled"',
         )
         for reason in precise_reasons:
@@ -270,11 +269,6 @@ class ServerKvPressureStaticTest(unittest.TestCase):
         lifecycle = function_body(self.context, "void handle_sleeping_state(bool new_state)")
         self.assertIn("kv_pressure_runtime.bounded_release_disable();", lifecycle)
 
-    def test_legacy_mutual_exclusion_check(self):
-        init_body = function_body(self.context, "bool init_kv_pressure_sampler()")
-        self.assertIn("LLAMA_KV_PAGED_RELEASE=1 and", init_body)
-        self.assertIn("LLAMA_KV_PRESSURE_BOUNDED_RELEASE=1 are mutually", init_body)
-
     def test_bounded_release_structural_query_in_memory_h(self):
         self.assertIn("virtual bool bounded_release_can_enable() const", self.memory_h)
 
@@ -330,21 +324,38 @@ class ServerKvPressureStaticTest(unittest.TestCase):
     # --- telemetry: no_dummy reason distinction and dummy candidate types ---
 
     def test_kv_paged_release_stats_ensure_pending_write_rejected(self):
-        """KV_PAGED_RELEASE_STATS must include ensure_pending_write_rejected."""
+        """KV_PAGED_BOUNDED_RELEASE_STATS must include ensure_pending_write_rejected."""
+        self.assertIn("KV_PAGED_BOUNDED_RELEASE_STATS", self.core)
         self.assertIn("ensure_pending_write_rejected=", self.core)
         self.assertIn("paged_block_ensure_pending_write_rejected", self.core_h)
 
     def test_kv_paged_release_stats_no_dummy_pending_write(self):
-        """KV_PAGED_RELEASE_STATS must distinguish RELEASED vs PENDING_WRITE no_dummy."""
+        """KV_PAGED_BOUNDED_RELEASE_STATS must distinguish RELEASED vs PENDING_WRITE no_dummy."""
+        self.assertIn("KV_PAGED_BOUNDED_RELEASE_STATS", self.core)
         self.assertIn("released_redirect_no_dummy_pending_write=", self.core)
         self.assertIn("paged_released_redirect_no_dummy_pending_write", self.core_h)
 
     def test_kv_paged_release_stats_dummy_candidate_types(self):
-        """KV_PAGED_RELEASE_STATS must include dummy candidate type counts."""
+        """KV_PAGED_BOUNDED_RELEASE_STATS must include dummy candidate type counts."""
+        self.assertIn("KV_PAGED_BOUNDED_RELEASE_STATS", self.core)
         self.assertIn("dummy_candidate_resident=", self.core)
         self.assertIn("dummy_candidate_pending_write_cell=", self.core)
         self.assertIn("paged_dummy_candidate_resident", self.core_h)
         self.assertIn("paged_dummy_candidate_pending_write_cell", self.core_h)
+
+    def test_kv_paged_release_stats_marker_closure(self):
+        """Cleanup-C2: producer/parser marker closure.
+
+        The current producer must emit ONLY the new bounded marker token; the
+        retired `KV_PAGED_RELEASE_STATS` token must not appear in core (legacy
+        artifacts continue to bind to their original parser identity).
+        """
+        # New marker must be the exact, single release-stats token in producer
+        self.assertIn("KV_PAGED_BOUNDED_RELEASE_STATS contract=", self.core)
+        # Retired marker must NOT appear anywhere in core — token-level closure
+        self.assertNotIn("KV_PAGED_RELEASE_STATS", self.core)
+        # Header must not declare a KV_PAGED_RELEASE_STATS log helper either
+        self.assertNotIn("KV_PAGED_RELEASE_STATS", self.core_h)
 
     def test_pending_write_cell_dummy_in_row_idx(self):
         """set_input_paged_row_idx must scan PENDING_WRITE cells as dummy candidates."""

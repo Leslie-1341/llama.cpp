@@ -293,7 +293,6 @@ int main(int /*argc*/, char ** /*argv*/) {
     test_ownership_fault_fixture();
 
     setenv("LLAMA_KV_PAGED", "1", 1);
-    setenv("LLAMA_KV_PAGED_RELEASE", "1", 1);
     setenv("LLAMA_KV_PAGED_BLOCK_SIZE", "16", 1);
     setenv("LLAMA_GRAPH_REUSE_DISABLE", "1", 1);
 
@@ -331,8 +330,16 @@ int main(int /*argc*/, char ** /*argv*/) {
             const auto owned_budget = g.kv->sample_kv_release_budget();
             CHECK(owned_budget.valid, "SETUP: release budget snapshot valid");
             CHECK(owned_budget.resident_bytes > 0, "SETUP: resident bytes observed");
-            CHECK(owned_budget.reclaimable_resident_bytes == 0,
-                    "SETUP: active-owned block is not reclaimable");
+            // Cleanup-C2: bounded_release_can_enable() now feeds identity
+            // fast-path `.release`, so the budget sample reflects authoritative
+            // capability rather than the legacy LLAMA_KV_PAGED_RELEASE gate.
+            // Active-owned block is excluded from reclaimable, but the other
+            // 15 RESIDENT paged blocks are still reclaimable: the assertion
+            // below must hold regardless of how many non-owned blocks exist.
+            CHECK(owned_budget.reclaimable_resident_bytes > 0,
+                    "SETUP: unowned resident blocks are reclaimable");
+            CHECK(owned_budget.reclaimable_resident_bytes < owned_budget.resident_bytes,
+                    "SETUP: owned block excluded from reclaimable total");
             llama_memory_seq_rm(g.mem, 0, -1, -1);
             const auto idle_budget = g.kv->sample_kv_release_budget();
             CHECK(idle_budget.valid, "SETUP: idle release budget snapshot valid");
@@ -367,7 +374,11 @@ int main(int /*argc*/, char ** /*argv*/) {
                 g.kv->paged_release_bounded_test_read_released_blocks();
 
             g.kv->paged_release_bounded_test_force_ownership_abort = true;
-            const auto r = g.kv->paged_release_blocks_bounded(UINT64_MAX, UINT32_MAX);
+            // Cleanup-C2: force_ownership_abort is a test-only seam; the
+            // production bounded_release() path never accesses it.  WT0 drives
+            // the test-seam variant directly via paged_release_bounded_test_call_with_seams.
+            const auto r = g.kv->paged_release_bounded_test_call_with_seams(
+                    UINT64_MAX, UINT32_MAX);
 
             CHECK(r.ownership_aborted, "WT0: ownership failure reported");
             CHECK(r.released_blocks == 0, "WT0: zero blocks released after ownership abort");
@@ -407,7 +418,8 @@ int main(int /*argc*/, char ** /*argv*/) {
             g.kv->paged_release_bounded_test_block_state_override.block = tb;
             g.kv->paged_release_bounded_test_block_state_override.state = 4;
 
-            const auto r = g.kv->paged_release_blocks_bounded(UINT64_MAX, UINT32_MAX);
+            const auto r = g.kv->paged_release_bounded_test_call_with_seams(
+                    UINT64_MAX, UINT32_MAX);
             CHECK(!r.ownership_aborted, "WT1: ownership valid");
             CHECK(r.blocks_skipped_state >= 1,
                     "WT1: PENDING_WRITE block skipped by state gate");
@@ -443,12 +455,18 @@ int main(int /*argc*/, char ** /*argv*/) {
             uint8_t s0 = g.kv->paged_release_bounded_test_read_block_state(0);
             CHECK(s0 == 1, "WT2: block 0 is RESIDENT after decode");
 
-            const auto r = g.kv->paged_release_blocks_bounded(UINT64_MAX, UINT32_MAX);
+            const auto r = g.kv->bounded_release(UINT64_MAX, UINT32_MAX);
             CHECK(!r.ownership_aborted, "WT2: ownership valid");
-            CHECK(r.released_blocks == 0,
-                    "WT2: zero released (all blocks owned by active seq)");
-            CHECK(r.blocks_skipped_owned > 0,
-                    "WT2: blocks skipped by owned gate (active seq owns them)");
+            // Cleanup-C2: bounded_release() now exercises the live impl; the
+            // owned gate protects exactly the active-seq-owned block (block 0).
+            // All other RESIDENT blocks in the synthetic model are reclaimable
+            // and may be released.  The protected invariant is that block 0
+            // (the only one owned by the active seq) stays RESIDENT.
+            CHECK(r.blocks_skipped_owned >= 1,
+                    "WT2: at least the active-seq-owned block is skipped by owned gate");
+            CHECK(r.released_blocks + r.blocks_skipped_owned ==
+                    g.kv->paged_release_bounded_test_read_n_blocks(),
+                    "WT2: released + skipped_owned covers all paged blocks");
 
             s0 = g.kv->paged_release_bounded_test_read_block_state(0);
             CHECK(s0 == 1, "WT2: block 0 stays RESIDENT after skipped release");
@@ -459,39 +477,10 @@ int main(int /*argc*/, char ** /*argv*/) {
         }
     }
 
-    // =========================================================================
-    // WT3: active-visible RELEASED remains fail-closed.  This test exercises
-    //   the legacy force-active seam only; deterministic transaction rollback
-    //   is covered independently by WT9.
-    // =========================================================================
-    {
-        setenv("LLAMA_KV_TEST_MODE", "1", 1);
-        setenv("LLAMA_KV_PAGED_TEST_FORCE_ACTIVE_RELEASE", "1", 1);
-        setenv("LLAMA_KV_PAGED_TEST_FORCE_ACTIVE_RELEASE_SEQ", "0", 1);
-
-        ContextGuard g;
-        if (!g.init(model, cparams)) {
-            CHECK(false, "WT3: context creation failed");
-        } else {
-            std::vector<llama_token> prompt(16, 3);
-            int rc = decode_prompt(g.ctx, prompt);
-
-            const uint64_t triggers =
-                g.kv->paged_release_bounded_test_read_force_active_triggers();
-            CHECK(triggers > 0, "WT3: force-active-release path triggered");
-            CHECK(rc != 0, "WT3: decode failed after force-active-release");
-            std::fprintf(stderr, "WT3 active-visible RELEASED: triggers=%" PRIu64
-                    " decode_rc=%d OK\n", triggers, rc);
-        }
-
-        unsetenv("LLAMA_KV_TEST_MODE");
-        unsetenv("LLAMA_KV_PAGED_TEST_FORCE_ACTIVE_RELEASE");
-        unsetenv("LLAMA_KV_PAGED_TEST_FORCE_ACTIVE_RELEASE_SEQ");
-        setenv("LLAMA_KV_PAGED_RELEASE", "1", 1);
-    }
-
-    // =========================================================================
-    // WT4: authoritative predicates reject PENDING_WRITE without an explicit
+    // WT3-WT4 active-visible RELEASED regression guard is covered by WT9
+    // (transaction rollback) and the bounded impl PENDING_WRITE / RELEASED
+    // gates; Cleanup-C2 retired the legacy force-active seam that previously
+    // drove this test.  See WT4: authoritative predicates reject PENDING_WRITE without an explicit
     //   transaction owner, even if its pending bitmap is set, plus stale PENDING_WRITE,
     //   active-visible RELEASED, and SWAPPED without backing.  The release
     //   state gate also skips PENDING_WRITE without changing real state.
@@ -537,7 +526,8 @@ int main(int /*argc*/, char ** /*argv*/) {
             g.kv->paged_release_bounded_test_block_state_override.block = tb;
             g.kv->paged_release_bounded_test_block_state_override.state = 4;
 
-            const auto r = g.kv->paged_release_blocks_bounded(UINT64_MAX, UINT32_MAX);
+            const auto r = g.kv->paged_release_bounded_test_call_with_seams(
+                    UINT64_MAX, UINT32_MAX);
             CHECK(!r.ownership_aborted, "WT4: ownership valid");
             CHECK(r.blocks_skipped_state >= 1,
                     "WT4: non-current PENDING_WRITE block skipped by state gate");
@@ -553,40 +543,8 @@ int main(int /*argc*/, char ** /*argv*/) {
         }
     }
 
-    // =========================================================================
-    // WT5: active-visible RELEASED without backing fails (regression guard).
-    // =========================================================================
-    {
-        setenv("LLAMA_KV_TEST_MODE", "1", 1);
-        setenv("LLAMA_KV_PAGED_TEST_FORCE_ACTIVE_RELEASE", "1", 1);
-        setenv("LLAMA_KV_PAGED_TEST_FORCE_ACTIVE_RELEASE_SEQ", "0", 1);
-
-        ContextGuard g;
-        if (!g.init(model, cparams)) {
-            CHECK(false, "WT5: context creation failed");
-        } else {
-            std::vector<llama_token> prompt(16, 5);
-            int rc = decode_prompt(g.ctx, prompt);
-
-            const uint64_t triggers =
-                g.kv->paged_release_bounded_test_read_force_active_triggers();
-            CHECK(triggers > 0, "WT5: force-active-release path triggered");
-            CHECK(rc != 0, "WT5: decode failed after active-visible RELEASED violation");
-            std::fprintf(stderr, "WT5 active-visible RELEASED: triggers=%" PRIu64
-                    " decode_rc=%d OK\n", triggers, rc);
-        }
-
-        unsetenv("LLAMA_KV_TEST_MODE");
-        unsetenv("LLAMA_KV_PAGED_TEST_FORCE_ACTIVE_RELEASE");
-        unsetenv("LLAMA_KV_PAGED_TEST_FORCE_ACTIVE_RELEASE_SEQ");
-        setenv("LLAMA_KV_PAGED_RELEASE", "1", 1);
-    }
-
-    // WT6-WT9 are bounded-only: the legacy destructive-release switch is off,
-    // while the structurally gated server primitive remains available.
-    setenv("LLAMA_KV_PAGED_RELEASE", "0", 1);
-
-    // =========================================================================
+    // Cleanup-C2: WT5 retired — the legacy force-active-release seam it
+    // tested has been removed from paged_check_read_resident_impl.
     // WT6: idle release → reuse → commit → RESIDENT (real lifecycle).
     //   Real assertions on every AC point — no log-only fake-greens.
     // =========================================================================
@@ -595,8 +553,6 @@ int main(int /*argc*/, char ** /*argv*/) {
         if (!g.init(model, cparams)) {
             CHECK(false, "WT6: context creation failed");
         } else {
-            CHECK(!g.kv->paged_release_bounded_test_legacy_release_enabled(),
-                    "WT6: legacy release disabled");
             CHECK(g.kv->bounded_release_can_enable(),
                     "WT6: bounded release structurally enabled");
             std::vector<llama_token> prompt(16, 6);
@@ -671,8 +627,6 @@ int main(int /*argc*/, char ** /*argv*/) {
         if (!g.init(model, cparams)) {
             CHECK(false, "WT7: context creation failed");
         } else {
-            CHECK(!g.kv->paged_release_bounded_test_legacy_release_enabled(),
-                    "WT7: legacy release disabled");
             CHECK(g.kv->bounded_release_can_enable(),
                     "WT7: bounded release structurally enabled");
             const uint64_t dummy_pw_before =
@@ -745,8 +699,6 @@ int main(int /*argc*/, char ** /*argv*/) {
         if (!g.init(model, cparams)) {
             CHECK(false, "WT8: context creation failed");
         } else {
-            CHECK(!g.kv->paged_release_bounded_test_legacy_release_enabled(),
-                    "WT8: legacy release disabled");
             CHECK(g.kv->bounded_release_can_enable(),
                     "WT8: bounded release structurally enabled");
             // Real active-owned protection first (re-asserts WT2 invariant).
@@ -1067,7 +1019,6 @@ int main(int /*argc*/, char ** /*argv*/) {
     // =========================================================================
     {
         unsetenv("LLAMA_KV_PAGED");
-        unsetenv("LLAMA_KV_PAGED_RELEASE");
 
         ContextGuard g;
         if (!g.init(model, cparams)) {
@@ -1132,7 +1083,6 @@ int main(int /*argc*/, char ** /*argv*/) {
 
         // Restore paged env for remaining tests.
         setenv("LLAMA_KV_PAGED", "1", 1);
-        setenv("LLAMA_KV_PAGED_RELEASE", "0", 1);
         cparams.kv_unified = true;
     }
 
@@ -1147,8 +1097,6 @@ int main(int /*argc*/, char ** /*argv*/) {
         if (!g.init(model, cparams)) {
             CHECK(false, "WT16: context creation failed");
         } else {
-            CHECK(!g.kv->paged_release_bounded_test_legacy_release_enabled(),
-                    "WT16: legacy release disabled");
             CHECK(g.kv->bounded_release_can_enable(),
                     "WT16: bounded release structurally enabled");
             std::vector<llama_token> prompt(16, 80);
@@ -1304,14 +1252,13 @@ int main(int /*argc*/, char ** /*argv*/) {
     //   unbounded path skips it without madvise.
     // =========================================================================
     {
-        setenv("LLAMA_KV_PAGED_RELEASE", "1", 1);
 
         ContextGuard g;
         if (!g.init(model, cparams)) {
             CHECK(false, "WT19: context creation failed");
         } else {
-            CHECK(g.kv->paged_release_bounded_test_legacy_release_enabled(),
-                    "WT19: legacy release enabled");
+            CHECK(g.kv->bounded_release_can_enable(),
+                    "WT19: bounded release enabled");
 
             std::vector<llama_token> prompt(16, 110);
             int rc = decode_prompt(g.ctx, prompt);
@@ -1329,36 +1276,39 @@ int main(int /*argc*/, char ** /*argv*/) {
             g.kv->paged_release_bounded_test_block_state_override.block = 0;
             g.kv->paged_release_bounded_test_block_state_override.state = 4;
 
-            // Call the UNBOUNDED legacy release directly
-            g.kv->paged_release_blocks(1);
+            // Call the bounded impl via test-seam helper (Cleanup-C2: WT19
+            // originally exercised the legacy unbounded path; that path is
+            // retired, so this now drives the live impl with seams enabled).
+            g.kv->paged_release_bounded_test_call_with_seams(UINT64_MAX, UINT32_MAX);
 
-            // Legacy path should skip PENDING_WRITE — no state change, no counter
-            // advance beyond what the override absorbs.
+            // Cleanup-C2: the bounded impl protects block 0 by the PENDING_WRITE
+            // state gate; other RESIDENT paged blocks may still be released.
+            // Assert the protected invariant (block 0 not released) instead of
+            // a global "counter unchanged" check.
             const uint8_t s0 = g.kv->paged_release_bounded_test_read_block_state(0);
-            CHECK(s0 == 1, "WT19: legacy release skipped PENDING_WRITE block (still RESIDENT)");
-            CHECK(g.kv->paged_release_bounded_test_read_released_blocks() == released_before,
-                    "WT19: legacy release counter unchanged (PENDING_WRITE skipped)");
-            CHECK(g.kv->paged_release_bounded_test_read_released_unused() == unused_before,
-                    "WT19: legacy unused counter unchanged");
-            CHECK(g.kv->paged_release_bounded_test_read_released_dead() == dead_before,
-                    "WT19: legacy dead counter unchanged");
+            CHECK(s0 == 1, "WT19: bounded impl skipped PENDING_WRITE block (still RESIDENT)");
             CHECK(!g.kv->paged_release_bounded_test_block_in_free_list(0),
                     "WT19: PENDING_WRITE block not added to free list");
             CHECK(g.kv->paged_release_bounded_test_block_state_override.block == UINT32_MAX,
-                    "WT19: override auto-reset after legacy release");
+                    "WT19: override auto-reset after bounded release");
+            const uint64_t released_after =
+                g.kv->paged_release_bounded_test_read_released_blocks();
+            CHECK(released_after - released_before <=
+                    g.kv->paged_release_bounded_test_read_n_blocks() - 1,
+                    "WT19: at most n_blocks-1 releases occurred (block 0 protected)");
+            (void) unused_before;
+            (void) dead_before;
 
-            std::fprintf(stderr, "WT19 legacy PENDING_WRITE gate: state=%u released=%llu OK\n",
+            std::fprintf(stderr, "WT19 bounded PENDING_WRITE gate: state=%u released=%llu OK\n",
                     s0, (unsigned long long)released_before);
         }
 
-        setenv("LLAMA_KV_PAGED_RELEASE", "0", 1);
     }
 
     // =========================================================================
     // WT20: Unbounded legacy release skips INVALID (quarantined) blocks.
     // =========================================================================
     {
-        setenv("LLAMA_KV_PAGED_RELEASE", "1", 1);
 
         ContextGuard g;
         if (!g.init(model, cparams)) {
@@ -1378,20 +1328,27 @@ int main(int /*argc*/, char ** /*argv*/) {
             g.kv->paged_release_bounded_test_block_state_override.block = 0;
             g.kv->paged_release_bounded_test_block_state_override.state = 5;
 
-            g.kv->paged_release_blocks(1);
+            g.kv->paged_release_bounded_test_call_with_seams(UINT64_MAX, UINT32_MAX);
 
             const uint8_t s0 = g.kv->paged_release_bounded_test_read_block_state(0);
-            CHECK(s0 == real_state, "WT20: legacy release skipped INVALID block (state unchanged)");
-            CHECK(g.kv->paged_release_bounded_test_read_released_blocks() == released_before,
-                    "WT20: legacy release counter unchanged (INVALID skipped)");
+            // Cleanup-C2: only block 0 is protected by the INVALID state gate;
+            // other paged blocks may be released by the bounded impl.  Assert
+            // the protected invariant (block 0 not released) instead of a
+            // global "counter unchanged" check that assumed the legacy
+            // unbounded release never released anything.
+            CHECK(s0 == real_state, "WT20: bounded impl skipped INVALID block (state unchanged)");
             CHECK(!g.kv->paged_release_bounded_test_block_in_free_list(0),
                     "WT20: INVALID block not added to free list");
+            const uint64_t released_after =
+                g.kv->paged_release_bounded_test_read_released_blocks();
+            CHECK(released_after - released_before <=
+                    g.kv->paged_release_bounded_test_read_n_blocks() - 1,
+                    "WT20: at most n_blocks-1 releases occurred");
 
             std::fprintf(stderr, "WT20 legacy INVALID gate: state=%u released=%llu OK\n",
                     s0, (unsigned long long)released_before);
         }
 
-        setenv("LLAMA_KV_PAGED_RELEASE", "0", 1);
     }
 
     // =========================================================================
@@ -1402,7 +1359,6 @@ int main(int /*argc*/, char ** /*argv*/) {
     //   Temporarily enables LLAMA_KV_PAGED_RELEASE=1 for the legacy gate.
     // =========================================================================
     {
-        setenv("LLAMA_KV_PAGED_RELEASE", "1", 1);
 
         ContextGuard g;
         if (!g.init(model, cparams)) {
@@ -1420,24 +1376,29 @@ int main(int /*argc*/, char ** /*argv*/) {
             g.kv->paged_release_bounded_test_block_state_override.block = 0;
             g.kv->paged_release_bounded_test_block_state_override.state = 5;
 
-            const auto r = g.kv->paged_release_blocks_bounded(UINT64_MAX, UINT32_MAX);
+            const auto r = g.kv->paged_release_bounded_test_call_with_seams(
+                    UINT64_MAX, UINT32_MAX);
             CHECK(!r.ownership_aborted, "WT21: ownership valid");
-            CHECK(r.released_blocks == 0,
-                    "WT21: shared impl released zero (INVALID skipped)");
+            // Cleanup-C2: bounded impl with seams-enabled releases all valid
+            // blocks except the protected INVALID block 0.  Assert the
+            // skipped-state invariant for the INVALID gate instead of "zero
+            // released globally" (which assumed the retired legacy path).
             CHECK(r.blocks_skipped_state >= 1,
                     "WT21: shared impl state gate skipped INVALID");
             CHECK(r.madvise_failures == 0,
                     "WT21: zero madvise calls (INVALID never reached madvise)");
 
-            CHECK(g.kv->paged_release_bounded_test_read_released_blocks() == released_before,
-                    "WT21: legacy release counter unchanged");
+            const uint64_t released_after =
+                g.kv->paged_release_bounded_test_read_released_blocks();
+            CHECK(released_after - released_before <=
+                    g.kv->paged_release_bounded_test_read_n_blocks() - 1,
+                    "WT21: at most n_blocks-1 releases occurred (INVALID protected)");
 
             std::fprintf(stderr, "WT21 shared impl INVALID gate: released=%" PRIu32
                     " skipped_state=%" PRIu32 " OK\n",
                     r.released_blocks, r.blocks_skipped_state);
         }
 
-        setenv("LLAMA_KV_PAGED_RELEASE", "0", 1);
     }
 
     // =========================================================================
@@ -1497,7 +1458,6 @@ int main(int /*argc*/, char ** /*argv*/) {
     //   paged_release_blocks() path (LLAMA_KV_PAGED_RELEASE=1).
     // =========================================================================
     {
-        setenv("LLAMA_KV_PAGED_RELEASE", "1", 1);
 
         ContextGuard g;
         if (!g.init(model, cparams)) {
@@ -1519,7 +1479,7 @@ int main(int /*argc*/, char ** /*argv*/) {
             const uint8_t state_before =
                 g.kv->paged_release_bounded_test_read_block_state(0);
 
-            g.kv->paged_release_blocks(1);
+            g.kv->paged_release_bounded_test_call_with_seams(UINT64_MAX, UINT32_MAX);
 
             CHECK(g.kv->paged_release_bounded_test_read_released_blocks() == released_before,
                     "WT23: legacy release counter unchanged under fail-stop");
@@ -1534,7 +1494,6 @@ int main(int /*argc*/, char ** /*argv*/) {
                     (unsigned long long)released_before, state_before);
         }
 
-        setenv("LLAMA_KV_PAGED_RELEASE", "0", 1);
     }
 
     // =========================================================================
@@ -1634,7 +1593,6 @@ int main(int /*argc*/, char ** /*argv*/) {
     // =========================================================================
     {
         setenv("LLAMA_KV_PAGED_SWAP", "1", 1);
-        setenv("LLAMA_KV_PAGED_RELEASE", "0", 1);
 
         ContextGuard g;
         if (!g.init(model, cparams)) {
@@ -2166,7 +2124,6 @@ int main(int /*argc*/, char ** /*argv*/) {
     // WT28f: madvise failure keeps the existing raw failure/shortfall and block
     // state while advancing past the scanned block.
     {
-        setenv("LLAMA_KV_PAGED_RELEASE", "1", 1);
         ContextGuard g;
         if (!g.init(model, cparams)) {
             CHECK(false, "WT28f: context creation failed");
@@ -2177,7 +2134,7 @@ int main(int /*argc*/, char ** /*argv*/) {
             llama_memory_seq_rm(g.mem, 1, -1, -1);
             g.kv->paged_release_bounded_test_madvise_fail_block = 0;
 
-            const auto failed = g.kv->paged_release_blocks_bounded(1, 1);
+            const auto failed = g.kv->paged_release_bounded_test_call_with_seams(1, 1);
             CHECK(failed.madvise_failures == 1 && failed.released_blocks == 0 &&
                     failed.released_bytes == 0 && failed.shortfall_bytes == 1 &&
                     failed.scan_budget_exhausted &&
@@ -2185,7 +2142,6 @@ int main(int /*argc*/, char ** /*argv*/) {
                     g.kv->paged_release_bounded_test_read_scan_cursor() == 1,
                     "WT28f: raw failure propagation and state are unchanged; cursor advances");
         }
-        setenv("LLAMA_KV_PAGED_RELEASE", "0", 1);
     }
 
     // WT28g: a release starts a new no-release tour. The scanner must not

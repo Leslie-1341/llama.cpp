@@ -27,11 +27,12 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 DRY_RUN_MARKER_RE = re.compile(r"kv_pressure_dry_run\b")
 TELEMETRY_MARKER_RE = re.compile(r"kv_pressure_telemetry\b")
 DESTRUCTIVE_RELEASE_RE = re.compile(
-    r"(?i)(?:paged_release_blocks\s*\(|release_blocks\s*\(|"
+    r"(?i)(?:bounded_release\s*\(|"
+    r"paged_release_blocks_bounded_impl\s*\(|"
     # Only match non-zero counter values — zero-value diagnostic dumps
     # are not evidence of actual destructive release.
-    r"paged_block_release_bytes=(?:0*[1-9][0-9]*)|"
-    r"paged_blocks_released=(?:0*[1-9][0-9]*)"
+    r"paged_bounded_release_bytes=(?:0*[1-9][0-9]*)|"
+    r"paged_bounded_release_blocks=(?:0*[1-9][0-9]*)"
     r")"
 )
 MADV_DONTNEED_RE = re.compile(r"(?i)madvise\s*\([^)]*MADV_DONTNEED")
@@ -141,8 +142,8 @@ def main() -> None:
     # =====================================================================
     print("--- Configuration isolation ---")
     check_env_isolation(off_env, on_env)
-    check("LLAMA_KV_PAGED_RELEASE" not in on_env or on_env["LLAMA_KV_PAGED_RELEASE"] == "0",
-          "LLAMA_KV_PAGED_RELEASE must not be set to 1 (release disabled)")
+    # Cleanup-C2: LLAMA_KV_PAGED_RELEASE is retired.  Any leftover env value
+    # is informational only — we never fail the test on it.
     check(on_env.get("LLAMA_KV_PRESSURE_DRY_RUN") == "1",
           "ON must have LLAMA_KV_PRESSURE_DRY_RUN=1")
     check("LLAMA_KV_PRESSURE_DRY_RUN" not in off_env,

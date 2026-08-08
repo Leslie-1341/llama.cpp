@@ -34,7 +34,9 @@ ON_ENV = {
     "LLAMA_KV_PRESSURE_LOG_INTERVAL_MS": "60000",
 }
 ZERO_ENV = (
-    "LLAMA_KV_PAGED_RELEASE", "LLAMA_KV_PAGED_SWAP", "LLAMA_KV_PAGED_IDLE_SWAP",
+    # Cleanup-C2: LLAMA_KV_PAGED_RELEASE removed — the legacy auto/unbounded
+    # path no longer exists and the env variable has no effect.
+    "LLAMA_KV_PAGED_SWAP", "LLAMA_KV_PAGED_IDLE_SWAP",
     "LLAMA_KV_PAGED_IDLE_SWAP_MADVISE", "LLAMA_KV_PAGED_RESUME_PREFETCH",
     "LLAMA_KV_PAGED_PREFETCH_DURING_ACTIVE", "LLAMA_KV_PAGED_PREFETCH_AUTO_DELAYED",
     "LLAMA_KV_SWAP", "LLAMA_KV_SWAP_MADVISE",
@@ -52,8 +54,12 @@ MARKER_KEYS = {
 }
 TRIGGERS = {"first", "state", "source", "stale", "periodic"}
 # Structured action evidence only.  Bare prose words are deliberately not banned.
+# Cleanup-C2 retired paged_release_blocks() (legacy unbounded release path);
+# bounded_release() is the only production destructive release authority now.
 FORBIDDEN_LOG = re.compile(
-    r"(?i)(?:paged_release_blocks\s*\(|release_blocks\s*\(|swap_(?:in|out)\s*\(|"
+    r"(?i)(?:bounded_release\s*\(|"
+    r"paged_release_blocks_bounded_impl\s*\(|"
+    r"swap_(?:in|out)\s*\(|"
     r"prefetch_seq(?:_step)?\s*\(|(?:kv|paged)_(?:release|swap|prefetch|madvise|reclaim)_"
     r"(?:action|event|marker|telemetry)\b|(?:(?:kv|paged)_)?(?:release|swap|prefetch|madvise|reclaim)_"
     r"(?:calls|blocks|bytes|actions?|enabled)=[1-9][0-9]*)"

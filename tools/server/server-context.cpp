@@ -787,7 +787,8 @@ private:
     server_kv_pressure_dry_run_config kv_pressure_dry_run_config;
 
     // Bounded destructive release: enabled only when LLAMA_KV_PRESSURE_BOUNDED_RELEASE=1.
-    // Independent of LLAMA_KV_PAGED_RELEASE (legacy apply-path gate).
+    // Cleanup-C2: the legacy LLAMA_KV_PAGED_RELEASE apply-path gate is RETIRED;
+    // bounded_release() is the sole destructive release authority.
     server_kv_pressure_bounded_release_config kv_pressure_bounded_release_config;
     uint64_t kv_pressure_bounded_release_episode = 0;
 
@@ -1265,8 +1266,9 @@ private:
 
         // Parse bounded destructive release config independently.
         // Mutual exclusion checks:
-        // - LLAMA_KV_PAGED_RELEASE=1 AND LLAMA_KV_PRESSURE_BOUNDED_RELEASE=1 → fail-closed
         // - LLAMA_KV_PRESSURE_DRY_RUN=1 AND LLAMA_KV_PRESSURE_BOUNDED_RELEASE=1 → fail-closed
+        // Cleanup-C2 retired the legacy LLAMA_KV_PAGED_RELEASE auto/unbounded
+        // path; the legacy mutual-exclusion check is therefore no longer needed.
         {
             server_kv_pressure_bounded_release_config bounded_cfg;
             std::string bounded_error;
@@ -1277,20 +1279,9 @@ private:
             } else if (bounded_cfg.enabled) {
                 bool bounded_disabled = false;
 
-                // Legacy mutual exclusion
-                const bool legacy_active = (std::getenv("LLAMA_KV_PAGED_RELEASE") &&
-                    std::strcmp(std::getenv("LLAMA_KV_PAGED_RELEASE"), "1") == 0);
-                if (legacy_active) {
-                    SRV_ERR("%s",
-                            "LLAMA_KV_PAGED_RELEASE=1 and "
-                            "LLAMA_KV_PRESSURE_BOUNDED_RELEASE=1 are mutually "
-                            "exclusive; bounded release disabled\n");
-                    bounded_disabled = true;
-                }
-
                 // Dry-run mutual exclusion: cannot run dry-run AND destructive
                 // bounded release simultaneously — they are alternative paths.
-                if (!bounded_disabled && kv_pressure_dry_run_config.enabled) {
+                if (kv_pressure_dry_run_config.enabled) {
                     SRV_ERR("%s",
                             "LLAMA_KV_PRESSURE_DRY_RUN=1 and "
                             "LLAMA_KV_PRESSURE_BOUNDED_RELEASE=1 are mutually "
@@ -1573,9 +1564,11 @@ private:
         // Mutually exclusive with dry-run Phase B at the per-sample level:
         // if dry-run already ran, bounded release is skipped this sample.
         //
-        // Also performs a defensive per-sample legacy contamination check:
-        // if LLAMA_KV_PAGED_RELEASE=1 is detected at sample time, bounded
-        // release is skipped even if the init-time check missed it.
+        // Cleanup-C2: the legacy per-sample LLAMA_KV_PAGED_RELEASE
+        // contamination check is RETIRED — the legacy env var no longer
+        // exists and bounded_release() is the sole destructive release
+        // authority.  bounded_event.legacy_enabled is always false and is
+        // retained solely for parser marker schema parity.
         {
             const auto & telemetry = kv_pressure_sampler_owner->telemetry();
 
@@ -1659,15 +1652,14 @@ private:
                     }
                     }
                 } else {
-                    // Per-sample legacy contamination check: if legacy release
-                    // is active, bounded release must not execute (fail-closed).
-                    const bool legacy_active =
-                        (std::getenv("LLAMA_KV_PAGED_RELEASE") &&
-                         std::strcmp(std::getenv("LLAMA_KV_PAGED_RELEASE"), "1") == 0);
-                    bounded_event.legacy_enabled = legacy_active;
-                    if (legacy_active) {
-                        bounded_skip_reason = "legacy_active";
-                    }
+                    // Cleanup-C2: legacy contamination check retired.  The
+                    // legacy LLAMA_KV_PAGED_RELEASE auto/unbounded path no
+                    // longer exists; bounded_release() is the only destructive
+                    // release authority and proceeds without fail-closed gates
+                    // from the removed env.  bounded_event.legacy_enabled is
+                    // always false; the field stays in the marker schema for
+                    // parser compatibility.
+                    bounded_event.legacy_enabled = false;
                 }
 
                 if (!bounded_skip_reason && telemetry.stale) {

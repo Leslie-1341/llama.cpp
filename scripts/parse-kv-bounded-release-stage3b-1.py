@@ -46,9 +46,10 @@ BOUNDED_RELEASE_RE = re.compile(r"kv_pressure_bounded_release\b")
 DRY_RUN_MARKER_RE = re.compile(r"kv_pressure_dry_run\b")
 TELEMETRY_MARKER_RE = re.compile(r"kv_pressure_telemetry\b")
 DESTRUCTIVE_RELEASE_RE = re.compile(
-    r"(?i)(?:paged_release_blocks_bounded\s*\(|"
-    r"paged_block_release_bytes=(?:0*[1-9][0-9]*)|"
-    r"paged_blocks_released=(?:0*[1-9][0-9]*)"
+    r"(?i)(?:bounded_release\s*\(|"
+    r"paged_release_blocks_bounded_impl\s*\(|"
+    r"paged_bounded_release_blocks=(?:0*[1-9][0-9]*)|"
+    r"paged_bounded_release_bytes=(?:0*[1-9][0-9]*)"
     r")"
 )
 MADV_DONTNEED_RE = re.compile(r"(?i)^\s*\d+\s+madvise\s*\([^)]*MADV_DONTNEED", re.MULTILINE)
@@ -118,7 +119,8 @@ ENUMS = {
 }
 TRIGGERS = {"first", "state", "source", "stale", "periodic", "wake_completion"}
 
-RELEASE_STATS_MARKER = "KV_PAGED_RELEASE_STATS"
+RELEASE_STATS_MARKER = "KV_PAGED_BOUNDED_RELEASE_STATS"
+RETIRED_RELEASE_STATS_MARKER = "KV_PAGED_RELEASE_STATS"
 LIFECYCLE_STATS_FIELDS = (
     "reuse_allocations", "write_commits", "write_rollbacks",
     "dummy_candidate_pending_write_cell", "released_redirect_no_dummy",
@@ -277,6 +279,19 @@ def find_markers(stderr_text: str, marker_re: re.Pattern[str], case: str) -> lis
 def extract_final_release_stats(case: str, stderr_text: str, check: Any) -> dict[str, int] | None:
     marker_lines = [line for line in stderr_text.splitlines()
                     if RELEASE_STATS_MARKER in line]
+    # Cleanup-C2: producer/parser token closure.  Reject artifacts still
+    # carrying the retired `KV_PAGED_RELEASE_STATS` token — old artifacts
+    # remain bound to their old parser identity and must not be silently
+    # re-validated by this parser.
+    retired_lines = [line for line in stderr_text.splitlines()
+                     if RETIRED_RELEASE_STATS_MARKER in line]
+    if retired_lines:
+        check(False,
+              f"{case}: {RETIRED_RELEASE_STATS_MARKER} is retired; current "
+              f"producer emits {RELEASE_STATS_MARKER}.  Old artifacts must "
+              f"continue to bind to the legacy parser identity and must not "
+              f"be re-validated by this parser.")
+        return None
     if not marker_lines:
         check(False, f"{case}: {RELEASE_STATS_MARKER} missing")
         return None
@@ -635,9 +650,8 @@ def main() -> None:
     check_env_isolation(envs, check)
 
     for label, env in envs.items():
-        legacy = env.get("LLAMA_KV_PAGED_RELEASE", "0")
-        check(legacy == "0" or legacy == "",
-              f"{label}: LLAMA_KV_PAGED_RELEASE must be 0 or unset, got {legacy!r}")
+        # Cleanup-C2: LLAMA_KV_PAGED_RELEASE retired.  Treat any leftover env
+        # value as informational only — never fail the test on its presence.
         id_fp = env.get("LLAMA_KV_PAGED_IDENTITY_FAST_PATH", "1")
         check(id_fp == "0",
               f"{label}: LLAMA_KV_PAGED_IDENTITY_FAST_PATH must be 0, got {id_fp!r}")

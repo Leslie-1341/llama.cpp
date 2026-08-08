@@ -477,10 +477,6 @@ public:
     // MADV_DONTNEED to lower current RSS. No-op unless LLAMA_KV_LAZY_TAIL=1 (and !v_trans &&
     // n_stream==1). See docs/kv_lazy_block_stage_f1_design.md.
     void madvise_tail(uint32_t n_kv);
-    void paged_release_blocks(uint32_t n_kv);
-    llama_kv_bounded_release_result paged_release_blocks_bounded(
-            uint64_t target_bytes,
-            uint32_t max_scan_blocks);
 
     // Bounded release for server pressure path — gated on
     // LLAMA_KV_PRESSURE_BOUNDED_RELEASE (not LLAMA_KV_PAGED_RELEASE).
@@ -500,7 +496,10 @@ public:
             uint64_t target_bytes,
             uint32_t max_scan_blocks) const;
 
-    // Test-only seams for paged_release_blocks_bounded().
+    // Test-only seams for paged_release_blocks_bounded_impl()
+    // (Cleanup-C2: the legacy paged_release_blocks_bounded() wrapper is
+    // retired; seams now live exclusively on the bounded impl and are
+    // engaged by paged_release_bounded_test_call_with_seams()).
     // All default to no-injection; no production behaviour changes unless a test sets them.
     // - test_force_ownership_abort: when true, the next bounded release call executes the full
     //   ownership-ABORT path (ownership_aborted=true, zero released, zero state changes).
@@ -543,17 +542,20 @@ public:
         return paged_block_size;
     }
     // Test-only accessors for dry-run zero-change verification.
+    // Counters live on the authoritative bounded/unified counter set; legacy
+    // paged_block_release_bytes / paged_blocks_released fields have been
+    // removed by Cleanup-C2.
     uint64_t paged_release_bounded_test_read_release_bytes() const {
-        return paged_block_release_bytes;
+        return paged_bounded_release_bytes;
     }
     uint64_t paged_release_bounded_test_read_released_blocks() const {
-        return paged_blocks_released;
+        return paged_bounded_release_blocks;
     }
     uint64_t paged_release_bounded_test_read_released_unused() const {
-        return paged_blocks_released_unused;
+        return paged_bounded_release_unused;
     }
     uint64_t paged_release_bounded_test_read_released_dead() const {
-        return paged_blocks_released_dead;
+        return paged_bounded_release_dead;
     }
     uint64_t paged_release_bounded_test_read_write_commits() const {
         return paged_release_write_commits;
@@ -564,12 +566,11 @@ public:
     uint64_t paged_release_bounded_test_read_ensure_pending_write_rejected() const {
         return paged_block_ensure_pending_write_rejected;
     }
-    uint64_t paged_release_bounded_test_read_force_active_triggers() const {
-        return paged_test_force_active_release_triggers;
-    }
-    bool paged_release_bounded_test_legacy_release_enabled() const {
-        return paged_block_release_enabled;
-    }
+    // Cleanup-C2: paged_release_bounded_test_read_force_active_triggers() was
+    // deleted — it had no real consumer and incorrectly aliased the legacy
+    // force-active trigger name onto the Unified paged_unified_release_blocks
+    // counter, which conflates two unrelated semantics.  WT19/WT20 read the
+    // authoritative bounded counters directly (see below).
     void paged_release_bounded_test_arm_fail_graph_alloc() {
         paged_release_bounded_test_fail_graph_alloc = true;
     }
@@ -585,6 +586,13 @@ public:
     void paged_release_bounded_test_arm_fail_rollback_madvise() {
         paged_release_bounded_test_fail_rollback_madvise = true;
     }
+    // Cleanup-C2: WT19/WT20 (formerly legacy paged_release_blocks()) test the
+    // PENDING_WRITE / INVALID skip paths.  Both gates are enforced by the
+    // authoritative bounded impl; this helper exposes a test-seam variant
+    // (use_test_seams=true) of bounded_release() so WT can drive the same
+    // gate logic via the live impl.
+    llama_kv_bounded_release_result paged_release_bounded_test_call_with_seams(
+            uint64_t target_bytes, uint32_t max_scan_blocks);
     uint64_t paged_release_bounded_test_read_fail_rollback_madvise_triggers() const {
         return paged_release_bounded_test_fail_rollback_madvise_triggers;
     }
@@ -592,11 +600,15 @@ public:
     // (release → reuse → commit / rollback).  These expose counters and
     // per-block state that WT6–WT9 assert on directly so the tests use REAL
     // assertions instead of log-only or override-driven fake-greens.
-    uint64_t paged_release_bounded_test_read_reuse_allocations() const {
-        return paged_block_release_reuse_allocations;
-    }
     uint64_t paged_release_bounded_test_read_dummy_candidate_pending_write_cell() const {
         return paged_dummy_candidate_pending_write_cell;
+    }
+    // Cleanup-C2: RELEASED→PENDING_WRITE reuse transactions are still tracked
+    // by the bounded impl via paged_block_release_reuse_allocations.  Stage 3B-1
+    // parser asserts reuse_allocations > 0 under the same marker field; the
+    // accessor below is the read-only WT entry point.
+    uint64_t paged_release_bounded_test_read_reuse_allocations() const {
+        return paged_block_release_reuse_allocations;
     }
     uint64_t paged_release_bounded_test_read_released_redirect_no_dummy() const {
         return paged_released_redirect_no_dummy;
@@ -1060,8 +1072,9 @@ private:
             uint64_t & skip_live,
             std::vector<paged_release_range> * advised_ranges = nullptr) const;
 
-    // Counter sink for paged_release_blocks_bounded_impl — separates legacy
-    // cumulative counters from independent bounded-release counters.
+    // Counter sink for paged_release_blocks_bounded_impl — bounded/unified
+    // counters only; the legacy `paged_block_release_*` cumulative counter set
+    // is RETIRED (Cleanup-C2) and is no longer routed through this struct.
     struct paged_bounded_release_counters {
         uint64_t * calls  = nullptr;
         uint64_t * blocks = nullptr;
@@ -1070,11 +1083,17 @@ private:
         uint64_t * dead   = nullptr;
     };
 
-    // Common destructive release implementation shared by the legacy
-    // paged_release_blocks_bounded() path and the server bounded_release() path.
-    // Both callers must verify their respective authorisation gate
-    // (paged_block_release_enabled or bounded_release_can_enable()) before entry.
-    // use_test_seams=true allows the legacy test-only seam injection path.
+    // Common destructive release implementation shared by:
+    //   - bounded_release() — server pressure path (gated by
+    //     bounded_release_can_enable() i.e. swap_disabled mode)
+    //   - paged_release_bounded_test_call_with_seams() — WT-only test path
+    //     (gated by bounded_release_can_enable() with use_test_seams=true)
+    //   - execute_action(RELEASE) — Unified Action Governor path
+    //     (gated by execute_action capability.can_release, NOT by
+    //     bounded_release_can_enable() — see execute_action())
+    // Cleanup-C2 retired the legacy paged_release_blocks_bounded() wrapper;
+    // there is no fourth caller and no legacy paged_block_release_enabled
+    // gate.  use_test_seams=true is reserved for the WT helper above.
     llama_kv_bounded_release_result paged_release_blocks_bounded_impl(
             uint64_t target_bytes,
             uint32_t max_scan_blocks,
@@ -1151,7 +1170,6 @@ private:
     bool paged_write_context_invalid = false;
     llama_paged_swap_error_reason paged_write_context_invalid_cause = llama_paged_swap_error_reason::NONE;
     mutable std::vector<paged_release_range> paged_release_post_ranges;
-    mutable std::vector<std::vector<paged_release_range>> paged_released_ranges_by_block;
     std::vector<uint32_t> paged_free_list;
     // Per-cache bounded RELEASE scan state. The cursor resumes after the last
     // visited block. scanned_since_release counts a candidate-space tour only
@@ -1199,22 +1217,6 @@ private:
     uint64_t paged_mapping_oob_fail = 0;
     mutable uint64_t paged_logical_to_physical_checks = 0;
     mutable uint64_t paged_logical_to_physical_fail = 0;
-    bool     paged_block_release_enabled = false;
-    bool     paged_block_release_requested = false;
-    uint64_t paged_block_release_calls = 0;
-    uint64_t paged_blocks_released = 0;
-    uint64_t paged_blocks_released_unused = 0;
-    uint64_t paged_block_release_bytes = 0;
-    uint64_t paged_block_release_blocks_last = 0;
-    uint64_t paged_block_release_bytes_last = 0;
-    uint64_t paged_block_release_skip_live = 0;
-    uint64_t paged_block_release_skip_owned = 0;
-    uint64_t paged_block_release_skip_shared = 0;
-    uint64_t paged_block_release_ownership_invalid = 0;
-    uint64_t paged_block_release_metadata_cleared = 0;
-    uint64_t paged_block_release_metadata_stale = 0;
-    uint64_t paged_block_release_idempotent = 0;
-    uint64_t paged_blocks_released_dead = 0;
 
     // Bounded-release independent counters (server pressure path, gated by
     // LLAMA_KV_PRESSURE_BOUNDED_RELEASE).  These are separate from the legacy
@@ -1223,6 +1225,10 @@ private:
     uint64_t paged_bounded_release_calls  = 0;
     uint64_t paged_bounded_release_blocks = 0;
     uint64_t paged_bounded_release_bytes  = 0;
+    // Cleanup-C2: bounded impl tracks RELEASED→PENDING_WRITE reuse transactions.
+    // Stage 3B-1 parser contract depends on this counter under marker name
+    // reuse_allocations; rename would break the protocol.
+    uint64_t paged_block_release_reuse_allocations = 0;
     uint64_t paged_unified_release_calls  = 0;
     uint64_t paged_unified_release_blocks = 0;
     uint64_t paged_unified_release_bytes  = 0;
@@ -1230,19 +1236,9 @@ private:
     uint64_t paged_bounded_release_unused = 0;
     uint64_t paged_bounded_release_dead   = 0;
 
-    uint64_t paged_block_release_skip_unaligned = 0;
-    uint64_t paged_block_release_fail = 0;
-    uint64_t paged_block_release_rss_samples = 0;
-    uint64_t paged_block_release_rss_before_last_kb = 0;
-    uint64_t paged_block_release_rss_after_last_kb = 0;
-    uint64_t paged_block_release_rss_before_max_kb = 0;
-    uint64_t paged_block_release_rss_after_min_kb = 0;
-    uint64_t paged_block_release_rss_drop_last_kb = 0;
-    uint64_t paged_block_release_rss_drop_max_kb = 0;
     mutable uint64_t paged_block_ensure_calls = 0;
     mutable uint64_t paged_block_ensure_released = 0;
     mutable uint64_t paged_block_ensure_pending_write_rejected = 0;
-    uint64_t paged_block_release_reuse_allocations = 0;
     mutable uint64_t paged_release_violation = 0;
     mutable uint64_t paged_active_release_violation = 0;
     mutable uint64_t paged_padded_release_violation = 0;
@@ -1262,25 +1258,8 @@ private:
     mutable uint64_t paged_release_mincore_reaccess_total_last = 0;
     mutable uint64_t paged_release_write_commits = 0;
     mutable uint64_t paged_release_write_rollbacks = 0;
-    mutable uint64_t paged_release_fresh_verify_bytes = 0;
-    mutable uint64_t paged_release_fresh_verify_hash = 1469598103934665603ULL;
-    bool paged_release_fresh_verify_enabled = false;
-    bool paged_release_test_repeat = false;
-    bool paged_release_test_repeat_active = false;
-    bool paged_release_test_reuse = false;
-    bool paged_release_test_repeat_marker_emitted = false;
-    bool paged_release_test_reuse_marker_emitted = false;
-    bool paged_release_test_r5_marker_emitted = false;
-    uint32_t paged_release_test_reuse_block = PAGED_BLOCK_INVALID;
-    bool paged_release_test_reuse_pending_seen = false;
-    bool paged_release_test_reuse_metadata_absent = false;
-    uint64_t paged_release_test_reuse_fresh_bytes_before = 0;
-    mutable uint64_t paged_release_test_repeat_passes = 0;
-    mutable uint64_t paged_release_test_reuse_commits = 0;
-    bool paged_test_force_active_release = false;
-    llama_seq_id paged_test_force_active_release_seq = -1;
-    mutable bool paged_test_force_active_release_consumed = false;
-    mutable uint64_t paged_test_force_active_release_triggers = 0;
+    // Cleanup-C2: legacy paged_release_mincore_* still drives the bounded impl's
+    // post-graph sample of released ranges.  Fresh-verify counters retired.
     bool     paged_swap_enabled = false;
     bool     paged_swap_explicit_only = false;
     mutable uint64_t paged_swap_out_calls = 0;
@@ -1560,13 +1539,13 @@ private:
     mutable uint64_t paged_base_timing_getenv_calls = 0;
     mutable uint64_t paged_base_timing_apply_calls = 0;
     mutable uint64_t paged_base_timing_apply_paged_total_us = 0;
+    // paged_base_timing_paged_release_blocks_us removed by Cleanup-C2.
     mutable uint64_t paged_base_timing_apply_ubatch_us = 0;
     mutable uint64_t paged_base_timing_note_cells_us = 0;
     mutable uint64_t paged_base_timing_assert_identity_us = 0;
     mutable uint64_t paged_base_timing_swap_out_window_us = 0;
     mutable uint64_t paged_base_timing_clear_frontier_us = 0;
     mutable uint64_t paged_base_timing_madvise_tail_us = 0;
-    mutable uint64_t paged_base_timing_paged_release_blocks_us = 0;
     mutable uint64_t paged_base_timing_set_row_idx_calls = 0;
     mutable uint64_t paged_base_timing_set_row_idx_total_us = 0;
     mutable uint64_t paged_base_timing_active_visible_us = 0;

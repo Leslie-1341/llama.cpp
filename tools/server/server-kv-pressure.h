@@ -60,7 +60,7 @@ struct server_kv_pressure_dry_run_event {
     kv_pressure_source pressure_source = kv_pressure_source::NONE;
     bool    stale           = false;
     bool    idle             = false;
-    bool    release_enabled  = false;   // LLAMA_KV_PAGED_RELEASE=1 is active
+    bool    release_enabled  = false;   // paged_release_status() reports available (derived from authoritative bounded capability)
     uint64_t sample_count    = 0;
     uint64_t target_bytes    = 0;
     uint32_t max_scan_blocks = 0;
@@ -109,7 +109,7 @@ struct server_kv_pressure_bounded_release_event {
     kv_pressure_source pressure_source = kv_pressure_source::NONE;
     bool    stale           = false;
     bool    idle             = false;
-    bool    legacy_enabled   = false;  // paged_block_release_enabled at sample time
+    bool    legacy_enabled   = false;  // Cleanup-C2: legacy LLAMA_KV_PAGED_RELEASE auto/unbounded path is retired; field is retained for parser schema parity and is always false.
     uint64_t sample_count    = 0;
     uint64_t episode         = 0;      // pressure-episode counter
     uint64_t target_bytes    = 0;
