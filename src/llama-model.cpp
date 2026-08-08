@@ -2146,6 +2146,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     double lock_gb = 1.0;
                     if (mib != SIZE_MAX && mib <= 1280) {
                         lock_gb = 0.75;
+                    } else if (mib != SIZE_MAX && mib < 3072) {
+                        lock_gb = 1.625;
                     } else if (mib != SIZE_MAX && mib >= 3072) {
                         lock_gb = 1.25;
                     }

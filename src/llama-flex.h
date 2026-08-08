@@ -28,6 +28,9 @@ struct llama_flex_tensor {
     size_t      size        = 0;  // tensor data size in bytes
     size_t      buf_offset  = 0;  // offset within the ring slot (streamed) or lock buffer (locked)
     bool        locked      = false; // balanced-locked: resident permanently, never streamed
+    bool        delta_locked = false; // runtime-pinned into a delta lock buffer
+    size_t      delta_buf_index = 0;
+    size_t      delta_buf_offset = 0;
 };
 
 struct llama_flex_params {
@@ -58,6 +61,9 @@ struct llama_flex_stats {
     uint64_t read_ops        = 0;  // number of pread() calls issued for streaming
     uint64_t total_io_us     = 0;
     uint64_t total_wait_us   = 0;
+    double   ewma_io_us      = 0.0;
+    double   ewma_compute_us = 0.0;
+    double   ewma_wait_us    = 0.0;
     uint64_t demand_loads    = 0;  // layer was not already queued/loading when compute needed it
     uint64_t prefetch_queued = 0;
     uint64_t prefetch_budget_dropped = 0;
@@ -68,9 +74,14 @@ struct llama_flex_stats {
     uint64_t ahead_adjustments = 0;
     uint64_t locked_tensors  = 0;
     uint64_t streamed_tensors = 0;
+    uint64_t delta_locked_tensors = 0;
+    uint64_t delta_pin_attempts = 0;
+    uint64_t delta_pin_failures = 0;
     size_t   ring_bytes      = 0;  // total bytes held by the ring
     size_t   slot_bytes      = 0;  // bytes charged for one streamed layer slot
     size_t   locked_bytes    = 0;  // bytes pinned by balanced locking
+    size_t   delta_locked_bytes = 0;
+    size_t   delta_pin_saved_per_token = 0;
     size_t   lock_budget_unused = 0;
     size_t   stream_per_token = 0; // unlocked bytes that must be read each token
     int      effective_ahead = 0;
@@ -90,6 +101,28 @@ struct llama_flex_reclaim_result {
     uint64_t released_bytes = 0;
     uint32_t released_layers = 0;
     bool target_satisfied = false;
+};
+
+struct llama_flex_resize_result {
+    bool attempted = false;
+    bool changed = false;
+    int old_slots = 0;
+    int new_slots = 0;
+    uint64_t old_bytes = 0;
+    uint64_t new_bytes = 0;
+    const char * reason = "none";
+};
+
+struct llama_flex_delta_pin_result {
+    bool attempted = false;
+    bool changed = false;
+    uint64_t requested_bytes = 0;
+    uint64_t pinned_bytes = 0;
+    uint64_t saved_per_token_bytes = 0;
+    uint64_t candidates = 0;
+    uint64_t pinned_tensors = 0;
+    double roi = 0.0;
+    const char * reason = "none";
 };
 
 struct ggml_tensor;
@@ -145,6 +178,17 @@ llama_flex_reclaim_result llama_flex_reclaim_released(
         llama_flex_context & ctx,
         uint64_t             target_bytes,
         uint32_t             max_layers);
+
+// Resize the streaming ring. Growing is immediate. Shrinking only removes free
+// slots so active/resident layers are never invalidated.
+llama_flex_resize_result llama_flex_resize_ring(
+        llama_flex_context & ctx,
+        int                 target_slots);
+
+llama_flex_delta_pin_result llama_flex_delta_pin(
+        llama_flex_context & ctx,
+        uint64_t             budget_bytes,
+        double               min_roi);
 
 // --- compute-path integration ---------------------------------------------
 

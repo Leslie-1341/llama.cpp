@@ -30,12 +30,43 @@ class MemoryGovernorObserveStaticTest(unittest.TestCase):
             "moe_budget_bytes",
             "kv_resident_bytes",
             "kv_reclaimable_resident_bytes",
+            "kv_slot_budget_valid",
+            "kv_slot_resident_bytes",
+            "kv_slot_reclaimable_resident_bytes",
+            "kv_effective_budget_source",
+            "kv_effective_resident_bytes",
+            "kv_effective_reclaimable_resident_bytes",
+            "global_optimizer_enabled",
+            "global_optimizer_decision",
+            "global_moe_utility",
+            "global_kv_utility",
+            "global_moe_roi",
+            "reallocation_enabled",
+            "reallocation_confirm_enabled",
+            "reallocation_pending_added_bytes",
+            "reallocation_observed_drop_bytes",
+            "reallocation_confirm_limit_bytes",
+            "reallocation_credit_earned_bytes",
+            "reallocation_credit_spent_bytes",
+            "reallocation_moe_grant_bytes",
+            "reallocation_reason",
+            "effective_pressure_state",
+            "effective_pressure_reason",
+            "effective_pressure_critical_excess_bytes",
             "pressure_excess_bytes",
+            "auction_candidates",
+            "auction_selected_allocation",
+            "auction_allocation_reason",
+            "auction_selected_reclaim",
+            "auction_reclaim_reason",
             "would_reclaim_candidates",
             "would_prefetch_candidates",
             "clean_reclaim_enabled",
+            "clean_reclaim_ranked_enabled",
             "clean_reclaim_attempted",
             "clean_reclaim_released_bytes",
+            "clean_reclaim_passes",
+            "clean_reclaim_candidates_tried",
             "kv_release_enabled",
             "kv_release_attempted",
             "kv_release_relieved_bytes",
@@ -44,6 +75,7 @@ class MemoryGovernorObserveStaticTest(unittest.TestCase):
             "kv_offload_attempted",
             "kv_offload_seq_id",
             "kv_offload_relieved_bytes",
+            "kv_offload_backend",
             "kv_offload_reason",
             "prefetch_budget_enabled",
             "prefetch_budget_tick_bytes",
@@ -57,11 +89,22 @@ class MemoryGovernorObserveStaticTest(unittest.TestCase):
         observe = self.observe_function()
         self.assertIn("memory_governor_format_candidates(reclaim_candidates, 3)", observe)
         self.assertIn("memory_governor_format_candidates(prefetch_candidates, 3)", observe)
+        self.assertIn("memory_governor_candidate_roi", SERVER_CONTEXT)
+        self.assertIn("memory_governor_candidate_before", SERVER_CONTEXT)
+        self.assertIn("memory_governor_auction_select", SERVER_CONTEXT)
+        self.assertIn("memory_governor_candidate_allowed_in_state", SERVER_CONTEXT)
+        self.assertIn("effective_pressure_state", SERVER_CONTEXT)
+        self.assertIn("high_excess", SERVER_CONTEXT)
+        self.assertIn("allocation_risk_tax", SERVER_CONTEXT)
+        self.assertIn("adaptive_grow_bytes", SERVER_CONTEXT)
+        self.assertIn("pressure_reclaim_boost_bytes", SERVER_CONTEXT)
+        self.assertIn("c.roi", SERVER_CONTEXT)
         for token in [
             '"dense_layer"',
             '"moe_expert"',
             '"kv_global"',
             '"kv_sequence"',
+            '"grow"',
             '"reclaim_clean"',
             '"release"',
             '"offload"',
@@ -72,6 +115,10 @@ class MemoryGovernorObserveStaticTest(unittest.TestCase):
     def test_clean_reclaim_is_gated_and_kv_safe(self):
         observe = self.observe_function()
         self.assertIn("memory_governor_clean_reclaim_enabled", observe)
+        self.assertIn("LLAMA_MEMORY_GOVERNOR_CLEAN_RECLAIM_RANKED", SERVER_CONTEXT)
+        self.assertIn("LLAMA_MEMORY_GOVERNOR_CLEAN_RECLAIM_MAX_PASSES", SERVER_CONTEXT)
+        self.assertIn("memory_governor_clean_reclaim_ranked_enabled", observe)
+        self.assertIn("ranked_submitted", observe)
         self.assertIn("llama_flex_reclaim_released(", observe)
         self.assertIn("llama_moe_buffer_reclaim_clean(", observe)
         forbidden = [
@@ -89,22 +136,30 @@ class MemoryGovernorObserveStaticTest(unittest.TestCase):
         observe = self.observe_function()
         self.assertIn("LLAMA_MEMORY_GOVERNOR_KV_RELEASE", SERVER_CONTEXT)
         self.assertIn("memory_governor_kv_release_enabled", observe)
-        self.assertIn("memory_governor_select_kv_release_candidate", observe)
+        self.assertIn("memory_governor_auction_select", observe)
+        self.assertIn("memory_governor_is_kv_release_candidate", observe)
         self.assertIn("llama_kv_action::evaluate", observe)
         self.assertIn("llama_kv_action::release", observe)
-        self.assertIn("telemetry->state != kv_pressure_state::PRESSURE", observe)
+        self.assertIn("effective_pressure_state != kv_pressure_state::PRESSURE", observe)
         self.assertIn("memory_governor_kv_release_next_sample", observe)
 
     def test_kv_offload_is_gated_release_first_and_seq_scoped(self):
         observe = self.observe_function()
         self.assertIn("LLAMA_MEMORY_GOVERNOR_KV_OFFLOAD", SERVER_CONTEXT)
         self.assertIn("memory_governor_kv_offload_enabled", observe)
-        self.assertIn("memory_governor_select_kv_offload_candidate", observe)
+        self.assertIn("memory_governor_auction_select", observe)
+        self.assertIn("memory_governor_is_kv_offload_candidate", observe)
         self.assertIn('"kv_sequence"', observe)
         self.assertIn('"offload"', observe)
         self.assertIn("release_disabled", observe)
         self.assertIn("release_cooldown", observe)
         self.assertIn("pressure_satisfied", observe)
+        self.assertIn("memory_governor_slot_state_offload", SERVER_CONTEXT)
+        self.assertIn("slot_state_offload_submitted", SERVER_CONTEXT)
+        self.assertIn("slot_state_offload_fallback", observe)
+        self.assertIn("slot_state_offload_needed", observe)
+        self.assertIn("!slot_state_offload_needed", observe)
+        self.assertIn("kv_offload_result.backend = \"slot_state\"", observe)
         self.assertIn("kv_release_result.relieved_bytes", observe)
         self.assertIn("llama_kv_action::offload", observe)
         self.assertIn("selected.id", observe)
@@ -122,6 +177,26 @@ class MemoryGovernorObserveStaticTest(unittest.TestCase):
     def test_prefetch_budget_is_unified_across_dense_moe_and_kv_resume(self):
         observe = self.observe_function()
         self.assertIn("LLAMA_MEMORY_GOVERNOR_PREFETCH_BUDGET_MB_PER_TICK", SERVER_CONTEXT)
+        self.assertIn("LLAMA_MEMORY_GOVERNOR_GLOBAL_OPTIMIZER", SERVER_CONTEXT)
+        self.assertIn("LLAMA_MEMORY_GOVERNOR_HARD_HEADROOM_MB", SERVER_CONTEXT)
+        self.assertIn("LLAMA_MEMORY_GOVERNOR_MOE_FAST_START", SERVER_CONTEXT)
+        self.assertIn("LLAMA_MEMORY_GOVERNOR_MOE_WARM_MB", SERVER_CONTEXT)
+        self.assertIn("LLAMA_MEMORY_GOVERNOR_MOE_PRESSURE_SHRINK_PCT", SERVER_CONTEXT)
+        self.assertIn("LLAMA_MEMORY_GOVERNOR_MOE_PRESSURE_SHRINK_MAX_MB", SERVER_CONTEXT)
+        self.assertIn("LLAMA_MEMORY_GOVERNOR_REALLOCATION", SERVER_CONTEXT)
+        self.assertIn("LLAMA_MEMORY_GOVERNOR_REALLOCATION_APPLY_MOE", SERVER_CONTEXT)
+        self.assertIn("LLAMA_MEMORY_GOVERNOR_REALLOCATION_CONFIRM", SERVER_CONTEXT)
+        self.assertIn("LLAMA_MEMORY_GOVERNOR_REALLOCATION_CONFIRM_SLACK_MB", SERVER_CONTEXT)
+        self.assertIn("LLAMA_MEMORY_GOVERNOR_REALLOCATION_CREDIT_CAP_MB", SERVER_CONTEXT)
+        self.assertIn("LLAMA_MEMORY_GOVERNOR_REALLOCATION_MAX_GRANT_MB", SERVER_CONTEXT)
+        self.assertIn("LLAMA_MEMORY_GOVERNOR_REALLOCATION_MIN_GRANT_MB", SERVER_CONTEXT)
+        self.assertIn("LLAMA_MEMORY_GOVERNOR_REALLOCATION_HARD_GUARD_MB", SERVER_CONTEXT)
+        self.assertIn("reallocation_reason = \"moe_credit_grant\"", observe)
+        self.assertIn("reallocation_credit_earned_bytes", observe)
+        self.assertIn("reallocation_moe_grant_bytes", observe)
+        self.assertIn("moe_budget_reason = \"fast_start\"", observe)
+        self.assertIn("moe_budget_reason = \"pressure_smooth\"", observe)
+        self.assertIn("moe_budget_reason = thrash ? \"thrash_headroom\" : \"headroom_probe\"", observe)
         self.assertIn("memory_governor_prefetch_budget_enabled", observe)
         self.assertIn("llama_flex_set_prefetch_budget", observe)
         self.assertIn("llama_moe_buffer_set_prefetch_budget", observe)
