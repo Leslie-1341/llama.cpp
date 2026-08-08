@@ -911,11 +911,6 @@ llama_kv_cache::llama_kv_cache(
         const char * LLAMA_KV_PAGED_SWAP_EXPLICIT_ONLY = std::getenv("LLAMA_KV_PAGED_SWAP_EXPLICIT_ONLY");
         const char * LLAMA_KV_PAGED_TRACE      = std::getenv("LLAMA_KV_PAGED_TRACE");
         const char * LLAMA_KV_PAGED_IDLE_TRACE = std::getenv("LLAMA_KV_PAGED_IDLE_TRACE");
-        const char * LLAMA_KV_PAGED_IDLE_SWAP  = std::getenv("LLAMA_KV_PAGED_IDLE_SWAP");
-        const char * LLAMA_KV_PAGED_IDLE_SWAP_MADVISE = std::getenv("LLAMA_KV_PAGED_IDLE_SWAP_MADVISE");
-        const char * LLAMA_KV_PAGED_IDLE_SWAP_EVERY_TOKENS = std::getenv("LLAMA_KV_PAGED_IDLE_SWAP_EVERY_TOKENS");
-        const char * LLAMA_KV_PAGED_IDLE_SWAP_MAX_BLOCKS_PER_STEP = std::getenv("LLAMA_KV_PAGED_IDLE_SWAP_MAX_BLOCKS_PER_STEP");
-        const char * LLAMA_KV_PAGED_IDLE_SWAP_MIN_IDLE_STEPS = std::getenv("LLAMA_KV_PAGED_IDLE_SWAP_MIN_IDLE_STEPS");
         const char * LLAMA_KV_PAGED_SHADOW_VALIDATE = std::getenv("LLAMA_KV_PAGED_SHADOW_VALIDATE");
         const char * LLAMA_KV_PAGED_MINCORE = std::getenv("LLAMA_KV_PAGED_MINCORE");
         const char * LLAMA_KV_PAGED_IO_STATS                = std::getenv("LLAMA_KV_PAGED_IO_STATS");
@@ -933,17 +928,15 @@ llama_kv_cache::llama_kv_cache(
         const bool paged_swap_env = LLAMA_KV_PAGED_SWAP && std::strcmp(LLAMA_KV_PAGED_SWAP, "1") == 0;
         const bool paged_swap_explicit_only_env = LLAMA_KV_PAGED_SWAP_EXPLICIT_ONLY &&
             std::strcmp(LLAMA_KV_PAGED_SWAP_EXPLICIT_ONLY, "1") == 0;
-        const bool idle_swap_env  = LLAMA_KV_PAGED_IDLE_SWAP && std::strcmp(LLAMA_KV_PAGED_IDLE_SWAP, "1") == 0;
-        const bool idle_swap_madvise_env = LLAMA_KV_PAGED_IDLE_SWAP_MADVISE && std::strcmp(LLAMA_KV_PAGED_IDLE_SWAP_MADVISE, "1") == 0;
-        paged_dynamic_swap_requested = paged_swap_env || idle_swap_env;
-        paged_dynamic_madvise_requested = idle_swap_madvise_env;
+        // Cleanup-C4A: production OFFLOAD authority is now exclusively the
+        // server/Governor -> execute_action(OFFLOAD) path. The legacy idle-swap
+        // env family only fed an automatic positional OFFLOAD decision closure
+        // (cadence / idle eligibility / candidate selection / direct
+        // state-changing swap-out) that is removed in this cleanup; the env
+        // vars are no longer consulted.
+        paged_dynamic_swap_requested = paged_swap_env;
+        paged_dynamic_madvise_requested = false;
         const bool paged_test_mode = LLAMA_KV_TEST_MODE && std::strcmp(LLAMA_KV_TEST_MODE, "1") == 0;
-        const long idle_swap_every_tokens_env =
-            LLAMA_KV_PAGED_IDLE_SWAP_EVERY_TOKENS ? std::atol(LLAMA_KV_PAGED_IDLE_SWAP_EVERY_TOKENS) : 1;
-        const long idle_swap_max_blocks_env =
-            LLAMA_KV_PAGED_IDLE_SWAP_MAX_BLOCKS_PER_STEP ? std::atol(LLAMA_KV_PAGED_IDLE_SWAP_MAX_BLOCKS_PER_STEP) : 0;
-        const long idle_swap_min_idle_steps_env =
-            LLAMA_KV_PAGED_IDLE_SWAP_MIN_IDLE_STEPS ? std::atol(LLAMA_KV_PAGED_IDLE_SWAP_MIN_IDLE_STEPS) : 0;
 
         if (block_size_env <= 0 ||
                 !ggml_is_power_of_2(block_size_env) ||
@@ -971,12 +964,7 @@ llama_kv_cache::llama_kv_cache(
             }
             paged_init(kv_size);
             paged_swap_enabled = paged_swap_env;
-            paged_swap_explicit_only = paged_swap_env && paged_swap_explicit_only_env && !idle_swap_env;
-            paged_idle_swap_requested = idle_swap_env;
-            paged_idle_swap_madvise_requested = idle_swap_madvise_env;
-            paged_idle_swap_every_tokens = idle_swap_every_tokens_env > 0 ? (uint64_t) idle_swap_every_tokens_env : 1;
-            paged_idle_swap_max_blocks_per_step = idle_swap_max_blocks_env > 0 ? (uint64_t) idle_swap_max_blocks_env : 0;
-            paged_idle_swap_min_idle_steps = idle_swap_min_idle_steps_env > 0 ? (uint64_t) idle_swap_min_idle_steps_env : 0;
+            paged_swap_explicit_only = paged_swap_env && paged_swap_explicit_only_env;
             paged_shadow_validate_enabled =
                 LLAMA_KV_PAGED_SHADOW_VALIDATE &&
                 std::strcmp(LLAMA_KV_PAGED_SHADOW_VALIDATE, "1") == 0;
@@ -1059,14 +1047,8 @@ llama_kv_cache::llama_kv_cache(
             if (paged_restore_k2_enabled) {
                 LLAMA_LOG_INFO("%s: KV paged restore K2 bounded two-stage pipeline enabled\n", __func__);
             }
-            if (paged_swap_explicit_only_env && idle_swap_env) {
-                LLAMA_LOG_WARN("%s: LLAMA_KV_PAGED_SWAP_EXPLICIT_ONLY=1 conflicts with "
-                        "LLAMA_KV_PAGED_IDLE_SWAP=1; explicit-only mode disabled\n", __func__);
-            } else if (paged_swap_explicit_only) {
+            if (paged_swap_explicit_only) {
                 LLAMA_LOG_INFO("%s: KV paged swap explicit-only mode enabled\n", __func__);
-            }
-            if (paged_idle_swap_requested) {
-                LLAMA_LOG_INFO("%s: KV paged idle swap requested (safe-candidate probe only)\n", __func__);
             }
         }
     }
@@ -3033,6 +3015,8 @@ llama_kv_runtime_capability llama_kv_cache::get_kv_runtime_capability() const {
     const bool swap_ready = backing_ready;
     const bool action_ready = !paged_write_context_invalid && !write_transaction_open;
 
+    // Explicit-only remains a capability fact. The removed automatic window was
+    // gated by !kv->paged_swap_explicit_only; execute_action(OFFLOAD) is not.
     return {
         n_seq_max,
         n_stream,
@@ -3043,7 +3027,7 @@ llama_kv_runtime_capability llama_kv_cache::get_kv_runtime_capability() const {
         swap_ready && action_ready,
         swap_ready && action_ready,
         backing_ready,
-        backing_ready && paged_swap_explicit_only && !paged_idle_swap_requested,
+        backing_ready && paged_swap_explicit_only,
     };
 }
 
@@ -4090,8 +4074,6 @@ void llama_kv_cache::paged_reset() {
     paged_build_block_table();
     paged_release_scan_reset();
     paged_blocks_in_use = 0;
-    paged_swap_pending = false;
-    paged_swap_pending_n_kv = 0;
 }
 
 void llama_kv_cache::paged_build_block_table() {
@@ -4636,38 +4618,6 @@ bool llama_kv_cache::paged_check_read_resident_impl(uint32_t phys_cell, bool req
     }
 
     return !has_paged_swap_error();
-}
-
-void llama_kv_cache::paged_swap_out_window(uint32_t n_kv) {
-    if (!kv_paged_enabled || !paged_swap_enabled) {
-        return;
-    }
-    if (paged_swap_explicit_only || paged_idle_swap_requested) {
-        paged_swap_window_skipped += 1;
-        return;
-    }
-
-    if (!kv_swap_store || v_trans || n_stream != 1 || paged_block_size == 0 || paged_n_blocks == 0 ||
-            paged_block_states.size() != paged_n_blocks) {
-        paged_swap_window_skipped += 1;
-        return;
-    }
-
-    const uint32_t sink_blocks = 1;
-    const uint32_t window_blocks = 1;
-    const uint32_t n_kv_blocks = (n_kv + paged_block_size - 1) / paged_block_size;
-    if (n_kv_blocks <= sink_blocks + window_blocks) {
-        paged_swap_window_skipped += 1;
-        return;
-    }
-
-    const uint32_t begin = std::min<uint32_t>(sink_blocks, paged_n_blocks);
-    const uint32_t end = std::min<uint32_t>(n_kv_blocks - window_blocks, paged_n_blocks);
-    for (uint32_t physical_block = begin; physical_block < end; ++physical_block) {
-        if (paged_block_states[physical_block] == paged_block_state::RESIDENT) {
-            paged_swap_out_block(physical_block);
-        }
-    }
 }
 
 void llama_kv_cache::paged_swap_out_block(
@@ -6031,7 +5981,7 @@ void llama_kv_cache::paged_log_base_timing() const {
             (unsigned long long) paged_base_timing_apply_ubatch_us,
             (unsigned long long) paged_base_timing_note_cells_us,
             (unsigned long long) paged_base_timing_assert_identity_us,
-            (unsigned long long) paged_base_timing_swap_out_window_us,
+            (unsigned long long) 0,
             (unsigned long long) paged_base_timing_clear_frontier_us,
             (unsigned long long) paged_base_timing_madvise_tail_us,
             (unsigned long long) paged_base_timing_set_row_idx_calls,
@@ -6187,13 +6137,13 @@ void llama_kv_cache::paged_log_stats() const {
             (unsigned long long) paged_idle_cold_not_in_read_window,
             (unsigned long long) paged_idle_skip_mixed_active,
             (unsigned long long) paged_idle_safe_swap_candidates,
-            paged_idle_swap_enabled ? 1 : 0,
-            (unsigned long long) paged_idle_swap_candidates,
-            (unsigned long long) paged_idle_swap_out_calls,
-            (unsigned long long) paged_idle_swap_skip_not_remapped,
-            (unsigned long long) paged_idle_swap_skip_not_resident,
-            (unsigned long long) paged_idle_swap_skip_protected,
-            (unsigned long long) paged_idle_swap_skip_deferred,
+            0,
+            (unsigned long long) 0,
+            (unsigned long long) 0,
+            (unsigned long long) 0,
+            (unsigned long long) 0,
+            (unsigned long long) 0,
+            (unsigned long long) 0,
             paged_nonidentity_probe_enabled ? 1 : 0,
             (unsigned long long) paged_nonidentity_remap_rows,
             (unsigned long long) paged_nonidentity_remap_blocks,
@@ -6242,7 +6192,7 @@ void llama_kv_cache::paged_log_stats() const {
             (unsigned long long) paged_swap_bytes_in,
             paged_swap_in_last_block,
             (unsigned long long) paged_swap_backend_failures,
-            (unsigned long long) paged_swap_window_skipped,
+            (unsigned long long) 0,
             (unsigned long long) paged_swap_read_swapped_hits,
             (unsigned long long) paged_swap_read_swap_in_calls,
             (unsigned long long) paged_swap_read_swap_in_failures,
@@ -7951,9 +7901,6 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
     }
     const bool timing_enabled = paged_resume_timing_enabled || paged_resume_timing_step_enabled;
     const uint64_t step = paged_trace_step;
-    const bool idle_swap_maintenance_due =
-        paged_idle_swap_every_tokens <= 1 ||
-        (paged_trace_step % paged_idle_swap_every_tokens) == 0;
     const uint64_t set_input_start_us = timing_enabled ? llama_paged_timing_now_us() : 0;
     const uint64_t idle_maintenance_us_before = paged_timing_idle_maintenance_us;
     const uint64_t swap_out_us_before = paged_timing_swap_out_us;
@@ -8035,33 +7982,6 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
     }
     const bool nonidentity_probe = paged_nonidentity_probe_requested;
     paged_nonidentity_probe_enabled = nonidentity_probe;
-
-    // Stage 10-E-F: idle swap execution no longer depends on the idle-trace print
-    // flag. LLAMA_KV_PAGED_IDLE_TRACE only gates the per-step KV_PAGED_IDLE_TRACE
-    // diagnostic line below; whether idle swap-out / madvise actually run is decided
-    // here from the functional prerequisites alone.
-    const bool idle_swap_ready =
-        paged_idle_swap_requested &&
-        paged_swap_enabled &&
-        kv_swap_store &&
-        nonidentity_probe;
-    paged_idle_swap_enabled = idle_swap_ready;
-    if (paged_idle_swap_requested && !idle_swap_ready && !paged_idle_swap_warned) {
-        LLAMA_LOG_WARN("%s: LLAMA_KV_PAGED_IDLE_SWAP=1 requires LLAMA_KV_PAGED_SWAP=1, "
-                "LLAMA_KV_PAGED_GATHER_NONIDENTITY=1, and a backing store; "
-                "idle swap disabled for this run\n", __func__);
-        paged_idle_swap_warned = true;
-    }
-
-    const bool idle_swap_madvise_ready = idle_swap_ready && paged_idle_swap_madvise_requested;
-    paged_idle_swap_madvise_enabled = idle_swap_madvise_ready;
-    if (paged_idle_swap_madvise_requested && !idle_swap_madvise_ready && !paged_idle_swap_madvise_warned) {
-        LLAMA_LOG_WARN("%s: LLAMA_KV_PAGED_IDLE_SWAP_MADVISE=1 requires idle swap ready "
-                "(LLAMA_KV_PAGED_IDLE_SWAP=1, LLAMA_KV_PAGED_SWAP=1, LLAMA_KV_PAGED_GATHER_NONIDENTITY=1, "
-                "and a backing store); idle swap madvise disabled for this run\n",
-                __func__);
-        paged_idle_swap_madvise_warned = true;
-    }
 
     const bool swapped_redirect_active =
         paged_block_size != 0 &&
@@ -8615,8 +8535,7 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                 if (!masked) {
                     paged_nonidentity_skip_not_masked += 1;
                 } else if (block >= paged_block_states.size() ||
-                        (paged_block_states[block] != paged_block_state::RESIDENT &&
-                         !(idle_swap_ready && paged_block_states[block] == paged_block_state::SWAPPED))) {
+                        paged_block_states[block] != paged_block_state::RESIDENT) {
                     paged_nonidentity_skip_not_resident += 1;
                 } else if (dummy_phys == PAGED_BLOCK_INVALID ||
                         dummy_phys > (uint32_t) std::numeric_limits<int32_t>::max()) {
@@ -8680,11 +8599,8 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
 
     uint64_t prefetch_protected_blocks_this_call = 0;
     uint64_t swapout_deferred_blocks_this_call = 0;
-    // Stage 10-E-F: idle maintenance (block analysis, safe-swap-candidate computation,
-    // prefetch-protection / defer checks, idle swap-out and madvise) is an execution path
-    // and must run whenever idle swap is requested OR diagnostics are on. The per-step
-    // KV_PAGED_IDLE_TRACE print is gated separately, inside this block.
-    const bool idle_maintenance_active = paged_idle_trace_enabled || paged_idle_swap_requested;
+    // Idle-sequence age/last-use facts and the existing idle trace remain telemetry-only.
+    const bool idle_maintenance_active = paged_idle_trace_enabled;
     if (idle_maintenance_active) {
         const uint64_t idle_maintenance_start_us = timing_enabled ? llama_paged_timing_now_us() : 0;
         const uint64_t idle_step = paged_idle_active_seq_steps;
@@ -8747,23 +8663,10 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
         uint64_t cold_not_in_read_window = 0;
         uint64_t skip_mixed_active = 0;
         uint64_t safe_swap_candidates = 0;
-        uint64_t nonidentity_remapped_this_round = 0;
-        uint64_t per_block_bytes = 0;
-        uint64_t idle_swap_out_attempts_this_call = 0;
         // Stage 5E-1: mincore window locals, hoisted so the post-loop latch can read them.
         uint64_t mincore_resident_before_loop = 0;
-        uint64_t mincore_madvise_calls_before = paged_swap_madvise_calls;
-        if (idle_swap_maintenance_due && paged_block_size != 0 && paged_n_blocks != 0 && !v_cells.empty()) {
-            for (const auto & layer : layers) {
-                if (!layer.k_stream.empty() && layer.k_stream[0]) {
-                    per_block_bytes += (uint64_t) layer.k_stream[0]->nb[1];
-                }
-                if (layer.v && !layer.v_stream.empty() && layer.v_stream[0]) {
-                    per_block_bytes += (uint64_t) layer.v_stream[0]->nb[1];
-                }
-            }
-            per_block_bytes *= paged_block_size;
-
+        const uint64_t mincore_madvise_calls_before = paged_swap_madvise_calls;
+        if (paged_idle_trace_enabled && paged_block_size != 0 && paged_n_blocks != 0 && !v_cells.empty()) {
             const auto & cells = v_cells[0];
             std::vector<std::bitset<LLAMA_MAX_SEQ>> block_seq((size_t) paged_n_blocks);
             // Stage 7C-G: per-block "true active-needed unmasked" bit, computed from the
@@ -8803,12 +8706,10 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                 }
             }
 
-            // Stage 5E-1: read-only KV resident sampling. prefill snapshot is recorded once at
-            // the first idle-trace step that reaches here. before_madvise/after_madvise latch the
-            // resident level around the step that actually performs idle swap-out + madvise (gated
-            // on paged_swap_madvise_calls growing), so the printed window reflects a real madvise
-            // drop rather than a later step where no block was advised.
-            mincore_madvise_calls_before = paged_swap_madvise_calls;
+            // Stage 5E-1: read-only KV resident sampling. The prefill snapshot is recorded once
+            // at the first idle-trace step that reaches here; before_madvise/after_madvise latch
+            // around any observed madvise activity so the physical-relief window remains available
+            // to diagnostics and explicit Governor actions.
             if (paged_mincore_enabled) {
                 mincore_resident_before_loop = paged_sample_mincore();
                 if (!paged_mincore_prefill_set) {
@@ -8817,11 +8718,7 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                 }
             }
 
-            bool idle_swap_budget_exhausted = false;
             for (uint32_t block = 0; block < block_seq.size(); ++block) {
-                if (idle_swap_budget_exhausted) {
-                    break;
-                }
                 const auto & owner = block_seq[block];
                 if (owner.none()) {
                     continue;
@@ -8855,9 +8752,8 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                     if (trace_read_blocks_before_remap.find(block) != trace_read_blocks_before_remap.end() ||
                             trace_read_blocks.find(block) != trace_read_blocks.end()) {
                         // Stage 7C-G: diagnostic only. This counts active-owned blocks that
-                        // also appear in the full-prefix read window. It does NOT gate
-                        // swap-out (the only swap-out path is the idle-only branch below);
-                        // it stays for continuity with earlier-stage trace comparisons.
+                        // also appear in the full-prefix read window; it does not gate any
+                        // lifecycle action and remains for continuity with earlier trace comparisons.
                         paged_swap_out_skip_active_visible_block += 1;
                     }
                 }
@@ -8893,100 +8789,13 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                 if (block < paged_block_states.size() &&
                         paged_block_states[block] == paged_block_state::RESIDENT) {
                     safe_swap_candidates += 1;
-                    if (nonidentity_remapped_blocks.find(block) != nonidentity_remapped_blocks.end()) {
-                        nonidentity_remapped_this_round += 1;
-                    }
-                    if (paged_idle_swap_requested) {
-                        paged_idle_swap_candidates += 1;
-                        paged_swap_out_candidate_blocks += 1;
-                        const bool in_read_window =
-                            trace_read_blocks_before_remap.find(block) != trace_read_blocks_before_remap.end() ||
-                            trace_read_blocks.find(block) != trace_read_blocks.end();
-                        // Stage 6C-1A: never swap out a block owned (even partially) by a
-                        // prefetch-protected / resume-pending seq, else interleaved prefetch
-                        // gets undone by this same idle gate within the active-decode window.
-                        if ((owner & paged_prefetch_protected_seq).any()) {
-                            paged_idle_swap_skip_protected += 1;
-                        } else if (!idle_swap_ready ||
-                                nonidentity_remapped_blocks.find(block) == nonidentity_remapped_blocks.end()) {
-                            paged_idle_swap_skip_not_remapped += 1;
-                        } else if (paged_block_states[block] != paged_block_state::RESIDENT) {
-                            paged_idle_swap_skip_not_resident += 1;
-                        } else if ((owner & active_seq).any()) {
-                            // Defensive: owner aggregates physical-cell seq ownership for this
-                            // block, so an active bit here means a physical cell really belongs
-                            // to an active seq. (only_seen_idle_seq already excludes this, so it
-                            // should be 0; kept as a true-active-owned hard skip + telemetry.)
-                            paged_swap_out_skip_active_owned_block += 1;
-                            paged_swap_out_skip_true_active_owned += 1;
-                            paged_swapped_active_violation_block_had_active_owner_at_swapout += 1;
-                        } else if (block_active_unmasked[block]) {
-                            // Stage 7C-G: the only correctness-mandated hard skip. A physical
-                            // cell in this block is owned by an active seq AND unmasked vs that
-                            // seq's pos_max, so swapping it out would hide an active-needed row.
-                            paged_swap_out_skip_true_active_unmasked += 1;
-                            paged_swap_out_skip_active_visible_block += 1;
-                        } else {
-                            if (paged_idle_swap_min_idle_steps > 0) {
-                                bool old_enough = true;
-                                for (llama_seq_id seq_id = 0; seq_id < LLAMA_MAX_SEQ; ++seq_id) {
-                                    if (!owner.test(seq_id)) {
-                                        continue;
-                                    }
-                                    if (!paged_idle_seq_seen.test(seq_id) ||
-                                            idle_step < paged_idle_seq_last_active_step[seq_id] ||
-                                            idle_step - paged_idle_seq_last_active_step[seq_id] < paged_idle_swap_min_idle_steps) {
-                                        old_enough = false;
-                                        break;
-                                    }
-                                }
-                                if (!old_enough) {
-                                    paged_idle_swap_skip_min_idle += 1;
-                                    continue;
-                                }
-                            }
-                            // Stage 7C-G: idle-only block with no true active-needed unmasked
-                            // cell. 7C-F skipped this whenever `in_read_window` was set, which
-                            // covered the entire full-prefix gather and killed all swap-out. The
-                            // full-prefix read window is NOT a correctness signal: those idle
-                            // rows are masked / redirected to the dummy row in the row_idx pass,
-                            // so the SWAPPED pages are never faulted back. Swap it out.
-                            if (in_read_window) {
-                                paged_swap_out_skip_fullprefix_read_window_only += 1;
-                            }
-                            if (defer_idle_swapout_now) {
-                                paged_idle_swap_skip_deferred += 1;
-                                swapout_deferred_blocks_this_call += 1;
-                            } else {
-                                if (paged_idle_swap_max_blocks_per_step > 0 &&
-                                        idle_swap_out_attempts_this_call >= paged_idle_swap_max_blocks_per_step) {
-                                    idle_swap_budget_exhausted = true;
-                                    break;
-                                }
-                                idle_swap_out_attempts_this_call += 1;
-                                const uint64_t before = paged_swap_out_calls;
-                                paged_swap_out_block(block, idle_swap_madvise_ready);
-                                if (paged_swap_out_calls > before) {
-                                    paged_idle_swap_out_calls += 1;
-                                    paged_swap_out_allowed_blocks += 1;
-                                }
-                                if (paged_idle_swap_max_blocks_per_step > 0 &&
-                                        idle_swap_out_attempts_this_call >= paged_idle_swap_max_blocks_per_step) {
-                                    idle_swap_budget_exhausted = true;
-                                }
-                            }
-                        }
-                    }
                 }
             }
-        }
-        // Stage 5E-1: if this step actually advised any block away (madvise_calls grew), latch the
-        // before/after resident snapshots for the madvise window. Steps that swapped nothing leave
-        // the prior window intact, so the printed madvise_drop reflects a real release.
-        if (paged_mincore_enabled && paged_swap_madvise_calls > mincore_madvise_calls_before) {
-            paged_mincore_before_madvise_resident_bytes = mincore_resident_before_loop;
-            paged_mincore_before_madvise_set = true;
-            paged_mincore_after_madvise_resident_bytes = paged_sample_mincore();
+            if (paged_mincore_enabled && paged_swap_madvise_calls > mincore_madvise_calls_before) {
+                paged_mincore_before_madvise_resident_bytes = mincore_resident_before_loop;
+                paged_mincore_before_madvise_set = true;
+                paged_mincore_after_madvise_resident_bytes = paged_sample_mincore();
+            }
         }
         paged_idle_non_empty_blocks = non_empty_blocks;
         paged_idle_single_seq_blocks = single_seq_blocks;
@@ -9003,8 +8812,9 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
         paged_nonidentity_cold_in_read_window_after = cold_in_read_window;
         paged_nonidentity_safe_candidates_after = safe_swap_candidates;
 
-        // Stage 10-E-F: per-step diagnostic line only. Execution (swap-out, madvise,
-        // counter updates, mincore snapshots above) is unconditional within this block.
+        // Cleanup-C4A: the cadence/idle candidate scan remains only as the
+        // existing IDLE_TRACE telemetry producer; its automatic OFFLOAD
+        // consumer and direct state-changing swap-out were removed.
         if (paged_idle_trace_enabled) {
         fprintf(stderr,
                 "KV_PAGED_IDLE_TRACE step=%llu active_seq_source=%s active_seq_count=%llu "
@@ -9063,13 +8873,13 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                 (unsigned long long) paged_idle_cold_not_in_read_window,
                 (unsigned long long) paged_idle_skip_mixed_active,
                 (unsigned long long) paged_idle_safe_swap_candidates,
-                paged_idle_swap_enabled ? 1 : 0,
-                (unsigned long long) paged_idle_swap_candidates,
-                (unsigned long long) paged_idle_swap_out_calls,
-                (unsigned long long) paged_idle_swap_skip_not_remapped,
-                (unsigned long long) paged_idle_swap_skip_not_resident,
-                (unsigned long long) paged_idle_swap_skip_protected,
-                (unsigned long long) paged_idle_swap_skip_deferred,
+                0,
+                (unsigned long long) 0,
+                (unsigned long long) 0,
+                (unsigned long long) 0,
+                (unsigned long long) 0,
+                (unsigned long long) 0,
+                (unsigned long long) 0,
                 paged_nonidentity_probe_enabled ? 1 : 0,
                 (unsigned long long) paged_nonidentity_remap_rows,
                 (unsigned long long) paged_nonidentity_remap_blocks,
@@ -9103,7 +8913,7 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                 (unsigned long long) paged_idle_only_swapped_blocks,
                 (unsigned long long) paged_write_to_swapped_block,
                 (unsigned long long) paged_write_to_swapped_block_seq,
-                paged_idle_swap_madvise_enabled ? 1 : 0,
+                0,
                 (unsigned long long) paged_swap_madvise_calls,
                 (unsigned long long) paged_swap_madvise_bytes,
                 (unsigned long long) paged_swap_madvise_failures,
@@ -10361,17 +10171,6 @@ bool llama_kv_cache_context::apply() {
         kv->paged_base_timing_apply_calls += 1;
     }
 
-    if (kv->paged_swap_pending) {
-        const uint32_t pending_n_kv = kv->paged_swap_pending_n_kv;
-        kv->paged_swap_pending = false;
-        kv->paged_swap_pending_n_kv = 0;
-        const uint64_t t0 = base_timing_enabled ? llama_paged_timing_now_us() : 0;
-        kv->paged_swap_out_window(pending_n_kv);
-        if (base_timing_enabled) {
-            kv->paged_base_timing_swap_out_window_us += llama_paged_timing_now_us() - t0;
-        }
-    }
-
     uint64_t t0 = base_timing_enabled ? llama_paged_timing_now_us() : 0;
     paged_write_failure_handled = false;
     paged_write_metadata_deltas.clear();
@@ -10506,9 +10305,6 @@ bool llama_kv_cache_context::apply() {
     if (base_timing_enabled) {
         kv->paged_base_timing_apply_paged_total_us += llama_paged_timing_now_us() - apply_paged_start_us;
     }
-    kv->paged_swap_pending = kv->paged_swap_enabled &&
-        !kv->paged_swap_explicit_only && !kv->paged_idle_swap_requested;
-    kv->paged_swap_pending_n_kv = n_kv;
 
     return true;
 }

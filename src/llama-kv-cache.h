@@ -799,8 +799,6 @@ public:
         return result;
     }
 
-    void paged_swap_out_window(uint32_t n_kv);
-
     // stage P2: clear-frontier. When LLAMA_KV_LAZY_CLEAR=1 (and !v_trans && n_stream==1),
     // the construction-time full buffer clear is replaced by clearing only the [0, clear_frontier)
     // prefix; the tail [clear_frontier, kv_size) is left untouched so it is never committed,
@@ -1254,7 +1252,6 @@ private:
     mutable uint64_t paged_swap_bytes_in = 0;
     mutable uint32_t paged_swap_in_last_block = PAGED_BLOCK_INVALID;
     mutable uint64_t paged_swap_backend_failures = 0;
-    mutable uint64_t paged_swap_window_skipped = 0;
     mutable uint64_t paged_swap_read_swapped_hits = 0;
     mutable uint64_t paged_swap_read_swap_in_calls = 0;
     mutable uint64_t paged_swap_read_swap_in_failures = 0;
@@ -1473,8 +1470,6 @@ private:
     mutable uint64_t paged_mincore_swapped_nonresident_bytes = 0;
     mutable uint64_t paged_mincore_swapped_resident_blocks = 0;
     mutable uint64_t paged_mincore_swapped_nonresident_blocks = 0;
-    bool     paged_swap_pending = false;
-    uint32_t paged_swap_pending_n_kv = 0;
 
     // Stage 4C-3: idle-seq and block-ownership telemetry only.
     bool     paged_idle_trace_enabled = false;
@@ -1496,7 +1491,6 @@ private:
     mutable uint64_t paged_base_timing_apply_ubatch_us = 0;
     mutable uint64_t paged_base_timing_note_cells_us = 0;
     mutable uint64_t paged_base_timing_assert_identity_us = 0;
-    mutable uint64_t paged_base_timing_swap_out_window_us = 0;
     mutable uint64_t paged_base_timing_clear_frontier_us = 0;
     mutable uint64_t paged_base_timing_madvise_tail_us = 0;
     mutable uint64_t paged_base_timing_set_row_idx_calls = 0;
@@ -1523,7 +1517,6 @@ private:
     // swap-out victim selection so interleaved prefetch is not undone by the same-step idle
     // gate. Does not change read-window / nonidentity / state-machine semantics.
     std::bitset<LLAMA_MAX_SEQ> paged_prefetch_protected_seq;
-    mutable uint64_t paged_idle_swap_skip_protected = 0;
     mutable uint64_t paged_idle_active_seq_steps = 0;
     mutable uint64_t paged_idle_active_seq_empty = 0;
     mutable uint64_t paged_idle_seq_seen_count = 0;
@@ -1541,21 +1534,6 @@ private:
     mutable uint64_t paged_idle_cold_not_in_read_window = 0;
     mutable uint64_t paged_idle_skip_mixed_active = 0;
     mutable uint64_t paged_idle_safe_swap_candidates = 0;
-    bool     paged_idle_swap_requested = false;
-    bool     paged_idle_swap_madvise_requested = false;
-    mutable bool     paged_idle_swap_enabled = false;
-    mutable bool     paged_idle_swap_madvise_enabled = false;
-    mutable bool     paged_idle_swap_warned = false;
-    mutable bool     paged_idle_swap_madvise_warned = false;
-    uint64_t paged_idle_swap_every_tokens = 1;
-    uint64_t paged_idle_swap_max_blocks_per_step = 0;
-    uint64_t paged_idle_swap_min_idle_steps = 0;
-    mutable uint64_t paged_idle_swap_candidates = 0;
-    mutable uint64_t paged_idle_swap_out_calls = 0;
-    mutable uint64_t paged_idle_swap_skip_not_remapped = 0;
-    mutable uint64_t paged_idle_swap_skip_not_resident = 0;
-    mutable uint64_t paged_idle_swap_skip_deferred = 0;
-    mutable uint64_t paged_idle_swap_skip_min_idle = 0;
     mutable int32_t  paged_defer_idle_swapout_steps = 0;
     mutable bool     paged_nonidentity_probe_enabled = false;
     mutable uint64_t paged_nonidentity_remap_rows = 0;
