@@ -75,6 +75,31 @@ static server_kv_pressure_unified_action_config enabled_config() {
     return config;
 }
 
+static server_kv_pressure_unified_action_config budget_config() {
+    auto config = enabled_config();
+    config.budget_target_enabled = true;
+    config.budget_target_bytes = 4096;
+    config.budget_basis_generation = 7;
+    config.budget_source = "env_static";
+    return config;
+}
+
+static server_kv_budget_view budget_view(uint64_t resident_bytes, bool valid = true) {
+    server_kv_budget_view view;
+    view.valid = valid;
+    view.resident_available = valid;
+    view.reclaimable_available = valid;
+    view.swapped_metadata_consistent = valid;
+    view.object_id = 11;
+    view.generation = 3;
+    view.resident_bytes = resident_bytes;
+    view.dead_resident_reclaimable_bytes = resident_bytes > 4096
+        ? resident_bytes - 4096
+        : 0;
+    view.transient_staging_bound_bytes = 1234;
+    return view;
+}
+
 static void clear_pressure_action_env() {
     unsetenv("LLAMA_KV_PRESSURE_UNIFIED_ACTION");
     unsetenv("LLAMA_KV_PRESSURE_UNIFIED_ACTION_TARGET_BYTES");
@@ -82,6 +107,8 @@ static void clear_pressure_action_env() {
     unsetenv("LLAMA_KV_PAGED_RELEASE");
     unsetenv("LLAMA_KV_PRESSURE_DRY_RUN");
     unsetenv("LLAMA_KV_PRESSURE_BOUNDED_RELEASE");
+    unsetenv("LLAMA_KV_RESIDENT_TARGET_BYTES");
+    unsetenv("LLAMA_KV_RESIDENT_TARGET_SOURCE");
 }
 
 static uint32_t release_request_count(const fake_core & core, uint64_t decision_id) {
@@ -390,6 +417,26 @@ static llama_kv_action_result no_candidate_offload(uint64_t decision_id) {
     return result;
 }
 
+static llama_kv_action_result protected_sequence_offload(uint64_t decision_id) {
+    llama_kv_action_result result;
+    result.action = llama_kv_action::offload;
+    result.decision_id = decision_id;
+    result.outcome = llama_kv_action_outcome::rejected;
+    result.reason = llama_kv_action_reason::protected_sequence;
+    result.shortfall_bytes = 4096;
+    return result;
+}
+
+static llama_kv_action_result shared_block_offload(uint64_t decision_id) {
+    llama_kv_action_result result;
+    result.action = llama_kv_action::offload;
+    result.decision_id = decision_id;
+    result.outcome = llama_kv_action_outcome::rejected;
+    result.reason = llama_kv_action_reason::shared_block;
+    result.shortfall_bytes = 4096;
+    return result;
+}
+
 static llama_kv_action_result offload_result(
         uint64_t decision_id, uint64_t bytes, bool io_failure = false) {
     llama_kv_action_result result;
@@ -449,6 +496,23 @@ static void arm_governor_offload(
     CHECK(core.requests[1].action == llama_kv_action::release);
     CHECK(result.offload_armed_after && state.offload_armed());
     CHECK(!result.observation.offload_attempted);
+}
+
+static void arm_soft_budget_offload(
+        server_kv_governor_state & state,
+        const server_kv_pressure_unified_action_config & config,
+        uint64_t sample_count,
+        uint64_t decision_id) {
+    fake_core core;
+    core.responses = { evaluation(decision_id), no_candidate_release(decision_id) };
+    const auto result = server_kv_pressure_execute_governor(
+            config, state, core.ops(), governor_pressure(sample_count, decision_id,
+                kv_pressure_state::NORMAL), {}, budget_view(12288));
+    CHECK(core.requests.size() == 2);
+    CHECK(core.requests[0].action == llama_kv_action::evaluate);
+    CHECK(core.requests[1].action == llama_kv_action::release);
+    CHECK(result.soft_offload_armed_after && state.soft_offload_armed());
+    CHECK(result.budget_debt_after_bytes == 8192);
 }
 
 static void test_governor_scores_idle_claimant_without_active_producer() {
@@ -872,6 +936,215 @@ static void test_governor_exhaustion_result_pollution_is_ignored() {
     CHECK(retried.selected_seq_id == 2);
 }
 
+static void test_v2_target_env_source_and_generation() {
+    clear_pressure_action_env();
+    std::string error;
+    const auto disabled = server_kv_resident_target_from_env(error);
+    CHECK(!disabled.valid() && error.empty());
+
+    setenv("LLAMA_KV_RESIDENT_TARGET_BYTES", "8192", 1);
+    setenv("LLAMA_KV_RESIDENT_TARGET_SOURCE", "env_static", 1);
+    error.clear();
+    const auto enabled = server_kv_resident_target_from_env(error);
+    CHECK(error.empty() && enabled.valid());
+    CHECK(enabled.target_bytes == 8192 && enabled.basis_generation == 1);
+    CHECK(std::string(enabled.source) == "env_static");
+
+    setenv("LLAMA_KV_RESIDENT_TARGET_SOURCE", "unknown", 1);
+    error.clear();
+    const auto invalid = server_kv_resident_target_from_env(error);
+    CHECK(!invalid.valid() && !error.empty());
+    clear_pressure_action_env();
+}
+
+static void test_v2_hard_pressure_wins_over_soft_budget() {
+    const auto config = budget_config();
+    server_kv_governor_state state;
+    fake_core core;
+    core.responses = { evaluation(3001), release(3001) };
+    const auto result = server_kv_pressure_execute_governor(
+            config, state, core.ops(), governor_pressure(1, 3001,
+                kv_pressure_state::PRESSURE), {}, budget_view(16384));
+    CHECK(result.budget_target_enabled && !result.budget_active);
+    CHECK(result.debt_before_bytes == 8192);
+    CHECK(result.budget_debt_before_bytes == 0);
+    CHECK(core.requests.size() == 2);
+    CHECK(core.requests[0].action == llama_kv_action::evaluate);
+    CHECK(core.requests[1].action == llama_kv_action::release);
+    CHECK(!state.soft_offload_armed() && state.budget_debt_bytes() == 0);
+    for (const auto & request : core.requests) {
+        CHECK(request.action != llama_kv_action::prefetch);
+        CHECK(!request.correctness_required);
+    }
+}
+
+static void test_v2_soft_release_then_later_offload() {
+    const auto config = budget_config();
+    server_kv_governor_state state;
+
+    fake_core first;
+    first.responses = { evaluation(3011), release(3011) };
+    const auto first_result = server_kv_pressure_execute_governor(
+            config, state, first.ops(), governor_pressure(1, 3011,
+                kv_pressure_state::NORMAL), {}, budget_view(12288));
+    CHECK(first.requests.size() == 2 && first.requests[1].action == llama_kv_action::release);
+    CHECK(first_result.budget_active);
+    CHECK(first_result.budget_observed_excess_bytes == 8192);
+    CHECK(first_result.budget_debt_after_bytes == 4096);
+    CHECK(!first_result.soft_offload_armed_after);
+
+    fake_core second;
+    second.responses = { evaluation(3012), no_candidate_release(3012) };
+    const auto second_result = server_kv_pressure_execute_governor(
+            config, state, second.ops(), governor_pressure(2, 3012,
+                kv_pressure_state::NORMAL), {}, budget_view(8192));
+    CHECK(second.requests.size() == 2 && second.requests[1].action == llama_kv_action::release);
+    CHECK(second_result.soft_offload_armed_after && state.soft_offload_armed());
+    CHECK(second_result.budget_debt_after_bytes == 4096);
+
+    fake_core third;
+    third.responses = { evaluation(3013), offload_result(3013, 4096) };
+    const auto third_result = server_kv_pressure_execute_governor(
+            config, state, third.ops(), governor_pressure(3, 3013,
+                kv_pressure_state::NORMAL), { claimant(2) }, budget_view(8192));
+    CHECK(third.requests.size() == 2);
+    CHECK(third.requests[0].action == llama_kv_action::evaluate);
+    CHECK(third.requests[1].action == llama_kv_action::offload);
+    CHECK(third.requests[1].seq_id == 2 && third.requests[1].target_bytes == 4096);
+    CHECK(third_result.budget_debt_after_bytes == 0);
+    CHECK(!third_result.soft_offload_armed_after && !state.soft_offload_armed());
+    for (const auto & request : third.requests) {
+        CHECK(request.action != llama_kv_action::prefetch);
+        CHECK(!request.correctness_required);
+    }
+    const auto marker = server_kv_pressure_unified_action_format_marker(third_result);
+    CHECK(marker.find("budget_target_enabled=1") != std::string::npos);
+    CHECK(marker.find("budget_source=env_static") != std::string::npos);
+    CHECK(marker.find("budget_debt_after_bytes=0") != std::string::npos);
+    CHECK(marker.find("budget_transient_staging_bound_bytes=1234") != std::string::npos);
+}
+
+static void test_v2_unmet_budget_terminates_correctness_protected_chasing() {
+    const auto config = budget_config();
+    server_kv_governor_state state;
+
+    fake_core arm;
+    arm.responses = { evaluation(3021), no_candidate_release(3021) };
+    server_kv_pressure_execute_governor(
+            config, state, arm.ops(), governor_pressure(1, 3021,
+                kv_pressure_state::NORMAL), {}, budget_view(12288));
+    CHECK(state.soft_offload_armed());
+
+    fake_core terminal;
+    terminal.responses = { evaluation(3022) };
+    const std::vector<server_kv_claimant_snapshot> protected_claimants = {
+        claimant(1, true), claimant(2, false, true), claimant(3, false, false, true),
+    };
+    const auto result = server_kv_pressure_execute_governor(
+            config, state, terminal.ops(), governor_pressure(2, 3022,
+                kv_pressure_state::NORMAL), protected_claimants, budget_view(12288));
+    CHECK(terminal.requests.size() == 1);
+    CHECK(!result.observation.offload_attempted);
+    CHECK(std::string(result.observation.reason) == "budget_unmet_terminal");
+    CHECK(result.unmet_budget_bytes_after == 8192);
+    CHECK(state.unmet_budget_bytes() == 8192);
+    CHECK(!state.idle_follow_up_pending());
+    for (const auto & request : terminal.requests) {
+        CHECK(request.action != llama_kv_action::prefetch);
+        CHECK(!request.correctness_required);
+    }
+
+    fake_core held;
+    const auto held_result = server_kv_pressure_execute_governor(
+            config, state, held.ops(), governor_pressure(3, 3023,
+                kv_pressure_state::NORMAL), protected_claimants, budget_view(12288));
+    CHECK(held.requests.empty());
+    CHECK(std::string(held_result.observation.reason) == "budget_unmet_hold");
+}
+
+static void test_v2_invalid_budget_view_fails_closed() {
+    const auto config = budget_config();
+    server_kv_governor_state state;
+    fake_core core;
+    const auto result = server_kv_pressure_execute_governor(
+            config, state, core.ops(), governor_pressure(1, 3031,
+                kv_pressure_state::NORMAL), { claimant(1) }, budget_view(16384, false));
+    CHECK(core.requests.empty());
+    CHECK(!result.budget_active);
+    CHECK(std::string(result.observation.reason) == "budget_view_unavailable");
+    CHECK(state.budget_debt_bytes() == 0);
+}
+
+static void test_v2_invalid_pressure_basis_holds_soft_state() {
+    const auto config = budget_config();
+    server_kv_governor_state state;
+    arm_soft_budget_offload(state, config, 1, 3041);
+    const uint64_t debt = state.budget_debt_bytes();
+    const uint64_t next_sample = state.budget_next_action_sample();
+
+    auto invalid_basis = governor_pressure(2, 3042, kv_pressure_state::NORMAL);
+    invalid_basis.pressure_basis_valid = false;
+    fake_core core;
+    const auto result = server_kv_pressure_execute_governor(
+            config, state, core.ops(), invalid_basis, { claimant(2) }, budget_view(12288));
+    CHECK(core.requests.empty());
+    CHECK(!result.budget_active);
+    CHECK(std::string(result.observation.reason) == "invalid_basis_hold");
+    CHECK(result.budget_view_valid && result.budget_resident_available);
+    CHECK(result.budget_debt_before_bytes == debt);
+    CHECK(result.budget_debt_after_bytes == debt);
+    CHECK(state.budget_debt_bytes() == debt);
+    CHECK(state.soft_offload_armed());
+    CHECK(state.budget_next_action_sample() == next_sample);
+}
+
+static void test_v2_protected_soft_offload_becomes_unmet_terminal() {
+    const auto config = budget_config();
+    server_kv_governor_state state;
+    arm_soft_budget_offload(state, config, 1, 3051);
+
+    fake_core core;
+    core.responses = { evaluation(3052), protected_sequence_offload(3052) };
+    const auto result = server_kv_pressure_execute_governor(
+            config, state, core.ops(), governor_pressure(2, 3052,
+                kv_pressure_state::NORMAL), { claimant(2) }, budget_view(12288));
+    CHECK(core.requests.size() == 2);
+    CHECK(core.requests[1].action == llama_kv_action::offload);
+    CHECK(result.offload.reason == llama_kv_action_reason::protected_sequence);
+    CHECK(std::string(result.observation.reason) == "budget_unmet_terminal");
+    CHECK(result.unmet_budget_bytes_after == 8192);
+    CHECK(state.unmet_budget_bytes() == 8192);
+    CHECK(!state.soft_offload_armed() && !state.idle_follow_up_pending());
+    CHECK(state.budget_next_action_sample() == 2 + config.budget_unmet_backoff_samples);
+
+    fake_core held;
+    const auto held_result = server_kv_pressure_execute_governor(
+            config, state, held.ops(), governor_pressure(3, 3053,
+                kv_pressure_state::NORMAL), { claimant(2) }, budget_view(12288));
+    CHECK(held.requests.empty());
+    CHECK(std::string(held_result.observation.reason) == "budget_unmet_hold");
+}
+
+static void test_v2_shared_soft_offload_becomes_unmet_terminal() {
+    const auto config = budget_config();
+    server_kv_governor_state state;
+    arm_soft_budget_offload(state, config, 1, 3061);
+
+    fake_core core;
+    core.responses = { evaluation(3062), shared_block_offload(3062) };
+    const auto result = server_kv_pressure_execute_governor(
+            config, state, core.ops(), governor_pressure(2, 3062,
+                kv_pressure_state::NORMAL), { claimant(2) }, budget_view(12288));
+    CHECK(core.requests.size() == 2);
+    CHECK(core.requests[1].action == llama_kv_action::offload);
+    CHECK(result.offload.reason == llama_kv_action_reason::shared_block);
+    CHECK(std::string(result.observation.reason) == "budget_unmet_terminal");
+    CHECK(result.unmet_budget_bytes_after == 8192);
+    CHECK(state.unmet_budget_bytes() == 8192);
+    CHECK(!state.soft_offload_armed() && !state.idle_follow_up_pending());
+    CHECK(state.budget_next_action_sample() == 2 + config.budget_unmet_backoff_samples);
+}
+
 int main() {
     test_startup_decision_distinguishes_disabled_and_enabled();
     test_startup_decision_rejects_invalid_unified_configuration();
@@ -893,6 +1166,14 @@ int main() {
     test_governor_io_failure_backoff_and_penalty();
     test_governor_exhaustion_epoch_and_stable_noop();
     test_governor_exhaustion_result_pollution_is_ignored();
+    test_v2_target_env_source_and_generation();
+    test_v2_hard_pressure_wins_over_soft_budget();
+    test_v2_soft_release_then_later_offload();
+    test_v2_unmet_budget_terminates_correctness_protected_chasing();
+    test_v2_invalid_budget_view_fails_closed();
+    test_v2_invalid_pressure_basis_holds_soft_state();
+    test_v2_protected_soft_offload_becomes_unmet_terminal();
+    test_v2_shared_soft_offload_becomes_unmet_terminal();
 
     std::printf("server KV pressure unified action tests: %d/%d passed\n",
             tests_total - tests_failed, tests_total);

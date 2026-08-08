@@ -6905,24 +6905,47 @@ llama_kv_resident_sample llama_kv_cache::sample_kv_resident() const {
 }
 
 llama_kv_release_budget_snapshot llama_kv_cache::sample_kv_release_budget() const {
-    // Cleanup-C2 scope note: this snapshot is currently gated by
-    // bounded_release_can_enable() (which requires swap_disabled).  It is
-    // NOT a Unified Governor budget view — Governor-side execute_action(RELEASE)
-    // may proceed under swap-enabled explicit-only runtime where this snapshot
-    // returns an empty budget.  A unified budget view is owned by the parallel
-    // KV-Budget-V1 task and is out of scope for C2; do not silently widen this
-    // gate without coordinating with that task.
+    // KV-Budget-V2 (step1) reclaimable-view contract.
+    //
+    // This snapshot is the read-only dead-resident reclaimable observation that
+    // feeds the unified Governor's soft budget chain.  Cleanup-C2 gated it on
+    // bounded_release_can_enable() (which requires swap_disabled), but that gate
+    // binds the *destructive release capability* — not the *observation* — and
+    // the unified Governor runs under LLAMA_KV_PAGED_SWAP_EXPLICIT_ONLY=1 where
+    // swap is enabled and paged destructive release is disabled by policy.
+    //
+    // V2 splits the two preconditions:
+    //   (a) physical/structural — required for the read-only observation.  We
+    //       keep the same fail-closed checks used by sample_kv_physical_budget_view():
+    //       paged layout authoritative, swap-metadata integrity validated by the
+    //       ownership collector + mincore scanner, no write-context corruption.
+    //   (b) destructive capability — required only when a caller wants to
+    //       actually destructively release.  That is bounded_release_can_enable()
+    //       and is intentionally NOT consulted here.
+    //
+    // The scanner/authority is the same code path (ownership collector +
+    // resident/reclaimable range enumeration + mincore) that already feeds
+    // sample_kv_physical_budget_view(); no second candidate rule is introduced.
+    // Unavailable is fail-closed: result.valid is false and callers MUST treat
+    // the snapshot as advisory only — never coerce to 0.
     llama_kv_release_budget_snapshot result;
 #if defined(__linux__)
-    if (!bounded_release_can_enable() || paged_write_context_invalid ||
-            paged_block_states.size() != paged_n_blocks) {
+    // Structural precondition identical to sample_kv_physical_budget_view():
+    // paged layout authoritative and write-context corruption fail-closed.
+    // Candidate ownership/state eligibility is delegated to the existing
+    // read-only bounded-release scanner below; this sampler does not maintain
+    // a second candidate rule.
+    const bool paged_layout_valid = kv_paged_enabled && !v_trans && n_stream == 1 &&
+        paged_block_size != 0 && paged_n_blocks != 0 &&
+        paged_block_states.size() == paged_n_blocks && !layers.empty() &&
+        !v_cells.empty();
+    if (!paged_layout_valid || paged_write_context_invalid) {
         return result;
     }
 
-    const auto ownership = llama_kv_release_collect_ownership(
-            v_cells, paged_n_blocks, paged_block_size, PAGED_BLOCK_INVALID, LLAMA_MAX_SEQ,
-            [&](uint32_t logical_cell) { return paged_resolve(logical_cell); });
-    if (!ownership.valid) {
+    const auto dry_run = paged_release_blocks_bounded_dry_run(
+            UINT64_MAX, std::numeric_limits<uint32_t>::max());
+    if (dry_run.ownership_aborted) {
         result.ownership_aborted = true;
         return result;
     }
@@ -6950,13 +6973,12 @@ llama_kv_release_budget_snapshot llama_kv_cache::sample_kv_release_budget() cons
         add_tensor(layer.k_stream.empty() ? nullptr : layer.k_stream[0]);
         add_tensor(layer.v_stream.empty() ? nullptr : layer.v_stream[0]);
     }
-    for (uint32_t block = 0; block < paged_n_blocks; ++block) {
-        if (ownership.owned[block]) {
-            continue;
-        }
-        const paged_block_state state = paged_block_states[block];
-        if (state != paged_block_state::RESIDENT && state != paged_block_state::UNUSED) {
-            continue;
+    for (const uint32_t block : dry_run.candidate_blocks) {
+        if (block >= paged_n_blocks) {
+            // The dry-run scanner is the authority; an impossible identity is
+            // treated as corruption rather than silently ignored.
+            result.ownership_aborted = true;
+            return result;
         }
 
         for (const auto & layer : layers) {
@@ -7293,7 +7315,11 @@ llama_kv_bounded_release_result llama_kv_cache::paged_release_blocks_bounded_dry
             continue;
         }
 
-        // This block WOULD be released by the destructive path.
+        // This block WOULD be released by the destructive path.  Publish its
+        // identity only in this ephemeral dry-run result so read-only samplers
+        // can consume the exact same candidate set without a second ownership
+        // or state scanner.
+        result.candidate_blocks.push_back(physical_block);
         result.released_blocks += 1;
         result.released_bytes += block_bytes;
 

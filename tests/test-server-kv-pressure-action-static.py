@@ -212,6 +212,86 @@ class UnifiedPressureActionStaticTest(unittest.TestCase):
                 "target_shortfall", "unsupported", "blocked", "failed"):
             self.assertIn(f'return "{reason}"', ACTION_CPP)
 
+    def test_v2_target_is_server_state_with_explicit_source_validation(self):
+        for token in (
+                "server_kv_resident_target_state",
+                "server_kv_resident_target_from_env",
+                "LLAMA_KV_RESIDENT_TARGET_BYTES",
+                "LLAMA_KV_RESIDENT_TARGET_SOURCE",
+                "env_static",
+                "basis_generation"):
+            self.assertIn(token, ACTION_H + ACTION_CPP + CONTEXT)
+        self.assertIn("must be env_static", ACTION_CPP)
+        self.assertIn("kv_resident_target_state", CONTEXT)
+        self.assertIn("budget_target_enabled", CONTEXT)
+        self.assertIn("budget_target_bytes", CONTEXT)
+        self.assertNotIn("/kv_resident_target", CONTEXT)
+        self.assertNotIn("OFFLOAD_GLOBAL", ACTION_CPP + ACTION_H)
+
+    def test_v2_soft_chain_preserves_hard_priority_and_single_action(self):
+        self.assertIn("budget_debt_bytes_", ACTION_H + ACTION_CPP)
+        self.assertIn("soft_offload_armed_", ACTION_H + ACTION_CPP)
+        self.assertIn("unmet_budget_bytes_", ACTION_H + ACTION_CPP)
+        self.assertIn("budget_unmet_terminal", ACTION_CPP)
+        self.assertIn("budget_view_unavailable", ACTION_CPP)
+        self.assertIn("budget_target_satisfied", ACTION_CPP)
+        self.assertIn("if (!state.soft_offload_armed_)", ACTION_CPP)
+        self.assertIn("result.release.reason == llama_kv_action_reason::no_candidate", ACTION_CPP)
+        self.assertIn("llama_kv_action::offload", ACTION_CPP)
+        self.assertNotIn("llama_kv_action::prefetch", ACTION_CPP)
+        governor = ACTION_CPP[
+            ACTION_CPP.index("server_kv_pressure_execute_governor("):
+            ACTION_CPP.index("server_kv_pressure_unified_action_format_marker(")]
+        basis_gate = governor.index("if (!pressure.pressure_basis_valid)")
+        soft_start = governor.index("if (pressure.state != kv_pressure_state::PRESSURE")
+        pressure_start = governor.index("result.observed_excess_bytes")
+        self.assertLess(basis_gate, soft_start)
+        self.assertLess(soft_start, pressure_start)
+        for token in ("protected_or_shared", "budget_unmet_terminal", "budget_unmet_backoff_samples"):
+            self.assertIn(token, governor)
+        for field in (
+                "budget_active=", "budget_target_enabled=", "budget_source=",
+                "budget_basis_generation=", "budget_view_valid=",
+                "budget_resident_available=", "budget_reclaimable_available=",
+                "budget_resident_bytes=",
+                "budget_dead_resident_reclaimable_bytes=",
+                "budget_transient_staging_bound_bytes=", "budget_observed_excess_bytes=",
+                "budget_debt_before_bytes=", "budget_debt_after_bytes=",
+                "soft_offload_armed_before=", "soft_offload_armed_after=",
+                "budget_next_action_sample=", "unmet_budget_bytes_after="):
+            self.assertIn(field, ACTION_CPP)
+        self.assertNotIn("std::thread", ACTION_H + ACTION_CPP)
+
+    def test_v2_budget_view_is_one_scheduler_cadence_call_and_not_per_token(self):
+        self.assertEqual(CONTEXT.count("mem->sample_kv_physical_budget_view()"), 1)
+        self.assertIn("maybe_sample_kv_pressure", CONTEXT)
+        self.assertLess(
+            CONTEXT.index("mem->sample_kv_physical_budget_view()"),
+            CONTEXT.index("server_kv_pressure_execute_governor"))
+        update_start = CONTEXT.index("void update_slots()")
+        update_end = CONTEXT.index("if (all_idle)", update_start)
+        self.assertIn("maybe_sample_kv_pressure(all_idle)", CONTEXT[update_start:update_end])
+        self.assertNotIn("sample_kv_physical_budget_view()", LLAMA_CONTEXT)
+
+    def test_v2_reclaimable_view_does_not_reuse_swap_disabled_gate(self):
+        sampler = KV_CACHE_CPP[
+            KV_CACHE_CPP.index("llama_kv_release_budget_snapshot llama_kv_cache::sample_kv_release_budget()"):
+            KV_CACHE_CPP.index("llama_kv_physical_budget_view llama_kv_cache::sample_kv_physical_budget_view()")]
+        self.assertIn("paged_layout_valid", sampler)
+        self.assertIn("paged_release_blocks_bounded_dry_run", sampler)
+        self.assertNotIn("if (!bounded_release_can_enable()", sampler)
+        self.assertNotIn("if (bounded_release_can_enable()", sampler)
+        self.assertIn("llama_kv_release_collect_ownership", KV_CACHE_CPP)
+        self.assertIn("paged_release_blocks_bounded_impl", KV_CACHE_CPP)
+        self.assertIn("execute_action", KV_CACHE_CPP)
+
+    def test_v2_keeps_target_separate_from_rss_and_staging(self):
+        self.assertIn("transient_staging_bound_bytes", ACTION_H + ACTION_CPP)
+        self.assertIn("not subtracted", ACTION_H)
+        self.assertNotIn("pressure_current_bytes - config.budget_target_bytes", ACTION_CPP)
+        self.assertNotIn("memory.current", ACTION_CPP)
+        self.assertNotIn("cgroup", ACTION_CPP)
+
 
 if __name__ == "__main__":
     unittest.main()

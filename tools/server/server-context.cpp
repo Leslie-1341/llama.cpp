@@ -795,6 +795,7 @@ private:
     // Unified pressure actions are an independent opt-in path. They only submit
     // logical EVALUATE/RELEASE requests to core and never inspect KV internals.
     server_kv_pressure_unified_action_config kv_pressure_unified_action_config;
+    server_kv_resident_target_state kv_resident_target_state;
     server_kv_governor_state kv_governor_state;
 #endif
 
@@ -857,6 +858,7 @@ private:
             kv_pressure_bounded_release_config = server_kv_pressure_bounded_release_config{};
             kv_pressure_bounded_release_episode = 0;
             kv_pressure_unified_action_config = server_kv_pressure_unified_action_config{};
+            kv_resident_target_state = server_kv_resident_target_state{};
             kv_governor_state.reset();
 #endif
             destroy();
@@ -1197,7 +1199,14 @@ private:
         kv_pressure_bounded_release_config = server_kv_pressure_bounded_release_config{};
         kv_pressure_bounded_release_episode = 0;
         kv_pressure_unified_action_config = server_kv_pressure_unified_action_config{};
+        kv_resident_target_state = server_kv_resident_target_state{};
         kv_governor_state.reset();
+
+        std::string resident_target_error;
+        kv_resident_target_state = server_kv_resident_target_from_env(resident_target_error);
+        if (!resident_target_error.empty()) {
+            SRV_WRN("KV resident target disabled: %s\n", resident_target_error.c_str());
+        }
         const char * claimant_trace = std::getenv("LLAMA_KV_PRESSURE_GOVERNOR_CLAIMANT_TRACE");
         kv_governor_claimant_trace = claimant_trace && std::strcmp(claimant_trace, "1") == 0;
 
@@ -1219,10 +1228,25 @@ private:
                 return false;
             }
             kv_pressure_unified_action_config = unified_decision.config;
+            if (kv_resident_target_state.valid()) {
+                kv_pressure_unified_action_config.budget_target_enabled = true;
+                kv_pressure_unified_action_config.budget_target_bytes =
+                    kv_resident_target_state.target_bytes;
+                kv_pressure_unified_action_config.budget_basis_generation =
+                    kv_resident_target_state.basis_generation;
+                kv_pressure_unified_action_config.budget_source =
+                    kv_resident_target_state.source;
+                SRV_INF("KV resident soft target enabled: target_bytes=%" PRIu64
+                        " source=%s basis_generation=%" PRIu64 "\n",
+                        kv_resident_target_state.target_bytes,
+                        kv_resident_target_state.source,
+                        kv_resident_target_state.basis_generation);
+            }
             SRV_INF("KV pressure unified action enabled: target_bytes=%" PRIu64
-                    " max_blocks=%" PRIu32 "\n",
+                    " max_blocks=%" PRIu32 " budget_target_enabled=%d\n",
                     kv_pressure_unified_action_config.target_bytes,
-                    kv_pressure_unified_action_config.max_blocks);
+                    kv_pressure_unified_action_config.max_blocks,
+                    kv_pressure_unified_action_config.budget_target_enabled ? 1 : 0);
         }
 
         const kv_pressure_enablement enablement = kv_pressure_sampler_environment_enablement();
@@ -1463,6 +1487,21 @@ private:
             const auto telemetry = kv_pressure_sampler_owner->telemetry();
             if (kv_pressure_unified_action_config.enabled) {
                 auto * mem = ctx_tgt ? llama_get_memory(ctx_tgt) : nullptr;
+                server_kv_budget_view budget_view;
+                if (mem && kv_pressure_unified_action_config.budget_target_enabled) {
+                    const auto view = mem->sample_kv_physical_budget_view();
+                    budget_view.valid = view.valid;
+                    budget_view.resident_available = view.resident_available;
+                    budget_view.reclaimable_available = view.reclaimable_available;
+                    budget_view.swapped_metadata_consistent = view.swapped_metadata_consistent;
+                    budget_view.object_id = view.object_id;
+                    budget_view.generation = view.generation;
+                    budget_view.resident_bytes = view.resident_bytes;
+                    budget_view.dead_resident_reclaimable_bytes =
+                        view.dead_resident_reclaimable_bytes;
+                    budget_view.transient_staging_bound_bytes =
+                        view.transient_staging_bound_bytes;
+                }
                 const uint64_t decision_id = ++kv_decision_next;
                 const server_kv_pressure_snapshot pressure_snapshot {
                     telemetry.state,
@@ -1543,7 +1582,8 @@ private:
                             },
                         } : server_kv_pressure_action_ops {},
                         pressure_snapshot,
-                        claimant_snapshots);
+                        claimant_snapshots,
+                        budget_view);
                 result.observation.idle = idle;
                 if (kv_governor_claimant_trace) {
                     result.runtime_claimants = std::move(runtime_claimants);

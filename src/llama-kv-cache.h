@@ -496,6 +496,16 @@ public:
             uint64_t target_bytes,
             uint32_t max_scan_blocks) const;
 
+    // Test-only seam for the physical budget view: make the swap metadata
+    // vector structurally inconsistent so the read-only view must fail closed.
+    // This never runs from production code and is intentionally a one-way
+    // mutation on the test-owned cache instance.
+    void paged_budget_view_test_corrupt_swap_metadata() {
+        if (!paged_swap_sizes.empty()) {
+            paged_swap_sizes.pop_back();
+        }
+    }
+
     // Test-only seams for paged_release_blocks_bounded_impl()
     // (Cleanup-C2: the legacy paged_release_blocks_bounded() wrapper is
     // retired; seams now live exclusively on the bounded impl and are

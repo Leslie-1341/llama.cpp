@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <sstream>
 
@@ -264,6 +265,32 @@ server_kv_pressure_unified_action_startup_decide_from_env() {
     return decision;
 }
 
+server_kv_resident_target_state server_kv_resident_target_from_env(std::string & error) {
+    server_kv_resident_target_state result;
+    const char * bytes = std::getenv("LLAMA_KV_RESIDENT_TARGET_BYTES");
+    const char * source = std::getenv("LLAMA_KV_RESIDENT_TARGET_SOURCE");
+    if (!bytes && !source) {
+        return result;
+    }
+    if (!source || std::strcmp(source, "env_static") != 0) {
+        error = "LLAMA_KV_RESIDENT_TARGET_SOURCE must be env_static";
+        return result;
+    }
+    uint64_t target = 0;
+    if (!parse_required_uint64_env("LLAMA_KV_RESIDENT_TARGET_BYTES", target, error) ||
+            target == 0) {
+        if (error.empty()) {
+            error = "LLAMA_KV_RESIDENT_TARGET_BYTES must be greater than zero";
+        }
+        return result;
+    }
+    result.enabled = true;
+    result.target_bytes = target;
+    result.basis_generation = 1;
+    result.source = "env_static";
+    return result;
+}
+
 server_kv_pressure_action_result server_kv_pressure_execute_unified_action(
         const server_kv_pressure_unified_action_config & config,
         const server_kv_pressure_action_ops & ops,
@@ -348,6 +375,12 @@ void server_kv_governor_state::reset() {
     claimant_epochs_.clear();
     exhausted_claimants_.clear();
     failure_counts_.clear();
+    // V2 step1: clear soft budget state too — handles sleeping/reload boundaries.
+    budget_debt_bytes_ = 0;
+    budget_basis_generation_ = 0;
+    soft_offload_armed_ = false;
+    unmet_budget_bytes_ = 0;
+    budget_next_action_sample_ = 0;
 }
 
 uint64_t server_kv_governor_state::claimant_epoch(llama_seq_id seq_id) const {
@@ -379,12 +412,36 @@ void server_kv_governor_state::invalidate_all_claimants() {
     }
 }
 
+// KV-Budget-V2 step1: soft budget debt derivation from the read-only view.
+// Saturating-subtract resident_bytes by target_bytes; the result is the
+// steady-resident excess.  Zero (or any non-negative value) means the soft
+// target is satisfied and no soft action runs.
+//
+// invalid view (layout corruption, write-context invalid, swap-metadata
+// drift) MUST fail-closed — the debt is left at 0, but `budget_active` stays
+// false and the soft chain does NOT enter the decision.  This prevents
+// stale-view soft actions from racing with the hard pressure sampler.
+static uint64_t derive_budget_excess(
+        const server_kv_pressure_unified_action_config & config,
+        const server_kv_budget_view & view) {
+    if (!config.budget_target_enabled || config.budget_target_bytes == 0) {
+        return 0;
+    }
+    if (!view.valid || !view.resident_available) {
+        return 0;
+    }
+    return view.resident_bytes > config.budget_target_bytes
+        ? view.resident_bytes - config.budget_target_bytes
+        : 0;
+}
+
 server_kv_pressure_action_result server_kv_pressure_execute_governor(
         const server_kv_pressure_unified_action_config & config,
         server_kv_governor_state & state,
         const server_kv_pressure_action_ops & ops,
         const server_kv_pressure_snapshot & pressure,
-        const std::vector<server_kv_claimant_snapshot> & claimants) {
+        const std::vector<server_kv_claimant_snapshot> & claimants,
+        const server_kv_budget_view & budget_view) {
     server_kv_pressure_action_result result;
     auto & observation = result.observation;
     observation.pressure_state = pressure.state;
@@ -401,8 +458,31 @@ server_kv_pressure_action_result server_kv_pressure_execute_governor(
     result.offload_armed_after = state.offload_armed_;
     result.next_action_sample = state.next_action_sample_;
 
+    // V2 step1: populate soft budget side-channel fields with last-known
+    // view snapshot regardless of which chain runs.  These are advisory and
+    // do not affect any decision state when `budget_target_enabled` is false.
+    result.budget_target_enabled  = config.budget_target_enabled;
+    result.budget_target_bytes    = config.budget_target_bytes;
+    result.budget_basis_generation = config.budget_basis_generation;
+    result.budget_source          = config.budget_source ? config.budget_source : "none";
+    result.budget_view_valid      = budget_view.valid;
+    result.budget_resident_available = budget_view.resident_available;
+    result.budget_reclaimable_available = budget_view.reclaimable_available;
+    result.budget_resident_bytes  = budget_view.resident_bytes;
+    result.budget_dead_resident_reclaimable_bytes = budget_view.dead_resident_reclaimable_bytes;
+    result.budget_transient_staging_bound_bytes  = budget_view.transient_staging_bound_bytes;
+    result.budget_debt_before_bytes = state.budget_debt_bytes_;
+    result.budget_debt_after_bytes  = state.budget_debt_bytes_;
+    result.soft_offload_armed_before = state.soft_offload_armed_;
+    result.soft_offload_armed_after  = state.soft_offload_armed_;
+    result.budget_next_action_sample = state.budget_next_action_sample_;
+    result.unmet_budget_bytes_after  = state.unmet_budget_bytes_;
+
     if (!config.enabled) {
         state.idle_follow_up_pending_ = false;
+        // V2 step1: when unified action is globally disabled we still keep
+        // the budget side-channel populated but never enter the soft chain.
+        result.budget_active = false;
         return result;
     }
     if (!ops.execute) {
@@ -415,22 +495,308 @@ server_kv_pressure_action_result server_kv_pressure_execute_governor(
         observation.reason = "stale_hold";
         return result;
     }
-    if (pressure.state != kv_pressure_state::PRESSURE &&
-            pressure.state != kv_pressure_state::CRITICAL) {
-        state.reset();
-        result.episode = 0;
-        result.debt_after_bytes = 0;
-        result.offload_armed_after = false;
-        result.next_action_sample = 0;
-        observation.reason = "not_pressure_reset";
-        return result;
-    }
+    // Pressure basis validity gates both hard and soft arbitration.  An
+    // invalid basis is not a zero-pressure observation and must preserve all
+    // existing soft debt, armed state, and unmet-budget backoff.
     if (!pressure.pressure_basis_valid) {
-        state.idle_follow_up_pending_ = false;
         observation.reason = "invalid_basis_hold";
         return result;
     }
+    if (pressure.state != kv_pressure_state::PRESSURE &&
+            pressure.state != kv_pressure_state::CRITICAL) {
+        // Hard-pressure episode ends, but claimant epochs/failure history and
+        // the independent soft budget state must not be reset together.
+        state.episode_active_ = false;
+        state.episode_ = 0;
+        state.pressure_basis_generation_ = 0;
+        state.pressure_debt_bytes_ = 0;
+        state.offload_armed_ = false;
+        state.idle_follow_up_pending_ = false;
+        state.next_action_sample_ = 0;
+        result.episode = 0;
+        result.debt_before_bytes = 0;
+        result.debt_after_bytes = 0;
+        result.offload_armed_before = false;
+        result.offload_armed_after = false;
+        result.next_action_sample = 0;
 
+        if (!config.budget_target_enabled || config.budget_target_bytes == 0) {
+            state.budget_debt_bytes_ = 0;
+            state.budget_basis_generation_ = 0;
+            state.soft_offload_armed_ = false;
+            state.unmet_budget_bytes_ = 0;
+            state.budget_next_action_sample_ = 0;
+            result.budget_debt_before_bytes = 0;
+            result.budget_debt_after_bytes = 0;
+            result.soft_offload_armed_before = false;
+            result.soft_offload_armed_after = false;
+            result.unmet_budget_bytes_after = 0;
+            observation.reason = "not_pressure_reset";
+            return result;
+        }
+
+        // A missing or invalid physical view is not a zero debt observation.
+        // Hold the soft chain and let the next scheduler sample retry.
+        if (!budget_view.valid || !budget_view.resident_available) {
+            result.budget_active = false;
+            observation.reason = "budget_view_unavailable";
+            return result;
+        }
+
+        result.budget_active = true;
+        result.budget_observed_excess_bytes = derive_budget_excess(config, budget_view);
+        if (state.budget_basis_generation_ != config.budget_basis_generation) {
+            state.budget_basis_generation_ = config.budget_basis_generation;
+            state.budget_debt_bytes_ = 0;
+            state.soft_offload_armed_ = false;
+            state.unmet_budget_bytes_ = 0;
+            state.budget_next_action_sample_ = 0;
+        }
+        state.budget_debt_bytes_ = result.budget_observed_excess_bytes;
+        result.budget_debt_before_bytes = state.budget_debt_bytes_;
+        result.budget_debt_after_bytes = state.budget_debt_bytes_;
+        result.soft_offload_armed_before = state.soft_offload_armed_;
+        result.soft_offload_armed_after = state.soft_offload_armed_;
+
+        if (state.budget_debt_bytes_ == 0) {
+            state.soft_offload_armed_ = false;
+            state.unmet_budget_bytes_ = 0;
+            state.budget_next_action_sample_ = 0;
+            observation.reason = "budget_target_satisfied";
+            result.budget_debt_after_bytes = 0;
+            result.soft_offload_armed_after = false;
+            result.budget_next_action_sample = 0;
+            result.unmet_budget_bytes_after = 0;
+            return result;
+        }
+
+        // A terminal unmet-budget result is held until the view improves, the
+        // target basis changes, or the explicit backoff expires. This prevents
+        // repeated claimant scans when all remaining KV is correctness-live.
+        if (state.unmet_budget_bytes_ > 0 &&
+                result.budget_observed_excess_bytes >= state.unmet_budget_bytes_) {
+            if (pressure.sample_count < state.budget_next_action_sample_) {
+                observation.reason = "budget_unmet_hold";
+                result.budget_next_action_sample = state.budget_next_action_sample_;
+                result.unmet_budget_bytes_after = state.unmet_budget_bytes_;
+                return result;
+            }
+            state.unmet_budget_bytes_ = 0;
+        }
+        if (pressure.sample_count < state.budget_next_action_sample_) {
+            observation.reason = "budget_backoff";
+            result.budget_next_action_sample = state.budget_next_action_sample_;
+            return result;
+        }
+
+        state.idle_follow_up_pending_ = false;
+        observation.evaluate_attempted = true;
+        result.evaluation = ops.execute({
+                llama_kv_action::evaluate,
+                pressure.decision_id,
+                -1,
+                0,
+                0,
+                false,
+                false,
+                llama_kv_memory_claimant::kv,
+                state.soft_offload_armed_ ? llama_kv_io_class::capacity_write
+                                          : llama_kv_io_class::background_write,
+                0,
+                0,
+        });
+        if (result.evaluation.decision_id != pressure.decision_id) {
+            observation.reason = "decision_mismatch";
+            return result;
+        }
+        if (result.evaluation.capability.context_invalid) {
+            observation.reason = "context_invalid";
+            return result;
+        }
+        if (result.evaluation.capability.write_transaction_open) {
+            observation.reason = "write_transaction_open";
+            return result;
+        }
+        if (result.evaluation.fail_stop) {
+            observation.reason = "fail_stop";
+            return result;
+        }
+
+        const uint64_t action_bytes = config.target_bytes > 0
+            ? std::min(config.target_bytes, state.budget_debt_bytes_)
+            : state.budget_debt_bytes_;
+        const uint64_t next_cooldown = saturating_add(
+                pressure.sample_count, std::max<uint32_t>(config.cooldown_samples, 1));
+
+        if (!state.soft_offload_armed_) {
+            if (!evaluate_allows_release(result.evaluation)) {
+                observation.reason = result.evaluation.capability.can_release
+                    ? "evaluate_rejected"
+                    : "release_unsupported";
+                return result;
+            }
+            observation.release_attempted = true;
+            result.release = ops.execute({
+                    llama_kv_action::release,
+                    pressure.decision_id,
+                    -1,
+                    action_bytes,
+                    config.max_blocks,
+                    false,
+                    false,
+                    llama_kv_memory_claimant::kv,
+                    llama_kv_io_class::background_write,
+                    0,
+                    action_bytes,
+            });
+            const bool matches = result.release.action == llama_kv_action::release &&
+                result.release.decision_id == pressure.decision_id;
+            const bool progressed = matches && !result.release.io_failure &&
+                result.release.state_changed && result.release.relieved_bytes > 0;
+            const bool scan_advanced = matches && !result.release.io_failure &&
+                !result.release.fail_stop &&
+                result.release.reason == llama_kv_action_reason::scan_budget_exhausted &&
+                (result.release.outcome == llama_kv_action_outcome::completed ||
+                 result.release.outcome == llama_kv_action_outcome::no_op);
+            const bool retry = matches && result.release.io_failure && !result.release.fail_stop;
+            if (matches) {
+                state.budget_debt_bytes_ = saturating_sub(
+                        state.budget_debt_bytes_, result.release.relieved_bytes);
+            }
+            const bool arm = matches &&
+                result.release.reason == llama_kv_action_reason::no_candidate &&
+                state.budget_debt_bytes_ > 0;
+            if (arm) {
+                state.soft_offload_armed_ = true;
+            }
+            state.budget_next_action_sample_ = result.release.io_failure
+                ? saturating_add(pressure.sample_count,
+                        std::max<uint32_t>(config.io_failure_backoff_samples, 1))
+                : next_cooldown;
+            state.idle_follow_up_pending_ = state.budget_debt_bytes_ > 0 &&
+                (progressed || scan_advanced || arm || retry);
+            observation.reason = "budget_release_submitted";
+        } else {
+            if (!evaluate_allows_offload(result.evaluation)) {
+                observation.reason = result.evaluation.capability.can_offload
+                    ? "evaluate_rejected"
+                    : "offload_unsupported";
+                return result;
+            }
+            result.scores.reserve(claimants.size());
+            for (const auto & claimant : claimants) {
+                const auto it = state.failure_counts_.find(claimant.seq_id);
+                const uint32_t failure_count = it == state.failure_counts_.end()
+                    ? 0
+                    : std::min(it->second, config.max_failure_penalty);
+                const uint64_t current_epoch = state.claimant_epoch(claimant.seq_id);
+                const auto exhausted_it = state.exhausted_claimants_.find(claimant.seq_id);
+                const bool exhausted = exhausted_it != state.exhausted_claimants_.end() &&
+                    exhausted_it->second == current_epoch;
+                result.scores.push_back(score_claimant(
+                        claimant, result.evaluation, failure_count, current_epoch, exhausted));
+            }
+            std::sort(result.scores.begin(), result.scores.end(),
+                    [](const server_kv_claimant_score & lhs, const server_kv_claimant_score & rhs) {
+                        if (lhs.eligible != rhs.eligible) return lhs.eligible > rhs.eligible;
+                        if (lhs.total != rhs.total) return lhs.total > rhs.total;
+                        return lhs.seq_id < rhs.seq_id;
+                    });
+            const auto selected = std::find_if(
+                    result.scores.begin(), result.scores.end(),
+                    [](const server_kv_claimant_score & score) { return score.eligible; });
+            if (selected == result.scores.end()) {
+                state.unmet_budget_bytes_ = state.budget_debt_bytes_;
+                state.soft_offload_armed_ = false;
+                state.idle_follow_up_pending_ = false;
+                state.budget_next_action_sample_ = saturating_add(
+                        pressure.sample_count,
+                        std::max<uint32_t>(config.budget_unmet_backoff_samples, 1));
+                observation.reason = "budget_unmet_terminal";
+            } else {
+                result.selected_seq_id = selected->seq_id;
+                result.selected_claimant_epoch = state.claimant_epoch(selected->seq_id);
+                const int64_t bounded_priority = std::max<int64_t>(
+                        std::numeric_limits<int32_t>::min(),
+                        std::min<int64_t>(std::numeric_limits<int32_t>::max(), selected->total));
+                observation.offload_attempted = true;
+                result.offload = ops.execute({
+                        llama_kv_action::offload,
+                        pressure.decision_id,
+                        selected->seq_id,
+                        action_bytes,
+                        config.max_blocks,
+                        false,
+                        false,
+                        llama_kv_memory_claimant::kv,
+                        llama_kv_io_class::capacity_write,
+                        (int32_t) bounded_priority,
+                        action_bytes,
+                });
+                const bool matches = result.offload.action == llama_kv_action::offload &&
+                    result.offload.decision_id == pressure.decision_id;
+                const bool protected_or_shared = matches &&
+                    (result.offload.reason == llama_kv_action_reason::protected_sequence ||
+                     result.offload.reason == llama_kv_action_reason::shared_block);
+                const bool progressed = matches && !protected_or_shared &&
+                    !result.offload.io_failure && result.offload.state_changed &&
+                    result.offload.relieved_bytes > 0;
+                const bool retry = matches && !protected_or_shared &&
+                    result.offload.io_failure && !result.offload.fail_stop;
+                if (matches && !protected_or_shared) {
+                    state.budget_debt_bytes_ = saturating_sub(
+                            state.budget_debt_bytes_, result.offload.relieved_bytes);
+                }
+                const bool exhausted = matches && !protected_or_shared &&
+                    result.offload.outcome == llama_kv_action_outcome::no_op &&
+                    result.offload.reason == llama_kv_action_reason::no_candidate &&
+                    !result.offload.state_changed && result.offload.relieved_bytes == 0;
+                if (protected_or_shared) {
+                    // Core ownership/state protection is terminal for this
+                    // soft-budget pursuit; do not penalize or retry the
+                    // protected claimant as if it were an I/O failure.
+                    state.unmet_budget_bytes_ = state.budget_debt_bytes_;
+                    state.soft_offload_armed_ = false;
+                    state.idle_follow_up_pending_ = false;
+                    state.budget_next_action_sample_ = saturating_add(
+                            pressure.sample_count,
+                            std::max<uint32_t>(config.budget_unmet_backoff_samples, 1));
+                    observation.reason = "budget_unmet_terminal";
+                } else {
+                    if (matches && (result.offload.io_failure || exhausted)) {
+                        if (exhausted) {
+                            state.exhausted_claimants_[selected->seq_id] = result.selected_claimant_epoch;
+                        }
+                        auto & failures = state.failure_counts_[selected->seq_id];
+                        if (failures < config.max_failure_penalty) ++failures;
+                        state.budget_next_action_sample_ = result.offload.io_failure
+                            ? saturating_add(pressure.sample_count,
+                                    std::max<uint32_t>(config.io_failure_backoff_samples, 1))
+                            : next_cooldown;
+                    } else if (matches) {
+                        state.failure_counts_.erase(selected->seq_id);
+                        state.budget_next_action_sample_ = next_cooldown;
+                    } else {
+                        state.budget_next_action_sample_ = next_cooldown;
+                    }
+                    state.idle_follow_up_pending_ = state.budget_debt_bytes_ > 0 &&
+                        (progressed || exhausted || retry);
+                    observation.reason = "budget_offload_submitted";
+                }
+            }
+        }
+
+        if (state.budget_debt_bytes_ == 0) {
+            state.soft_offload_armed_ = false;
+            state.unmet_budget_bytes_ = 0;
+            state.idle_follow_up_pending_ = false;
+        }
+        result.budget_debt_after_bytes = state.budget_debt_bytes_;
+        result.soft_offload_armed_after = state.soft_offload_armed_;
+        result.budget_next_action_sample = state.budget_next_action_sample_;
+        result.unmet_budget_bytes_after = state.unmet_budget_bytes_;
+        return result;
+    }
     if (state.episode_active_ &&
             state.pressure_basis_generation_ != pressure.pressure_basis_generation) {
         state.reset();
@@ -663,6 +1029,16 @@ server_kv_pressure_action_result server_kv_pressure_execute_governor(
     return result;
 }
 
+server_kv_pressure_action_result server_kv_pressure_execute_governor(
+        const server_kv_pressure_unified_action_config & config,
+        server_kv_governor_state & state,
+        const server_kv_pressure_action_ops & ops,
+        const server_kv_pressure_snapshot & pressure,
+        const std::vector<server_kv_claimant_snapshot> & claimants) {
+    return server_kv_pressure_execute_governor(
+            config, state, ops, pressure, claimants, server_kv_budget_view {});
+}
+
 std::string server_kv_pressure_unified_action_format_marker(
         const server_kv_pressure_action_result & result) {
     const auto & observation = result.observation;
@@ -680,6 +1056,26 @@ std::string server_kv_pressure_unified_action_format_marker(
         << " observed_excess_bytes=" << result.observed_excess_bytes
         << " debt_before_bytes=" << result.debt_before_bytes
         << " debt_after_bytes=" << result.debt_after_bytes
+        << " budget_active=" << (result.budget_active ? 1 : 0)
+        << " budget_target_enabled=" << (result.budget_target_enabled ? 1 : 0)
+        << " budget_source=" << (result.budget_source ? result.budget_source : "none")
+        << " budget_target_bytes=" << result.budget_target_bytes
+        << " budget_basis_generation=" << result.budget_basis_generation
+        << " budget_view_valid=" << (result.budget_view_valid ? 1 : 0)
+        << " budget_resident_available=" << (result.budget_resident_available ? 1 : 0)
+        << " budget_reclaimable_available=" << (result.budget_reclaimable_available ? 1 : 0)
+        << " budget_resident_bytes=" << result.budget_resident_bytes
+        << " budget_dead_resident_reclaimable_bytes="
+        << result.budget_dead_resident_reclaimable_bytes
+        << " budget_transient_staging_bound_bytes="
+        << result.budget_transient_staging_bound_bytes
+        << " budget_observed_excess_bytes=" << result.budget_observed_excess_bytes
+        << " budget_debt_before_bytes=" << result.budget_debt_before_bytes
+        << " budget_debt_after_bytes=" << result.budget_debt_after_bytes
+        << " soft_offload_armed_before=" << (result.soft_offload_armed_before ? 1 : 0)
+        << " soft_offload_armed_after=" << (result.soft_offload_armed_after ? 1 : 0)
+        << " budget_next_action_sample=" << result.budget_next_action_sample
+        << " unmet_budget_bytes_after=" << result.unmet_budget_bytes_after
         << " offload_armed_before=" << (result.offload_armed_before ? 1 : 0)
         << " offload_armed_after=" << (result.offload_armed_after ? 1 : 0)
         << " next_action_sample=" << result.next_action_sample

@@ -29,6 +29,11 @@ struct llama_kv_bounded_release_result {
     bool     block_scan_exhausted = false;
     bool     scan_budget_exhausted = false;
     bool     ownership_aborted    = false;
+    // Ephemeral read-only candidate identities from the dry-run scanner.  This
+    // is not persistent KV state or a shadow counter; callers may use it to
+    // sample the exact same candidate set without duplicating ownership/state
+    // rules.
+    std::vector<uint32_t> candidate_blocks;
 };
 
 // One read-only residency snapshot used to bound a dynamic release decision.

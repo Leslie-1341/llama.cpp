@@ -295,6 +295,70 @@ int main(int /*argc*/, char ** /*argv*/) {
     }
 
     // -------------------------------------------------------------------------
+    // BV2A: explicit-only swap keeps read-only dead-resident observation
+    // available even though destructive bounded-release capability is false.
+    // This is the V2 P0 gate-closure regression test.
+    // -------------------------------------------------------------------------
+    {
+        setenv("LLAMA_KV_PAGED_SWAP", "1", 1);
+        setenv("LLAMA_KV_PAGED_SWAP_EXPLICIT_ONLY", "1", 1);
+        ContextGuard g;
+        if (!g.init(model, cparams)) {
+            CHECK(false, "BV2A: context creation failed");
+        } else {
+            std::vector<llama_token> prompt(16, 35);
+            CHECK(decode_prompt(g.ctx, prompt) == 0, "BV2A: decode ok");
+            llama_memory_seq_rm(g.mem, 0, -1, -1);
+
+            const auto release_cap = g.kv->bounded_release_can_enable();
+            const auto rb = g.kv->sample_kv_release_budget();
+            const auto view = g.kv->sample_kv_physical_budget_view();
+            CHECK(!release_cap,
+                    "BV2A: destructive bounded release remains disabled under explicit-only swap");
+            CHECK(rb.valid && rb.reclaimable_resident_bytes > 0,
+                    "BV2A: read-only reclaimable sampler remains valid under explicit-only swap");
+            CHECK(view.valid && view.reclaimable_available &&
+                    view.dead_resident_reclaimable_bytes == rb.reclaimable_resident_bytes,
+                    "BV2A: physical budget view exposes dead resident bytes under explicit-only swap");
+        }
+        unsetenv("LLAMA_KV_PAGED_SWAP_EXPLICIT_ONLY");
+        setenv("LLAMA_KV_PAGED_SWAP", "0", 1);
+    }
+
+    // -------------------------------------------------------------------------
+    // BV2B: invalid layout and invalid swap metadata fail closed.
+    // -------------------------------------------------------------------------
+    {
+        setenv("LLAMA_KV_PAGED_BLOCK_SIZE", "3", 1);
+        ContextGuard invalid_layout;
+        if (!invalid_layout.init(model, cparams)) {
+            CHECK(false, "BV2B: invalid-layout context creation failed");
+        } else {
+            const auto view = invalid_layout.kv->sample_kv_physical_budget_view();
+            CHECK(!view.valid && !view.reclaimable_available,
+                    "BV2B: invalid paged layout returns unavailable view");
+        }
+        setenv("LLAMA_KV_PAGED_BLOCK_SIZE", "16", 1);
+
+        setenv("LLAMA_KV_PAGED_SWAP", "1", 1);
+        ContextGuard invalid_metadata;
+        if (!invalid_metadata.init(model, cparams)) {
+            CHECK(false, "BV2B: invalid-metadata context creation failed");
+        } else {
+            CHECK(decode_prompt(invalid_metadata.ctx, std::vector<llama_token>(16, 36)) == 0,
+                    "BV2B: metadata setup decode ok");
+            const auto offload = invalid_metadata.kv->execute_action({
+                llama_kv_action::offload, 7351, 0, UINT64_MAX, 1, false });
+            CHECK(offload.state_changed, "BV2B: metadata setup offload ok");
+            invalid_metadata.kv->paged_budget_view_test_corrupt_swap_metadata();
+            const auto view = invalid_metadata.kv->sample_kv_physical_budget_view();
+            CHECK(!view.valid && !view.swapped_metadata_consistent,
+                    "BV2B: swap metadata drift invalidates physical budget view");
+        }
+        setenv("LLAMA_KV_PAGED_SWAP", "0", 1);
+    }
+
+    // -------------------------------------------------------------------------
     // BV3: OFFLOAD → SWAPPED — swapped_authoritative_bytes exactly equals
     //      offload.bytes on a clean single-block case (no other SWAPPED
     //      blocks from a prior cycle).
