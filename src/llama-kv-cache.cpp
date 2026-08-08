@@ -653,62 +653,6 @@ llama_kv_backing_store_status llama_kv_backing_store_file::reset() {
 #endif
 }
 
-static void llama_kv_backing_store_selftest_once() {
-    static bool checked = false;
-    if (checked) {
-        return;
-    }
-    checked = true;
-
-    const char * env = std::getenv("LLAMA_KV_SWAP_BACKEND_SELFTEST");
-    if (!env || std::atoi(env) == 0) {
-        return;
-    }
-
-    const char payload[] = "hello-kv";
-
-    llama_kv_backing_store_file store("", /*n_slots=*/1, /*cell_stride=*/sizeof(payload));
-    if (!store.is_enabled()) {
-        const auto & stats = store.get_stats();
-        LLAMA_LOG_ERROR("KV_SWAP_BACKEND_SELFTEST: backing store selftest fail status=disabled errno=%d\n",
-                stats.last_errno);
-        return;
-    }
-
-    char restored[sizeof(payload)] = {};
-    uint64_t offset = 0;
-
-    auto write_status = store.write_cell(0, 0, payload, sizeof(payload), offset);
-    auto read_status  = store.read_cell (0, 0, offset, restored, sizeof(restored));
-    const bool same = std::memcmp(payload, restored, sizeof(payload)) == 0;
-    auto release_status = store.release(offset, sizeof(payload));
-
-    const auto stats_before_reset = store.get_stats();
-    auto reset_status = store.reset();
-
-    const bool pass =
-        write_status   == llama_kv_backing_store_status::ok &&
-        read_status    == llama_kv_backing_store_status::ok &&
-        release_status == llama_kv_backing_store_status::ok &&
-        reset_status   == llama_kv_backing_store_status::ok &&
-        same;
-
-    LLAMA_LOG_INFO("KV_SWAP_BACKEND_SELFTEST: backing store selftest %s write=%s read=%s release=%s reset=%s "
-            "bytes_written=%llu bytes_read=%llu released_bytes=%llu write_calls=%llu read_calls=%llu release_calls=%llu\n",
-            pass ? "pass" : "fail",
-            llama_kv_backing_store_status_name(write_status),
-            llama_kv_backing_store_status_name(read_status),
-            llama_kv_backing_store_status_name(release_status),
-            llama_kv_backing_store_status_name(reset_status),
-            (unsigned long long) stats_before_reset.bytes_written,
-            (unsigned long long) stats_before_reset.bytes_read,
-            (unsigned long long) stats_before_reset.bytes_released,
-            (unsigned long long) stats_before_reset.write_calls,
-            (unsigned long long) stats_before_reset.read_calls,
-            (unsigned long long) stats_before_reset.release_calls);
-}
-
-//
 // llama_kv_cache
 //
 
@@ -732,8 +676,6 @@ llama_kv_cache::llama_kv_cache(
     GGML_ASSERT(kv_size % n_pad == 0);
 
     paged_resident_object_id = llama_kv_next_resident_object_id();
-
-    llama_kv_backing_store_selftest_once();
 
     // KV-P0-B2B-1: deterministic paged swap-in read failure for dynamic tests. Parse once per
     // KV cache; the hot path only reads this context-local state and never calls getenv().
@@ -933,56 +875,10 @@ llama_kv_cache::llama_kv_cache(
                 paged_test_io_fault_.fail_once ? 1 : 0);
     }
 
-    // KV-P0-B1: shared backing-store directory for both exact and paged swap. Honored exactly
-    // as given (see llama_kv_backing_store_file ctor) - no silent fallback to a different dir.
+    // KV-P0-B1: backing-store directory for paged swap. Honored exactly as given
+    // (see llama_kv_backing_store_file ctor) - no silent fallback to a different dir.
     const char * LLAMA_KV_SWAP_DIR = std::getenv("LLAMA_KV_SWAP_DIR");
     const std::string kv_swap_dir = LLAMA_KV_SWAP_DIR ? LLAMA_KV_SWAP_DIR : "";
-
-    // Resolved to true below if exact swap passes its own validity checks. Actual backing-store
-    // construction (and the exact/paged mutual-exclusion decision) is deferred until the KV
-    // layer tensors exist, because the fixed per-cell slot stride is computed from their row
-    // sizes (see the deferred construction block after the layer loop).
-    bool kv_swap_want_exact = false;
-
-    const char * LLAMA_KV_SWAP      = std::getenv("LLAMA_KV_SWAP");
-    const char * LLAMA_KV_SWAP_MODE = std::getenv("LLAMA_KV_SWAP_MODE");
-    const char * LLAMA_KV_SWAP_WINDOW = std::getenv("LLAMA_KV_SWAP_WINDOW");
-    const char * LLAMA_KV_SWAP_SINK   = std::getenv("LLAMA_KV_SWAP_SINK");
-    const char * LLAMA_KV_SWAP_RSS_SAMPLE = std::getenv("LLAMA_KV_SWAP_RSS_SAMPLE");
-    const char * LLAMA_KV_SWAP_MADVISE = std::getenv("LLAMA_KV_SWAP_MADVISE");
-    kv_swap_window = LLAMA_KV_SWAP_WINDOW ? std::max(0, std::atoi(LLAMA_KV_SWAP_WINDOW)) : 0;
-    kv_swap_sink   = LLAMA_KV_SWAP_SINK   ? std::max(0, std::atoi(LLAMA_KV_SWAP_SINK))   : 0;
-    kv_swap_rss_sample = LLAMA_KV_SWAP_RSS_SAMPLE ? (std::atoi(LLAMA_KV_SWAP_RSS_SAMPLE) != 0) : false;
-    const bool kv_swap_madvise_requested = LLAMA_KV_SWAP_MADVISE ? (std::atoi(LLAMA_KV_SWAP_MADVISE) != 0) : false;
-
-    const bool kv_swap_requested = LLAMA_KV_SWAP ? (std::atoi(LLAMA_KV_SWAP) != 0) : false;
-    if (kv_swap_requested) {
-        if (!LLAMA_KV_SWAP_MODE) {
-            LLAMA_LOG_WARN("%s: KV swap requested but LLAMA_KV_SWAP_MODE=%s is unsupported "
-                    "(expected exact or approx) - disabled\n", __func__, "<unset>");
-        } else if (std::strcmp(LLAMA_KV_SWAP_MODE, "approx") == 0) {
-            if (v_trans || n_stream != 1 || n_seq_max != 1) {
-                LLAMA_LOG_WARN("%s: KV swap approx mode requires single-seq, !v_trans, and n_stream==1 "
-                        "(n_seq_max=%u, v_trans=%d, n_stream=%u) - disabled\n",
-                        __func__, n_seq_max, (int) v_trans, n_stream);
-            } else {
-                kv_swap_enabled = true;
-                kv_swap_mode_   = kv_swap_mode::approx;
-                kv_approx_window = kv_swap_window;
-                LLAMA_LOG_INFO("%s: KV swap approx mode enabled (no-op scaffold, window=%u, sink=%u)\n",
-                        __func__, kv_swap_window, kv_swap_sink);
-            }
-        } else if (std::strcmp(LLAMA_KV_SWAP_MODE, "exact") != 0) {
-            LLAMA_LOG_WARN("%s: KV swap requested but LLAMA_KV_SWAP_MODE=%s is unsupported "
-                    "(expected exact or approx) - disabled\n", __func__, LLAMA_KV_SWAP_MODE);
-        } else if (v_trans || n_stream != 1) {
-            LLAMA_LOG_WARN("%s: KV swap exact mode requires !v_trans && n_stream==1 "
-                    "(v_trans=%d, n_stream=%u) - disabled\n", __func__, (int) v_trans, n_stream);
-        } else {
-            // backing-store construction deferred: see kv_swap_want_exact declaration above.
-            kv_swap_want_exact = true;
-        }
-    }
 
     const char * LLAMA_KV_PAGED = std::getenv("LLAMA_KV_PAGED");
     const char * LLAMA_KV_PAGED_INGRAPH = std::getenv("LLAMA_KV_PAGED_INGRAPH");
@@ -1176,7 +1072,7 @@ llama_kv_cache::llama_kv_cache(
                 }
             }
             // paged_swap_enabled here is still the tentative request flag; final resolution
-            // (mutual exclusion with exact swap, then backing-store construction) happens after
+            // (backing-store construction) happens after
             // the KV layer tensors are built - see the deferred construction block below.
             // Destructive release is resolved only after the KV tensors exist and the final
             // row-index topology is known.  Until then the request must not enable execution.
@@ -1233,19 +1129,6 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
-    // KV-P0-B1: exact swap and paged block swap cannot share one fixed-slot backing store in
-    // this stage (exact addresses by physical cell id, paged addresses the same physical-cell
-    // id space one block at a time - reusing the same n_slots=kv_size layout would work
-    // arithmetically, but the two paths have never been validated to swap-out/in the same cell
-    // concurrently without racing each other's SWAPPED/RESIDENT bookkeeping). If both are
-    // requested, keep paged swap and disable exact - never pick silently.
-    if (kv_swap_want_exact && paged_swap_enabled) {
-        LLAMA_LOG_WARN("%s: KV exact swap (LLAMA_KV_SWAP_MODE=exact) and KV paged block swap "
-                "(LLAMA_KV_PAGED_SWAP=1) were both requested; a single fixed-slot backing store "
-                "cannot safely serve both in this stage - keeping paged block swap, disabling "
-                "exact swap\n", __func__);
-        kv_swap_want_exact = false;
-    }
 
     const uint32_t n_layer_kv = hparams.n_layer_kv();
 
@@ -1378,13 +1261,13 @@ llama_kv_cache::llama_kv_cache(
     }
 
     // KV-P0-B1: deferred fixed-slot backing-store construction. cell_stride is the full K/V
-    // byte width of one physical cell across all layers - the same formula swap_out_cell() /
-    // paged_swap_out_block_impl() already use for their staging buffer, computed here from the
+    // byte width of one physical cell across all layers - the same formula
+    // paged_swap_out_block_impl() uses for its staging buffer, computed here from the
     // just-built layer tensors (nb[1] is set at tensor-creation time, independent of whether the
     // backing buffer has been allocated yet). n_slots = kv_size, i.e. one slot per physical
     // cell; paged block swap-out still writes/reads one cell at a time into this same fixed
     // layout (no block aggregation in this stage).
-    if (kv_swap_want_exact || paged_swap_enabled) {
+    if (paged_swap_enabled) {
         size_t cell_stride = 0;
         bool cell_stride_overflow = false;
         for (const auto & layer : layers) {
@@ -1407,43 +1290,25 @@ llama_kv_cache::llama_kv_cache(
         }
 
         if (cell_stride_overflow) {
-            LLAMA_LOG_ERROR("%s: KV swap disabled: per-cell K/V byte stride overflow (errno=%d)\n",
+            LLAMA_LOG_ERROR("%s: KV paged swap disabled: per-cell K/V byte stride overflow (errno=%d)\n",
                     __func__, EOVERFLOW);
-            if (kv_swap_want_exact) {
-                kv_swap_backend_failures += 1;
-            }
-            if (paged_swap_enabled) {
-                paged_swap_backend_failures += 1;
-                paged_swap_enabled = false;
-            }
-            kv_swap_want_exact = false;
+            paged_swap_backend_failures += 1;
+            paged_swap_enabled = false;
         } else if (cell_stride == 0) {
-            LLAMA_LOG_WARN("%s: KV swap disabled: could not determine a non-zero per-cell K/V byte stride\n",
+            LLAMA_LOG_WARN("%s: KV paged swap disabled: could not determine a non-zero per-cell K/V byte stride\n",
                     __func__);
-            if (kv_swap_want_exact) {
-                kv_swap_backend_failures += 1;
-            }
-            if (paged_swap_enabled) {
-                paged_swap_backend_failures += 1;
-                paged_swap_enabled = false;
-            }
-            kv_swap_want_exact = false;
+            paged_swap_backend_failures += 1;
+            paged_swap_enabled = false;
         } else {
             auto store = std::make_unique<llama_kv_backing_store_file>(kv_swap_dir, kv_size, cell_stride);
             if (!store->is_enabled()) {
                 const auto & st = store->get_stats();
-                LLAMA_LOG_WARN("%s: KV swap backing store unavailable (dir=%s errno=%d) - swap disabled\n",
+                LLAMA_LOG_WARN("%s: KV paged swap backing store unavailable (dir=%s errno=%d) - swap disabled\n",
                         __func__, (kv_swap_dir.empty() ? "/tmp" : kv_swap_dir.c_str()), st.last_errno);
-                if (kv_swap_want_exact) {
-                    kv_swap_backend_failures += 1;
-                }
-                if (paged_swap_enabled) {
-                    paged_swap_backend_failures += 1;
-                    paged_swap_enabled = false;
-                }
-                kv_swap_want_exact = false;
+                paged_swap_backend_failures += 1;
+                paged_swap_enabled = false;
             } else {
-                LLAMA_LOG_INFO("%s: KV swap backing store ready (dir=%s o_tmpfile=%d n_slots=%u "
+                LLAMA_LOG_INFO("%s: KV paged swap backing store ready (dir=%s o_tmpfile=%d n_slots=%u "
                         "cell_stride=%zu capacity=%.2f MiB)\n",
                         __func__, store->get_dir().c_str(), store->used_o_tmpfile() ? 1 : 0,
                         store->get_n_slots(), store->get_cell_stride(),
@@ -1452,16 +1317,7 @@ llama_kv_cache::llama_kv_cache(
                 kv_swap_cell_stride = cell_stride;
                 kv_swap_store = std::move(store);
 
-                if (kv_swap_want_exact) {
-                    kv_swap_enabled = true;
-                    kv_swap_mode_   = kv_swap_mode::exact;
-                    kv_swap_madvise = kv_swap_madvise_requested;
-                    LLAMA_LOG_INFO("%s: KV swap exact mode enabled (backend=file, window=%u, sink=%u)\n",
-                            __func__, kv_swap_window, kv_swap_sink);
-                }
-                if (paged_swap_enabled) {
-                    LLAMA_LOG_INFO("%s: KV paged block swap enabled (backend=file, release=disabled)\n", __func__);
-                }
+                LLAMA_LOG_INFO("%s: KV paged block swap enabled (backend=file, release=disabled)\n", __func__);
             }
         }
     }
@@ -1632,12 +1488,11 @@ llama_kv_cache::llama_kv_cache(
         /* .ingraph_enabled  = */ paged_ingraph_enabled,
         /* .single_stream    = */ n_stream == 1,
         /* .v_trans          = */ v_trans,
-        /* .approx_dynamic   = */ uses_approx_dynamic_view(),
         /* .identity_mapping = */ identity_mapping,
         /* .dynamic_remap    = */ paged_dynamic_remap_requested,
-        /* .swap             = */ kv_swap_requested || paged_dynamic_swap_requested,
+        /* .swap             = */ paged_dynamic_swap_requested,
         /* .release          = */ paged_dynamic_release_requested,
-        /* .madvise          = */ kv_swap_madvise_requested || paged_dynamic_madvise_requested || kv_lazy_tail,
+        /* .madvise          = */ paged_dynamic_madvise_requested || kv_lazy_tail,
         /* .mapping_read_fault  = */ paged_test_mapping_fault_.scope == paged_test_mapping_fail_scope::READ,
         /* .mapping_write_fault = */ paged_test_mapping_fault_.scope == paged_test_mapping_fail_scope::WRITE,
         /* .swapin_fault        = */ paged_test_swapin_fault_.scope != paged_test_swapin_fail_scope::OFF,
@@ -1698,53 +1553,17 @@ llama_kv_cache::~llama_kv_cache() {
     paged_refault_drain();
     paged_refault_unprotect_all();
 
-    kv_swap_roundtrip_selftest();
-
     static const llama_kv_backing_store_stats kv_swap_empty_stats;
     const auto & kv_swap_stats = kv_swap_store ? kv_swap_store->get_stats() : kv_swap_empty_stats;
-    const char * kv_swap_mode_name =
-        kv_swap_mode_ == kv_swap_mode::exact  ? "exact"  :
-        kv_swap_mode_ == kv_swap_mode::approx ? "approx" : "off";
-    LLAMA_LOG_INFO("%s: KV swap stats: enabled=%d mode=%s window=%u sink=%u "
-            "swap_out_calls=%llu swap_in_calls=%llu ensure_calls=%llu window_calls=%llu "
-            "window_skipped=%llu backend_failures=%llu bytes_written=%llu bytes_read=%llu "
-            "write_calls=%llu read_calls=%llu release_calls=%llu "
-            "RSS peak_kb=%llu current_last_kb=%llu current_min_kb=%llu current_max_kb=%llu "
-            "rss_samples=%llu madvise_enabled=%d madvise_calls=%llu madvise_candidate_runs=%llu "
-            "madvise_advised_runs=%llu madvise_advised_bytes=%llu madvise_failures=%llu "
-            "madvise_skipped_bytes=%llu approx_calls=%llu approx_window=%llu approx_masked=%llu "
-            "approx_debug_get_k_visible_gt0_calls=%llu approx_debug_get_v_visible_gt0_calls=%llu\n",
-            __func__, kv_swap_enabled ? 1 : 0,
-            kv_swap_mode_name,
-            kv_swap_window, kv_swap_sink,
-            (unsigned long long) kv_swap_out_calls,
-            (unsigned long long) kv_swap_in_calls,
-            (unsigned long long) kv_swap_ensure_calls,
-            (unsigned long long) kv_swap_window_calls,
-            (unsigned long long) kv_swap_window_skipped,
-            (unsigned long long) kv_swap_backend_failures,
+    LLAMA_LOG_INFO("%s: KV paged swap backing-store stats: bytes_written=%llu bytes_read=%llu "
+            "write_calls=%llu read_calls=%llu release_calls=%llu backend_failures=%llu\n",
+            __func__,
             (unsigned long long) kv_swap_stats.bytes_written,
             (unsigned long long) kv_swap_stats.bytes_read,
             (unsigned long long) kv_swap_stats.write_calls,
             (unsigned long long) kv_swap_stats.read_calls,
             (unsigned long long) kv_swap_stats.release_calls,
-            (unsigned long long) get_peak_rss_kb(),
-            (unsigned long long) kv_swap_rss_last_kb,
-            (unsigned long long) kv_swap_rss_min_kb,
-            (unsigned long long) kv_swap_rss_max_kb,
-            (unsigned long long) kv_swap_rss_samples,
-            kv_swap_madvise ? 1 : 0,
-            (unsigned long long) kv_swap_madvise_calls,
-            (unsigned long long) kv_swap_madvise_candidate_runs,
-            (unsigned long long) kv_swap_madvise_advised_runs,
-            (unsigned long long) kv_swap_madvise_advised_bytes,
-            (unsigned long long) kv_swap_madvise_failures,
-            (unsigned long long) kv_swap_madvise_skipped_bytes,
-            (unsigned long long) kv_approx_calls,
-            (unsigned long long) kv_approx_window,
-            (unsigned long long) kv_approx_masked,
-            (unsigned long long) kv_approx_debug_get_k_visible_gt0_calls,
-            (unsigned long long) kv_approx_debug_get_v_visible_gt0_calls);
+            (unsigned long long) paged_swap_backend_failures);
 
     if (kv_lazy_tail) {
         // stage F1 / P1: lazy-tail madvise counters (debug-only, current-RSS check).
@@ -4981,6 +4800,38 @@ bool llama_kv_cache::paged_check_read_resident_impl(uint32_t phys_cell, bool req
     return !has_paged_swap_error();
 }
 
+void llama_kv_cache::paged_swap_out_window(uint32_t n_kv) {
+    if (!kv_paged_enabled || !paged_swap_enabled) {
+        return;
+    }
+    if (paged_swap_explicit_only || paged_idle_swap_requested) {
+        paged_swap_window_skipped += 1;
+        return;
+    }
+
+    if (!kv_swap_store || v_trans || n_stream != 1 || paged_block_size == 0 || paged_n_blocks == 0 ||
+            paged_block_states.size() != paged_n_blocks) {
+        paged_swap_window_skipped += 1;
+        return;
+    }
+
+    const uint32_t sink_blocks = 1;
+    const uint32_t window_blocks = 1;
+    const uint32_t n_kv_blocks = (n_kv + paged_block_size - 1) / paged_block_size;
+    if (n_kv_blocks <= sink_blocks + window_blocks) {
+        paged_swap_window_skipped += 1;
+        return;
+    }
+
+    const uint32_t begin = std::min<uint32_t>(sink_blocks, paged_n_blocks);
+    const uint32_t end = std::min<uint32_t>(n_kv_blocks - window_blocks, paged_n_blocks);
+    for (uint32_t physical_block = begin; physical_block < end; ++physical_block) {
+        if (paged_block_states[physical_block] == paged_block_state::RESIDENT) {
+            paged_swap_out_block(physical_block);
+        }
+    }
+}
+
 void llama_kv_cache::paged_swap_out_block(
         uint32_t physical_block,
         bool do_madvise,
@@ -6765,7 +6616,7 @@ void llama_kv_cache::paged_log_base_timing() const {
             "KV_PAGED_TIMING_SUMMARY "
             "apply_calls=%llu apply_paged_total_us=%llu "
             "apply_ubatch_us=%llu note_cells_us=%llu assert_identity_us=%llu "
-            "swap_out_window_us=%llu ensure_resident_us=%llu "
+            "swap_out_window_us=%llu "
             "clear_frontier_us=%llu madvise_tail_us=%llu paged_release_blocks_us=%llu "
             "set_row_idx_calls=%llu set_row_idx_total_us=%llu "
             "row_idx_fill_us=%llu active_visible_us=%llu nonidentity_probe_us=%llu "
@@ -6779,7 +6630,6 @@ void llama_kv_cache::paged_log_base_timing() const {
             (unsigned long long) paged_base_timing_note_cells_us,
             (unsigned long long) paged_base_timing_assert_identity_us,
             (unsigned long long) paged_base_timing_swap_out_window_us,
-            (unsigned long long) paged_base_timing_ensure_resident_us,
             (unsigned long long) paged_base_timing_clear_frontier_us,
             (unsigned long long) paged_base_timing_madvise_tail_us,
             (unsigned long long) paged_base_timing_paged_release_blocks_us,
@@ -7283,399 +7133,6 @@ void llama_kv_cache::paged_log_stats() const {
     }
 }
 
-void llama_kv_cache::swap_out_cell(uint32_t cell) {
-    if (!kv_swap_enabled) {
-        return;
-    }
-
-    if (kv_swap_mode_ != kv_swap_mode::exact || !kv_swap_store || v_trans || n_stream != 1 || v_cells.empty()) {
-        return;
-    }
-
-    auto & cells = v_cells[0];
-    if (cell >= cells.size() || !cells.is_resident(cell)) {
-        return;
-    }
-
-    size_t total_size = 0;
-    for (const auto & layer : layers) {
-        if (!layer.k_stream.empty() && layer.k_stream[0]) {
-            total_size += layer.k_stream[0]->nb[1];
-        }
-        if (layer.v && !layer.v_stream.empty() && layer.v_stream[0]) {
-            total_size += layer.v_stream[0]->nb[1];
-        }
-    }
-    if (total_size == 0) {
-        return;
-    }
-
-    // Fixed staging layout: layer0 K, layer0 V, layer1 K, layer1 V, ...
-    std::vector<uint8_t> staging(total_size);
-    size_t cursor = 0;
-    for (const auto & layer : layers) {
-        if (!layer.k_stream.empty() && layer.k_stream[0]) {
-            auto * k = layer.k_stream[0];
-            const size_t row_size = k->nb[1];
-            ggml_backend_tensor_get(k, staging.data() + cursor, (size_t) cell * row_size, row_size);
-            cursor += row_size;
-        }
-        if (layer.v && !layer.v_stream.empty() && layer.v_stream[0]) {
-            auto * v = layer.v_stream[0];
-            const size_t row_size = v->nb[1];
-            ggml_backend_tensor_get(v, staging.data() + cursor, (size_t) cell * row_size, row_size);
-            cursor += row_size;
-        }
-    }
-
-    GGML_ASSERT(cursor == total_size);
-
-    uint64_t offset = 0;
-    const auto status = kv_swap_store->write_cell(0, cell, staging.data(), staging.size(), offset);
-    if (status != llama_kv_backing_store_status::ok) {
-        kv_swap_backend_failures += 1;
-        return;
-    }
-
-    cells.set_swap_offset(cell, offset);
-    cells.set_swap_size(cell, staging.size());
-    cells.set_state(cell, llama_kv_cell_state::SWAPPED);
-    kv_swap_out_calls += 1;
-}
-
-void llama_kv_cache::swap_in_cell(uint32_t cell) {
-    if (!kv_swap_enabled) {
-        return;
-    }
-
-    if (kv_swap_mode_ != kv_swap_mode::exact || !kv_swap_store || v_trans || n_stream != 1 || v_cells.empty()) {
-        return;
-    }
-
-    auto & cells = v_cells[0];
-    if (cell >= cells.size() || !cells.is_swapped(cell)) {
-        return;
-    }
-
-    const uint64_t offset = cells.get_swap_offset(cell);
-    const size_t swap_size = cells.get_swap_size(cell);
-    if (swap_size == 0) {
-        return;
-    }
-
-    size_t total_size = 0;
-    for (const auto & layer : layers) {
-        if (!layer.k_stream.empty() && layer.k_stream[0]) {
-            total_size += layer.k_stream[0]->nb[1];
-        }
-        if (layer.v && !layer.v_stream.empty() && layer.v_stream[0]) {
-            total_size += layer.v_stream[0]->nb[1];
-        }
-    }
-    if (total_size == 0 || total_size != swap_size) {
-        kv_swap_backend_failures += 1;
-        return;
-    }
-
-    std::vector<uint8_t> staging(total_size);
-    const auto status = kv_swap_store->read_cell(0, cell, offset, staging.data(), staging.size());
-    if (status != llama_kv_backing_store_status::ok) {
-        kv_swap_backend_failures += 1;
-        return;
-    }
-
-    // Fixed staging layout mirrors swap_out_cell(): layer0 K, layer0 V, layer1 K, layer1 V, ...
-    size_t cursor = 0;
-    for (const auto & layer : layers) {
-        if (!layer.k_stream.empty() && layer.k_stream[0]) {
-            auto * k = layer.k_stream[0];
-            const size_t row_size = k->nb[1];
-            ggml_backend_tensor_set(k, staging.data() + cursor, (size_t) cell * row_size, row_size);
-            cursor += row_size;
-        }
-        if (layer.v && !layer.v_stream.empty() && layer.v_stream[0]) {
-            auto * v = layer.v_stream[0];
-            const size_t row_size = v->nb[1];
-            ggml_backend_tensor_set(v, staging.data() + cursor, (size_t) cell * row_size, row_size);
-            cursor += row_size;
-        }
-    }
-
-    GGML_ASSERT(cursor == total_size);
-
-    cells.set_state(cell, llama_kv_cell_state::RESIDENT);
-    kv_swap_in_calls += 1;
-}
-
-void llama_kv_cache::ensure_resident(uint32_t n_kv) {
-    if (!kv_swap_enabled) {
-        return;
-    }
-
-    if (kv_swap_mode_ != kv_swap_mode::exact || v_cells.empty()) {
-        return;
-    }
-
-    auto & cells = v_cells[0];
-    const uint32_t end = std::min<uint32_t>(n_kv, cells.size());
-    for (uint32_t i = 0; i < end; ++i) {
-        if (cells.is_swapped(i)) {
-            swap_in_cell(i);
-        }
-    }
-    kv_swap_ensure_calls += 1;
-}
-
-void llama_kv_cache::swap_out_window(uint32_t n_kv) {
-    if (!kv_swap_enabled) {
-        return;
-    }
-
-    kv_swap_window_calls += 1;
-
-    if (kv_swap_mode_ != kv_swap_mode::exact || v_trans || n_stream != 1 || v_cells.empty()) {
-        kv_swap_window_skipped += 1;
-        return;
-    }
-    if (kv_swap_window == 0) {
-        kv_swap_window_skipped += 1;
-        return;
-    }
-    if ((uint64_t) n_kv <= (uint64_t) kv_swap_window + kv_swap_sink) {
-        kv_swap_window_skipped += 1;
-        return;
-    }
-
-    auto & cells = v_cells[0];
-    const uint32_t begin = std::min<uint32_t>(kv_swap_sink, cells.size());
-    const uint32_t end = std::min<uint32_t>(n_kv - kv_swap_window, cells.size());
-    for (uint32_t cell = begin; cell < end; ++cell) {
-        if (cells.is_resident(cell)) {
-            swap_out_cell(cell);
-        }
-    }
-    madvise_swapped_runs(n_kv);
-}
-
-void llama_kv_cache::paged_swap_out_window(uint32_t n_kv) {
-    if (!kv_paged_enabled || !paged_swap_enabled) {
-        return;
-    }
-    if (paged_swap_explicit_only || paged_idle_swap_requested) {
-        paged_swap_window_skipped += 1;
-        return;
-    }
-
-    if (!kv_swap_store || v_trans || n_stream != 1 || paged_block_size == 0 || paged_n_blocks == 0 ||
-            paged_block_states.size() != paged_n_blocks) {
-        paged_swap_window_skipped += 1;
-        return;
-    }
-
-    const uint32_t sink_blocks = 1;
-    const uint32_t window_blocks = 1;
-    const uint32_t n_kv_blocks = (n_kv + paged_block_size - 1) / paged_block_size;
-    if (n_kv_blocks <= sink_blocks + window_blocks) {
-        paged_swap_window_skipped += 1;
-        return;
-    }
-
-    const uint32_t begin = std::min<uint32_t>(sink_blocks, paged_n_blocks);
-    const uint32_t end = std::min<uint32_t>(n_kv_blocks - window_blocks, paged_n_blocks);
-    for (uint32_t physical_block = begin; physical_block < end; ++physical_block) {
-        if (paged_block_states[physical_block] == paged_block_state::RESIDENT) {
-            paged_swap_out_block(physical_block);
-        }
-    }
-}
-
-void llama_kv_cache::madvise_swapped_runs(uint32_t n_kv) {
-    if (!kv_swap_madvise) {
-        return;
-    }
-
-    kv_swap_madvise_calls += 1;
-
-    if (kv_swap_mode_ != kv_swap_mode::exact || v_trans || n_stream != 1 || v_cells.empty()) {
-        return;
-    }
-
-    const long page = sysconf(_SC_PAGESIZE);
-    if (page <= 0) {
-        kv_swap_madvise_failures += 1;
-        return;
-    }
-    const uintptr_t page_size = (uintptr_t) page;
-    const auto page_align_up = [page_size](uintptr_t p) {
-        return (p + page_size - 1) & ~(page_size - 1);
-    };
-    const auto page_align_down = [page_size](uintptr_t p) {
-        return p & ~(page_size - 1);
-    };
-
-    auto & cells = v_cells[0];
-    const uint32_t end = std::min<uint32_t>(n_kv, cells.size());
-    uint32_t c_lo = 0;
-    while (c_lo < end) {
-        while (c_lo < end && !cells.is_swapped(c_lo)) {
-            ++c_lo;
-        }
-        if (c_lo >= end) {
-            break;
-        }
-
-        uint32_t c_hi = c_lo + 1;
-        while (c_hi < end && cells.is_swapped(c_hi)) {
-            ++c_hi;
-        }
-
-        for (const auto & layer : layers) {
-            const auto dry_run_tensor = [&](ggml_tensor * t, uint32_t n_embd_gqa) {
-                if (!t || !t->data) {
-                    return;
-                }
-
-                kv_swap_madvise_candidate_runs += 1;
-
-                const size_t row = ggml_row_size(t->type, n_embd_gqa);
-                const uint64_t run_bytes = (uint64_t) (c_hi - c_lo) * (uint64_t) t->nb[1];
-                if (row != (size_t) t->nb[1]) {
-                    kv_swap_madvise_failures += 1;
-                    kv_swap_madvise_skipped_bytes += run_bytes;
-                    return;
-                }
-
-                const uintptr_t base = (uintptr_t) t->data;
-                const uintptr_t lo_byte = base + (uintptr_t) c_lo * (uintptr_t) row;
-                const uintptr_t hi_byte = base + (uintptr_t) c_hi * (uintptr_t) row;
-                const uintptr_t a_start = page_align_up(lo_byte);
-                const uintptr_t a_end = page_align_down(hi_byte);
-                if (a_end > a_start) {
-                    const size_t len = (size_t) (a_end - a_start);
-#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
-                    if (madvise((void *) a_start, len, MADV_DONTNEED) == 0) {
-                        kv_swap_madvise_advised_runs += 1;
-                        kv_swap_madvise_advised_bytes += (uint64_t) len;
-                    } else {
-                        kv_swap_madvise_failures += 1;
-                    }
-#else
-                    (void) len;
-                    kv_swap_madvise_failures += 1;
-#endif
-                } else {
-                    kv_swap_madvise_skipped_bytes += (uint64_t) (hi_byte - lo_byte);
-                }
-            };
-
-            if (!layer.k_stream.empty()) {
-                dry_run_tensor(layer.k_stream[0], hparams.n_embd_k_gqa(layer.il));
-            }
-            if (layer.v && !layer.v_stream.empty()) {
-                dry_run_tensor(layer.v_stream[0], hparams.n_embd_v_gqa(layer.il));
-            }
-        }
-
-        c_lo = c_hi;
-    }
-}
-
-void llama_kv_cache::kv_swap_roundtrip_selftest() {
-    const char * LLAMA_KV_SWAP_ROUNDTRIP_SELFTEST = std::getenv("LLAMA_KV_SWAP_ROUNDTRIP_SELFTEST");
-    if (!LLAMA_KV_SWAP_ROUNDTRIP_SELFTEST || std::atoi(LLAMA_KV_SWAP_ROUNDTRIP_SELFTEST) == 0) {
-        return;
-    }
-
-    static bool done = false;
-    if (done || !kv_swap_enabled || kv_swap_mode_ != kv_swap_mode::exact || !kv_swap_store ||
-            v_trans || n_stream != 1 || v_cells.empty()) {
-        return;
-    }
-
-    auto & cells = v_cells[0];
-    uint32_t cell = cells.size();
-    for (uint32_t i = 0; i < cells.size(); ++i) {
-        if (cells.is_resident(i)) {
-            cell = i;
-            break;
-        }
-    }
-    if (cell == cells.size()) {
-        return;
-    }
-
-    size_t total_size = 0;
-    for (const auto & layer : layers) {
-        if (!layer.k_stream.empty() && layer.k_stream[0]) {
-            total_size += layer.k_stream[0]->nb[1];
-        }
-        if (layer.v && !layer.v_stream.empty() && layer.v_stream[0]) {
-            total_size += layer.v_stream[0]->nb[1];
-        }
-    }
-    if (total_size == 0) {
-        return;
-    }
-
-    auto read_cell_bytes = [&](std::vector<uint8_t> & out) {
-        out.resize(total_size);
-        size_t cursor = 0;
-        for (const auto & layer : layers) {
-            if (!layer.k_stream.empty() && layer.k_stream[0]) {
-                auto * k = layer.k_stream[0];
-                const size_t row_size = k->nb[1];
-                ggml_backend_tensor_get(k, out.data() + cursor, (size_t) cell * row_size, row_size);
-                cursor += row_size;
-            }
-            if (layer.v && !layer.v_stream.empty() && layer.v_stream[0]) {
-                auto * v = layer.v_stream[0];
-                const size_t row_size = v->nb[1];
-                ggml_backend_tensor_get(v, out.data() + cursor, (size_t) cell * row_size, row_size);
-                cursor += row_size;
-            }
-        }
-        return cursor == total_size;
-    };
-
-    std::vector<uint8_t> before;
-    if (!read_cell_bytes(before)) {
-        done = true;
-        LLAMA_LOG_ERROR("%s: KV swap roundtrip selftest fail: snapshot layout mismatch\n", __func__);
-        return;
-    }
-
-    swap_out_cell(cell);
-    if (!cells.is_swapped(cell)) {
-        done = true;
-        LLAMA_LOG_ERROR("%s: KV swap roundtrip selftest fail: swap_out did not mark cell %u swapped\n",
-                __func__, cell);
-        return;
-    }
-
-    swap_in_cell(cell);
-    if (!cells.is_resident(cell)) {
-        done = true;
-        LLAMA_LOG_ERROR("%s: KV swap roundtrip selftest fail: swap_in did not restore cell %u resident\n",
-                __func__, cell);
-        return;
-    }
-
-    std::vector<uint8_t> after;
-    if (!read_cell_bytes(after)) {
-        done = true;
-        LLAMA_LOG_ERROR("%s: KV swap roundtrip selftest fail: restore layout mismatch\n", __func__);
-        return;
-    }
-
-    done = true;
-    if (before == after) {
-        LLAMA_LOG_INFO("%s: KV swap roundtrip selftest pass: cell=%u bytes=%zu\n",
-                __func__, cell, total_size);
-    } else {
-        LLAMA_LOG_ERROR("%s: KV swap roundtrip selftest fail: byte mismatch cell=%u bytes=%zu\n",
-                __func__, cell, total_size);
-    }
-}
 
 uint64_t llama_kv_cache::get_current_rss_kb() const {
 #if defined(__linux__)
@@ -7698,50 +7155,6 @@ uint64_t llama_kv_cache::get_current_rss_kb() const {
 #else
     return 0;
 #endif
-}
-
-uint64_t llama_kv_cache::get_peak_rss_kb() const {
-#if defined(__linux__)
-    FILE * f = fopen("/proc/self/status", "r");
-    if (!f) {
-        return 0;
-    }
-    char line[256];
-    uint64_t peak_kb = 0;
-    while (fgets(line, sizeof(line), f)) {
-        if (std::strncmp(line, "VmHWM:", 6) == 0) {
-            unsigned long long value = 0;
-            if (sscanf(line + 6, "%llu", &value) == 1) {
-                peak_kb = (uint64_t) value;
-            }
-            break;
-        }
-    }
-    fclose(f);
-    return peak_kb;
-#else
-    return 0;
-#endif
-}
-
-void llama_kv_cache::sample_swap_rss() {
-    if (!kv_swap_rss_sample) {
-        return;
-    }
-
-    const uint64_t rss_kb = get_current_rss_kb();
-    if (rss_kb == 0) {
-        return;
-    }
-
-    if (kv_swap_rss_samples == 0 || rss_kb < kv_swap_rss_min_kb) {
-        kv_swap_rss_min_kb = rss_kb;
-    }
-    if (rss_kb > kv_swap_rss_max_kb) {
-        kv_swap_rss_max_kb = rss_kb;
-    }
-    kv_swap_rss_last_kb = rss_kb;
-    kv_swap_rss_samples += 1;
 }
 
 void llama_kv_cache::madvise_tail(uint32_t n_kv) {
@@ -8866,10 +8279,6 @@ ggml_type llama_kv_cache::type_v() const {
 }
 
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
-    if (uses_approx_dynamic_view()) {
-        return get_reserve_n_kv();
-    }
-
     uint32_t result = 0;
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
@@ -8885,42 +8294,10 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     return result;
 }
 
-uint32_t llama_kv_cache::get_visible_lo(const slot_info & sinfo) const {
-    if (!uses_approx_dynamic_view()) {
-        return 0;
-    }
-
-    uint32_t used_max_p1 = 0;
-    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-        used_max_p1 = std::max(used_max_p1, v_cells[sinfo.strm[s]].used_max_p1());
-    }
-
-    const uint32_t n_kv = get_reserve_n_kv();
-    const uint32_t kv_size = get_size();
-    const uint32_t keep_from = used_max_p1 > kv_swap_window ? used_max_p1 - kv_swap_window : 0;
-    const uint32_t max_visible_lo = kv_size > n_kv ? kv_size - n_kv : 0;
-
-    return std::min(keep_from, max_visible_lo);
-}
-
-uint32_t llama_kv_cache::get_reserve_n_kv() const {
-    if (!uses_approx_dynamic_view()) {
-        return get_size();
-    }
-
-    return std::min<uint32_t>(GGML_PAD(kv_swap_window, 256), get_size());
-}
-
-bool llama_kv_cache::uses_approx_dynamic_view() const {
-    return kv_swap_enabled && kv_swap_mode_ == kv_swap_mode::approx &&
-        kv_swap_window > 0 && !v_trans && n_stream == 1 && n_seq_max == 1;
-}
-
 ggml_tensor * llama_kv_cache::get_k(
         ggml_context * ctx,
         int32_t il,
         uint32_t n_kv,
-        uint32_t visible_lo,
         const slot_info & sinfo,
         bool causal_attn,
         ggml_tensor * row_idx) const {
@@ -8934,21 +8311,10 @@ ggml_tensor * llama_kv_cache::get_k(
     assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
-    const bool approx_dynamic = uses_approx_dynamic_view() && causal_attn && ns == 1;
     const uint64_t row_size = ggml_row_size(k->type, n_embd_k_gqa);
-    const uint64_t byte_offset = row_size*visible_lo;
-
-    if (uses_approx_dynamic_view() && !approx_dynamic && !kv_approx_dynamic_warned) {
-        LLAMA_LOG_WARN("%s: KV swap approx dynamic view requires single-seq causal attention "
-                "with !v_trans and n_stream==1 - falling back to original K view\n", __func__);
-        kv_approx_dynamic_warned = true;
-    }
-    if (approx_dynamic && visible_lo > 0) {
-        ++kv_approx_debug_get_k_visible_gt0_calls;
-    }
 
     if (!paged_identity_fast_path_enabled && row_idx &&
-            paged_ingraph_gather_supported(il) && ns == 1 && !approx_dynamic) {
+            paged_ingraph_gather_supported(il) && ns == 1) {
         ggml_tensor * k2d = ggml_reshape_2d(ctx, k, n_embd_k_gqa, kv_size);
         ggml_tensor * rows = ggml_get_rows(ctx, k2d, row_idx);
         paged_ingraph_gather_layers += 1;
@@ -8962,14 +8328,13 @@ ggml_tensor * llama_kv_cache::get_k(
             ggml_row_size(k->type, hparams.n_embd_head_k(il)),
             row_size,
             ggml_row_size(k->type, n_embd_k_gqa*kv_size),
-            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0 + (approx_dynamic ? byte_offset : 0));
+            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
 }
 
 ggml_tensor * llama_kv_cache::get_v(
         ggml_context * ctx,
         int32_t il,
         uint32_t n_kv,
-        uint32_t visible_lo,
         const slot_info & sinfo,
         bool causal_attn,
         ggml_tensor * row_idx) const {
@@ -8986,21 +8351,10 @@ ggml_tensor * llama_kv_cache::get_v(
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
     if (!v_trans) {
-        const bool approx_dynamic = uses_approx_dynamic_view() && causal_attn && ns == 1;
         const uint64_t row_size = ggml_row_size(v->type, n_embd_v_gqa);
-        const uint64_t byte_offset = row_size*visible_lo;
-
-        if (uses_approx_dynamic_view() && !approx_dynamic && !kv_approx_dynamic_warned) {
-            LLAMA_LOG_WARN("%s: KV swap approx dynamic view requires single-seq causal attention "
-                    "with !v_trans and n_stream==1 - falling back to original V view\n", __func__);
-            kv_approx_dynamic_warned = true;
-        }
-        if (approx_dynamic && visible_lo > 0) {
-            ++kv_approx_debug_get_v_visible_gt0_calls;
-        }
 
         if (!paged_identity_fast_path_enabled && row_idx &&
-                paged_ingraph_gather_supported(il) && ns == 1 && !approx_dynamic) {
+                paged_ingraph_gather_supported(il) && ns == 1) {
             ggml_tensor * v2d = ggml_reshape_2d(ctx, v, n_embd_v_gqa, kv_size);
             ggml_tensor * rows = ggml_get_rows(ctx, v2d, row_idx);
             paged_ingraph_gather_layers += 1;
@@ -9015,7 +8369,7 @@ ggml_tensor * llama_kv_cache::get_v(
                 ggml_row_size(v->type, hparams.n_embd_head_v(il)),          // v->nb[1]
                 row_size,                                                // v->nb[2]
                 ggml_row_size(v->type, n_embd_v_gqa*kv_size),           // v->nb[3]
-                ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0 + (approx_dynamic ? byte_offset : 0));
+                ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0);
     }
 
     // note: v->nb[1] > v->nb[2]
@@ -10899,9 +10253,6 @@ struct args_set_input_kq_mask {
     int64_t n_kv;
     int64_t n_stream;
     int64_t n_tps;
-
-    bool     approx_enabled;
-    uint32_t visible_lo;
 };
 
 template<bool causal, bool swa, bool is_2d, bool alibi>
@@ -10991,7 +10342,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * 
                     }
                 }
 
-                const uint32_t cell_idx = args.approx_enabled ? args.visible_lo + j : j;
+                const uint32_t cell_idx = j;
 
                 if (cells.is_empty(cell_idx)) {
                     goto skip;
@@ -11083,7 +10434,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * 
 }
 
 void llama_kv_cache::set_input_kq_mask(
-        ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t visible_lo, const slot_info & sinfo) const {
+        ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, const slot_info & sinfo) const {
     GGML_UNUSED(sinfo);
 
     const uint32_t n_tokens = ubatch->n_tokens;
@@ -11099,16 +10450,6 @@ void llama_kv_cache::set_input_kq_mask(
     // n_tps == n_tokens_per_stream
     const int64_t n_tps = n_tokens/n_stream;
 
-    const bool approx_enabled = uses_approx_dynamic_view() && causal_attn && visible_lo > 0;
-
-    if (kv_swap_enabled && kv_swap_mode_ == kv_swap_mode::approx) {
-        ++kv_approx_calls;
-    }
-    if (approx_enabled) {
-        // Estimate cells hidden by the shifted physical read window; the mask tensor itself only spans [visible_lo, visible_hi).
-        kv_approx_masked += (uint64_t) visible_lo*n_tokens;
-    }
-
     const args_set_input_kq_mask args = {
         /*.hparams          =*/ hparams,
         /*.ubatch           =*/ ubatch,
@@ -11119,8 +10460,6 @@ void llama_kv_cache::set_input_kq_mask(
         /*.n_kv             =*/ n_kv,
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
-        /*.approx_enabled   =*/ approx_enabled,
-        /*.visible_lo       =*/ visible_lo,
     };
 
     if (causal_attn) {
@@ -11851,8 +11190,7 @@ llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : sta
 
 llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
-    n_kv = kv->get_reserve_n_kv();
-    visible_lo = 0;
+    n_kv = kv->get_size();
 
     const uint32_t n_stream = kv->get_n_stream();
 
@@ -12053,20 +11391,8 @@ bool llama_kv_cache_context::apply() {
     }
 
     n_kv = kv->get_n_kv(sinfos[i_cur]);
-    visible_lo = kv->get_visible_lo(sinfos[i_cur]);
     paged_shadow_n_kv = n_kv;
     paged_shadow_pending = true;
-
-    t0 = base_timing_enabled ? llama_paged_timing_now_us() : 0;
-    kv->swap_out_window(n_kv);
-    if (base_timing_enabled) {
-        kv->paged_base_timing_swap_out_window_us += llama_paged_timing_now_us() - t0;
-    }
-    t0 = base_timing_enabled ? llama_paged_timing_now_us() : 0;
-    kv->ensure_resident(n_kv);
-    if (base_timing_enabled) {
-        kv->paged_base_timing_ensure_resident_us += llama_paged_timing_now_us() - t0;
-    }
 
     // stage P2: zero any rows that just entered the [0, n_kv) read window but were left
     // uncommitted at construction. Must run before madvise_tail so the cleared range and the
@@ -12097,7 +11423,6 @@ bool llama_kv_cache_context::apply() {
     kv->paged_swap_pending = kv->paged_swap_enabled &&
         !kv->paged_swap_explicit_only && !kv->paged_idle_swap_requested;
     kv->paged_swap_pending_n_kv = n_kv;
-    kv->sample_swap_rss();
 
     return true;
 }
@@ -12235,14 +11560,6 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
 }
 
-uint32_t llama_kv_cache_context::get_visible_lo() const {
-    return visible_lo;
-}
-
-bool llama_kv_cache_context::uses_approx_dynamic_view() const {
-    return kv->uses_approx_dynamic_view();
-}
-
 ggml_type llama_kv_cache_context::type_k() const {
     return kv->type_k();
 }
@@ -12252,11 +11569,11 @@ ggml_type llama_kv_cache_context::type_v() const {
 }
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il, bool causal_attn, ggml_tensor * row_idx) const {
-    return kv->get_k(ctx, il, n_kv, visible_lo, sinfos[i_cur], causal_attn, row_idx);
+    return kv->get_k(ctx, il, n_kv, sinfos[i_cur], causal_attn, row_idx);
 }
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il, bool causal_attn, ggml_tensor * row_idx) const {
-    return kv->get_v(ctx, il, n_kv, visible_lo, sinfos[i_cur], causal_attn, row_idx);
+    return kv->get_v(ctx, il, n_kv, sinfos[i_cur], causal_attn, row_idx);
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
@@ -12308,7 +11625,7 @@ bool llama_kv_cache_context::set_input_paged_row_idx(ggml_tensor * dst, const ll
 }
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
-    kv->set_input_kq_mask(dst, ubatch, causal_attn, visible_lo, sinfos[i_cur]);
+    kv->set_input_kq_mask(dst, ubatch, causal_attn, sinfos[i_cur]);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

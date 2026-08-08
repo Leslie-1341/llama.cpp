@@ -501,9 +501,6 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     }
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
-    if (mctx->uses_approx_dynamic_view() && params.cparams.causal_attn) {
-        res &= visible_lo == mctx->get_visible_lo();
-    }
 
     return res;
 }
@@ -524,9 +521,6 @@ bool llm_graph_input_attn_k::can_reuse(const llm_graph_params & params) {
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
-    if (mctx->uses_approx_dynamic_view() && params.cparams.causal_attn) {
-        res &= visible_lo == mctx->get_visible_lo();
-    }
 
     return res;
 }
@@ -2199,7 +2193,6 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     const llama_kv_cache_context * mctx_cur) {
 
     auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur);
-    inp->visible_lo = mctx_cur->get_visible_lo();
 
     {
         GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE && "Use llama_kv_cache_iswa for SWA");
@@ -2310,7 +2303,6 @@ static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(
     const llama_kv_cache_context * mctx_cur) {
 
     auto inp = std::make_unique<llm_graph_input_attn_k>(hparams, cparams, mctx_cur);
-    inp->visible_lo = mctx_cur->get_visible_lo();
 
     {
         GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE && "Use llama_kv_cache_iswa for SWA");

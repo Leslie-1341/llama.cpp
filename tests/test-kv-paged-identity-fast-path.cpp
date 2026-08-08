@@ -17,7 +17,6 @@ static llama_kv_paged_identity_fast_path_config eligible_config() {
         /* .ingraph_enabled  = */ true,
         /* .single_stream    = */ true,
         /* .v_trans          = */ false,
-        /* .approx_dynamic   = */ false,
         /* .identity_mapping = */ true,
         /* .dynamic_remap    = */ false,
         /* .swap             = */ false,
@@ -72,8 +71,6 @@ int main() {
     expect_reject(config, llama_kv_paged_identity_fast_path_reject::MULTI_STREAM);
     config = eligible_config(); config.v_trans = true;
     expect_reject(config, llama_kv_paged_identity_fast_path_reject::V_TRANS);
-    config = eligible_config(); config.approx_dynamic = true;
-    expect_reject(config, llama_kv_paged_identity_fast_path_reject::APPROX_DYNAMIC);
     config = eligible_config(); config.layers_supported = false;
     expect_reject(config, llama_kv_paged_identity_fast_path_reject::UNSUPPORTED_LAYER);
 

@@ -37,12 +37,11 @@ class llama_kv_cache_context;
 // llama_kv_cache
 //
 
-// Stage2-backend0: backing-store abstraction shell for runtime KV swap.
+// Backing-store interface for paged KV swap-out/swap-in of block bytes.
 //
-// This interface is intentionally not instantiated or called in backend0. It only fixes the
-// seam for future exact offload work, where a file-backed/tmpfile implementation can persist
-// cell or block bytes outside the anonymous KV tensor allocation. No file I/O, swap-out,
-// swap-in, ensure_resident, prefetch, or madvise behavior is implemented here.
+// Only the file-backed implementation is instantiated by the paged runtime; it persists
+// block bytes outside the anonymous KV tensor allocation. No legacy exact-swap offload
+// path exists on this interface.
 enum class llama_kv_backing_store_status : uint8_t {
     ok = 0,
     disabled,
@@ -441,13 +440,10 @@ public:
     //
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
-    uint32_t get_visible_lo(const slot_info & sinfo) const;
-    uint32_t get_reserve_n_kv() const;
-    bool uses_approx_dynamic_view() const;
 
     // get views of the current state of the cache
-    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, uint32_t visible_lo, const slot_info & sinfo, bool causal_attn, ggml_tensor * row_idx = nullptr) const;
-    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, uint32_t visible_lo, const slot_info & sinfo, bool causal_attn, ggml_tensor * row_idx = nullptr) const;
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, bool causal_attn, ggml_tensor * row_idx = nullptr) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, bool causal_attn, ggml_tensor * row_idx = nullptr) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
@@ -470,12 +466,6 @@ public:
 
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
-
-    // Stage2-exact-swapout0: no-op scaffold for future exact swap-in before KV reads.
-    // Not called from apply() in this stage.
-    void ensure_resident(uint32_t n_kv);
-    void swap_out_window(uint32_t n_kv);
-    void sample_swap_rss();
 
     // Bounded release result — defined in llama-kv-cache-release.h for shared access
     // between core (llama_kv_cache) and server (llama_memory_i).
@@ -824,7 +814,7 @@ public:
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t visible_lo, const slot_info & sinfo) const;
+    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, const slot_info & sinfo) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
@@ -875,50 +865,12 @@ private:
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
 
-    // Stage2-exact-swapout0 scaffold. This only parses env, owns the file-backed backend
-    // when explicitly enabled, and defines counters/no-op hooks. It does not touch KV tensors,
-    // cell state, apply(), attention, madvise, or prefetch.
-    enum class kv_swap_mode {
-        off,
-        exact,
-        approx,
-    };
-
+    // Shared fixed-slot file-backed store used by the paged runtime (LLAMA_KV_PAGED_SWAP=1
+    // path) for OFFLOAD/PREFETCH. The legacy single-cell exact swap path that previously
+    // distinguished LLAMA_KV_SWAP_MODE=exact|approx has been removed; only the paged runtime
+    // owns and consumes this store. The directory is honored exactly via LLAMA_KV_SWAP_DIR.
     std::unique_ptr<llama_kv_backing_store_i> kv_swap_store;
     size_t kv_swap_cell_stride = 0;
-    bool kv_swap_enabled = false;
-    kv_swap_mode kv_swap_mode_ = kv_swap_mode::off;
-    uint64_t kv_swap_out_calls = 0;
-    uint64_t kv_swap_in_calls = 0;
-    uint64_t kv_swap_ensure_calls = 0;
-    uint32_t kv_swap_window = 0;
-    uint32_t kv_swap_sink = 0;
-    uint64_t kv_swap_window_calls = 0;
-    uint64_t kv_swap_window_skipped = 0;
-    uint64_t kv_swap_backend_failures = 0;
-    mutable uint64_t kv_approx_calls = 0;
-    uint64_t kv_approx_window = 0;
-    mutable uint64_t kv_approx_masked = 0;
-    mutable uint64_t kv_approx_debug_get_k_visible_gt0_calls = 0;
-    mutable uint64_t kv_approx_debug_get_v_visible_gt0_calls = 0;
-    mutable bool     kv_approx_dynamic_warned = false;
-    bool     kv_swap_rss_sample = false;
-    uint64_t kv_swap_rss_samples = 0;
-    uint64_t kv_swap_rss_min_kb = 0;
-    uint64_t kv_swap_rss_max_kb = 0;
-    uint64_t kv_swap_rss_last_kb = 0;
-    bool     kv_swap_madvise = false;
-    uint64_t kv_swap_madvise_calls = 0;
-    uint64_t kv_swap_madvise_candidate_runs = 0;
-    uint64_t kv_swap_madvise_advised_runs = 0;
-    uint64_t kv_swap_madvise_advised_bytes = 0;
-    uint64_t kv_swap_madvise_failures = 0;
-    uint64_t kv_swap_madvise_skipped_bytes = 0;
-
-    void swap_out_cell(uint32_t cell);
-    void swap_in_cell(uint32_t cell);
-    void madvise_swapped_runs(uint32_t n_kv);
-    void kv_swap_roundtrip_selftest();
 
     // Stage 1 paged KV metadata scaffold. Off unless LLAMA_KV_PAGED=1 and only maintains an
     // identity block table for internal accounting; it is not consumed by KV read/write paths.
@@ -1612,7 +1564,6 @@ private:
     mutable uint64_t paged_base_timing_note_cells_us = 0;
     mutable uint64_t paged_base_timing_assert_identity_us = 0;
     mutable uint64_t paged_base_timing_swap_out_window_us = 0;
-    mutable uint64_t paged_base_timing_ensure_resident_us = 0;
     mutable uint64_t paged_base_timing_clear_frontier_us = 0;
     mutable uint64_t paged_base_timing_madvise_tail_us = 0;
     mutable uint64_t paged_base_timing_paged_release_blocks_us = 0;
@@ -1813,8 +1764,6 @@ private:
 
     // current process RSS in KiB from /proc/self/statm (0 if unavailable).
     uint64_t get_current_rss_kb() const;
-    // peak process RSS in KiB from /proc/self/status VmHWM (0 if unavailable).
-    uint64_t get_peak_rss_kb() const;
 
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
@@ -1924,8 +1873,6 @@ public:
     //
 
     uint32_t get_n_kv() const;
-    uint32_t get_visible_lo() const;
-    bool uses_approx_dynamic_view() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
@@ -1998,7 +1945,6 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
-    uint32_t visible_lo = 0;
 
     bool     paged_shadow_pending = false;
     uint32_t paged_shadow_n_kv    = 0;

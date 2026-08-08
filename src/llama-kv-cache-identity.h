@@ -9,7 +9,6 @@ enum class llama_kv_paged_identity_fast_path_reject : uint8_t {
     INGRAPH_DISABLED,
     MULTI_STREAM,
     V_TRANS,
-    APPROX_DYNAMIC,
     NON_IDENTITY_MAPPING,
     DYNAMIC_REMAP,
     SWAP,
@@ -25,7 +24,6 @@ struct llama_kv_paged_identity_fast_path_config {
     bool ingraph_enabled  = false;
     bool single_stream    = false;
     bool v_trans          = false;
-    bool approx_dynamic   = false;
     bool identity_mapping = false;
     bool dynamic_remap    = false;
     bool swap             = false;
@@ -65,9 +63,6 @@ inline llama_kv_paged_identity_fast_path_result llama_kv_paged_identity_fast_pat
     if (config.v_trans) {
         return { false, llama_kv_paged_identity_fast_path_reject::V_TRANS };
     }
-    if (config.approx_dynamic) {
-        return { false, llama_kv_paged_identity_fast_path_reject::APPROX_DYNAMIC };
-    }
     if (!config.identity_mapping) {
         return { false, llama_kv_paged_identity_fast_path_reject::NON_IDENTITY_MAPPING };
     }
@@ -98,7 +93,6 @@ inline const char * llama_kv_paged_identity_fast_path_reject_name(
         case llama_kv_paged_identity_fast_path_reject::INGRAPH_DISABLED:     return "ingraph_disabled";
         case llama_kv_paged_identity_fast_path_reject::MULTI_STREAM:         return "multi_stream";
         case llama_kv_paged_identity_fast_path_reject::V_TRANS:              return "v_trans";
-        case llama_kv_paged_identity_fast_path_reject::APPROX_DYNAMIC:       return "approx_dynamic";
         case llama_kv_paged_identity_fast_path_reject::NON_IDENTITY_MAPPING: return "non_identity_mapping";
         case llama_kv_paged_identity_fast_path_reject::DYNAMIC_REMAP:        return "dynamic_remap";
         case llama_kv_paged_identity_fast_path_reject::SWAP:                 return "swap";
