@@ -399,6 +399,7 @@ public:
     uint64_t sample_kv_resident_bytes() const override;
     llama_kv_resident_sample sample_kv_resident() const override;
     llama_kv_release_budget_snapshot sample_kv_release_budget() const override;
+    llama_kv_physical_budget_view sample_kv_physical_budget_view() const override;
     uint64_t bounded_release_counter_bytes() const override {
         return paged_bounded_release_bytes;
     }

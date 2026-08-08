@@ -7627,6 +7627,170 @@ llama_kv_release_budget_snapshot llama_kv_cache::sample_kv_release_budget() cons
     return result;
 }
 
+llama_kv_physical_budget_view llama_kv_cache::sample_kv_physical_budget_view() const {
+    llama_kv_physical_budget_view result;
+
+    // Structural precondition identical to sample_kv_resident() and
+    // sample_kv_release_budget(): paged layout must be authoritative.
+    const bool paged_layout_valid = kv_paged_enabled && !v_trans && n_stream == 1 &&
+        paged_block_size != 0 && paged_n_blocks != 0 &&
+        paged_block_states.size() == paged_n_blocks && !layers.empty();
+    if (!paged_layout_valid || paged_write_context_invalid) {
+        return result;
+    }
+
+    result.object_id = paged_resident_object_id;
+    result.generation = paged_resident_generation;
+    result.n_blocks = paged_n_blocks;
+
+    long page_size_l = 0;
+#if defined(__linux__)
+    page_size_l = sysconf(_SC_PAGESIZE);
+#endif
+    result.page_size = page_size_l > 0 ? (uint64_t) page_size_l : 4096;
+
+    // Per-layer K/V row sizes (static for the cache lifetime).  Used both
+    // for total_bytes and as the per-cell logical byte budget when validating
+    // paged_swap_sizes consistency (fail-closed SWAPPED rule below).
+    uint64_t row_sum = 0;
+    uint64_t bytes_per_cell = 0;
+    for (const auto & layer : layers) {
+        ggml_tensor * k = layer.k_stream.empty() ? nullptr : layer.k_stream[0];
+        ggml_tensor * v = (!layer.v || layer.v_stream.empty()) ? nullptr : layer.v_stream[0];
+        if (k) {
+            const size_t r = ggml_row_size(k->type, hparams.n_embd_k_gqa(layer.il));
+            row_sum += r;
+            bytes_per_cell += k->nb[1];
+        }
+        if (v) {
+            const size_t r = ggml_row_size(v->type, hparams.n_embd_v_gqa(layer.il));
+            row_sum += r;
+            bytes_per_cell += v->nb[1];
+        }
+    }
+    if (row_sum == 0 || bytes_per_cell == 0) {
+        return result;
+    }
+    result.total_bytes = (uint64_t) paged_kv_size * row_sum;
+
+    // SWAPPED authoritative bytes — direct sum of paged_swap_sizes[c] for
+    // cells inside SWAPPED blocks.  Fail-closed rules:
+    //   1. paged_swap_sizes.size() MUST equal paged_kv_size; any drift is
+    //      metadata corruption and forces valid=false (snapshot discarded).
+    //   2. Any non-zero paged_swap_sizes[c] that exceeds bytes_per_cell is
+    //      over-publish corruption and forces valid=false.
+    //   3. Any non-zero paged_swap_sizes[c] whose block is in an ineligible
+    //      state (RELEASED / UNUSED / PENDING_WRITE / INVALID) is stale
+    //      metadata corruption.  RESIDENT cells legitimately retain
+    //      paged_swap_sizes after prefetch restore until the next release
+    //      / reset boundary clears them — this is the documented lifecycle,
+    //      not corruption.
+    //   4. SWAPPED-block cells with paged_swap_sizes[c] == 0 are skipped
+    //      (legal — partial tail or skipped cell); we do NOT assume they
+    //      are zero-size valid publications.
+    if (paged_swap_sizes.size() != paged_kv_size) {
+        return result;
+    }
+    bool swap_metadata_corrupt = false;
+    for (uint32_t cell = 0; cell < paged_kv_size; ++cell) {
+        const uint64_t sz = paged_swap_sizes[cell];
+        if (sz == 0) {
+            continue;
+        }
+        if (sz > bytes_per_cell) {
+            swap_metadata_corrupt = true;
+            break;
+        }
+        const uint32_t block = cell / paged_block_size;
+        const paged_block_state bs = paged_block_states[block];
+        if (bs != paged_block_state::SWAPPED && bs != paged_block_state::RESIDENT) {
+            swap_metadata_corrupt = true;
+            break;
+        }
+    }
+    if (swap_metadata_corrupt) {
+        return result;
+    }
+    result.swapped_metadata_consistent = true;
+
+    for (uint32_t block = 0; block < paged_n_blocks; ++block) {
+        const paged_block_state state = paged_block_states[block];
+        switch (state) {
+            case paged_block_state::UNUSED:        result.unused_block_count        += 1; break;
+            case paged_block_state::RESIDENT:      result.resident_block_count      += 1; break;
+            case paged_block_state::RELEASED:      result.released_block_count      += 1; break;
+            case paged_block_state::PENDING_WRITE: result.pending_write_block_count += 1; break;
+            case paged_block_state::INVALID:       result.invalid_block_count       += 1; break;
+            case paged_block_state::SWAPPED:
+                result.swapped_block_count += 1;
+                {
+                    const uint32_t begin = block * paged_block_size;
+                    const uint32_t end = std::min<uint32_t>(begin + paged_block_size, paged_kv_size);
+                    for (uint32_t cell = begin; cell < end; ++cell) {
+                        result.swapped_authoritative_bytes += paged_swap_sizes[cell];
+                    }
+                }
+                break;
+        }
+    }
+
+    // Resident + reclaimable — delegate to existing authorities so the
+    // budget view cannot drift from the samplers that already drive
+    // Governor decisions.
+    const auto resident_sample = sample_kv_resident();
+    if (resident_sample.available) {
+        result.resident_available = true;
+        result.resident_bytes = resident_sample.resident_bytes;
+    }
+
+    const auto release_budget = sample_kv_release_budget();
+    if (release_budget.valid) {
+        result.reclaimable_available = true;
+        result.dead_resident_reclaimable_bytes = release_budget.reclaimable_resident_bytes;
+    }
+
+    // Neutral ownership counts — single reuse of the existing
+    // llama_kv_release_collect_ownership helper.  Returns owned[] and
+    // shared[] vectors of length n_blocks.  No byte computation, no
+    // policy assignment; this view only exposes counts.
+    //
+    // `max_sequences` here is the seq_id scan upper bound, NOT the
+    // concurrent-sequence count.  Pass LLAMA_MAX_SEQ (matching every
+    // other llama_kv_release_collect_ownership caller in this file) so
+    // owners beyond n_seq_max (created via seq_cp) are not truncated.
+    if (!v_cells.empty()) {
+        const auto ownership = llama_kv_release_collect_ownership(
+                v_cells, paged_n_blocks, paged_block_size,
+                PAGED_BLOCK_INVALID, LLAMA_MAX_SEQ,
+                [this](uint32_t logical_cell) -> uint32_t { return paged_resolve(logical_cell); });
+        if (ownership.valid) {
+            for (uint32_t b = 0; b < paged_n_blocks; ++b) {
+                if (ownership.owned[b]) {
+                    result.n_owned_blocks += 1;
+                }
+                if (ownership.shared[b]) {
+                    result.n_shared_blocks += 1;
+                }
+            }
+        } else {
+            // Ownership collector itself reports invalid mappings — drop the
+            // snapshot rather than expose numbers built on a broken mapping.
+            return result;
+        }
+    }
+
+    // K2 staging bound — published by the K2 restore pipeline and zero when
+    // K2 is disabled OR no restore pipeline has run yet.  Captured here so
+    // the budget view reports the same number the request-resume gate is
+    // bound to.
+    if (paged_restore_k2_enabled) {
+        result.transient_staging_bound_bytes = paged_restore_k2_staging_bound_bytes;
+    }
+
+    result.valid = true;
+    return result;
+}
+
 llama_kv_bounded_release_result llama_kv_cache::paged_release_blocks_bounded_dry_run(
         uint64_t target_bytes,
         uint32_t max_scan_blocks) const {

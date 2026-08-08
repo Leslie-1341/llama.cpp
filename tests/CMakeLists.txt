@@ -201,6 +201,7 @@ if (UNIX)
     llama_build_and_test(test-kv-paged-identity-fast-path.cpp)
     llama_build_and_test(test-kv-paged-release-ownership.cpp)
     llama_build_and_test(test-kv-paged-release-bounded.cpp)
+    llama_build_and_test(test-kv-physical-budget-view.cpp)
     # No SKIP_RETURN_CODE: this test builds an in-memory synthetic
     # LLM_ARCH_LLAMA model (llama_model_init_from_user) and always runs —
     # never needs an external GGUF model file.

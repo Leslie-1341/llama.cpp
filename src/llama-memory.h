@@ -247,6 +247,15 @@ struct llama_memory_i {
         return {};
     }
 
+    // Read-only whole-KV physical budget view.  Aggregates authoritative
+    // block-state / swap-metadata / mincore-resident / release-budget /
+    // K2-staging sources at snapshot time.  Default no-op returns a
+    // `valid=false` snapshot.  See llama_kv_physical_budget_view in
+    // llama-kv-cache-action.h for field semantics.
+    virtual llama_kv_physical_budget_view sample_kv_physical_budget_view() const {
+        return {};
+    }
+
     // Structural capability query for bounded destructive release,
     // independent of LLAMA_KV_PAGED_RELEASE or any legacy policy state.
     // Returns true when paged KV is active with a valid layout, in-graph
