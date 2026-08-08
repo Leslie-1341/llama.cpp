@@ -37,9 +37,6 @@ KV_ENV_COMMON=(
     LLAMA_KV_PAGED=1
     LLAMA_KV_PAGED_RELEASE=0
     LLAMA_KV_PAGED_SWAP=1
-    LLAMA_KV_PAGED_IDLE_SWAP=1
-    LLAMA_KV_PAGED_IDLE_SWAP_MADVISE=1
-    LLAMA_KV_PAGED_IDLE_SWAP_DEBUG_PROBES=0
     LLAMA_KV_PAGED_GATHER_NONIDENTITY=1
     LLAMA_KV_PAGED_INGRAPH=1
     LLAMA_KV_PAGED_TRACE=0
@@ -50,11 +47,6 @@ KV_ENV_COMMON=(
     LLAMA_KV_LAZY_CLEAR=0
     LLAMA_KV_IDLE_NUM_IDLE_SEQS=2
     LLAMA_KV_IDLE_SEQ0_WARMUP_TOKENS=256
-    LLAMA_KV_PAGED_RESUME_PREFETCH=0
-    LLAMA_KV_PAGED_PREFETCH_DURING_ACTIVE=0
-    LLAMA_KV_PAGED_PREFETCH_AUTO_DELAYED=0
-    LLAMA_KV_PAGED_PREFETCH_FINAL_SYNC_BLOCKS=0
-    LLAMA_KV_PAGED_DEFER_SWAPOUT_ON_RESUME=0
     LLAMA_KV_STABILITY_VERIFY_TOKENS="$VERIFY_TOKENS"
     LLAMA_KV_STABILITY_PROGRESS_EVERY="$PROGRESS_EVERY"
     LLAMA_KV_STABILITY_RSS_LIMIT_MB="$RSS_LIMIT_MB"
@@ -132,6 +124,79 @@ summary_value() {
             }
         }
     ' "$file"
+}
+
+claimant_value() {
+    local file="$1"
+    local prefix="$2"
+    local key="$3"
+    grep -F "$prefix" "$file" 2>/dev/null | awk -v key="$key" '
+        {
+            for (i = 1; i <= NF; ++i) {
+                split($i, kv, "=")
+                if (kv[1] == key) {
+                    print kv[2]
+                    exit
+                }
+            }
+        }
+    '
+}
+
+assert_claimant_before_offload() {
+    local file="$1"
+    local prefix="KV_UNIFIED_STATE phase=seq0_before_offload"
+    local valid target eligible swapped shared blocked
+    valid="$(claimant_value "$file" "$prefix" valid)"
+    target="$(claimant_value "$file" "$prefix" target_blocks)"
+    eligible="$(claimant_value "$file" "$prefix" eligible_resident_blocks)"
+    swapped="$(claimant_value "$file" "$prefix" swapped_blocks)"
+    shared="$(claimant_value "$file" "$prefix" shared_blocks)"
+    blocked="$(claimant_value "$file" "$prefix" blocked_blocks)"
+    [[ "$valid" == 1 && "$target" =~ ^[1-9][0-9]*$ &&
+        "$eligible" == "$target" && "$swapped" == 0 &&
+        "$shared" == 0 && "$blocked" == 0 ]] ||
+        fail "invalid pre-OFFLOAD claimant in $file"
+}
+
+assert_claimant_after_offload() {
+    local file="$1"
+    local before="KV_UNIFIED_STATE phase=seq0_before_offload"
+    local after="KV_UNIFIED_STATE phase=seq0_after_offload"
+    local target_before eligible_before swapped_before shared_before blocked_before
+    local valid_after target_after eligible_after swapped_after shared_after blocked_after
+    target_before="$(claimant_value "$file" "$before" target_blocks)"
+    eligible_before="$(claimant_value "$file" "$before" eligible_resident_blocks)"
+    swapped_before="$(claimant_value "$file" "$before" swapped_blocks)"
+    shared_before="$(claimant_value "$file" "$before" shared_blocks)"
+    blocked_before="$(claimant_value "$file" "$before" blocked_blocks)"
+    valid_after="$(claimant_value "$file" "$after" valid)"
+    target_after="$(claimant_value "$file" "$after" target_blocks)"
+    eligible_after="$(claimant_value "$file" "$after" eligible_resident_blocks)"
+    swapped_after="$(claimant_value "$file" "$after" swapped_blocks)"
+    shared_after="$(claimant_value "$file" "$after" shared_blocks)"
+    blocked_after="$(claimant_value "$file" "$after" blocked_blocks)"
+    [[ "$valid_after" == 1 && "$target_before" =~ ^[1-9][0-9]*$ &&
+        "$eligible_before" =~ ^[0-9]+$ && "$swapped_before" =~ ^[0-9]+$ &&
+        "$target_after" == "$target_before" && "$eligible_after" =~ ^[0-9]+$ &&
+        "$swapped_after" =~ ^[0-9]+$ && "$shared_after" == "$shared_before" &&
+        "$blocked_after" == "$blocked_before" &&
+        $((eligible_after + 1)) -eq "$eligible_before" &&
+        $((swapped_after)) -eq $((swapped_before + 1)) ]] ||
+        fail "invalid OFFLOAD claimant transition in $file"
+}
+
+assert_claimant_equal() {
+    local file="$1"
+    local prefix_a="$2"
+    local prefix_b="$3"
+    local key a b
+    for key in valid target_blocks eligible_resident_blocks swapped_blocks shared_blocks blocked_blocks; do
+        a="$(claimant_value "$file" "$prefix_a" "$key")"
+        b="$(claimant_value "$file" "$prefix_b" "$key")"
+        [[ -n "$a" && -n "$b" && "$a" == "$b" ]] ||
+            fail "claimant field $key changed between $prefix_a and $prefix_b in $file"
+    done
 }
 
 io_stats_value() {
@@ -232,7 +297,6 @@ POLLUTION_ENV=(
     LLAMA_KV_LAZY_TAIL
     LLAMA_KV_PAGED
     LLAMA_KV_PAGED_BLOCK_SIZE
-    LLAMA_KV_PAGED_DEFER_SWAPOUT_ON_RESUME
     LLAMA_KV_PAGED_GATHER_NONIDENTITY
     LLAMA_KV_PAGED_IDLE_SWAP
     LLAMA_KV_PAGED_IDLE_SWAP_DEBUG_PROBES
@@ -244,23 +308,11 @@ POLLUTION_ENV=(
     LLAMA_KV_PAGED_INGRAPH
     LLAMA_KV_PAGED_IO_STATS
     LLAMA_KV_PAGED_MINCORE
-    LLAMA_KV_PAGED_PREFETCH_AFTER_ACTIVE_TOKENS
-    LLAMA_KV_PAGED_PREFETCH_AUTO_BLOCKS_PER_STEP
-    LLAMA_KV_PAGED_PREFETCH_AUTO_DELAYED
-    LLAMA_KV_PAGED_PREFETCH_AUTO_EVERY_TOKENS
-    LLAMA_KV_PAGED_PREFETCH_AUTO_SAFETY_TOKENS
-    LLAMA_KV_PAGED_PREFETCH_BLOCKS_PER_STEP
-    LLAMA_KV_PAGED_PREFETCH_DURING_ACTIVE
-    LLAMA_KV_PAGED_PREFETCH_EVERY_TOKENS
-    LLAMA_KV_PAGED_PREFETCH_FINAL_SYNC_BLOCKS
-    LLAMA_KV_PAGED_PREFETCH_PRESSURE_MODE
     LLAMA_KV_PAGED_REFAULT_TRACE
     LLAMA_KV_PAGED_REFAULT_TRACE_BACKTRACE
     LLAMA_KV_PAGED_REFAULT_TRACE_MAX
     LLAMA_KV_PAGED_REFAULT_TRACE_ONCE
     LLAMA_KV_PAGED_RELEASE
-    LLAMA_KV_PAGED_RESUME_PENDING_TOKEN
-    LLAMA_KV_PAGED_RESUME_PREFETCH
     LLAMA_KV_PAGED_RESUME_TIMING
     LLAMA_KV_PAGED_RESUME_TIMING_STEP
     LLAMA_KV_PAGED_SHADOW_VALIDATE
@@ -408,6 +460,22 @@ main() {
     assert_token_count "$OUTPUT_ROOT/control/run.out" seq0_resume_decoded_tokens "$VERIFY_TOKENS"
     assert_token_count "$OUTPUT_ROOT/stress/run.out" seq1_decoded_tokens "$VERIFY_TOKENS"
     assert_token_count "$OUTPUT_ROOT/stress/run.out" seq0_resume_decoded_tokens "$VERIFY_TOKENS"
+
+    local case_name case_err
+    for case_name in control stress; do
+        case_err="$OUTPUT_ROOT/$case_name/run.err"
+        grep -F -q "KV_UNIFIED_ACTION phase=seq0_offload action=offload decision_id=1 outcome=completed reason=target_satisfied state_changed=1 fail_stop=0 io_failure=0 io_errno=0 blocks=1" "$case_err" || \
+            fail "$case_name missing completed one-block Unified OFFLOAD"
+        grep -F -q "shortfall_bytes=0" "$case_err" || \
+            fail "$case_name Unified OFFLOAD did not satisfy the byte target"
+        assert_claimant_before_offload "$case_err"
+        assert_claimant_after_offload "$case_err"
+        grep -F -q "KV_RESUME_PREFETCH mode=full seq=0" "$case_err" || \
+            fail "$case_name missing full Unified PREFETCH"
+        assert_claimant_equal "$case_err" \
+            "KV_UNIFIED_STATE phase=seq0_before_offload" \
+            "KV_UNIFIED_STATE phase=seq0_after_prefetch"
+    done
 
     grep -q 'KV_STABILITY_SUMMARY' "$OUTPUT_ROOT/stress/run.err" || fail "missing KV_STABILITY_SUMMARY"
     local io_stats_line=""

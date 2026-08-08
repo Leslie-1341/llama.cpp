@@ -32,9 +32,6 @@ KV_ENV_COMMON=(
     LLAMA_KV_PAGED=1
     LLAMA_KV_PAGED_RELEASE=0
     LLAMA_KV_PAGED_SWAP=1
-    LLAMA_KV_PAGED_IDLE_SWAP=1
-    LLAMA_KV_PAGED_IDLE_SWAP_MADVISE=1
-    LLAMA_KV_PAGED_IDLE_SWAP_DEBUG_PROBES=0
     LLAMA_KV_PAGED_GATHER_NONIDENTITY=1
     LLAMA_KV_PAGED_INGRAPH=1
     LLAMA_KV_PAGED_TRACE=0
@@ -45,11 +42,6 @@ KV_ENV_COMMON=(
     LLAMA_KV_LAZY_CLEAR=0
     LLAMA_KV_IDLE_NUM_IDLE_SEQS=2
     LLAMA_KV_IDLE_SEQ0_WARMUP_TOKENS=256
-    LLAMA_KV_PAGED_RESUME_PREFETCH=0
-    LLAMA_KV_PAGED_PREFETCH_DURING_ACTIVE=0
-    LLAMA_KV_PAGED_PREFETCH_AUTO_DELAYED=0
-    LLAMA_KV_PAGED_PREFETCH_FINAL_SYNC_BLOCKS=0
-    LLAMA_KV_PAGED_DEFER_SWAPOUT_ON_RESUME=0
 )
 
 POLLUTION_ENV=(
@@ -59,7 +51,6 @@ POLLUTION_ENV=(
     LLAMA_KV_LAZY_TAIL
     LLAMA_KV_PAGED
     LLAMA_KV_PAGED_BLOCK_SIZE
-    LLAMA_KV_PAGED_DEFER_SWAPOUT_ON_RESUME
     LLAMA_KV_PAGED_GATHER_NONIDENTITY
     LLAMA_KV_PAGED_IDLE_SWAP
     LLAMA_KV_PAGED_IDLE_SWAP_DEBUG_PROBES
@@ -69,25 +60,14 @@ POLLUTION_ENV=(
     LLAMA_KV_PAGED_IDLE_SWAP_MIN_IDLE_STEPS
     LLAMA_KV_PAGED_IDLE_TRACE
     LLAMA_KV_PAGED_INGRAPH
-    LLAMA_KV_PAGED_PREFETCH_AUTO_DELAYED
-    LLAMA_KV_PAGED_PREFETCH_AUTO_BLOCKS_PER_STEP
-    LLAMA_KV_PAGED_PREFETCH_AUTO_EVERY_TOKENS
-    LLAMA_KV_PAGED_PREFETCH_AUTO_SAFETY_TOKENS
-    LLAMA_KV_PAGED_PREFETCH_AFTER_ACTIVE_TOKENS
-    LLAMA_KV_PAGED_PREFETCH_BLOCKS_PER_STEP
-    LLAMA_KV_PAGED_PREFETCH_DURING_ACTIVE
-    LLAMA_KV_PAGED_PREFETCH_EVERY_TOKENS
-    LLAMA_KV_PAGED_PREFETCH_FINAL_SYNC_BLOCKS
-    LLAMA_KV_PAGED_PREFETCH_PRESSURE_MODE
     LLAMA_KV_PAGED_RELEASE
-    LLAMA_KV_PAGED_RESUME_PENDING_TOKEN
-    LLAMA_KV_PAGED_RESUME_PREFETCH
     LLAMA_KV_PAGED_RESUME_TIMING
     LLAMA_KV_PAGED_RESUME_TIMING_STEP
     LLAMA_KV_PAGED_SWAP
     LLAMA_KV_PAGED_TEST_IO_FAIL_SCOPE
     LLAMA_KV_PAGED_TEST_IO_FAIL_KIND
     LLAMA_KV_PAGED_TEST_IO_FAIL_SEQ_ID
+    LLAMA_KV_PAGED_TEST_IO_FAIL_BLOCK
     LLAMA_KV_PAGED_TEST_IO_FAIL_ONCE
     LLAMA_KV_PAGED_TEST_MAPPING_FAIL_SCOPE
     LLAMA_KV_PAGED_TEST_MAPPING_FAIL_SEQ_ID
@@ -234,16 +214,69 @@ assert_equal_field_between() {
     }
 }
 
-assert_positive_field() {
+assert_claimant_before_offload() {
     local file="$1"
-    local prefix="$2"
-    local key="$3"
-    local value
-    value="$(line_value "$file" "$prefix" "$key")"
-    [[ -n "$value" && "$value" =~ ^[0-9]+$ && "$value" -gt 0 ]] || {
-        printf 'expected %s > 0 on "%s", got %s' "$key" "$prefix" "${value:-missing}"
+    local prefix="KV_UNIFIED_STATE phase=seq0_before_offload"
+    local valid target eligible swapped shared blocked
+    valid="$(line_value "$file" "$prefix" valid)"
+    target="$(line_value "$file" "$prefix" target_blocks)"
+    eligible="$(line_value "$file" "$prefix" eligible_resident_blocks)"
+    swapped="$(line_value "$file" "$prefix" swapped_blocks)"
+    shared="$(line_value "$file" "$prefix" shared_blocks)"
+    blocked="$(line_value "$file" "$prefix" blocked_blocks)"
+    [[ "$valid" == 1 && "$target" =~ ^[1-9][0-9]*$ &&
+        "$eligible" == "$target" && "$swapped" == 0 &&
+        "$shared" == 0 && "$blocked" == 0 ]] || {
+        printf 'invalid pre-OFFLOAD claimant: valid=%s target=%s eligible=%s swapped=%s shared=%s blocked=%s' \
+            "${valid:-missing}" "${target:-missing}" "${eligible:-missing}" "${swapped:-missing}" \
+            "${shared:-missing}" "${blocked:-missing}"
         return 1
     }
+}
+
+assert_claimant_after_offload() {
+    local file="$1"
+    local before="KV_UNIFIED_STATE phase=seq0_before_offload"
+    local after="KV_UNIFIED_STATE phase=seq0_after_offload"
+    local target_before eligible_before swapped_before shared_before blocked_before
+    local valid_after target_after eligible_after swapped_after shared_after blocked_after
+    target_before="$(line_value "$file" "$before" target_blocks)"
+    eligible_before="$(line_value "$file" "$before" eligible_resident_blocks)"
+    swapped_before="$(line_value "$file" "$before" swapped_blocks)"
+    shared_before="$(line_value "$file" "$before" shared_blocks)"
+    blocked_before="$(line_value "$file" "$before" blocked_blocks)"
+    valid_after="$(line_value "$file" "$after" valid)"
+    target_after="$(line_value "$file" "$after" target_blocks)"
+    eligible_after="$(line_value "$file" "$after" eligible_resident_blocks)"
+    swapped_after="$(line_value "$file" "$after" swapped_blocks)"
+    shared_after="$(line_value "$file" "$after" shared_blocks)"
+    blocked_after="$(line_value "$file" "$after" blocked_blocks)"
+    [[ "$valid_after" == 1 && "$target_before" =~ ^[1-9][0-9]*$ &&
+        "$eligible_before" =~ ^[0-9]+$ && "$swapped_before" =~ ^[0-9]+$ &&
+        "$target_after" == "$target_before" && "$eligible_after" =~ ^[0-9]+$ &&
+        "$swapped_after" =~ ^[0-9]+$ && "$shared_after" == "$shared_before" &&
+        "$blocked_after" == "$blocked_before" &&
+        $((eligible_after + 1)) -eq "$eligible_before" &&
+        $((swapped_after)) -eq $((swapped_before + 1)) ]] || {
+        printf 'invalid OFFLOAD claimant transition'
+        return 1
+    }
+}
+
+assert_claimant_equal() {
+    local file="$1"
+    local prefix_a="$2"
+    local prefix_b="$3"
+    local key a b
+    for key in valid target_blocks eligible_resident_blocks swapped_blocks shared_blocks blocked_blocks; do
+        a="$(line_value "$file" "$prefix_a" "$key")"
+        b="$(line_value "$file" "$prefix_b" "$key")"
+        [[ -n "$a" && -n "$b" && "$a" == "$b" ]] || {
+            printf 'claimant field %s changed between "%s" and "%s": %s vs %s' \
+                "$key" "$prefix_a" "$prefix_b" "${a:-missing}" "${b:-missing}"
+            return 1
+        }
+    done
 }
 
 assert_tokens() {
@@ -304,8 +337,15 @@ validate_control() {
     reason="$(assert_exit "$dir" 0)" || { report_fail "$name" "$reason"; return 1; }
     reason="$(assert_tokens "$dir/run.out" seq1_decoded_tokens 128)" || { report_fail "$name" "$reason"; return 1; }
     reason="$(assert_tokens "$dir/run.out" seq0_resume_decoded_tokens 128)" || { report_fail "$name" "$reason"; return 1; }
+    reason="$(assert_contains "$all" "KV_UNIFIED_ACTION phase=seq0_offload action=offload decision_id=1 outcome=completed reason=target_satisfied state_changed=1 fail_stop=0 io_failure=0 io_errno=0 blocks=1")" || { report_fail "$name" "$reason"; return 1; }
+    reason="$(assert_claimant_before_offload "$all")" || { report_fail "$name" "$reason"; return 1; }
+    reason="$(assert_claimant_after_offload "$all")" || { report_fail "$name" "$reason"; return 1; }
+    reason="$(assert_contains "$all" "shortfall_bytes=0")" || { report_fail "$name" "$reason"; return 1; }
+    reason="$(assert_contains "$all" "KV_RESUME_PREFETCH mode=full seq=0")" || { report_fail "$name" "$reason"; return 1; }
+    reason="$(assert_claimant_equal "$all" \
+        "KV_UNIFIED_STATE phase=seq0_before_offload" \
+        "KV_UNIFIED_STATE phase=seq0_after_prefetch")" || { report_fail "$name" "$reason"; return 1; }
     reason="$(assert_not_contains "$all" "KV_PAGED_IO_FAULT")" || { report_fail "$name" "$reason"; return 1; }
-    reason="$(assert_not_contains "$all" "failed before graph_compute")" || { report_fail "$name" "$reason"; return 1; }
     report_pass "$name"
 }
 
@@ -318,6 +358,18 @@ validate_swap_out_enospc() {
     reason="$(assert_exit "$dir" 0)" || { report_fail "$name" "$reason"; return 1; }
     reason="$(assert_tokens "$dir/run.out" seq1_decoded_tokens 128)" || { report_fail "$name" "$reason"; return 1; }
     reason="$(assert_tokens "$dir/run.out" seq0_resume_decoded_tokens 128)" || { report_fail "$name" "$reason"; return 1; }
+    reason="$(assert_contains "$all" "KV_UNIFIED_ACTION phase=seq0_offload action=offload decision_id=1 outcome=failed reason=io_failure state_changed=0 fail_stop=0 io_failure=1")" || { report_fail "$name" "$reason"; return 1; }
+    reason="$(assert_claimant_before_offload "$all")" || { report_fail "$name" "$reason"; return 1; }
+    reason="$(assert_claimant_equal "$all" \
+        "KV_UNIFIED_STATE phase=seq0_before_offload" \
+        "KV_UNIFIED_STATE phase=seq0_after_failed_offload")" || { report_fail "$name" "$reason"; return 1; }
+    reason="$(assert_contains "$all" "KV_UNIFIED_ACTION phase=seq0_offload_retry action=offload decision_id=2 outcome=completed reason=target_satisfied state_changed=1 fail_stop=0 io_failure=0 io_errno=0 blocks=1")" || { report_fail "$name" "$reason"; return 1; }
+    reason="$(assert_claimant_after_offload "$all")" || { report_fail "$name" "$reason"; return 1; }
+    reason="$(assert_contains "$all" "shortfall_bytes=0")" || { report_fail "$name" "$reason"; return 1; }
+    reason="$(assert_contains "$all" "KV_RESUME_PREFETCH mode=full seq=0")" || { report_fail "$name" "$reason"; return 1; }
+    reason="$(assert_claimant_equal "$all" \
+        "KV_UNIFIED_STATE phase=seq0_before_offload" \
+        "KV_UNIFIED_STATE phase=seq0_after_prefetch")" || { report_fail "$name" "$reason"; return 1; }
     reason="$(assert_count "$all" "KV_PAGED_IO_FAULT scope=swap_out kind=write_enospc_once" 1)" || { report_fail "$name" "$reason"; return 1; }
     reason="$(assert_line_contains "$all" "KV_PAGED_IO_FAULT scope=swap_out" \
         "target_seq=0" \
@@ -345,7 +397,6 @@ validate_swap_out_enospc() {
         "KV_PAGED_IO_FAULT_RETRY_SUCCESS scope=swap_out" fault_attempt_id)" || { report_fail "$name" "$reason"; return 1; }
     reason="$(assert_increased_fields "$all" "KV_PAGED_IO_FAULT_RETRY_SUCCESS scope=swap_out" swap_out_counter_before swap_out_counter_after)" || { report_fail "$name" "$reason"; return 1; }
     reason="$(assert_increased_fields "$all" "KV_PAGED_IO_FAULT_RETRY_SUCCESS scope=swap_out" madvise_counter_before madvise_counter_after)" || { report_fail "$name" "$reason"; return 1; }
-    reason="$(assert_not_contains "$all" "failed before graph_compute")" || { report_fail "$name" "$reason"; return 1; }
     reason="$(assert_not_contains "$all" "llama_decode: failed to decode, ret = -3")" || { report_fail "$name" "$reason"; return 1; }
     reason="$(assert_line_contains "$all" "KV_TEST_SUMMARY" "expected_swap_out_io_failure=1" "active_decode_failures_observed=0")" || { report_fail "$name" "$reason"; return 1; }
     report_pass "$name"
@@ -360,6 +411,11 @@ validate_active_swap_in_eof() {
     reason="$(assert_exit "$dir" 0)" || { report_fail "$name" "$reason"; return 1; }
     reason="$(assert_tokens "$dir/run.out" seq1_decoded_tokens 128)" || { report_fail "$name" "$reason"; return 1; }
     reason="$(assert_tokens "$dir/run.out" seq0_resume_decoded_tokens 128)" || { report_fail "$name" "$reason"; return 1; }
+    reason="$(assert_contains "$all" "KV_UNIFIED_ACTION phase=seq0_offload action=offload decision_id=1 outcome=completed reason=target_satisfied state_changed=1 fail_stop=0 io_failure=0 io_errno=0 blocks=1")" || { report_fail "$name" "$reason"; return 1; }
+    reason="$(assert_claimant_before_offload "$all")" || { report_fail "$name" "$reason"; return 1; }
+    reason="$(assert_claimant_after_offload "$all")" || { report_fail "$name" "$reason"; return 1; }
+    reason="$(assert_contains "$all" "shortfall_bytes=0")" || { report_fail "$name" "$reason"; return 1; }
+    reason="$(assert_contains "$all" "KV_RESUME_PREFETCH mode=skipped seq=0 reason=active_decode_failure")" || { report_fail "$name" "$reason"; return 1; }
     reason="$(assert_count "$all" "KV_PAGED_IO_FAULT scope=active_swap_in kind=read_eof_once" 1)" || { report_fail "$name" "$reason"; return 1; }
     reason="$(assert_line_contains "$all" "KV_PAGED_IO_FAULT scope=active_swap_in" \
         "target_seq=0" \
@@ -367,14 +423,11 @@ validate_active_swap_in_eof() {
         "state_after=SWAPPED" \
         "backend_status=io_error" \
         "backend_errno=5" \
+        "metadata_present_cells=16" \
         "failure_reason=PAGED_SWAP_IN_IO_ERROR" \
         "trigger_count=1")" || { report_fail "$name" "$reason"; return 1; }
-    reason="$(assert_positive_field "$all" "KV_PAGED_IO_FAULT scope=active_swap_in" metadata_present_cells)" || { report_fail "$name" "$reason"; return 1; }
     reason="$(assert_increased_fields "$all" "KV_PAGED_IO_FAULT scope=active_swap_in" pread_attempts_before pread_attempts_after)" || { report_fail "$name" "$reason"; return 1; }
     reason="$(assert_equal_fields "$all" "KV_PAGED_IO_FAULT scope=active_swap_in" swap_in_counter_before swap_in_counter_after)" || { report_fail "$name" "$reason"; return 1; }
-    reason="$(assert_line_contains "$all" "failed before graph_compute" \
-        "reason=PAGED_SWAP_IN_IO_ERROR" \
-        "backend_errno=5")" || { report_fail "$name" "$reason"; return 1; }
     reason="$(assert_count "$all" "llama_decode: failed to decode, ret = -3" 1)" || { report_fail "$name" "$reason"; return 1; }
     reason="$(assert_count "$all" "KV_TEST_RETRY_SAME_BATCH" 1)" || { report_fail "$name" "$reason"; return 1; }
     reason="$(assert_count "$all" "KV_TEST_RETRY_SUCCEEDED" 1)" || { report_fail "$name" "$reason"; return 1; }
@@ -392,6 +445,7 @@ validate_active_swap_in_eof() {
         "KV_PAGED_IO_FAULT_RETRY_SUCCESS scope=active_swap_in" fault_attempt_id)" || { report_fail "$name" "$reason"; return 1; }
     reason="$(assert_increased_fields "$all" "KV_PAGED_IO_FAULT_RETRY_SUCCESS scope=active_swap_in" swap_in_counter_before swap_in_counter_after)" || { report_fail "$name" "$reason"; return 1; }
     reason="$(assert_line_contains "$all" "KV_TEST_SUMMARY" \
+        "result=PASS" \
         "active_decode_failures_observed=1" \
         "active_decode_retries=1" \
         "active_decode_retry_successes=1")" || { report_fail "$name" "$reason"; return 1; }

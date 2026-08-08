@@ -1677,7 +1677,7 @@ int main(int /*argc*/, char ** /*argv*/) {
         setenv("LLAMA_KV_PAGED_TEST_IO_FAIL_SCOPE", "swap_out", 1);
         setenv("LLAMA_KV_PAGED_TEST_IO_FAIL_KIND", "write_enospc_once", 1);
         setenv("LLAMA_KV_PAGED_TEST_IO_FAIL_SEQ_ID", "0", 1);
-        setenv("LLAMA_KV_PAGED_TEST_IO_FAIL_BLOCK", "1", 1);
+        unsetenv("LLAMA_KV_PAGED_TEST_IO_FAIL_BLOCK");
         setenv("LLAMA_KV_PAGED_TEST_IO_FAIL_ONCE", "1", 1);
         ContextGuard g;
         if (!g.init(model, cparams)) {
@@ -1686,13 +1686,31 @@ int main(int /*argc*/, char ** /*argv*/) {
             std::vector<llama_token> prompt(32, 122);
             int rc = decode_prompt(g.ctx, prompt);
             CHECK(rc == 0, "WT26a: decode ok");
+            const auto fault_before = g.kv->paged_unified_action_test_read_io_fault();
             const auto failed = g.kv->execute_action({
                 llama_kv_action::offload, 7201, 0, UINT64_MAX, 1, false });
             CHECK(failed.outcome == llama_kv_action_outcome::failed && failed.io_failure &&
                     !failed.state_changed && failed.core_transaction_id == 0,
                     "WT26a: swap-out I/O failure is structured and has no transaction");
-            CHECK(g.kv->paged_release_bounded_test_read_block_state(1) == 1,
-                    "WT26a: failed swap-out keeps target block RESIDENT");
+            const auto fault_after = g.kv->paged_unified_action_test_read_io_fault();
+            const uint32_t failed_block = fault_after.failed_block;
+            CHECK(fault_after.matching_attempts == fault_before.matching_attempts + 1 &&
+                    fault_after.trigger_count == fault_before.trigger_count + 1 &&
+                    failed_block != UINT32_MAX && fault_after.failed_attempt_id > 0 &&
+                    g.kv->paged_release_bounded_test_read_block_state(failed_block) == 1,
+                    "WT26a: unspecified swap-out binds the failed physical block and keeps it RESIDENT");
+
+            const auto retry = g.kv->execute_action({
+                llama_kv_action::offload, 7202, 0, UINT64_MAX, 1, false });
+            CHECK(retry.outcome == llama_kv_action_outcome::completed && retry.blocks == 1 &&
+                    retry.state_changed && retry.core_transaction_id > failed.core_transaction_id,
+                    "WT26a: same-block retry completes the one-block OFFLOAD");
+            CHECK(g.kv->paged_release_bounded_test_read_block_state(failed_block) == 3,
+                    "WT26a: retry swaps the physical block recorded by the fault");
+            const auto fault_retry = g.kv->paged_unified_action_test_read_io_fault();
+            CHECK(fault_retry.matching_attempts == fault_after.matching_attempts &&
+                    fault_retry.trigger_count == fault_after.trigger_count,
+                    "WT26a: one-shot fault is not re-armed on the same-block retry");
         }
         unsetenv("LLAMA_KV_PAGED_TEST_IO_FAIL_SCOPE");
         unsetenv("LLAMA_KV_PAGED_TEST_IO_FAIL_KIND");

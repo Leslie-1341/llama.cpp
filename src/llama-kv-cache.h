@@ -406,7 +406,6 @@ public:
     uint64_t bounded_release_counter_blocks() const override {
         return paged_bounded_release_blocks;
     }
-    void defer_idle_swapout(int32_t n_steps);
     void prefetch_seq_last_stats(
             uint64_t & owned_blocks,
             uint64_t & swapped_blocks,
@@ -1513,9 +1512,7 @@ private:
     mutable uint64_t paged_timing_swap_out_calls = 0;
     mutable uint64_t paged_timing_check_read_us = 0;
     mutable uint64_t paged_timing_check_read_calls = 0;
-    // Stage 6C-1A: seqs marked prefetch-protected (resume-pending) are excluded from idle
-    // swap-out victim selection so interleaved prefetch is not undone by the same-step idle
-    // gate. Does not change read-window / nonidentity / state-machine semantics.
+    // Request-resume protection blocks OFFLOAD for sequences required by correctness.
     std::bitset<LLAMA_MAX_SEQ> paged_prefetch_protected_seq;
     mutable uint64_t paged_idle_active_seq_steps = 0;
     mutable uint64_t paged_idle_active_seq_empty = 0;
@@ -1534,7 +1531,6 @@ private:
     mutable uint64_t paged_idle_cold_not_in_read_window = 0;
     mutable uint64_t paged_idle_skip_mixed_active = 0;
     mutable uint64_t paged_idle_safe_swap_candidates = 0;
-    mutable int32_t  paged_defer_idle_swapout_steps = 0;
     mutable bool     paged_nonidentity_probe_enabled = false;
     mutable uint64_t paged_nonidentity_remap_rows = 0;
     mutable uint64_t paged_nonidentity_remap_blocks = 0;

@@ -1048,19 +1048,16 @@ class RunnerContractTest(unittest.TestCase):
             RUNNER.KV_EXPERIMENTAL_DISABLED_ENV)
         self.assertEqual(env["LLAMA_KV_PAGED"], "0")
         self.assertEqual(env["LLAMA_KV_PRESSURE_UNIFIED_ACTION"], "0")
-        self.assertEqual(env["LLAMA_KV_PAGED_PREFETCH_DURING_ACTIVE"], "0")
-        self.assertEqual(env["LLAMA_KV_PAGED_PREFETCH_AUTO_DELAYED"], "0")
 
-    def test_k1_sync_is_not_legacy_e5_delayed_prefetch(self) -> None:
+    def test_k1_sync_uses_current_exact_resume_path(self) -> None:
         resident = RUNNER.baseline_env("FLEXKV_RESIDENT")
         k1 = RUNNER.baseline_env("FLEXKV_K1_SYNC")
         self.assertEqual(resident["LLAMA_KV_G0_S1_RESIDENT_OBSERVATION"], "preflight")
         self.assertEqual(k1["LLAMA_KV_G0_S1_RESIDENT_OBSERVATION"], "1")
         self.assertEqual(resident["LLAMA_KV_PRESSURE_UNIFIED_ACTION"], "0")
         self.assertEqual(k1["LLAMA_KV_PRESSURE_UNIFIED_ACTION"], "1")
-        self.assertEqual(k1["LLAMA_KV_PAGED_PREFETCH_DURING_ACTIVE"], "0")
-        self.assertEqual(k1["LLAMA_KV_PAGED_PREFETCH_AUTO_DELAYED"], "0")
-        self.assertEqual(k1["LLAMA_KV_PAGED_DEFER_SWAPOUT_ON_RESUME"], "0")
+        self.assertEqual(k1["LLAMA_KV_RESUME_STAGE_TIMING"], "1")
+        self.assertEqual(k1["LLAMA_KV_PAGED_PREFETCH_PHASE_TRACE"], "1")
 
 
 if __name__ == "__main__":

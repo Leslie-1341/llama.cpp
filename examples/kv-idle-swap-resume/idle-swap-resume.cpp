@@ -3,6 +3,7 @@
 #include "llama.h"
 #include "sampling.h"
 #include "../../src/llama-kv-cache-stability.h"
+#include "../../src/llama-memory.h"
 
 #include <algorithm>
 #include <chrono>
@@ -37,10 +38,6 @@ extern "C" bool llama_kv_cache_set_seq_prefetch_protected(
         llama_seq_id   seq_id,
         bool           enabled);
 
-extern "C" bool llama_kv_cache_defer_idle_swapout(
-        llama_memory_t mem,
-        int32_t        n_steps);
-
 static double elapsed_ms(perf_clock::time_point t0, perf_clock::time_point t1) {
     return std::chrono::duration<double, std::milli>(t1 - t0).count();
 }
@@ -51,13 +48,96 @@ static uint64_t elapsed_ms_u64(perf_clock::time_point t0, perf_clock::time_point
 
 struct active_token_stat {
     int32_t token = 0;
-    bool prefetched = false;
-    uint32_t requested_blocks = 0;
-    int32_t restored_blocks = 0;
     double decode_ms = 0.0;
-    double prefetch_ms = 0.0;
     double total_ms = 0.0;
 };
+
+static const char * kv_action_name(llama_kv_action action) {
+    switch (action) {
+        case llama_kv_action::noop:     return "noop";
+        case llama_kv_action::evaluate: return "evaluate";
+        case llama_kv_action::prefetch: return "prefetch";
+        case llama_kv_action::release:  return "release";
+        case llama_kv_action::offload:  return "offload";
+    }
+    return "unknown";
+}
+
+static const char * kv_action_outcome_name(llama_kv_action_outcome outcome) {
+    switch (outcome) {
+        case llama_kv_action_outcome::completed:       return "completed";
+        case llama_kv_action_outcome::no_op:           return "no_op";
+        case llama_kv_action_outcome::unsupported:     return "unsupported";
+        case llama_kv_action_outcome::rejected:        return "rejected";
+        case llama_kv_action_outcome::failed:          return "failed";
+        case llama_kv_action_outcome::partial_failure: return "partial_failure";
+    }
+    return "unknown";
+}
+
+static const char * kv_action_reason_name(llama_kv_action_reason reason) {
+    switch (reason) {
+        case llama_kv_action_reason::none:                   return "none";
+        case llama_kv_action_reason::zero_budget:            return "zero_budget";
+        case llama_kv_action_reason::invalid_sequence:       return "invalid_sequence";
+        case llama_kv_action_reason::context_invalid:        return "context_invalid";
+        case llama_kv_action_reason::write_transaction_open: return "write_transaction_open";
+        case llama_kv_action_reason::unsupported:            return "unsupported";
+        case llama_kv_action_reason::protected_sequence:     return "protected_sequence";
+        case llama_kv_action_reason::shared_block:           return "shared_block";
+        case llama_kv_action_reason::no_eligible_block:      return "no_eligible_block";
+        case llama_kv_action_reason::state_rejected:         return "state_rejected";
+        case llama_kv_action_reason::ownership_invalid:      return "ownership_invalid";
+        case llama_kv_action_reason::io_failure:             return "io_failure";
+        case llama_kv_action_reason::prefetch_failed:        return "prefetch_failed";
+        case llama_kv_action_reason::no_candidate:           return "no_candidate";
+        case llama_kv_action_reason::scan_budget_exhausted:  return "scan_budget_exhausted";
+        case llama_kv_action_reason::target_satisfied:       return "target_satisfied";
+        case llama_kv_action_reason::target_shortfall:       return "target_shortfall";
+        case llama_kv_action_reason::blocked:                return "blocked";
+        case llama_kv_action_reason::failed:                 return "failed";
+    }
+    return "unknown";
+}
+
+static void print_unified_action_result(
+        const char * phase,
+        const llama_kv_action_result & result) {
+    fprintf(stderr,
+            "KV_UNIFIED_ACTION phase=%s action=%s decision_id=%llu outcome=%s reason=%s "
+            "state_changed=%d fail_stop=%d io_failure=%d io_errno=%d blocks=%u bytes=%llu "
+            "shortfall_bytes=%llu core_transaction_id=%llu can_offload=%d can_prefetch=%d\n",
+            phase,
+            kv_action_name(result.action),
+            (unsigned long long) result.decision_id,
+            kv_action_outcome_name(result.outcome),
+            kv_action_reason_name(result.reason),
+            result.state_changed ? 1 : 0,
+            result.fail_stop ? 1 : 0,
+            result.io_failure ? 1 : 0,
+            result.io_errno,
+            result.blocks,
+            (unsigned long long) result.bytes,
+            (unsigned long long) result.shortfall_bytes,
+            (unsigned long long) result.core_transaction_id,
+            result.capability.can_offload ? 1 : 0,
+            result.capability.can_prefetch ? 1 : 0);
+}
+
+static void print_unified_state(
+        const char * phase,
+        const llama_kv_runtime_claimant & state) {
+    fprintf(stderr,
+            "KV_UNIFIED_STATE phase=%s valid=%d target_blocks=%u eligible_resident_blocks=%u "
+            "swapped_blocks=%u shared_blocks=%u blocked_blocks=%u\n",
+            phase,
+            state.valid ? 1 : 0,
+            state.target_blocks,
+            state.eligible_resident_blocks,
+            state.swapped_blocks,
+            state.shared_blocks,
+            state.blocked_blocks);
+}
 
 enum class kv_get_rows_profile_error {
     none,
@@ -502,64 +582,6 @@ static bool parse_env_i32_nonnegative_strict(const char * name, uint64_t fallbac
     return true;
 }
 
-enum class prefetch_pressure_mode {
-    off,
-    low,
-    medium,
-    high,
-};
-
-static const char * prefetch_pressure_mode_name(prefetch_pressure_mode mode) {
-    switch (mode) {
-        case prefetch_pressure_mode::off:
-            return "off";
-        case prefetch_pressure_mode::low:
-            return "low";
-        case prefetch_pressure_mode::medium:
-            return "medium";
-        case prefetch_pressure_mode::high:
-            return "high";
-    }
-
-    return "off";
-}
-
-static prefetch_pressure_mode parse_prefetch_pressure_mode(const char * env) {
-    if (env == nullptr || std::strcmp(env, "off") == 0) {
-        return prefetch_pressure_mode::off;
-    }
-    if (std::strcmp(env, "low") == 0) {
-        return prefetch_pressure_mode::low;
-    }
-    if (std::strcmp(env, "medium") == 0) {
-        return prefetch_pressure_mode::medium;
-    }
-    if (std::strcmp(env, "high") == 0) {
-        return prefetch_pressure_mode::high;
-    }
-
-    fprintf(stderr,
-            "%s: warning: invalid LLAMA_KV_PAGED_PREFETCH_PRESSURE_MODE=%s; using off\n",
-            __func__, env);
-    return prefetch_pressure_mode::off;
-}
-
-static uint64_t clamp_prefetch_target_by_pressure(
-        uint64_t remaining_blocks,
-        prefetch_pressure_mode mode) {
-    switch (mode) {
-        case prefetch_pressure_mode::off:
-        case prefetch_pressure_mode::low:
-            return remaining_blocks;
-        case prefetch_pressure_mode::medium:
-            return std::min<uint64_t>(remaining_blocks, 3);
-        case prefetch_pressure_mode::high:
-            return 0;
-    }
-
-    return remaining_blocks;
-}
-
 static void print_usage(int, char ** argv) {
     fprintf(stderr, "\nexample usage:\n");
     fprintf(stderr, "\n    %s -m model.gguf -p \"Active request prompt\" -n 64 --ctx-size 768\n", argv[0]);
@@ -884,6 +906,32 @@ int main(int argc, char ** argv) {
     common_sampler * seq0_smpl = common_sampler_init(model, params.sampling);
     common_sampler * seq1_smpl = common_sampler_init(model, params.sampling);
     llama_batch batch = llama_batch_init((int32_t) max_prompt_tokens, 0, (int32_t) ctx_params.n_seq_max);
+    llama_memory_i * const memory = llama_get_memory(ctx);
+    if (memory == nullptr) {
+        fprintf(stderr, "%s: context has no memory object\n", __func__);
+        cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
+        return 1;
+    }
+
+    const auto execute_unified_action = [&](const char * phase, const llama_kv_action_request & request) {
+        const llama_kv_action_result result = memory->execute_action(request);
+        print_unified_action_result(phase, result);
+        return result;
+    };
+    const auto query_seq0_claimant = [&](const char * phase) {
+        const llama_kv_runtime_claimant state = memory->get_kv_runtime_claimant(0);
+        print_unified_state(phase, state);
+        return state;
+    };
+    const auto same_claimant = [](const llama_kv_runtime_claimant & lhs,
+                                  const llama_kv_runtime_claimant & rhs) {
+        return lhs.valid == rhs.valid &&
+            lhs.target_blocks == rhs.target_blocks &&
+            lhs.eligible_resident_blocks == rhs.eligible_resident_blocks &&
+            lhs.swapped_blocks == rhs.swapped_blocks &&
+            lhs.shared_blocks == rhs.shared_blocks &&
+            lhs.blocked_blocks == rhs.blocked_blocks;
+    };
 
     const auto total_t0 = perf_clock::now();
     double seq0_prefill_ms = 0.0;
@@ -894,14 +942,6 @@ int main(int argc, char ** argv) {
     const char * resume_timing_step_env = std::getenv("LLAMA_KV_PAGED_RESUME_TIMING_STEP");
     const bool resume_timing_step_enabled =
         resume_timing_step_env != nullptr && std::strcmp(resume_timing_step_env, "1") == 0;
-    const char * defer_swapout_on_resume_env = std::getenv("LLAMA_KV_PAGED_DEFER_SWAPOUT_ON_RESUME");
-    const bool defer_swapout_on_resume =
-        defer_swapout_on_resume_env != nullptr && std::strcmp(defer_swapout_on_resume_env, "1") == 0;
-    const char * resume_prefetch_env = std::getenv("LLAMA_KV_PAGED_RESUME_PREFETCH");
-    const bool prefetch_enabled = resume_prefetch_env != nullptr && std::atoi(resume_prefetch_env) != 0;
-    const char * prefetch_during_active_env = std::getenv("LLAMA_KV_PAGED_PREFETCH_DURING_ACTIVE");
-    const bool prefetch_during_active =
-        prefetch_during_active_env != nullptr && std::atoi(prefetch_during_active_env) != 0;
     const char * active_token_stats_env = std::getenv("LLAMA_KV_ACTIVE_TOKEN_STATS");
     const bool active_token_stats_enabled =
         active_token_stats_env != nullptr && std::strcmp(active_token_stats_env, "1") == 0;
@@ -909,63 +949,12 @@ int main(int argc, char ** argv) {
     if (active_token_stats_enabled) {
         active_token_stats.reserve(n_decode);
     }
-    int32_t prefetch_after_active_tokens = 64;
-    int32_t prefetch_every_tokens = 8;
-    int32_t prefetch_blocks_per_step = 1;
-    const char * prefetch_auto_delayed_env = std::getenv("LLAMA_KV_PAGED_PREFETCH_AUTO_DELAYED");
-    const bool prefetch_auto_delayed =
-        prefetch_auto_delayed_env != nullptr && std::atoi(prefetch_auto_delayed_env) != 0;
-    const char * prefetch_auto_every_tokens_env = std::getenv("LLAMA_KV_PAGED_PREFETCH_AUTO_EVERY_TOKENS");
-    const char * prefetch_auto_blocks_per_step_env = std::getenv("LLAMA_KV_PAGED_PREFETCH_AUTO_BLOCKS_PER_STEP");
-    const char * prefetch_auto_safety_tokens_env = std::getenv("LLAMA_KV_PAGED_PREFETCH_AUTO_SAFETY_TOKENS");
-    const char * resume_pending_token_env = std::getenv("LLAMA_KV_PAGED_RESUME_PENDING_TOKEN");
-    const prefetch_pressure_mode pressure_mode =
-        parse_prefetch_pressure_mode(std::getenv("LLAMA_KV_PAGED_PREFETCH_PRESSURE_MODE"));
-    if (const char * env = std::getenv("LLAMA_KV_PAGED_PREFETCH_AFTER_ACTIVE_TOKENS")) {
-        prefetch_after_active_tokens = std::atoi(env);
-    }
-    if (const char * env = std::getenv("LLAMA_KV_PAGED_PREFETCH_EVERY_TOKENS")) {
-        prefetch_every_tokens = std::atoi(env);
-    }
-    if (const char * env = std::getenv("LLAMA_KV_PAGED_PREFETCH_BLOCKS_PER_STEP")) {
-        prefetch_blocks_per_step = std::atoi(env);
-    }
-    prefetch_after_active_tokens = std::max<int32_t>(0, prefetch_after_active_tokens);
-    prefetch_every_tokens = std::max<int32_t>(1, prefetch_every_tokens);
-    prefetch_blocks_per_step = std::max<int32_t>(1, prefetch_blocks_per_step);
-    int32_t prefetch_auto_every_tokens = prefetch_auto_every_tokens_env ?
-        std::atoi(prefetch_auto_every_tokens_env) : prefetch_every_tokens;
-    int32_t prefetch_auto_blocks_per_step = prefetch_auto_blocks_per_step_env ?
-        std::atoi(prefetch_auto_blocks_per_step_env) : prefetch_blocks_per_step;
-    int32_t prefetch_auto_safety_tokens = prefetch_auto_safety_tokens_env ?
-        std::atoi(prefetch_auto_safety_tokens_env) : 0;
-    prefetch_auto_every_tokens = std::max<int32_t>(1, prefetch_auto_every_tokens);
-    prefetch_auto_blocks_per_step = std::max<int32_t>(1, prefetch_auto_blocks_per_step);
-    prefetch_auto_safety_tokens = std::max<int32_t>(0, prefetch_auto_safety_tokens);
-    const int32_t resume_pending_token = resume_pending_token_env ? std::atoi(resume_pending_token_env) : 0;
-    int32_t prefetch_auto_active_total_tokens = 0;
-    uint64_t prefetch_auto_remaining_blocks = 0;
-    uint64_t target_restore_blocks = 0;
-    uint64_t prefetch_auto_need_steps = 0;
-    int32_t prefetch_auto_start_token = 0;
-    int32_t prefetch_auto_window_ok = 1;
-    int32_t resume_pending_started = 0;
-    int32_t resume_pending_target_limited = 0;
-    int32_t active_window_remaining = 0;
-    int32_t effective_start_token = 0;
-    int32_t resume_pending_window_ok = 1;
     double prefetch_ms = 0.0;
     int32_t prefetch_blocks = 0;
-    int32_t prefetch_during_active_calls = 0;
-    int32_t prefetch_during_active_blocks = 0;
     int32_t prefetch_protect_enabled = 0;
-    double prefetch_during_active_ms_total = 0.0;
-    double prefetch_during_active_ms_max = 0.0;
     uint64_t prefetch_remaining_blocks_before_resume = 0;
     uint64_t rss_before_prefetch_kb = 0;
     uint64_t rss_after_prefetch_kb = 0;
-    uint64_t rss_before_active_prefetch_kb = 0;
-    uint64_t rss_after_active_prefetch_kb = 0;
     uint64_t rss_before_resume_kb = 0;
     uint64_t rss_after_resume_kb = 0;
     uint64_t prefetch_owned_blocks = 0;
@@ -1081,89 +1070,6 @@ int main(int argc, char ** argv) {
     }
     seq1_prefill_ms = elapsed_ms(seq1_prefill_t0, perf_clock::now());
 
-    bool prefetch_during_active_schedule_enabled = prefetch_during_active && !prefetch_auto_delayed;
-    const auto start_resume_pending = [&]() -> bool {
-        if (resume_pending_started) {
-            return true;
-        }
-
-        resume_pending_started = 1;
-        llama_kv_cache_set_seq_prefetch_protected(llama_get_memory(ctx), 0, true);
-        prefetch_protect_enabled = 1;
-
-        const int32_t prefetch_auto_probe_blocks = llama_memory_prefetch_seq_step(llama_get_memory(ctx), 0, 0);
-        if (!handle_prefetch_result(prefetch_auto_probe_blocks, test_state)) {
-            fprintf(stderr, "%s: llama_memory_prefetch_seq_step() auto probe failed for seq0\n", __func__);
-            return false;
-        }
-
-        uint64_t prefetch_auto_owned_blocks = 0;
-        uint64_t prefetch_auto_resident_blocks = 0;
-        uint64_t prefetch_auto_released_blocks = 0;
-        uint64_t prefetch_auto_invalid_cells = 0;
-        uint64_t prefetch_auto_failures = 0;
-        llama_kv_cache_prefetch_seq_last_stats(
-                llama_get_memory(ctx),
-                &prefetch_auto_owned_blocks,
-                &prefetch_auto_remaining_blocks,
-                &prefetch_auto_resident_blocks,
-                &prefetch_auto_released_blocks,
-                &prefetch_auto_invalid_cells,
-                &prefetch_auto_failures);
-
-        prefetch_auto_active_total_tokens = n_decode;
-        active_window_remaining = std::max<int32_t>(0, n_decode - resume_pending_token);
-        target_restore_blocks = clamp_prefetch_target_by_pressure(prefetch_auto_remaining_blocks, pressure_mode);
-        resume_pending_target_limited = 1;
-        if (target_restore_blocks == 0) {
-            prefetch_auto_need_steps = 0;
-            effective_start_token = resume_pending_token;
-            prefetch_auto_start_token = effective_start_token;
-            prefetch_auto_window_ok = 1;
-            resume_pending_window_ok = 1;
-            prefetch_during_active_schedule_enabled = false;
-        } else {
-            prefetch_auto_need_steps =
-                (target_restore_blocks + (uint64_t) prefetch_auto_blocks_per_step - 1) /
-                (uint64_t) prefetch_auto_blocks_per_step;
-            const int64_t need_span =
-                (int64_t) (prefetch_auto_need_steps - 1) * (int64_t) prefetch_auto_every_tokens +
-                (int64_t) prefetch_auto_safety_tokens;
-            if (need_span <= (int64_t) active_window_remaining) {
-                effective_start_token =
-                    resume_pending_token + (active_window_remaining - (int32_t) need_span);
-                prefetch_auto_window_ok = 1;
-                resume_pending_window_ok = 1;
-            } else {
-                effective_start_token = resume_pending_token;
-                prefetch_auto_window_ok = 0;
-                resume_pending_window_ok = 0;
-            }
-            prefetch_auto_start_token = effective_start_token;
-            prefetch_during_active_schedule_enabled = true;
-        }
-
-        prefetch_after_active_tokens = prefetch_auto_start_token;
-        prefetch_every_tokens = prefetch_auto_every_tokens;
-        prefetch_blocks_per_step = prefetch_auto_blocks_per_step;
-
-        return true;
-    };
-
-    if (prefetch_during_active && prefetch_auto_delayed &&
-            resume_pending_token == 0 &&
-            !start_resume_pending()) {
-        cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
-        return 1;
-    }
-
-    // Stage 6C-1A: while interleaving prefetch for seq0 during seq1 active decode, mark seq0
-    // resume-pending so the idle swap-out gate does not re-evict the blocks we just prefetched.
-    if (prefetch_during_active && !prefetch_auto_delayed) {
-        llama_kv_cache_set_seq_prefetch_protected(llama_get_memory(ctx), 0, true);
-        prefetch_protect_enabled = 1;
-    }
-
     std::string seq1_generated;
     int32_t sample_idx = batch.n_tokens - 1;
     llama_pos seq1_pos = (llama_pos) active_tokens.size();
@@ -1194,79 +1100,10 @@ int main(int argc, char ** argv) {
         const auto active_token_decode_t1 = active_token_stats_enabled ? perf_clock::now() : perf_clock::time_point();
         auto active_token_total_t1 = active_token_decode_t1;
 
-        const int32_t seq1_decoded_done = seq1_decoded + 1;
-        bool active_token_prefetched = false;
-        uint32_t active_token_requested_blocks = 0;
-        int32_t active_token_restored_blocks = 0;
-        double active_token_prefetch_ms = 0.0;
-        if (prefetch_during_active && prefetch_auto_delayed &&
-                resume_pending_token > 0 &&
-                seq1_decoded_done >= resume_pending_token &&
-                !start_resume_pending()) {
-            cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
-            return 1;
-        }
-
-        if (prefetch_during_active_schedule_enabled &&
-                (!prefetch_auto_delayed || resume_pending_started) &&
-                (!resume_pending_target_limited ||
-                 (uint64_t) prefetch_during_active_blocks < target_restore_blocks) &&
-                seq1_decoded_done >= prefetch_after_active_tokens &&
-                ((seq1_decoded_done - prefetch_after_active_tokens) % prefetch_every_tokens) == 0) {
-            if (prefetch_during_active_calls == 0) {
-                rss_before_active_prefetch_kb = current_rss_kb();
-            }
-
-            uint32_t blocks_this_step = (uint32_t) prefetch_blocks_per_step;
-            if (resume_pending_target_limited) {
-                const uint64_t target_remaining =
-                    target_restore_blocks - (uint64_t) prefetch_during_active_blocks;
-                blocks_this_step = (uint32_t) std::min<uint64_t>(target_remaining, blocks_this_step);
-            }
-
-            const auto active_prefetch_t0 = perf_clock::now();
-            const int32_t restored = llama_memory_prefetch_seq_step(
-                    llama_get_memory(ctx), 0, blocks_this_step);
-            const auto active_prefetch_t1 = perf_clock::now();
-            const double active_prefetch_ms = elapsed_ms(active_prefetch_t0, active_prefetch_t1);
-
-            active_token_prefetched = true;
-            active_token_requested_blocks = blocks_this_step;
-            active_token_restored_blocks = restored;
-            active_token_prefetch_ms = active_prefetch_ms;
-            if (active_token_stats_enabled) {
-                active_token_total_t1 = active_prefetch_t1;
-            }
-
-            prefetch_during_active_calls += 1;
-            prefetch_during_active_ms_total += active_prefetch_ms;
-            prefetch_during_active_ms_max = std::max(prefetch_during_active_ms_max, active_prefetch_ms);
-            if (restored > 0) {
-                int32_t restored_capped = restored;
-                if (resume_pending_target_limited) {
-                    const uint64_t target_remaining =
-                        target_restore_blocks - (uint64_t) prefetch_during_active_blocks;
-                    restored_capped = (int32_t) std::min<uint64_t>((uint64_t) restored, target_remaining);
-                }
-                prefetch_during_active_blocks += restored_capped;
-            }
-            rss_after_active_prefetch_kb = current_rss_kb();
-
-            if (!handle_prefetch_result(restored, test_state)) {
-                fprintf(stderr, "%s: llama_memory_prefetch_seq_step() failed for seq0 during seq1 active decode\n", __func__);
-                cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
-                return 1;
-            }
-        }
-
         if (active_token_stats_enabled) {
             const active_token_stat stat = {
-                seq1_decoded_done,
-                active_token_prefetched,
-                active_token_requested_blocks,
-                active_token_restored_blocks,
+                seq1_decoded + 1,
                 elapsed_ms(active_token_t0, active_token_decode_t1),
-                active_token_prefetch_ms,
                 elapsed_ms(active_token_t0, active_token_total_t1),
             };
             active_token_stats.push_back(stat);
@@ -1603,37 +1440,124 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // The explicit OFFLOAD fixture starts from an isolated seq0 ownership snapshot;
+    // prior active and stability workloads are complete but remain in this context.
+    llama_memory_seq_keep(memory, 0);
+
     std::string seq0_resume_generated;
     llama_token seq0_token = seq0_warmed > 0 ? seq0_warm_token : seq0_resume_first;
     llama_pos seq0_pos = (llama_pos) idle_tokens.size() + seq0_warmed;
     int32_t seq0_resume_decoded = 0;
 
-    rss_before_prefetch_kb = current_rss_kb();
-    const int32_t prefetch_probe_blocks = llama_memory_prefetch_seq_step(llama_get_memory(ctx), 0, 0);
-    if (!handle_prefetch_result(prefetch_probe_blocks, test_state)) {
-        fprintf(stderr, "%s: llama_memory_prefetch_seq_step() probe failed for seq0\n", __func__);
+    const auto fail_controlled_fixture = [&](const char * message) {
+        fprintf(stderr, "%s: controlled lifecycle fixture failed: %s\n", __func__, message);
         cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
+    };
+    const auto seq0_before_offload = query_seq0_claimant("seq0_before_offload");
+    if (!seq0_before_offload.valid || seq0_before_offload.target_blocks == 0 ||
+            seq0_before_offload.eligible_resident_blocks != seq0_before_offload.target_blocks ||
+            seq0_before_offload.swapped_blocks != 0 || seq0_before_offload.shared_blocks != 0 ||
+            seq0_before_offload.blocked_blocks != 0) {
+        fail_controlled_fixture("seq0 must start with exclusively RESIDENT blocks");
         return 1;
     }
-    uint64_t prefetch_probe_owned_blocks = 0;
-    uint64_t prefetch_probe_resident_blocks = 0;
-    uint64_t prefetch_probe_released_blocks = 0;
-    uint64_t prefetch_probe_invalid_cells = 0;
-    uint64_t prefetch_probe_failures = 0;
-    llama_kv_cache_prefetch_seq_last_stats(
-            llama_get_memory(ctx),
-            &prefetch_probe_owned_blocks,
-            &prefetch_remaining_blocks_before_resume,
-            &prefetch_probe_resident_blocks,
-            &prefetch_probe_released_blocks,
-            &prefetch_probe_invalid_cells,
-            &prefetch_probe_failures);
-    if (prefetch_enabled) {
+
+    llama_kv_action_request offload_request;
+    offload_request.action = llama_kv_action::offload;
+    offload_request.decision_id = 1;
+    offload_request.seq_id = 0;
+    offload_request.target_bytes = 1;
+    offload_request.max_blocks = 1;
+    offload_request.claimant = llama_kv_memory_claimant::kv;
+    offload_request.io_class = llama_kv_io_class::capacity_write;
+
+    const llama_kv_action_result offload_result =
+        execute_unified_action("seq0_offload", offload_request);
+    if (test_state.expect_swap_out_io_failure) {
+        if (offload_result.outcome != llama_kv_action_outcome::failed ||
+                offload_result.reason != llama_kv_action_reason::io_failure ||
+                !offload_result.io_failure || offload_result.state_changed ||
+                offload_result.blocks != 0 || offload_result.core_transaction_id != 0) {
+            fail_controlled_fixture("expected the first OFFLOAD to fail without publishing state");
+            return 1;
+        }
+
+        const auto seq0_after_failed_offload = query_seq0_claimant("seq0_after_failed_offload");
+        if (!same_claimant(seq0_after_failed_offload, seq0_before_offload)) {
+            fail_controlled_fixture("failed OFFLOAD changed the authoritative claimant state");
+            return 1;
+        }
+
+        offload_request.decision_id = 2;
+        const llama_kv_action_result retry_result =
+            execute_unified_action("seq0_offload_retry", offload_request);
+        if (retry_result.outcome != llama_kv_action_outcome::completed ||
+                retry_result.reason == llama_kv_action_reason::io_failure ||
+                !retry_result.state_changed || retry_result.io_failure ||
+                retry_result.blocks != 1 || retry_result.core_transaction_id == 0) {
+            fail_controlled_fixture("explicit OFFLOAD retry did not publish SWAPPED state");
+            return 1;
+        }
+    } else if (offload_result.outcome != llama_kv_action_outcome::completed ||
+            !offload_result.capability.can_offload || !offload_result.state_changed ||
+            offload_result.blocks != 1 || offload_result.core_transaction_id == 0) {
+        fail_controlled_fixture("explicit OFFLOAD did not publish SWAPPED state");
+        return 1;
+    }
+
+    const auto seq0_after_offload = query_seq0_claimant("seq0_after_offload");
+    if (!seq0_after_offload.valid ||
+            seq0_after_offload.target_blocks != seq0_before_offload.target_blocks ||
+            seq0_after_offload.eligible_resident_blocks + 1 !=
+                seq0_before_offload.eligible_resident_blocks ||
+            seq0_after_offload.swapped_blocks != seq0_before_offload.swapped_blocks + 1 ||
+            seq0_after_offload.shared_blocks != seq0_before_offload.shared_blocks ||
+            seq0_after_offload.blocked_blocks != seq0_before_offload.blocked_blocks) {
+        fail_controlled_fixture("explicit OFFLOAD did not leave one seq0 block SWAPPED");
+        return 1;
+    }
+
+    prefetch_remaining_blocks_before_resume = seq0_after_offload.swapped_blocks;
+    prefetch_owned_blocks = seq0_after_offload.target_blocks;
+    prefetch_swapped_blocks = seq0_after_offload.swapped_blocks;
+    prefetch_resident_blocks = seq0_after_offload.eligible_resident_blocks;
+    llama_kv_cache_set_seq_prefetch_protected(memory, 0, true);
+    prefetch_protect_enabled = 1;
+    rss_before_prefetch_kb = current_rss_kb();
+
+    const bool skip_resume_prefetch = test_state.expect_active_decode_failure;
+    if (skip_resume_prefetch) {
+        fprintf(stderr,
+                "KV_RESUME_PREFETCH mode=skipped seq=0 reason=active_decode_failure "
+                "swapped_blocks=%llu\n",
+                (unsigned long long) seq0_after_offload.swapped_blocks);
+        rss_after_prefetch_kb = current_rss_kb();
+    } else {
+        const int32_t prefetch_probe_blocks = llama_memory_prefetch_seq_step(memory, 0, 0);
+        if (!handle_prefetch_result(prefetch_probe_blocks, test_state)) {
+            fprintf(stderr, "%s: llama_memory_prefetch_seq_step() probe failed for seq0\n", __func__);
+            cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
+            return 1;
+        }
+        uint64_t prefetch_probe_owned_blocks = 0;
+        uint64_t prefetch_probe_resident_blocks = 0;
+        uint64_t prefetch_probe_released_blocks = 0;
+        uint64_t prefetch_probe_invalid_cells = 0;
+        uint64_t prefetch_probe_failures = 0;
+        llama_kv_cache_prefetch_seq_last_stats(
+                memory,
+                &prefetch_probe_owned_blocks,
+                &prefetch_remaining_blocks_before_resume,
+                &prefetch_probe_resident_blocks,
+                &prefetch_probe_released_blocks,
+                &prefetch_probe_invalid_cells,
+                &prefetch_probe_failures);
+
         const auto prefetch_t0 = perf_clock::now();
-        prefetch_blocks = llama_memory_prefetch_seq(llama_get_memory(ctx), 0);
+        prefetch_blocks = llama_memory_prefetch_seq(memory, 0);
         prefetch_ms = elapsed_ms(prefetch_t0, perf_clock::now());
         llama_kv_cache_prefetch_seq_last_stats(
-                llama_get_memory(ctx),
+                memory,
                 &prefetch_owned_blocks,
                 &prefetch_swapped_blocks,
                 &prefetch_resident_blocks,
@@ -1641,18 +1565,28 @@ int main(int argc, char ** argv) {
                 &prefetch_invalid_cells,
                 &prefetch_failures);
         rss_after_prefetch_kb = current_rss_kb();
+        fprintf(stderr,
+                "KV_RESUME_PREFETCH mode=full seq=0 restored=%d elapsed_ms=%.3f\n",
+                prefetch_blocks, prefetch_ms);
         if (!handle_prefetch_result(prefetch_blocks, test_state)) {
             fprintf(stderr, "%s: llama_memory_prefetch_seq() failed for seq0\n", __func__);
             cleanup(batch, seq0_smpl, seq1_smpl, ctx, model);
             return 1;
         }
-    } else {
-        rss_after_prefetch_kb = rss_before_prefetch_kb;
+        if (test_state.expect_prefetch_failure) {
+            const auto seq0_after_prefetch_failure = query_seq0_claimant("seq0_after_prefetch_failure");
+            if (!same_claimant(seq0_after_prefetch_failure, seq0_after_offload)) {
+                fail_controlled_fixture("failed PREFETCH changed the authoritative claimant state");
+                return 1;
+            }
+        } else {
+            const auto seq0_after_prefetch = query_seq0_claimant("seq0_after_prefetch");
+            if (!same_claimant(seq0_after_prefetch, seq0_before_offload)) {
+                fail_controlled_fixture("full PREFETCH did not restore all seq0 blocks");
+                return 1;
+            }
+        }
     }
-    const int32_t prefetch_auto_completed =
-        prefetch_remaining_blocks_before_resume == 0 ? 1 : 0;
-    const uint64_t prefetch_auto_fallback_blocks = prefetch_remaining_blocks_before_resume;
-    const uint64_t resume_pending_fallback_blocks = prefetch_remaining_blocks_before_resume;
 
     rss_before_resume_kb = current_rss_kb();
     const auto seq0_resume_total_t0 = perf_clock::now();
@@ -1664,9 +1598,6 @@ int main(int argc, char ** argv) {
         seq0_resume_generated += common_token_to_piece(ctx, seq0_token);
 
         const auto seq0_resume_step_t0 = seq0_resume_decoded == 0 ? perf_clock::now() : perf_clock::time_point{};
-        if (seq0_resume_decoded == 0 && defer_swapout_on_resume) {
-            llama_kv_cache_defer_idle_swapout(llama_get_memory(ctx), 1);
-        }
         if (seq0_resume_decoded == 0 && resume_timing_step_enabled) {
             fprintf(stderr, "KV_RESUME_FIRST_BEGIN\n");
         }
@@ -1726,8 +1657,7 @@ int main(int argc, char ** argv) {
     seq0_resume_total_ms = elapsed_ms(seq0_resume_total_t0, perf_clock::now());
     rss_after_resume_kb = current_rss_kb();
 
-    // Stage 6C-1A: seq0 has resumed; drop the resume-pending protection so the default idle
-    // swap-out policy applies again to seq0-owned blocks.
+    // Resume is complete; release the correctness protection for this sequence.
     if (prefetch_protect_enabled) {
         llama_kv_cache_set_seq_prefetch_protected(llama_get_memory(ctx), 0, false);
     }
@@ -1789,25 +1719,11 @@ int main(int argc, char ** argv) {
             "seq1_active_tokens=%d seq0_resume_tokens=%d total_measured_tokens=%d "
             "tokens_per_second=%.6f seq0_prefill_ms=%.3f seq1_prefill_ms=%.3f "
             "seq0_warmup_tokens=%d seq0_warmed_tokens=%d "
-            "prefetch_enabled=%d prefetch_ms=%.3f prefetch_blocks=%d "
-            "prefetch_during_active_enabled=%d prefetch_during_active_calls=%d "
-            "prefetch_protect_enabled=%d "
-            "prefetch_during_active_blocks=%d prefetch_during_active_ms_total=%.3f "
-            "prefetch_during_active_ms_max=%.3f prefetch_remaining_blocks_before_resume=%llu "
+            "resume_prefetch_ms=%.3f resume_prefetch_blocks=%d prefetch_protect_enabled=%d "
+            "prefetch_remaining_blocks_before_resume=%llu "
             "prefetch_owned_blocks=%llu prefetch_swapped_blocks=%llu "
             "prefetch_resident_blocks=%llu prefetch_released_blocks=%llu "
             "prefetch_invalid_cells=%llu prefetch_failures=%llu "
-            "prefetch_auto_enabled=%d prefetch_auto_active_total_tokens=%d "
-            "prefetch_auto_remaining_blocks=%llu prefetch_auto_need_steps=%llu "
-            "pressure_mode=%s target_restore_blocks=%llu "
-            "prefetch_auto_start_token=%d prefetch_auto_every_tokens=%d "
-            "prefetch_auto_blocks_per_step=%d prefetch_auto_safety_tokens=%d "
-            "prefetch_auto_window_ok=%d prefetch_auto_started=%d "
-            "prefetch_auto_completed=%d prefetch_auto_fallback_blocks=%llu "
-            "resume_pending_token=%d resume_pending_started=%d "
-            "active_window_remaining=%d effective_start_token=%d "
-            "resume_pending_window_ok=%d resume_pending_fallback_blocks=%llu "
-            "rss_before_active_prefetch_kb=%llu rss_after_active_prefetch_kb=%llu "
             "rss_before_prefetch_kb=%llu rss_after_prefetch_kb=%llu "
             "rss_before_resume_kb=%llu rss_after_resume_kb=%llu\n",
             total_wall_ms, seq1_active_ms,
@@ -1819,13 +1735,7 @@ int main(int argc, char ** argv) {
             seq1_active_tokens, seq0_resume_tokens, total_measured_tokens,
             tokens_per_second, seq0_prefill_ms, seq1_prefill_ms,
             seq0_warmup, seq0_warmed,
-            prefetch_enabled ? 1 : 0, prefetch_ms, prefetch_blocks,
-            prefetch_during_active ? 1 : 0,
-            prefetch_during_active_calls,
-            prefetch_protect_enabled,
-            prefetch_during_active_blocks,
-            prefetch_during_active_ms_total,
-            prefetch_during_active_ms_max,
+            prefetch_ms, prefetch_blocks, prefetch_protect_enabled,
             (unsigned long long) prefetch_remaining_blocks_before_resume,
             (unsigned long long) prefetch_owned_blocks,
             (unsigned long long) prefetch_swapped_blocks,
@@ -1833,28 +1743,6 @@ int main(int argc, char ** argv) {
             (unsigned long long) prefetch_released_blocks,
             (unsigned long long) prefetch_invalid_cells,
             (unsigned long long) prefetch_failures,
-            prefetch_auto_delayed ? 1 : 0,
-            prefetch_auto_active_total_tokens,
-            (unsigned long long) prefetch_auto_remaining_blocks,
-            (unsigned long long) prefetch_auto_need_steps,
-            prefetch_pressure_mode_name(pressure_mode),
-            (unsigned long long) target_restore_blocks,
-            prefetch_auto_start_token,
-            prefetch_auto_every_tokens,
-            prefetch_auto_blocks_per_step,
-            prefetch_auto_safety_tokens,
-            prefetch_auto_window_ok,
-            prefetch_auto_delayed && prefetch_during_active_calls > 0 ? 1 : 0,
-            prefetch_auto_completed,
-            (unsigned long long) prefetch_auto_fallback_blocks,
-            resume_pending_token,
-            resume_pending_started,
-            active_window_remaining,
-            effective_start_token,
-            resume_pending_window_ok,
-            (unsigned long long) resume_pending_fallback_blocks,
-            (unsigned long long) rss_before_active_prefetch_kb,
-            (unsigned long long) rss_after_active_prefetch_kb,
             (unsigned long long) rss_before_prefetch_kb,
             (unsigned long long) rss_after_prefetch_kb,
             (unsigned long long) rss_before_resume_kb,
@@ -1865,37 +1753,23 @@ int main(int argc, char ** argv) {
         total_samples.reserve(active_token_stats.size());
         double total_ms_sum = 0.0;
         double decode_ms_sum = 0.0;
-        double active_prefetch_ms_total = 0.0;
-        size_t active_prefetch_calls = 0;
         for (const active_token_stat & stat : active_token_stats) {
             total_samples.push_back(stat.total_ms);
             total_ms_sum += stat.total_ms;
             decode_ms_sum += stat.decode_ms;
-            if (stat.prefetched) {
-                active_prefetch_calls += 1;
-                active_prefetch_ms_total += stat.prefetch_ms;
-                fprintf(stderr,
-                        "KV_ACTIVE_TOKEN_PREFETCH token=%d requested_blocks=%u restored_blocks=%d "
-                        "decode_ms=%.3f prefetch_ms=%.3f total_ms=%.3f\n",
-                        stat.token, stat.requested_blocks, stat.restored_blocks,
-                        stat.decode_ms, stat.prefetch_ms, stat.total_ms);
-            }
         }
         std::sort(total_samples.begin(), total_samples.end());
 
         fprintf(stderr,
                 "KV_ACTIVE_TOKEN_STATS active_token_count=%zu avg_ms=%.3f p50_ms=%.3f "
-                "p95_ms=%.3f p99_ms=%.3f max_ms=%.3f decode_avg_ms=%.3f "
-                "prefetch_calls=%zu prefetch_total_ms=%.3f\n",
+                "p95_ms=%.3f p99_ms=%.3f max_ms=%.3f decode_avg_ms=%.3f\n",
                 active_token_stats.size(),
                 total_ms_sum / (double) active_token_stats.size(),
                 active_token_percentile(total_samples, 50),
                 active_token_percentile(total_samples, 95),
                 active_token_percentile(total_samples, 99),
                 total_samples.back(),
-                decode_ms_sum / (double) active_token_stats.size(),
-                active_prefetch_calls,
-                active_prefetch_ms_total);
+                decode_ms_sum / (double) active_token_stats.size());
     }
 
     if (get_rows_profile_enabled) {

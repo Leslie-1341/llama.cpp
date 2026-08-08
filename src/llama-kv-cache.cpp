@@ -821,8 +821,19 @@ llama_kv_cache::llama_kv_cache(
             paged_test_io_fault_.target_seq = (llama_seq_id) target_seq;
         }
 
-        if (paged_test_io_fault_.scope == paged_test_io_fail_scope::SWAP_OUT ||
-                paged_test_io_fault_.scope == paged_test_io_fail_scope::PREFETCH_SWAP_IN) {
+        if (paged_test_io_fault_.scope == paged_test_io_fail_scope::SWAP_OUT) {
+            if (!test_io_block_env) {
+                paged_test_io_fault_.target_block = PAGED_BLOCK_INVALID;
+            } else {
+                uint64_t target_block = 0;
+                if (!llama_kv_parse_u64_strict(test_io_block_env, target_block) ||
+                        target_block > (uint64_t) std::numeric_limits<uint32_t>::max()) {
+                    test_io_config_valid = false;
+                } else {
+                    paged_test_io_fault_.target_block = (uint32_t) target_block;
+                }
+            }
+        } else if (paged_test_io_fault_.scope == paged_test_io_fail_scope::PREFETCH_SWAP_IN) {
             uint64_t target_block = 0;
             if (!test_io_block_env ||
                     !llama_kv_parse_u64_strict(test_io_block_env, target_block) ||
@@ -3334,6 +3345,11 @@ llama_kv_action_result llama_kv_cache::execute_action(
         uint64_t block_relieved_bytes = 0;
         bool block_io_failure = false;
         int block_io_errno = 0;
+        if (paged_test_io_fault_.scope == paged_test_io_fail_scope::SWAP_OUT &&
+                paged_test_io_fault_.target_seq == request.seq_id &&
+                paged_test_io_fault_.target_block == PAGED_BLOCK_INVALID) {
+            paged_test_io_fault_.target_block = physical_block;
+        }
         paged_swap_out_block(
                 physical_block, true, false,
                 &block_relieved_bytes, &block_io_failure, &block_io_errno);
@@ -3383,13 +3399,6 @@ void llama_kv_cache::set_seq_prefetch_protected(llama_seq_id seq_id, bool enable
     paged_prefetch_protected_seq.set(seq_id, enabled);
 }
 
-void llama_kv_cache::defer_idle_swapout(int32_t n_steps) {
-    if (n_steps <= 0) {
-        return;
-    }
-    paged_defer_idle_swapout_steps = std::max(paged_defer_idle_swapout_steps, n_steps);
-}
-
 extern "C" bool llama_kv_cache_set_seq_prefetch_protected(
         llama_memory_t mem,
         llama_seq_id   seq_id,
@@ -3399,17 +3408,6 @@ extern "C" bool llama_kv_cache_set_seq_prefetch_protected(
         return false;
     }
     kv->set_seq_prefetch_protected(seq_id, enabled);
-    return true;
-}
-
-extern "C" bool llama_kv_cache_defer_idle_swapout(
-        llama_memory_t mem,
-        int32_t        n_steps) {
-    auto * kv = dynamic_cast<llama_kv_cache *>(mem);
-    if (!kv) {
-        return false;
-    }
-    kv->defer_idle_swapout(n_steps);
     return true;
 }
 
@@ -7907,7 +7905,6 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
     const uint64_t swap_out_calls_before = paged_timing_swap_out_calls;
     const uint64_t check_read_us_before = paged_timing_check_read_us;
     const uint64_t check_read_calls_before = paged_timing_check_read_calls;
-    const bool defer_idle_swapout_now = paged_defer_idle_swapout_steps > 0;
     if (!dst) {
         if (timing_enabled) {
             const uint64_t set_input_us = llama_paged_timing_now_us() - set_input_start_us;
@@ -7916,20 +7913,15 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                         "KV_PAGED_STEP_TIMING step=%llu set_input_us=%llu "
                         "idle_maintenance_us=0 swap_out_us=0 swap_out_calls=0 "
                         "check_read_us=0 check_read_calls=0 swapped_blocks=0 "
-                        "idle_owned_blocks=0 prefetch_protected_blocks=0 remaining_prefetch_blocks=0 "
-                        "defer_idle_swapout=%d swapout_deferred_blocks=0\n",
+                        "idle_owned_blocks=0 prefetch_protected_blocks=0 remaining_prefetch_blocks=0\n",
                         (unsigned long long) step,
-                        (unsigned long long) set_input_us,
-                        defer_idle_swapout_now ? 1 : 0);
+                        (unsigned long long) set_input_us);
             }
             paged_timing_set_input_us += set_input_us;
             paged_timing_set_input_calls += 1;
         }
         if (base_timing_enabled) {
             paged_base_timing_set_row_idx_total_us += llama_paged_timing_now_us() - base_set_input_start_us;
-        }
-        if (defer_idle_swapout_now && paged_defer_idle_swapout_steps > 0) {
-            paged_defer_idle_swapout_steps -= 1;
         }
         paged_trace_step += 1;
         return true;
@@ -8598,7 +8590,6 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
     paged_swapped_active_visible_violation_blocks += swapped_active_visible_violation_blocks_this_call.size();
 
     uint64_t prefetch_protected_blocks_this_call = 0;
-    uint64_t swapout_deferred_blocks_this_call = 0;
     // Idle-sequence age/last-use facts and the existing idle trace remain telemetry-only.
     const bool idle_maintenance_active = paged_idle_trace_enabled;
     if (idle_maintenance_active) {
@@ -9000,8 +8991,7 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                     "KV_PAGED_STEP_TIMING step=%llu set_input_us=%llu "
                     "idle_maintenance_us=%llu swap_out_us=%llu swap_out_calls=%llu "
                     "check_read_us=%llu check_read_calls=%llu swapped_blocks=%llu "
-                    "idle_owned_blocks=%llu prefetch_protected_blocks=%llu remaining_prefetch_blocks=%llu "
-                    "defer_idle_swapout=%d swapout_deferred_blocks=%llu\n",
+                    "idle_owned_blocks=%llu prefetch_protected_blocks=%llu remaining_prefetch_blocks=%llu\n",
                     (unsigned long long) step,
                     (unsigned long long) set_input_us,
                     (unsigned long long) (paged_timing_idle_maintenance_us - idle_maintenance_us_before),
@@ -9012,15 +9002,10 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                     (unsigned long long) swapped_blocks,
                     (unsigned long long) paged_idle_cold_candidates,
                     (unsigned long long) prefetch_protected_blocks_this_call,
-                    (unsigned long long) paged_prefetch_seq_last_swapped_blocks,
-                    defer_idle_swapout_now ? 1 : 0,
-                    (unsigned long long) swapout_deferred_blocks_this_call);
+                    (unsigned long long) paged_prefetch_seq_last_swapped_blocks);
         }
         paged_timing_set_input_us += set_input_us;
         paged_timing_set_input_calls += 1;
-    }
-    if (defer_idle_swapout_now && paged_defer_idle_swapout_steps > 0) {
-        paged_defer_idle_swapout_steps -= 1;
     }
     if (base_timing_enabled) {
         paged_base_timing_set_row_idx_total_us += llama_paged_timing_now_us() - base_set_input_start_us;
