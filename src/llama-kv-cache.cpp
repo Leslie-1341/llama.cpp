@@ -31,7 +31,6 @@
 #endif
 
 #if defined(__linux__) && defined(__GLIBC__)
-#include <execinfo.h>
 #include <sys/resource.h>
 #if defined(RUSAGE_THREAD)
 #define LLAMA_KV_RESTORE_FAULT_STATS_SUPPORTED 1
@@ -39,7 +38,6 @@
 #if defined(MADV_POPULATE_WRITE)
 #define LLAMA_KV_RESTORE_PREFAULT_SUPPORTED 1
 #endif
-#define LLAMA_KV_REFAULT_TRACE_SUPPORTED 1
 #endif
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -918,13 +916,8 @@ llama_kv_cache::llama_kv_cache(
         const char * LLAMA_KV_PAGED_IDLE_SWAP_EVERY_TOKENS = std::getenv("LLAMA_KV_PAGED_IDLE_SWAP_EVERY_TOKENS");
         const char * LLAMA_KV_PAGED_IDLE_SWAP_MAX_BLOCKS_PER_STEP = std::getenv("LLAMA_KV_PAGED_IDLE_SWAP_MAX_BLOCKS_PER_STEP");
         const char * LLAMA_KV_PAGED_IDLE_SWAP_MIN_IDLE_STEPS = std::getenv("LLAMA_KV_PAGED_IDLE_SWAP_MIN_IDLE_STEPS");
-        const char * LLAMA_KV_PAGED_IDLE_SWAP_DEBUG_PROBES = std::getenv("LLAMA_KV_PAGED_IDLE_SWAP_DEBUG_PROBES");
         const char * LLAMA_KV_PAGED_SHADOW_VALIDATE = std::getenv("LLAMA_KV_PAGED_SHADOW_VALIDATE");
         const char * LLAMA_KV_PAGED_MINCORE = std::getenv("LLAMA_KV_PAGED_MINCORE");
-        const char * LLAMA_KV_PAGED_REFAULT_TRACE           = std::getenv("LLAMA_KV_PAGED_REFAULT_TRACE");
-        const char * LLAMA_KV_PAGED_REFAULT_TRACE_MAX       = std::getenv("LLAMA_KV_PAGED_REFAULT_TRACE_MAX");
-        const char * LLAMA_KV_PAGED_REFAULT_TRACE_BACKTRACE = std::getenv("LLAMA_KV_PAGED_REFAULT_TRACE_BACKTRACE");
-        const char * LLAMA_KV_PAGED_REFAULT_TRACE_ONCE      = std::getenv("LLAMA_KV_PAGED_REFAULT_TRACE_ONCE");
         const char * LLAMA_KV_PAGED_IO_STATS                = std::getenv("LLAMA_KV_PAGED_IO_STATS");
 #if defined(LLAMA_KV_RESTORE_FAULT_STATS_SUPPORTED)
         const char * LLAMA_KV_PAGED_RESTORE_FAULT_STATS     = std::getenv("LLAMA_KV_PAGED_RESTORE_FAULT_STATS");
@@ -984,9 +977,6 @@ llama_kv_cache::llama_kv_cache(
             paged_idle_swap_every_tokens = idle_swap_every_tokens_env > 0 ? (uint64_t) idle_swap_every_tokens_env : 1;
             paged_idle_swap_max_blocks_per_step = idle_swap_max_blocks_env > 0 ? (uint64_t) idle_swap_max_blocks_env : 0;
             paged_idle_swap_min_idle_steps = idle_swap_min_idle_steps_env > 0 ? (uint64_t) idle_swap_min_idle_steps_env : 0;
-            paged_idle_swap_debug_probes =
-                !(LLAMA_KV_PAGED_IDLE_SWAP_DEBUG_PROBES &&
-                  std::strcmp(LLAMA_KV_PAGED_IDLE_SWAP_DEBUG_PROBES, "0") == 0);
             paged_shadow_validate_enabled =
                 LLAMA_KV_PAGED_SHADOW_VALIDATE &&
                 std::strcmp(LLAMA_KV_PAGED_SHADOW_VALIDATE, "1") == 0;
@@ -1028,23 +1018,6 @@ llama_kv_cache::llama_kv_cache(
             }
             paged_trace_enabled = LLAMA_KV_PAGED_TRACE && std::strcmp(LLAMA_KV_PAGED_TRACE, "1") == 0;
             paged_idle_trace_enabled = LLAMA_KV_PAGED_IDLE_TRACE && std::strcmp(LLAMA_KV_PAGED_IDLE_TRACE, "1") == 0;
-            paged_refault_trace_requested =
-                LLAMA_KV_PAGED_REFAULT_TRACE && std::strcmp(LLAMA_KV_PAGED_REFAULT_TRACE, "1") == 0;
-            if (paged_refault_trace_requested) {
-                paged_refault_trace_backtrace =
-                    LLAMA_KV_PAGED_REFAULT_TRACE_BACKTRACE &&
-                    std::strcmp(LLAMA_KV_PAGED_REFAULT_TRACE_BACKTRACE, "1") == 0;
-                // ONCE defaults to on; only "0" turns it off.
-                paged_refault_trace_once =
-                    !(LLAMA_KV_PAGED_REFAULT_TRACE_ONCE &&
-                      std::strcmp(LLAMA_KV_PAGED_REFAULT_TRACE_ONCE, "0") == 0);
-                if (LLAMA_KV_PAGED_REFAULT_TRACE_MAX) {
-                    const long m = std::atol(LLAMA_KV_PAGED_REFAULT_TRACE_MAX);
-                    if (m > 0) {
-                        paged_refault_trace_max = (uint64_t) m;
-                    }
-                }
-            }
             // Destructive release authority is owned by bounded_release_can_enable();
             // see llama-kv-cache-release.h.  Cleanup-C2 retired the legacy
             // LLAMA_KV_PAGED_RELEASE auto/unbounded path; no legacy gate is
@@ -1095,9 +1068,6 @@ llama_kv_cache::llama_kv_cache(
             if (paged_idle_swap_requested) {
                 LLAMA_LOG_INFO("%s: KV paged idle swap requested (safe-candidate probe only)\n", __func__);
             }
-            // Stage 7D-A: install the refault SIGSEGV handler + arm bookkeeping. The trap table
-            // itself is built lazily on the first protect call, once KV tensor data is allocated.
-            paged_refault_init();
         }
     }
 
@@ -1421,9 +1391,6 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
-    const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
-    debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
-
     // stage F1 / P1: KV Lazy-Block tail madvise (debug-only, off by default).
     // See docs/kv_lazy_block_stage_f1_design.md.
     const char * LLAMA_KV_LAZY_TAIL = getenv("LLAMA_KV_LAZY_TAIL");
@@ -1514,11 +1481,6 @@ llama_kv_cache::llama_kv_cache(
 llama_kv_cache::~llama_kv_cache() {
     paged_restore_worker_stop_and_join();
 
-    // Stage 7D-A: tear down refault protection BEFORE anything else touches KV memory during
-    // teardown -- restore every protected page to PROT_READ|PROT_WRITE and disarm the handler so
-    // no late access traps. Drain the atomic fault counters into the instance for the stats line.
-    paged_refault_drain();
-    paged_refault_unprotect_all();
 
     static const llama_kv_backing_store_stats kv_swap_empty_stats;
     const auto & kv_swap_stats = kv_swap_store ? kv_swap_store->get_stats() : kv_swap_empty_stats;
@@ -2419,14 +2381,8 @@ bool llama_kv_cache::paged_restore_group_post_read(paged_restore_group_task & ta
     }
 
     task.restore_start_us = llama_paged_timing_now_us();
-    for (const uint32_t block : task.blocks) {
-        paged_refault_unprotect_block(block);
-    }
 
     if (!paged_restore_group_prefault(task)) {
-        for (const uint32_t block : task.blocks) {
-            paged_refault_protect_block(block);
-        }
         paged_swap_in_fail_bad_size += 1;
         paged_swap_backend_failures += 1;
         task.read_status = llama_kv_backing_store_status::bad_slot;
@@ -3876,72 +3832,6 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 
 llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont) const {
 
-    if (debug > 0) {
-        for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
-            const auto seq_id = ubatch.seq_id_unq[s];
-            const auto stream_id = seq_to_stream[seq_id];
-            const auto & cells = v_cells[stream_id];
-            const uint32_t head_cur = v_heads[stream_id];
-
-            LLAMA_LOG_DEBUG("%s: stream[%d], n = %5d, used = %5d, head = %5d, size = %5d, n_swa = %5d\n",
-                    __func__, stream_id, cells.used_max_p1(), cells.get_used(), head_cur, get_size(), n_swa);
-
-            if ((debug == 2 && n_swa > 0) || debug > 2) {
-                std::string ss;
-                for (uint32_t i = 0; i < cells.size(); ++i) {
-                    if (cells.is_empty(i)) {
-                        ss += '.';
-                    } else {
-                        assert(cells.seq_count(i) >= 1);
-
-                        if (cells.seq_count(i) == 1) {
-                            ss += std::to_string(cells.seq_get(i));
-                        } else {
-                            ss += 'M';
-                        }
-                    }
-                    if (i%256 == 255) {
-                        ss += " *";
-                        ss += '\n';
-                    }
-                }
-                LLAMA_LOG_DEBUG("\n%s\n", ss.c_str());
-            }
-
-            if ((debug == 2 && n_swa > 0) || debug > 2) {
-                std::string ss;
-                for (uint32_t i = 0; i < cells.size(); ++i) {
-                    std::string cur;
-                    if (cells.is_empty(i)) {
-                        cur = '.';
-                    } else {
-                        cur = std::to_string(cells.pos_get(i));
-                    }
-                    const int n = cur.size();
-                    for (int j = 0; j < 5 - n; ++j) {
-                        cur += ' ';
-                    }
-                    ss += cur;
-                    if (i%256 == 255) {
-                        ss += " *";
-                    }
-                    if (i%64 == 63) {
-                        ss += '\n';
-                    }
-                }
-                LLAMA_LOG_DEBUG("\n%s\n", ss.c_str());
-            }
-
-            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
-                if (cells.seq_pos_min(s) < 0) {
-                    continue;
-                }
-
-                LLAMA_LOG_DEBUG("%s: stream[%d] min[%d] = %5d, max[%d] = %5d\n", __func__, stream_id, s, cells.seq_pos_min(s), s, cells.seq_pos_max(s));
-            }
-        }
-    }
-
     uint32_t n_tokens = ubatch.n_tokens;
     uint32_t n_seqs   = 1;
 
@@ -5092,12 +4982,6 @@ void llama_kv_cache::paged_swap_out_block_impl(
         }
     }
 
-    // Stage 7D-A: arm refault protection AFTER madvise. The block is now SWAPPED and its pages
-    // have been advised away; mprotect(PROT_NONE) so any subsequent read of those virtual
-    // addresses traps. Must come after madvise (a fault would re-fault the page resident, which is
-    // exactly the event we want to catch); doing it before madvise would also work but would not
-    // reflect the post-madvise state we are measuring. No-op unless refault tracing is enabled.
-    paged_refault_protect_block(physical_block);
     if (paged_io_stats_enabled) {
         paged_io_block_out_madvise_us += llama_paged_timing_now_us() - madvise_start_us;
         paged_io_block_out_madvise_calls += 1;
@@ -5364,9 +5248,6 @@ bool llama_kv_cache::paged_swap_in_block(
             return fail(begin, status, backend_errno);
     }
 
-    // Keep SWAPPED pages protected until the complete cell-major file image has been read into
-    // staging. A terminal read failure above therefore leaves refault protection intact.
-    paged_refault_unprotect_block(physical_block);
     const uint64_t unpack_start_us = paged_io_stats_enabled ? llama_paged_timing_now_us() : 0;
     for (uint32_t cell = begin; cell < end; ++cell) {
         size_t cursor = (size_t) (cell - begin) * total_size;
@@ -5950,406 +5831,6 @@ bool llama_kv_cache::paged_finish_write_transaction(
     return finished;
 }
 
-// ===========================================================================================
-// Stage 7D-A: debug-only SWAPPED-page refault tracing.
-//
-// Goal: find out which read path touches an already-swapped-out + madvise'd KV page during graph
-// compute (the "refault" that keeps whole-KV resident drop pinned at ~63.75 MiB). When enabled we
-// mprotect(PROT_NONE) the exact page-aligned K/V interior we just advised away; any later access
-// traps into the SIGSEGV handler below, which logs the fault site, restores the page, and returns
-// so the faulting instruction retries. This is purely diagnostic -- it never changes swap/madvise/
-// row_idx semantics and is a no-op unless LLAMA_KV_PAGED_REFAULT_TRACE=1.
-//
-// Signal-handler safety: the handler only does async-signal-safe work -- it scans a fixed,
-// pre-built trap table (never reallocated while armed), calls mprotect(2), bumps lock-free atomic
-// counters, and emits one line via write(2) using a hand-rolled integer formatter (no malloc, no
-// locks, no stdio). Optional backtrace uses backtrace()+backtrace_symbols_fd() (the fd variant is
-// the async-signal-safe one). All aggregate counters live in file-scope atomics and are copied
-// into the instance for the stats line by paged_refault_drain().
-// ===========================================================================================
-#if defined(LLAMA_KV_REFAULT_TRACE_SUPPORTED)
-namespace {
-
-struct refault_trap {
-    uintptr_t lo;        // page-aligned start of this block's K or V interval in one layer
-    uintptr_t hi;        // page-aligned end (exclusive)
-    uint32_t  block;     // owning physical block id
-    uint32_t  layer_il;  // KV layer id
-    uint8_t   is_v;      // 0 = K tensor, 1 = V tensor
-    std::atomic<uint8_t> armed; // 1 => currently PROT_NONE and watched
-};
-
-// Fixed table, allocated once (covers every block x layer x {K,V}) and published before arming.
-refault_trap *        g_refault_traps   = nullptr;
-std::atomic<size_t>   g_refault_ntraps  {0};
-std::atomic<bool>     g_refault_armed   {false};
-std::atomic<long>     g_refault_pagesize{0};
-std::atomic<int>      g_refault_backtrace{0};
-std::atomic<int>      g_refault_once    {1};
-std::atomic<uint64_t> g_refault_max     {64};
-std::atomic<uint64_t> g_refault_step    {0};
-
-std::atomic<uint64_t> g_refault_fault_count{0};
-std::atomic<uint64_t> g_refault_fault_k   {0};
-std::atomic<uint64_t> g_refault_fault_v   {0};
-std::atomic<uint64_t> g_refault_unmapped  {0};
-
-struct sigaction g_refault_old_sa;
-std::atomic<bool> g_refault_installed{false};
-
-// async-signal-safe unsigned -> decimal, appended at p, returns new end.
-char * refault_u64(char * p, uint64_t v) {
-    char tmp[20];
-    int n = 0;
-    if (v == 0) {
-        tmp[n++] = '0';
-    }
-    while (v > 0) {
-        tmp[n++] = (char) ('0' + (v % 10));
-        v /= 10;
-    }
-    while (n > 0) {
-        *p++ = tmp[--n];
-    }
-    return p;
-}
-
-// async-signal-safe uintptr -> 0x-prefixed hex.
-char * refault_hex(char * p, uintptr_t v) {
-    static const char hexd[] = "0123456789abcdef";
-    *p++ = '0';
-    *p++ = 'x';
-    char tmp[16];
-    int n = 0;
-    if (v == 0) {
-        tmp[n++] = '0';
-    }
-    while (v > 0) {
-        tmp[n++] = hexd[v & 0xf];
-        v >>= 4;
-    }
-    while (n > 0) {
-        *p++ = tmp[--n];
-    }
-    return p;
-}
-
-char * refault_lit(char * p, const char * s) {
-    while (*s) {
-        *p++ = *s++;
-    }
-    return p;
-}
-
-void paged_refault_sigsegv_handler(int sig, siginfo_t * si, void * /*uc*/) {
-    const uintptr_t addr = (uintptr_t) (si ? si->si_addr : nullptr);
-
-    if (g_refault_armed.load(std::memory_order_acquire) && g_refault_traps) {
-        const size_t n = g_refault_ntraps.load(std::memory_order_acquire);
-        for (size_t i = 0; i < n; ++i) {
-            refault_trap & t = g_refault_traps[i];
-            if (t.armed.load(std::memory_order_acquire) == 0) {
-                continue;
-            }
-            if (addr < t.lo || addr >= t.hi) {
-                continue;
-            }
-
-            const long pg  = g_refault_pagesize.load(std::memory_order_relaxed);
-            const int  once = g_refault_once.load(std::memory_order_relaxed);
-
-            // Restore access so the faulting instruction can retry. With ONCE we drop protection
-            // on this whole K/V-per-layer trap region (so we do not segv-storm on the same range);
-            // without ONCE we restore just the single faulting page and keep the rest watched.
-            void * raddr;
-            size_t rlen;
-            if (once) {
-                raddr = (void *) t.lo;
-                rlen  = (size_t) (t.hi - t.lo);
-            } else {
-                const uintptr_t page = addr & ~((uintptr_t) pg - 1);
-                raddr = (void *) page;
-                rlen  = (size_t) pg;
-            }
-            mprotect(raddr, rlen, PROT_READ | PROT_WRITE);
-            if (once) {
-                t.armed.store(0, std::memory_order_release);
-            }
-
-            const uint64_t cnt = g_refault_fault_count.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (t.is_v) {
-                g_refault_fault_v.fetch_add(1, std::memory_order_relaxed);
-            } else {
-                g_refault_fault_k.fetch_add(1, std::memory_order_relaxed);
-            }
-
-            if (cnt <= g_refault_max.load(std::memory_order_relaxed)) {
-                char buf[256];
-                char * p = buf;
-                p = refault_lit(p, "KV_REFAULT_TRACE step=");
-                p = refault_u64(p, g_refault_step.load(std::memory_order_relaxed));
-                p = refault_lit(p, " addr=");
-                p = refault_hex(p, addr);
-                p = refault_lit(p, " kind=");
-                p = refault_lit(p, t.is_v ? "V" : "K");
-                p = refault_lit(p, " layer=");
-                p = refault_u64(p, t.layer_il);
-                p = refault_lit(p, " block=");
-                p = refault_u64(p, t.block);
-                p = refault_lit(p, " state=SWAPPED page=");
-                p = refault_hex(p, addr & ~((uintptr_t) pg - 1));
-                p = refault_lit(p, " offset=");
-                p = refault_u64(p, (uint64_t) (addr - t.lo));
-                p = refault_lit(p, " fault_count=");
-                p = refault_u64(p, cnt);
-                *p++ = '\n';
-                (void) !write(STDERR_FILENO, buf, (size_t) (p - buf));
-
-                if (g_refault_backtrace.load(std::memory_order_relaxed)) {
-                    void * bt[32];
-                    const int nb = backtrace(bt, 32);
-                    const char * hdr = "KV_REFAULT_TRACE_BT\n";
-                    (void) !write(STDERR_FILENO, hdr, std::strlen(hdr));
-                    backtrace_symbols_fd(bt, nb, STDERR_FILENO);
-                }
-            }
-            return; // retry faulting instruction against the now-readable page
-        }
-    }
-
-    // Not one of our (currently-armed) KV pages: this is a genuine fault. Count it, restore the
-    // previous SIGSEGV disposition, and return so the faulting instruction re-runs and crashes
-    // through the original handler instead of being silently swallowed.
-    g_refault_unmapped.fetch_add(1, std::memory_order_relaxed);
-    sigaction(SIGSEGV, &g_refault_old_sa, nullptr);
-    (void) sig;
-}
-
-} // namespace
-#endif // LLAMA_KV_REFAULT_TRACE_SUPPORTED
-
-void llama_kv_cache::paged_refault_init() {
-#if defined(LLAMA_KV_REFAULT_TRACE_SUPPORTED)
-    if (!kv_paged_enabled || !paged_refault_trace_requested) {
-        return;
-    }
-    // Refault tracing only makes sense on the same CPU/single-stream path that swap+madvise use.
-    if (v_trans || n_stream != 1 || paged_block_size == 0 || paged_n_blocks == 0) {
-        LLAMA_LOG_WARN("%s: LLAMA_KV_PAGED_REFAULT_TRACE=1 requires CPU KV path "
-                "(n_stream==1, !v_trans, paged enabled); refault tracing disabled\n", __func__);
-        return;
-    }
-    const long page = sysconf(_SC_PAGESIZE);
-    if (page <= 0) {
-        return;
-    }
-
-    struct sigaction sa;
-    std::memset(&sa, 0, sizeof(sa));
-    sa.sa_sigaction = paged_refault_sigsegv_handler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_SIGINFO | SA_RESTART;
-    if (sigaction(SIGSEGV, &sa, &g_refault_old_sa) != 0) {
-        LLAMA_LOG_WARN("%s: failed to install refault SIGSEGV handler (errno=%d); disabled\n",
-                __func__, errno);
-        return;
-    }
-
-    g_refault_pagesize.store(page, std::memory_order_relaxed);
-    g_refault_backtrace.store(paged_refault_trace_backtrace ? 1 : 0, std::memory_order_relaxed);
-    g_refault_once.store(paged_refault_trace_once ? 1 : 0, std::memory_order_relaxed);
-    g_refault_max.store(paged_refault_trace_max, std::memory_order_relaxed);
-    g_refault_installed.store(true, std::memory_order_release);
-
-    paged_refault_trace_enabled = true;
-    paged_refault_protected.assign(paged_n_blocks, 0);
-    LLAMA_LOG_INFO("%s: KV paged refault tracing enabled (mprotect PROT_NONE on SWAPPED KV pages, "
-            "backtrace=%d once=%d max=%llu)\n",
-            __func__, paged_refault_trace_backtrace ? 1 : 0, paged_refault_trace_once ? 1 : 0,
-            (unsigned long long) paged_refault_trace_max);
-#else
-    if (paged_refault_trace_requested) {
-        LLAMA_LOG_WARN("%s: LLAMA_KV_PAGED_REFAULT_TRACE=1 requires Linux+glibc; disabled\n", __func__);
-    }
-#endif
-}
-
-void llama_kv_cache::paged_refault_protect_block(uint32_t physical_block) const {
-#if defined(LLAMA_KV_REFAULT_TRACE_SUPPORTED)
-    if (!paged_refault_trace_enabled || physical_block >= paged_n_blocks) {
-        return;
-    }
-    const long page = g_refault_pagesize.load(std::memory_order_relaxed);
-    if (page <= 0) {
-        return;
-    }
-    const uintptr_t pg = (uintptr_t) page;
-
-    // Build the trap table once, covering every block x layer x {K,V}. Tensor base pointers are
-    // fixed after buffer allocation, so this is built outside any signal context and never
-    // reallocated while the handler can run.
-    if (g_refault_traps == nullptr) {
-        const size_t cap = (size_t) paged_n_blocks * layers.size() * 2 + 1;
-        refault_trap * traps = new (std::nothrow) refault_trap[cap];
-        if (!traps) {
-            return;
-        }
-        size_t idx = 0;
-        for (uint32_t b = 0; b < paged_n_blocks; ++b) {
-            for (const auto & layer : layers) {
-                ggml_tensor * k = layer.k_stream.empty() ? nullptr : layer.k_stream[0];
-                ggml_tensor * v = layer.v_stream.empty() ? nullptr : layer.v_stream[0];
-                auto add = [&](ggml_tensor * t, uint8_t is_v) {
-                    if (!t || idx >= cap) {
-                        return;
-                    }
-                    paged_block_page_range page_range;
-                    if (!paged_compute_block_page_range(
-                            t, b, (uint64_t) t->nb[1], pg, page_range)) {
-                        return;
-                    }
-                    refault_trap & tr = traps[idx++];
-                    tr.lo = page_range.page_begin;
-                    tr.hi = page_range.page_end;
-                    tr.block = b;
-                    tr.layer_il = layer.il;
-                    tr.is_v = is_v;
-                    tr.armed.store(0, std::memory_order_relaxed);
-                };
-                add(k, 0);
-                add(v, 1);
-            }
-        }
-        g_refault_traps = traps;
-        g_refault_ntraps.store(idx, std::memory_order_release);
-        g_refault_armed.store(true, std::memory_order_release);
-    }
-
-    if (paged_refault_protected[physical_block]) {
-        return;
-    }
-
-    const size_t n = g_refault_ntraps.load(std::memory_order_relaxed);
-    uint64_t pages = 0;
-    bool any_fail = false;
-    for (size_t i = 0; i < n; ++i) {
-        refault_trap & t = g_refault_traps[i];
-        if (t.block != physical_block) {
-            continue;
-        }
-        if (mprotect((void *) t.lo, (size_t) (t.hi - t.lo), PROT_NONE) != 0) {
-            any_fail = true;
-            continue;
-        }
-        t.armed.store(1, std::memory_order_release);
-        pages += (uint64_t) ((t.hi - t.lo) / pg);
-    }
-    if (any_fail) {
-        paged_refault_protect_failures += 1;
-    }
-    if (pages > 0) {
-        paged_refault_protected[physical_block] = 1;
-        paged_refault_protect_calls += 1;
-        paged_refault_protected_pages += pages;
-    }
-#else
-    (void) physical_block;
-#endif
-}
-
-void llama_kv_cache::paged_refault_unprotect_block(uint32_t physical_block) const {
-#if defined(LLAMA_KV_REFAULT_TRACE_SUPPORTED)
-    if (!paged_refault_trace_enabled || physical_block >= paged_n_blocks ||
-            g_refault_traps == nullptr) {
-        return;
-    }
-    if (physical_block < paged_refault_protected.size() && !paged_refault_protected[physical_block]) {
-        return;
-    }
-    const long page = g_refault_pagesize.load(std::memory_order_relaxed);
-    const uintptr_t pg = page > 0 ? (uintptr_t) page : 4096;
-    const size_t n = g_refault_ntraps.load(std::memory_order_relaxed);
-    uint64_t pages = 0;
-    bool any_fail = false;
-    for (size_t i = 0; i < n; ++i) {
-        refault_trap & t = g_refault_traps[i];
-        if (t.block != physical_block) {
-            continue;
-        }
-        if (t.armed.load(std::memory_order_acquire) == 0) {
-            continue;
-        }
-        if (mprotect((void *) t.lo, (size_t) (t.hi - t.lo), PROT_READ | PROT_WRITE) != 0) {
-            any_fail = true;
-        } else {
-            pages += (uint64_t) ((t.hi - t.lo) / pg);
-        }
-        t.armed.store(0, std::memory_order_release);
-    }
-    if (any_fail) {
-        paged_refault_unprotect_failures += 1;
-    }
-    if (physical_block < paged_refault_protected.size()) {
-        paged_refault_protected[physical_block] = 0;
-    }
-    if (pages > 0) {
-        paged_refault_unprotect_calls += 1;
-        paged_refault_unprotected_pages += pages;
-    }
-#else
-    (void) physical_block;
-#endif
-}
-
-void llama_kv_cache::paged_refault_unprotect_all() const {
-#if defined(LLAMA_KV_REFAULT_TRACE_SUPPORTED)
-    if (!paged_refault_trace_enabled) {
-        return;
-    }
-    for (uint32_t b = 0; b < paged_n_blocks; ++b) {
-        paged_refault_unprotect_block(b);
-    }
-    // Stop the handler from touching the table after this point.
-    g_refault_armed.store(false, std::memory_order_release);
-#endif
-}
-
-void llama_kv_cache::paged_refault_drain() const {
-#if defined(LLAMA_KV_REFAULT_TRACE_SUPPORTED)
-    if (!paged_refault_trace_enabled) {
-        return;
-    }
-    paged_refault_fault_count        = g_refault_fault_count.load(std::memory_order_relaxed);
-    paged_refault_fault_k_count      = g_refault_fault_k.load(std::memory_order_relaxed);
-    paged_refault_fault_v_count      = g_refault_fault_v.load(std::memory_order_relaxed);
-    paged_refault_unmapped_fault_count = g_refault_unmapped.load(std::memory_order_relaxed);
-    paged_refault_trace_enabled_flag = 1;
-    // Distinct faulted blocks: count blocks whose protection was dropped by a fault (armed flag
-    // cleared while we still recorded it as protected). Coarse signal; the per-fault
-    // KV_REFAULT_TRACE lines carry the authoritative block list.
-    uint64_t faulted_blocks = 0;
-    if (g_refault_traps) {
-        const size_t n = g_refault_ntraps.load(std::memory_order_relaxed);
-        for (uint32_t b = 0; b < paged_n_blocks; ++b) {
-            if (b >= paged_refault_protected.size() || !paged_refault_protected[b]) {
-                continue;
-            }
-            bool any_disarmed = false;
-            for (size_t i = 0; i < n; ++i) {
-                if (g_refault_traps[i].block == b &&
-                        g_refault_traps[i].armed.load(std::memory_order_relaxed) == 0) {
-                    any_disarmed = true;
-                    break;
-                }
-            }
-            if (any_disarmed) {
-                faulted_blocks += 1;
-            }
-        }
-    }
-    paged_refault_fault_blocks = faulted_blocks;
-#endif
-}
 
 void llama_kv_cache::paged_assert_identity(const slot_info & sinfo) {
     if (!kv_paged_enabled) {
@@ -6573,9 +6054,6 @@ void llama_kv_cache::paged_log_stats() const {
         return;
     }
 
-    // Stage 7D-A: copy live atomic refault counters into the instance before emitting.
-    paged_refault_drain();
-
     LLAMA_LOG_INFO("%s: KV paged metadata stats: enabled=%d block_size=%u n_blocks=%u "
             "blocks_in_use=%llu free_blocks=%zu alloc_calls=%llu identity_checks=%llu identity_fail=%llu "
             "write_resolve_checks=%llu write_resolve_fail=%llu write_resolve_changed=%llu "
@@ -6616,13 +6094,8 @@ void llama_kv_cache::paged_log_stats() const {
             "paged_nonidentity_cold_in_read_window_after=%llu "
             "paged_nonidentity_safe_candidates_after=%llu "
             "paged_swapped_redirect_rows=%llu paged_swapped_redirect_blocks=%llu "
-            "paged_swapped_redirect_skip_no_dummy=%llu paged_swapped_active_visible_violation=%llu paged_swapped_redirect_probe_rows=%llu paged_swapped_redirect_probe_swapped_rows=%llu paged_swapped_redirect_probe_resident_rows=%llu paged_swapped_redirect_probe_invalid_rows=%llu paged_swapped_redirect_probe_state_mismatch=%llu paged_swapped_redirect_probe_disabled=%llu paged_swapped_active_visible_violation_rows=%llu paged_swapped_active_visible_violation_blocks=%llu paged_swapped_active_visible_logical_seq_has=%llu paged_swapped_active_visible_phys_seq_has=%llu paged_swapped_active_visible_in_read_window=%llu paged_swapped_active_visible_not_in_read_window=%llu paged_swapped_active_visible_masked=%llu paged_swapped_active_visible_unmasked=%llu paged_row_mapping_invalid_fatal=%llu paged_write_mapping_invalid_fatal=%llu paged_active_row_nonresident_fatal=%llu paged_input_setup_fatal=%llu paged_no_dummy_restore_sync=%llu paged_active_row_dummy_redirect_blocked=%llu paged_swapped_active_violation_rows=%llu paged_swapped_active_violation_blocks=%llu paged_swapped_active_violation_block_had_active_owner_at_swapout=%llu paged_swapped_active_violation_after_swapout_write=%llu paged_swapped_active_violation_resolve_to_swapped=%llu paged_swapped_active_visible_restore_rows=%llu paged_swapped_active_visible_restore_blocks=%llu paged_swap_out_skip_active_visible_block=%llu paged_swap_out_skip_active_owned_block=%llu paged_swap_out_candidate_blocks=%llu paged_swap_out_allowed_blocks=%llu paged_swap_out_skip_fullprefix_read_window_only=%llu paged_swap_out_skip_true_active_owned=%llu paged_swap_out_skip_true_active_unmasked=%llu paged_active_restore_from_swapped_blocks=%llu paged_idle_only_swapped_blocks=%llu paged_write_to_swapped_block=%llu paged_write_to_swapped_block_seq=%llu "
-            "paged_cov_idle_owned_blocks=%llu paged_cov_in_read_window_blocks=%llu "
-            "paged_cov_not_in_read_window_blocks=%llu paged_cov_resident_safe_blocks=%llu "
-            "paged_cov_nonidentity_remapped_blocks=%llu "
-            "paged_cov_idle_owned_bytes=%llu paged_cov_in_read_window_bytes=%llu "
-            "paged_cov_resident_safe_bytes=%llu paged_cov_nonidentity_remapped_bytes=%llu "
-            "paged_swap_enabled=%d paged_swap_out_calls=%llu paged_swap_in_calls=%llu "
+            "paged_swapped_redirect_skip_no_dummy=%llu paged_swapped_active_visible_violation=%llu paged_swapped_active_visible_violation_rows=%llu paged_swapped_active_visible_violation_blocks=%llu paged_row_mapping_invalid_fatal=%llu paged_write_mapping_invalid_fatal=%llu paged_active_row_nonresident_fatal=%llu paged_input_setup_fatal=%llu paged_no_dummy_restore_sync=%llu paged_active_row_dummy_redirect_blocked=%llu paged_swapped_active_violation_rows=%llu paged_swapped_active_violation_blocks=%llu paged_swapped_active_violation_block_had_active_owner_at_swapout=%llu paged_swapped_active_violation_after_swapout_write=%llu paged_swapped_active_violation_resolve_to_swapped=%llu paged_swapped_active_visible_restore_rows=%llu paged_swapped_active_visible_restore_blocks=%llu paged_swap_out_skip_active_visible_block=%llu paged_swap_out_skip_active_owned_block=%llu paged_swap_out_candidate_blocks=%llu paged_swap_out_allowed_blocks=%llu paged_swap_out_skip_fullprefix_read_window_only=%llu paged_swap_out_skip_true_active_owned=%llu paged_swap_out_skip_true_active_unmasked=%llu paged_active_restore_from_swapped_blocks=%llu paged_idle_only_swapped_blocks=%llu paged_write_to_swapped_block=%llu paged_write_to_swapped_block_seq=%llu "
+                        "paged_swap_enabled=%d paged_swap_out_calls=%llu paged_swap_in_calls=%llu "
             "paged_blocks_swapped_out=%llu paged_blocks_swapped_in=%llu "
             "paged_swap_bytes_out=%llu paged_swap_bytes_in=%llu paged_swap_in_last_block=%u "
             "paged_swap_backend_failures=%llu paged_swap_window_skipped=%llu "
@@ -6652,13 +6125,7 @@ void llama_kv_cache::paged_log_stats() const {
             "kv_mincore_swapped_block_count=%llu kv_mincore_swapped_total_bytes=%llu "
             "kv_mincore_swapped_resident_bytes=%llu kv_mincore_swapped_nonresident_bytes=%llu "
             "kv_mincore_swapped_resident_blocks=%llu kv_mincore_swapped_nonresident_blocks=%llu "
-            "kv_mincore_swapped_resident_ratio_permille=%llu "
-            "paged_refault_trace_enabled=%llu paged_refault_fault_count=%llu "
-            "paged_refault_fault_k_count=%llu paged_refault_fault_v_count=%llu "
-            "paged_refault_fault_blocks=%llu paged_refault_unmapped_fault_count=%llu "
-            "paged_refault_protect_calls=%llu paged_refault_unprotect_calls=%llu "
-            "paged_refault_protected_pages=%llu paged_refault_unprotected_pages=%llu "
-            "paged_refault_protect_failures=%llu paged_refault_unprotect_failures=%llu\n",
+            "kv_mincore_swapped_resident_ratio_permille=%llu\n",
             __func__, kv_paged_enabled ? 1 : 0, paged_block_size, paged_n_blocks,
             (unsigned long long) paged_blocks_in_use,
             paged_free_list.size(),
@@ -6740,20 +6207,8 @@ void llama_kv_cache::paged_log_stats() const {
             (unsigned long long) paged_swapped_redirect_blocks,
             (unsigned long long) paged_swapped_redirect_skip_no_dummy,
             (unsigned long long) paged_swapped_active_visible_violation,
-            (unsigned long long) paged_swapped_redirect_probe_rows,
-            (unsigned long long) paged_swapped_redirect_probe_swapped_rows,
-            (unsigned long long) paged_swapped_redirect_probe_resident_rows,
-            (unsigned long long) paged_swapped_redirect_probe_invalid_rows,
-            (unsigned long long) paged_swapped_redirect_probe_state_mismatch,
-            (unsigned long long) paged_swapped_redirect_probe_disabled,
             (unsigned long long) paged_swapped_active_visible_violation_rows,
             (unsigned long long) paged_swapped_active_visible_violation_blocks,
-            (unsigned long long) paged_swapped_active_visible_logical_seq_has,
-            (unsigned long long) paged_swapped_active_visible_phys_seq_has,
-            (unsigned long long) paged_swapped_active_visible_in_read_window,
-            (unsigned long long) paged_swapped_active_visible_not_in_read_window,
-            (unsigned long long) paged_swapped_active_visible_masked,
-            (unsigned long long) paged_swapped_active_visible_unmasked,
             (unsigned long long) paged_row_mapping_invalid_fatal,
             (unsigned long long) paged_write_mapping_invalid_fatal,
             (unsigned long long) paged_active_row_nonresident_fatal,
@@ -6778,15 +6233,6 @@ void llama_kv_cache::paged_log_stats() const {
             (unsigned long long) paged_idle_only_swapped_blocks,
             (unsigned long long) paged_write_to_swapped_block,
             (unsigned long long) paged_write_to_swapped_block_seq,
-            (unsigned long long) paged_cov_idle_owned_blocks,
-            (unsigned long long) paged_cov_in_read_window_blocks,
-            (unsigned long long) paged_cov_not_in_read_window_blocks,
-            (unsigned long long) paged_cov_resident_safe_blocks,
-            (unsigned long long) paged_cov_nonidentity_remapped_blocks,
-            (unsigned long long) paged_cov_idle_owned_bytes,
-            (unsigned long long) paged_cov_in_read_window_bytes,
-            (unsigned long long) paged_cov_resident_safe_bytes,
-            (unsigned long long) paged_cov_nonidentity_remapped_bytes,
             paged_swap_enabled ? 1 : 0,
             (unsigned long long) paged_swap_out_calls,
             (unsigned long long) paged_swap_in_calls,
@@ -6855,19 +6301,7 @@ void llama_kv_cache::paged_log_stats() const {
             (unsigned long long) paged_mincore_swapped_resident_blocks,
             (unsigned long long) paged_mincore_swapped_nonresident_blocks,
             (unsigned long long) (paged_mincore_swapped_total_bytes > 0
-                ? paged_mincore_swapped_resident_bytes * 1000ull / paged_mincore_swapped_total_bytes : 0),
-            (unsigned long long) paged_refault_trace_enabled_flag,
-            (unsigned long long) paged_refault_fault_count,
-            (unsigned long long) paged_refault_fault_k_count,
-            (unsigned long long) paged_refault_fault_v_count,
-            (unsigned long long) paged_refault_fault_blocks,
-            (unsigned long long) paged_refault_unmapped_fault_count,
-            (unsigned long long) paged_refault_protect_calls,
-            (unsigned long long) paged_refault_unprotect_calls,
-            (unsigned long long) paged_refault_protected_pages,
-            (unsigned long long) paged_refault_unprotected_pages,
-            (unsigned long long) paged_refault_protect_failures,
-            (unsigned long long) paged_refault_unprotect_failures);
+                ? paged_mincore_swapped_resident_bytes * 1000ull / paged_mincore_swapped_total_bytes : 0));
 
     fprintf(stderr,
             "KV_PAGED_BOUNDED_RELEASE_STATS contract=no_backing_unrecoverable_dead_or_unused_only "
@@ -8517,7 +7951,6 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
     }
     const bool timing_enabled = paged_resume_timing_enabled || paged_resume_timing_step_enabled;
     const uint64_t step = paged_trace_step;
-    const bool idle_swap_debug_probes = paged_idle_swap_debug_probes;
     const bool idle_swap_maintenance_due =
         paged_idle_swap_every_tokens <= 1 ||
         (paged_trace_step % paged_idle_swap_every_tokens) == 0;
@@ -8571,14 +8004,6 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
         set_paged_swap_error(reason, physical_block, physical_cell);
         return false;
     };
-
-#if defined(LLAMA_KV_REFAULT_TRACE_SUPPORTED)
-    // Stage 7D-A: publish the current decode step so a fault during the upcoming graph compute is
-    // attributed to the right step in KV_REFAULT_TRACE lines. Cheap, only when tracing is armed.
-    if (paged_refault_trace_enabled) {
-        g_refault_step.store(paged_trace_step, std::memory_order_relaxed);
-    }
-#endif
 
     std::set<uint32_t> trace_read_blocks;
     std::set<uint32_t> trace_read_blocks_before_remap;
@@ -8638,7 +8063,7 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
         paged_idle_swap_madvise_warned = true;
     }
 
-    const bool swapped_redirect_probe_ready =
+    const bool swapped_redirect_active =
         paged_block_size != 0 &&
         paged_n_blocks != 0 &&
         !v_cells.empty() &&
@@ -8647,12 +8072,11 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
     struct active_row_visibility {
         bool in_read_window = false;
         bool logical_seq_has = false;
-        bool phys_seq_has = false;
         bool unmasked_for_active = false;
         bool required_by_active = false;
     };
 
-    const auto get_active_row_visibility = [&](uint32_t logical_cell, uint32_t phys_cell, bool collect_phys_seq_has) {
+    const auto get_active_row_visibility = [&](uint32_t logical_cell) {
         active_row_visibility result;
         if (!active_seq.any() || logical_cell >= active_n_kv || v_cells.empty()) {
             return result;
@@ -8673,13 +8097,6 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                         (p0 <= p1 && !llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1))) {
                     result.unmasked_for_active = true;
                 }
-            }
-            if (collect_phys_seq_has &&
-                    active_seq.test(seq_id) &&
-                    phys_cell < cells.size() &&
-                    !cells.is_empty(phys_cell) &&
-                    cells.seq_has(phys_cell, seq_id)) {
-                result.phys_seq_has = true;
             }
         }
 
@@ -8708,7 +8125,7 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
             (p0 <= p1 && !llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1));
     };
 
-    if (swapped_redirect_probe_ready && active_seq.any()) {
+    if (swapped_redirect_active && active_seq.any()) {
         const uint64_t t_active_visible = base_timing_enabled ? llama_paged_timing_now_us() : 0;
         if (base_timing_enabled) {
             paged_base_timing_cells_scanned += active_n_kv;
@@ -8729,7 +8146,7 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
             const uint32_t block = phys / paged_block_size;
             if (block < paged_block_states.size() &&
                     paged_block_states[block] == paged_block_state::SWAPPED &&
-                    get_active_row_visibility(cell, phys, false).required_by_active) {
+                    get_active_row_visibility(cell).required_by_active) {
                 active_visible_swapped_rows += 1;
                 active_visible_swapped_blocks.insert(block);
             }
@@ -8855,7 +8272,7 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
         }
     }
 
-    if (dummy_phys == PAGED_BLOCK_INVALID && swapped_redirect_probe_ready && active_seq.any()) {
+    if (dummy_phys == PAGED_BLOCK_INVALID && swapped_redirect_active && active_seq.any()) {
         nonidentity_probe_timed = true;
         if (base_timing_enabled) {
             paged_base_timing_cells_scanned += active_n_kv;
@@ -8952,28 +8369,7 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
         paged_base_timing_nonidentity_probe_us += llama_paged_timing_now_us() - t_nonidentity_probe;
     }
 
-    uint64_t swapped_probe_rows_this_call = 0;
-    uint64_t swapped_probe_swapped_rows_this_call = 0;
-    uint64_t swapped_probe_resident_rows_this_call = 0;
-    uint64_t swapped_probe_invalid_rows_this_call = 0;
-    uint64_t swapped_blocks_at_row_idx = 0;
     std::set<uint32_t> swapped_active_visible_violation_blocks_this_call;
-    if (idle_swap_debug_probes && swapped_redirect_probe_ready) {
-        const uint64_t t_swapped_scan = base_timing_enabled ? llama_paged_timing_now_us() : 0;
-        if (base_timing_enabled) {
-            paged_base_timing_blocks_scanned += paged_n_blocks;
-        }
-        for (uint32_t block = 0; block < paged_n_blocks; ++block) {
-            if (paged_block_states[block] == paged_block_state::SWAPPED) {
-                swapped_blocks_at_row_idx += 1;
-            }
-        }
-        if (base_timing_enabled) {
-            paged_base_timing_swapped_blocks_scan_us += llama_paged_timing_now_us() - t_swapped_scan;
-        }
-    } else if (!swapped_redirect_probe_ready) {
-        paged_swapped_redirect_probe_disabled += 1;
-    }
 
     std::set<uint32_t> nonidentity_remapped_blocks;
     std::set<uint32_t> swapped_redirected_blocks;
@@ -9026,7 +8422,7 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
         bool required_by_active = false;
         const auto ensure_visibility = [&]() {
             if (!visibility_known && active_seq.any() && !v_cells.empty()) {
-                visibility = get_active_row_visibility((uint32_t) r, phys_orig, idle_swap_debug_probes);
+                visibility = get_active_row_visibility((uint32_t) r);
                 required_by_active = visibility.required_by_active;
                 visibility_known = true;
             }
@@ -9156,37 +8552,11 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
             // else: pending_fresh_cell — cell is being written in current
             // transaction; physical row has valid backing → keep real phys.
         }
-        if (!released_handled && swapped_redirect_probe_ready) {
-            if (idle_swap_debug_probes) {
-                swapped_probe_rows_this_call += 1;
-            }
+        if (!released_handled && swapped_redirect_active) {
             if (!phys_orig_valid || !block_state_valid) {
-                if (idle_swap_debug_probes) {
-                    swapped_probe_invalid_rows_this_call += 1;
-                }
+                // Probe-style: no redirect path applies; fall through.
             } else if (state == paged_block_state::SWAPPED) {
                 ensure_visibility();
-                if (idle_swap_debug_probes) {
-                    swapped_probe_swapped_rows_this_call += 1;
-                }
-                if (idle_swap_debug_probes && visibility.logical_seq_has) {
-                    paged_swapped_active_visible_logical_seq_has += 1;
-                }
-                if (idle_swap_debug_probes && visibility.phys_seq_has) {
-                    paged_swapped_active_visible_phys_seq_has += 1;
-                }
-                if (idle_swap_debug_probes) {
-                    if (visibility.in_read_window) {
-                        paged_swapped_active_visible_in_read_window += 1;
-                    } else {
-                        paged_swapped_active_visible_not_in_read_window += 1;
-                    }
-                }
-                if (idle_swap_debug_probes && visibility.logical_seq_has && !visibility.unmasked_for_active) {
-                    paged_swapped_active_visible_masked += 1;
-                } else if (idle_swap_debug_probes && required_by_active) {
-                    paged_swapped_active_visible_unmasked += 1;
-                }
 
                 if (required_by_active) {
                     paged_active_row_dummy_redirect_blocked += 1;
@@ -9219,8 +8589,6 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                     paged_swapped_redirect_rows += 1;
                     swapped_handled = true;
                 }
-            } else if (idle_swap_debug_probes && state == paged_block_state::RESIDENT) {
-                swapped_probe_resident_rows_this_call += 1;
             }
         }
 
@@ -9304,15 +8672,6 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
     if (base_timing_enabled) {
         paged_base_timing_row_idx_fill_us += llama_paged_timing_now_us() - t_row_idx_fill;
     }
-    if (idle_swap_debug_probes) {
-        paged_swapped_redirect_probe_rows += swapped_probe_rows_this_call;
-        paged_swapped_redirect_probe_swapped_rows += swapped_probe_swapped_rows_this_call;
-        paged_swapped_redirect_probe_resident_rows += swapped_probe_resident_rows_this_call;
-        paged_swapped_redirect_probe_invalid_rows += swapped_probe_invalid_rows_this_call;
-        if (swapped_blocks_at_row_idx > 0 && swapped_probe_swapped_rows_this_call == 0) {
-            paged_swapped_redirect_probe_state_mismatch += 1;
-        }
-    }
 
     paged_nonidentity_remap_blocks += nonidentity_remapped_blocks.size();
     paged_swapped_redirect_blocks += swapped_redirected_blocks.size();
@@ -9353,7 +8712,7 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
 
         std::string active_seq_csv;
         std::string last_active_csv;
-        if (idle_swap_debug_probes && paged_idle_trace_enabled) {
+        if (paged_idle_trace_enabled) {
             for (llama_seq_id seq_id = 0; seq_id < LLAMA_MAX_SEQ; ++seq_id) {
                 if (!active_seq.test(seq_id)) {
                     continue;
@@ -9391,7 +8750,6 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
         uint64_t nonidentity_remapped_this_round = 0;
         uint64_t per_block_bytes = 0;
         uint64_t idle_swap_out_attempts_this_call = 0;
-        const uint64_t madvise_calls_before_cov = paged_swap_madvise_calls;
         // Stage 5E-1: mincore window locals, hoisted so the post-loop latch can read them.
         uint64_t mincore_resident_before_loop = 0;
         uint64_t mincore_madvise_calls_before = paged_swap_madvise_calls;
@@ -9641,17 +8999,6 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
         paged_idle_cold_not_in_read_window = cold_not_in_read_window;
         paged_idle_skip_mixed_active = skip_mixed_active;
         paged_idle_safe_swap_candidates = safe_swap_candidates;
-        if (idle_swap_debug_probes && paged_swap_madvise_calls > madvise_calls_before_cov) {
-            paged_cov_idle_owned_blocks = cold_candidates;
-            paged_cov_in_read_window_blocks = cold_in_read_window;
-            paged_cov_not_in_read_window_blocks = cold_not_in_read_window;
-            paged_cov_resident_safe_blocks = safe_swap_candidates;
-            paged_cov_nonidentity_remapped_blocks = nonidentity_remapped_this_round;
-            paged_cov_idle_owned_bytes = cold_candidates * per_block_bytes;
-            paged_cov_in_read_window_bytes = cold_in_read_window * per_block_bytes;
-            paged_cov_resident_safe_bytes = safe_swap_candidates * per_block_bytes;
-            paged_cov_nonidentity_remapped_bytes = nonidentity_remapped_this_round * per_block_bytes;
-        }
         paged_nonidentity_cold_in_read_window_before = cold_in_read_window_before;
         paged_nonidentity_cold_in_read_window_after = cold_in_read_window;
         paged_nonidentity_safe_candidates_after = safe_swap_candidates;
@@ -9677,13 +9024,8 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                 "paged_nonidentity_cold_in_read_window_after=%llu "
                 "paged_nonidentity_safe_candidates_after=%llu "
                 "paged_swapped_redirect_rows=%llu paged_swapped_redirect_blocks=%llu "
-                "paged_swapped_redirect_skip_no_dummy=%llu paged_swapped_active_visible_violation=%llu paged_swapped_redirect_probe_rows=%llu paged_swapped_redirect_probe_swapped_rows=%llu paged_swapped_redirect_probe_resident_rows=%llu paged_swapped_redirect_probe_invalid_rows=%llu paged_swapped_redirect_probe_state_mismatch=%llu paged_swapped_redirect_probe_disabled=%llu paged_swapped_active_visible_violation_rows=%llu paged_swapped_active_visible_violation_blocks=%llu paged_swapped_active_visible_logical_seq_has=%llu paged_swapped_active_visible_phys_seq_has=%llu paged_swapped_active_visible_in_read_window=%llu paged_swapped_active_visible_not_in_read_window=%llu paged_swapped_active_visible_masked=%llu paged_swapped_active_visible_unmasked=%llu paged_swapped_active_violation_rows=%llu paged_swapped_active_violation_blocks=%llu paged_swapped_active_violation_block_had_active_owner_at_swapout=%llu paged_swapped_active_violation_after_swapout_write=%llu paged_swapped_active_violation_resolve_to_swapped=%llu paged_swapped_active_visible_restore_rows=%llu paged_swapped_active_visible_restore_blocks=%llu paged_swap_out_skip_active_visible_block=%llu paged_swap_out_skip_active_owned_block=%llu paged_swap_out_candidate_blocks=%llu paged_swap_out_allowed_blocks=%llu paged_swap_out_skip_fullprefix_read_window_only=%llu paged_swap_out_skip_true_active_owned=%llu paged_swap_out_skip_true_active_unmasked=%llu paged_active_restore_from_swapped_blocks=%llu paged_idle_only_swapped_blocks=%llu paged_write_to_swapped_block=%llu paged_write_to_swapped_block_seq=%llu "
-                "paged_cov_idle_owned_blocks=%llu paged_cov_in_read_window_blocks=%llu "
-                "paged_cov_not_in_read_window_blocks=%llu paged_cov_resident_safe_blocks=%llu "
-                "paged_cov_nonidentity_remapped_blocks=%llu "
-                "paged_cov_idle_owned_bytes=%llu paged_cov_in_read_window_bytes=%llu "
-                "paged_cov_resident_safe_bytes=%llu paged_cov_nonidentity_remapped_bytes=%llu "
-                "paged_idle_swap_madvise_enabled=%d paged_swap_madvise_calls=%llu "
+                "paged_swapped_redirect_skip_no_dummy=%llu paged_swapped_active_visible_violation=%llu paged_swapped_active_visible_violation_rows=%llu paged_swapped_active_visible_violation_blocks=%llu paged_swapped_active_violation_rows=%llu paged_swapped_active_violation_blocks=%llu paged_swapped_active_violation_block_had_active_owner_at_swapout=%llu paged_swapped_active_violation_after_swapout_write=%llu paged_swapped_active_violation_resolve_to_swapped=%llu paged_swapped_active_visible_restore_rows=%llu paged_swapped_active_visible_restore_blocks=%llu paged_swap_out_skip_active_visible_block=%llu paged_swap_out_skip_active_owned_block=%llu paged_swap_out_candidate_blocks=%llu paged_swap_out_allowed_blocks=%llu paged_swap_out_skip_fullprefix_read_window_only=%llu paged_swap_out_skip_true_active_owned=%llu paged_swap_out_skip_true_active_unmasked=%llu paged_active_restore_from_swapped_blocks=%llu paged_idle_only_swapped_blocks=%llu paged_write_to_swapped_block=%llu paged_write_to_swapped_block_seq=%llu "
+                                "paged_idle_swap_madvise_enabled=%d paged_swap_madvise_calls=%llu "
                 "paged_swap_madvise_bytes=%llu paged_swap_madvise_failures=%llu "
                 "paged_swap_madvise_skip_no_full_page=%llu paged_swap_madvise_skip_neighbor=%llu "
                 "paged_swap_rss_before_last_kb=%llu paged_swap_rss_after_last_kb=%llu "
@@ -9741,20 +9083,8 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                 (unsigned long long) paged_swapped_redirect_blocks,
                 (unsigned long long) paged_swapped_redirect_skip_no_dummy,
                 (unsigned long long) paged_swapped_active_visible_violation,
-                (unsigned long long) paged_swapped_redirect_probe_rows,
-                (unsigned long long) paged_swapped_redirect_probe_swapped_rows,
-                (unsigned long long) paged_swapped_redirect_probe_resident_rows,
-                (unsigned long long) paged_swapped_redirect_probe_invalid_rows,
-                (unsigned long long) paged_swapped_redirect_probe_state_mismatch,
-                (unsigned long long) paged_swapped_redirect_probe_disabled,
                 (unsigned long long) paged_swapped_active_visible_violation_rows,
                 (unsigned long long) paged_swapped_active_visible_violation_blocks,
-                (unsigned long long) paged_swapped_active_visible_logical_seq_has,
-                (unsigned long long) paged_swapped_active_visible_phys_seq_has,
-                (unsigned long long) paged_swapped_active_visible_in_read_window,
-                (unsigned long long) paged_swapped_active_visible_not_in_read_window,
-                (unsigned long long) paged_swapped_active_visible_masked,
-                (unsigned long long) paged_swapped_active_visible_unmasked,
                 (unsigned long long) paged_swapped_active_violation_rows,
                 (unsigned long long) paged_swapped_active_violation_blocks,
                 (unsigned long long) paged_swapped_active_violation_block_had_active_owner_at_swapout,
@@ -9773,15 +9103,6 @@ bool llama_kv_cache::set_input_paged_row_idx(ggml_tensor * dst, const llama_ubat
                 (unsigned long long) paged_idle_only_swapped_blocks,
                 (unsigned long long) paged_write_to_swapped_block,
                 (unsigned long long) paged_write_to_swapped_block_seq,
-                (unsigned long long) paged_cov_idle_owned_blocks,
-                (unsigned long long) paged_cov_in_read_window_blocks,
-                (unsigned long long) paged_cov_not_in_read_window_blocks,
-                (unsigned long long) paged_cov_resident_safe_blocks,
-                (unsigned long long) paged_cov_nonidentity_remapped_blocks,
-                (unsigned long long) paged_cov_idle_owned_bytes,
-                (unsigned long long) paged_cov_in_read_window_bytes,
-                (unsigned long long) paged_cov_resident_safe_bytes,
-                (unsigned long long) paged_cov_nonidentity_remapped_bytes,
                 paged_idle_swap_madvise_enabled ? 1 : 0,
                 (unsigned long long) paged_swap_madvise_calls,
                 (unsigned long long) paged_swap_madvise_bytes,
@@ -9957,7 +9278,7 @@ void llama_kv_cache::paged_trace_emit_step(
             "active_read_block_count=%zu active_read_blocks=%s "
             "write_block_count=%zu write_block=%s blocks_in_use=%llu "
             "resident_blocks=%u swapped_blocks=%u released_blocks=%u free_blocks=%u "
-            "paged_swap_in_calls=%llu paged_swap_bytes_in=%llu paged_swap_in_last_block=%u paged_swapped_redirect_probe_rows=%llu paged_swapped_redirect_probe_swapped_rows=%llu paged_swapped_redirect_probe_resident_rows=%llu paged_swapped_redirect_probe_invalid_rows=%llu paged_swapped_redirect_probe_state_mismatch=%llu paged_swapped_redirect_probe_disabled=%llu paged_swapped_active_visible_violation_rows=%llu paged_swapped_active_visible_violation_blocks=%llu paged_swapped_active_visible_logical_seq_has=%llu paged_swapped_active_visible_phys_seq_has=%llu paged_swapped_active_visible_in_read_window=%llu paged_swapped_active_visible_not_in_read_window=%llu paged_swapped_active_visible_masked=%llu paged_swapped_active_visible_unmasked=%llu paged_swapped_active_violation_rows=%llu paged_swapped_active_violation_blocks=%llu paged_swapped_active_violation_block_had_active_owner_at_swapout=%llu paged_swapped_active_violation_after_swapout_write=%llu paged_swapped_active_violation_resolve_to_swapped=%llu paged_swapped_active_visible_restore_rows=%llu paged_swapped_active_visible_restore_blocks=%llu paged_swap_out_skip_active_visible_block=%llu paged_swap_out_skip_active_owned_block=%llu paged_swap_out_candidate_blocks=%llu paged_swap_out_allowed_blocks=%llu paged_swap_out_skip_fullprefix_read_window_only=%llu paged_swap_out_skip_true_active_owned=%llu paged_swap_out_skip_true_active_unmasked=%llu paged_active_restore_from_swapped_blocks=%llu paged_idle_only_swapped_blocks=%llu paged_write_to_swapped_block=%llu paged_write_to_swapped_block_seq=%llu\n",
+            "paged_swap_in_calls=%llu paged_swap_bytes_in=%llu paged_swap_in_last_block=%u paged_swapped_active_visible_violation_rows=%llu paged_swapped_active_visible_violation_blocks=%llu paged_swapped_active_violation_rows=%llu paged_swapped_active_violation_blocks=%llu paged_swapped_active_violation_block_had_active_owner_at_swapout=%llu paged_swapped_active_violation_after_swapout_write=%llu paged_swapped_active_violation_resolve_to_swapped=%llu paged_swapped_active_visible_restore_rows=%llu paged_swapped_active_visible_restore_blocks=%llu paged_swap_out_skip_active_visible_block=%llu paged_swap_out_skip_active_owned_block=%llu paged_swap_out_candidate_blocks=%llu paged_swap_out_allowed_blocks=%llu paged_swap_out_skip_fullprefix_read_window_only=%llu paged_swap_out_skip_true_active_owned=%llu paged_swap_out_skip_true_active_unmasked=%llu paged_active_restore_from_swapped_blocks=%llu paged_idle_only_swapped_blocks=%llu paged_write_to_swapped_block=%llu paged_write_to_swapped_block_seq=%llu\n",
             (unsigned long long) step, n_kv, active_n_kv,
             read_blocks.size(), read_csv.empty() ? "-" : read_csv.c_str(),
             active_read_blocks.size(), active_read_csv.empty() ? "-" : active_read_csv.c_str(),
@@ -9967,20 +9288,8 @@ void llama_kv_cache::paged_trace_emit_step(
             (unsigned long long) paged_swap_in_calls,
             (unsigned long long) paged_swap_bytes_in,
             paged_swap_in_last_block,
-            (unsigned long long) paged_swapped_redirect_probe_rows,
-            (unsigned long long) paged_swapped_redirect_probe_swapped_rows,
-            (unsigned long long) paged_swapped_redirect_probe_resident_rows,
-            (unsigned long long) paged_swapped_redirect_probe_invalid_rows,
-            (unsigned long long) paged_swapped_redirect_probe_state_mismatch,
-            (unsigned long long) paged_swapped_redirect_probe_disabled,
             (unsigned long long) paged_swapped_active_visible_violation_rows,
             (unsigned long long) paged_swapped_active_visible_violation_blocks,
-            (unsigned long long) paged_swapped_active_visible_logical_seq_has,
-            (unsigned long long) paged_swapped_active_visible_phys_seq_has,
-            (unsigned long long) paged_swapped_active_visible_in_read_window,
-            (unsigned long long) paged_swapped_active_visible_not_in_read_window,
-            (unsigned long long) paged_swapped_active_visible_masked,
-            (unsigned long long) paged_swapped_active_visible_unmasked,
             (unsigned long long) paged_swapped_active_violation_rows,
             (unsigned long long) paged_swapped_active_violation_blocks,
             (unsigned long long) paged_swapped_active_violation_block_had_active_owner_at_swapout,

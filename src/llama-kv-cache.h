@@ -875,9 +875,6 @@ private:
     // pre-computed hadamard martrices
     std::unordered_map<int64_t, std::vector<float>> attn_rot_hadamard;
 
-    // env: LLAMA_KV_CACHE_DEBUG
-    int debug = 0;
-
     // Shared fixed-slot file-backed store used by the paged runtime (LLAMA_KV_PAGED_SWAP=1
     // path) for OFFLOAD/PREFETCH. The legacy single-cell exact swap path that previously
     // distinguished LLAMA_KV_SWAP_MODE=exact|approx has been removed; only the paged runtime
@@ -1106,20 +1103,6 @@ private:
     // returns total resident bytes across all KV tensors. No-op (returns 0) unless
     // paged_mincore_enabled. Does not touch tensor contents or block state.
     uint64_t paged_sample_mincore() const;
-
-    // Stage 7D-A: debug-only SWAPPED-page refault tracing. When LLAMA_KV_PAGED_REFAULT_TRACE=1,
-    // a block that has been swapped out + madvise'd has its K/V page ranges mprotect(PROT_NONE)'d
-    // (same page-aligned interior as paged_madvise_block, so only pages fully owned by the block
-    // are touched). Any later read/write to those pages -- e.g. the decode graph's
-    // ggml_get_rows(k2d/v2d, row_idx) -- traps into a SIGSEGV handler that records the fault site
-    // (K/V, layer, block, step), restores the page to PROT_READ|PROT_WRITE, and returns so the
-    // faulting instruction retries. This is a diagnostic, NOT a memory-optimization mechanism: it
-    // does not change swap/madvise/row_idx semantics and is a no-op unless explicitly enabled.
-    void paged_refault_init();
-    void paged_refault_protect_block(uint32_t physical_block) const;
-    void paged_refault_unprotect_block(uint32_t physical_block) const;
-    void paged_refault_unprotect_all() const;
-    void paged_refault_drain() const;
 
     void paged_assert_identity(const slot_info & sinfo);
     void paged_shadow_validate(const slot_info & sinfo, uint32_t n_kv) const;
@@ -1493,37 +1476,6 @@ private:
     bool     paged_swap_pending = false;
     uint32_t paged_swap_pending_n_kv = 0;
 
-    // Stage 7D-A: debug-only refault tracing state. All off unless LLAMA_KV_PAGED_REFAULT_TRACE=1.
-    // A trap range maps a contiguous page-aligned [lo, hi) host interval back to (block, kind,
-    // layer) so the (async-signal-safe) handler can identify the fault and restore the page.
-    struct paged_refault_range {
-        uintptr_t lo;          // page-aligned start of the protected interval
-        uintptr_t hi;          // page-aligned end (exclusive)
-        uint32_t  block;       // owning physical block
-        uint32_t  layer_il;    // KV layer id
-        uint8_t   is_v;        // 0 = K tensor, 1 = V tensor
-    };
-    bool     paged_refault_trace_requested = false;
-    mutable bool     paged_refault_trace_enabled = false;
-    bool     paged_refault_trace_backtrace = false;
-    bool     paged_refault_trace_once = true;   // unprotect a page on first fault (default on)
-    uint64_t paged_refault_trace_max = 64;      // max faults logged before tracing self-disables
-    // Per-block protection bookkeeping. paged_refault_protected[block] != 0 means the block's
-    // pages are currently PROT_NONE. Indexed by physical block id, sized paged_n_blocks.
-    mutable std::vector<uint8_t> paged_refault_protected;
-    mutable uint64_t paged_refault_trace_enabled_flag = 0; // mirrors enabled for trace line
-    mutable uint64_t paged_refault_fault_count = 0;
-    mutable uint64_t paged_refault_fault_k_count = 0;
-    mutable uint64_t paged_refault_fault_v_count = 0;
-    mutable uint64_t paged_refault_fault_blocks = 0;       // distinct blocks that faulted
-    mutable uint64_t paged_refault_unmapped_fault_count = 0; // faults not in any KV trap range
-    mutable uint64_t paged_refault_protect_calls = 0;
-    mutable uint64_t paged_refault_unprotect_calls = 0;
-    mutable uint64_t paged_refault_protected_pages = 0;
-    mutable uint64_t paged_refault_unprotected_pages = 0;
-    mutable uint64_t paged_refault_protect_failures = 0;
-    mutable uint64_t paged_refault_unprotect_failures = 0;
-
     // Stage 4C-3: idle-seq and block-ownership telemetry only.
     bool     paged_idle_trace_enabled = false;
     mutable std::array<uint64_t, LLAMA_MAX_SEQ> paged_idle_seq_last_active_step = {};
@@ -1589,15 +1541,6 @@ private:
     mutable uint64_t paged_idle_cold_not_in_read_window = 0;
     mutable uint64_t paged_idle_skip_mixed_active = 0;
     mutable uint64_t paged_idle_safe_swap_candidates = 0;
-    mutable uint64_t paged_cov_idle_owned_blocks = 0;
-    mutable uint64_t paged_cov_in_read_window_blocks = 0;
-    mutable uint64_t paged_cov_not_in_read_window_blocks = 0;
-    mutable uint64_t paged_cov_resident_safe_blocks = 0;
-    mutable uint64_t paged_cov_nonidentity_remapped_blocks = 0;
-    mutable uint64_t paged_cov_idle_owned_bytes = 0;
-    mutable uint64_t paged_cov_in_read_window_bytes = 0;
-    mutable uint64_t paged_cov_resident_safe_bytes = 0;
-    mutable uint64_t paged_cov_nonidentity_remapped_bytes = 0;
     bool     paged_idle_swap_requested = false;
     bool     paged_idle_swap_madvise_requested = false;
     mutable bool     paged_idle_swap_enabled = false;
@@ -1607,7 +1550,6 @@ private:
     uint64_t paged_idle_swap_every_tokens = 1;
     uint64_t paged_idle_swap_max_blocks_per_step = 0;
     uint64_t paged_idle_swap_min_idle_steps = 0;
-    bool     paged_idle_swap_debug_probes = true;
     mutable uint64_t paged_idle_swap_candidates = 0;
     mutable uint64_t paged_idle_swap_out_calls = 0;
     mutable uint64_t paged_idle_swap_skip_not_remapped = 0;
@@ -1638,20 +1580,8 @@ private:
     mutable uint64_t paged_swapped_redirect_blocks = 0;
     mutable uint64_t paged_swapped_redirect_skip_no_dummy = 0;
     mutable uint64_t paged_swapped_active_visible_violation = 0;
-    mutable uint64_t paged_swapped_redirect_probe_rows = 0;
-    mutable uint64_t paged_swapped_redirect_probe_swapped_rows = 0;
-    mutable uint64_t paged_swapped_redirect_probe_resident_rows = 0;
-    mutable uint64_t paged_swapped_redirect_probe_invalid_rows = 0;
-    mutable uint64_t paged_swapped_redirect_probe_state_mismatch = 0;
-    mutable uint64_t paged_swapped_redirect_probe_disabled = 0;
     mutable uint64_t paged_swapped_active_visible_violation_rows = 0;
     mutable uint64_t paged_swapped_active_visible_violation_blocks = 0;
-    mutable uint64_t paged_swapped_active_visible_logical_seq_has = 0;
-    mutable uint64_t paged_swapped_active_visible_phys_seq_has = 0;
-    mutable uint64_t paged_swapped_active_visible_in_read_window = 0;
-    mutable uint64_t paged_swapped_active_visible_not_in_read_window = 0;
-    mutable uint64_t paged_swapped_active_visible_masked = 0;
-    mutable uint64_t paged_swapped_active_visible_unmasked = 0;
     mutable uint64_t paged_row_mapping_invalid_fatal = 0;
     mutable uint64_t paged_write_mapping_invalid_fatal = 0;
     mutable uint64_t paged_active_row_nonresident_fatal = 0;
