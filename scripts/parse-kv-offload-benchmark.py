@@ -14,13 +14,14 @@ from typing import Any
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT = pathlib.Path(__file__).resolve()
 PROTOCOL = "kv_offload_benchmark"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SUPPORTED_POLICIES = {"resident", "v2"}
 SUPPORTED_KV_REPRESENTATIONS = {"paged"}
 SUPPORTED_LOADING_MODES = {"exact"}
 SUPPORTED_RESTORES = {"k1_sync", "k2_pipeline"}
 SUPPORTED_PREFAULTS = {"off", "r2"}
 SUPPORTED_RUN_KINDS = {"qualification", "formal"}
+SUPPORTED_RUN_MODES = {"qualification", "characterization"}
 CASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 UINT = re.compile(r"^[0-9]+$")
 SIGNED_INT = re.compile(r"^-?[0-9]+$")
@@ -39,20 +40,23 @@ MANIFEST_REQUIRED = {
 }
 MANIFEST_OPTIONAL = {"dry_run", "finished_at_utc"}
 SPEC_KEYS = {
-    "schema_version", "protocol", "phase", "run_kind", "binary", "model", "model_quantization",
+    "schema_version", "protocol", "phase", "run_kind", "run_mode", "binary", "model", "model_quantization",
     "server_args", "environment", "pressure_basis", "workload", "cases", "run_order", "sampler", "cgroup",
     "max_blocks", "health_timeout_seconds", "request_timeout_seconds",
 }
-CASE_KEYS = {"case_id", "policy", "kv_representation", "loading_mode", "restore", "prefault", "kv_target_bytes"}
+CASE_KEYS = {
+    "case_id", "policy", "kv_representation", "loading_mode", "restore", "prefault",
+    "kv_target_bytes", "action_target_bytes",
+}
 PLAN_KEYS = {
     "run_id", "round", "run_order", "case_id", "policy", "kv_representation", "loading_mode",
-    "restore", "prefault", "kv_target_bytes",
+    "restore", "prefault", "kv_target_bytes", "action_target_bytes",
 }
 RUN_KEYS = {"run_id", "round", "run_order", "case_id", "execution_index", "case", "request_plan"}
 EXECUTION_KEYS = {
-    "run_id", "round", "run_order", "case_id", "execution_index", "argv", "environment", "server_identity",
+    "run_id", "round", "run_order", "case_id", "execution_index", "run_mode", "argv", "environment", "server_identity",
     "server_cgroup", "pressure_basis", "sampler_identity", "sampler_schema", "sampler_argv", "request_loop_started",
-    "request_count", "qualification",
+    "request_count", "qualification", "characterization",
 }
 CLEANUP_KEYS = {"server", "sampler", "residual_process", "cleanup_complete"}
 PROCESS_CLEANUP_KEYS = {
@@ -60,7 +64,7 @@ PROCESS_CLEANUP_KEYS = {
     "pgid_check_complete", "residual_process",
 }
 RESPONSE_KEYS = {
-    "sequence", "request_id", "repeat_index", "measurement", "n_predict", "stream",
+    "sequence", "request_id", "repeat_index", "measurement", "measurement_phase", "n_predict", "stream",
     "started_mono_ns", "started_realtime_ns", "first_byte_mono_ns", "finished_mono_ns",
     "http_status", "headers", "body_path", "body_bytes", "body_sha256", "response_json", "error",
 }
@@ -103,9 +107,17 @@ TIMING_REQUIRED = {
 }
 IO_REQUIRED = {
     "block_swap_out_calls", "block_swap_in_calls", "backing_read_syscalls", "backing_write_syscalls",
-    "bytes_read", "bytes_written", "staging_buffer_bytes", "k2_enabled", "k2_staging_bound_bytes",
-    "k2_peak_staging_groups", "k2_peak_staging_bytes", "k2_pipeline_wall_us", "k2_exposed_read_wait_us",
-    "k2_pipeline_stall_us", "k2_read_completed_ahead", "restore_prefault_enabled",
+    "bytes_read", "bytes_written", "avg_block_swap_out_latency_us", "max_block_swap_out_latency_us",
+    "avg_block_swap_in_latency_us", "max_block_swap_in_latency_us", "staging_buffer_bytes",
+    "k2_enabled", "k2_group_byte_cap", "k2_staging_bound_bytes", "k2_peak_staging_groups",
+    "k2_peak_staging_bytes", "k2_pipeline_wall_us", "k2_exposed_read_wait_us",
+    "k2_pipeline_stall_us", "k2_read_completed_ahead", "block_out_validate_us",
+    "avg_block_out_validate_us", "block_out_pack_us", "avg_block_out_pack_us",
+    "block_out_write_us", "avg_block_out_write_us", "block_out_metadata_us",
+    "avg_block_out_metadata_us", "block_out_madvise_us", "avg_block_out_madvise_us",
+    "block_in_validate_us", "avg_block_in_validate_us", "block_in_read_us",
+    "avg_block_in_read_us", "block_in_unpack_us", "avg_block_in_unpack_us",
+    "block_in_commit_us", "avg_block_in_commit_us", "restore_prefault_enabled",
     "restore_prefault_groups", "restore_prefault_calls", "restore_prefault_us",
     "restore_prefault_minor_faults", "restore_prefault_major_faults", "restore_scatter_groups",
     "restore_scatter_us", "restore_scatter_fault_groups", "restore_scatter_minor_faults",
@@ -255,7 +267,11 @@ def pressure_basis_source(basis: dict[str, Any]) -> str:
 
 
 def normalize_workload(workload: Any) -> dict[str, Any]:
-    value = exact(workload, {"warmup", "requests", "repeat", "qualification"}, "spec.workload")
+    value = exact(
+        workload,
+        {"warmup", "requests", "repeat", "qualification", "characterization"},
+        "spec.workload",
+    )
     if not isinstance(value["warmup"], list) or not isinstance(value["requests"], list):
         raise ParseError("spec.workload warmup/requests must be arrays")
     all_requests = value["warmup"] + value["requests"]
@@ -275,6 +291,8 @@ def normalize_workload(workload: Any) -> dict[str, Any]:
         raise ParseError("workload.repeat is invalid")
     if not value["requests"]:
         raise ParseError("workload.requests must contain at least one measurement request")
+
+    normalized = dict(value)
     qualification = value["qualification"]
     if qualification is not None:
         qualification = exact(
@@ -295,26 +313,66 @@ def normalize_workload(workload: Any) -> dict[str, Any]:
                 "workload.qualification.resume_request_id must reference a measurement request")
         if not value["warmup"]:
             raise ParseError("qualification requires at least one warmup request")
-        value = dict(value)
-        value["qualification"] = {
+        normalized["qualification"] = {
             "idle_seconds": idle_seconds,
             "offload_timeout_seconds": offload_timeout_seconds,
             "resume_request_id": resume_request_id,
         }
-    return value
+
+    characterization = value["characterization"]
+    if characterization is not None:
+        characterization = exact(
+            characterization,
+            {
+                "idle_seconds", "settle_timeout_seconds", "target_tolerance_bytes",
+                "resume_request_id",
+            },
+            "workload.characterization",
+        )
+        idle_seconds = require_finite_positive(
+            characterization["idle_seconds"], "workload.characterization.idle_seconds")
+        settle_timeout_seconds = require_finite_positive(
+            characterization["settle_timeout_seconds"],
+            "workload.characterization.settle_timeout_seconds",
+        )
+        tolerance = characterization["target_tolerance_bytes"]
+        if isinstance(tolerance, bool) or not isinstance(tolerance, int) or tolerance < 0:
+            raise ParseError(
+                "workload.characterization.target_tolerance_bytes is invalid")
+        resume_request_id = characterization["resume_request_id"]
+        if not isinstance(resume_request_id, str) or resume_request_id not in {
+                item["request_id"] for item in value["requests"]}:
+            raise ParseError(
+                "workload.characterization.resume_request_id must reference a measurement request")
+        if resume_request_id != value["requests"][0]["request_id"]:
+            raise ParseError(
+                "workload.characterization.resume_request_id must be the first measurement request")
+        if not value["warmup"]:
+            raise ParseError("characterization requires at least one warmup/fill request")
+        normalized["characterization"] = {
+            "idle_seconds": idle_seconds,
+            "settle_timeout_seconds": settle_timeout_seconds,
+            "target_tolerance_bytes": tolerance,
+            "resume_request_id": resume_request_id,
+        }
+    return normalized
 
 
-def expanded_request_plan(workload: dict[str, Any], case: dict[str, Any]) -> list[dict[str, Any]]:
+def expanded_request_plan(
+        workload: dict[str, Any], case: dict[str, Any], run_mode: str) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     sequence = 0
 
-    def append(item: dict[str, Any], request_id: str, repeat_index: int, measurement: bool) -> None:
+    def append(
+            item: dict[str, Any], request_id: str, repeat_index: int, measurement: bool,
+            measurement_phase: str) -> None:
         nonlocal sequence
         result.append({
             "sequence": sequence,
             "request_id": request_id,
             "repeat_index": repeat_index,
             "measurement": measurement,
+            "measurement_phase": measurement_phase,
             "n_predict": item["n_predict"],
             "prompt_sha256": sha256_bytes(item["prompt"].encode("utf-8")),
             "stream": item["stream"],
@@ -322,15 +380,23 @@ def expanded_request_plan(workload: dict[str, Any], case: dict[str, Any]) -> lis
         sequence += 1
 
     for item in workload["warmup"]:
-        append(item, item["request_id"], 0, False)
+        append(item, item["request_id"], 0, False, "fill")
     for repeat_index in range(1, workload["repeat"] + 1):
-        for item in workload["requests"]:
-            append(item, item["request_id"], repeat_index, True)
-    if workload["qualification"] is not None and case["policy"] == "v2":
+        for request_index, item in enumerate(workload["requests"]):
+            if run_mode == "characterization" and case["policy"] == "v2":
+                measurement_phase = (
+                    "resume" if repeat_index == 1 and request_index == 0
+                    else "post_resume_steady")
+            elif run_mode == "characterization":
+                measurement_phase = "resident_steady"
+            else:
+                measurement_phase = "qualification_measurement"
+            append(item, item["request_id"], repeat_index, True, measurement_phase)
+    if run_mode == "qualification" and workload["qualification"] is not None and case["policy"] == "v2":
         resume_request_id = workload["qualification"]["resume_request_id"]
         resume_request = next(
             item for item in workload["requests"] if item["request_id"] == resume_request_id)
-        append(resume_request, resume_request_id, 0, False)
+        append(resume_request, resume_request_id, 0, False, "qualification_resume")
     return result
 
 
@@ -342,6 +408,8 @@ def validate_spec(spec: Any) -> tuple[dict[str, dict[str, Any]], list[dict[str, 
         raise ParseError("spec.phase is invalid")
     if value["run_kind"] not in SUPPORTED_RUN_KINDS:
         raise ParseError("spec.run_kind is invalid")
+    if value["run_mode"] not in SUPPORTED_RUN_MODES:
+        raise ParseError("spec.run_mode is invalid")
     if not isinstance(value["server_args"], list) or any(not isinstance(item, str) for item in value["server_args"]):
         raise ParseError("spec.server_args is invalid")
     reject_canonical_server_args(value["server_args"], "spec.server_args")
@@ -352,8 +420,13 @@ def validate_spec(spec: Any) -> tuple[dict[str, dict[str, Any]], list[dict[str, 
     reject_canonical_kv_environment(value["environment"], "spec.environment")
     pressure_basis = normalize_pressure_basis(value["pressure_basis"])
     workload = normalize_workload(value["workload"])
-    if value["run_kind"] == "qualification" and workload["qualification"] is None:
-        raise ParseError("qualification run requires explicit idle/offload-barrier/resume configuration")
+    if value["run_mode"] == "qualification":
+        if workload["qualification"] is None or workload["characterization"] is not None:
+            raise ParseError(
+                "qualification mode requires only workload.qualification configuration")
+    elif workload["characterization"] is None or workload["qualification"] is not None:
+        raise ParseError(
+            "characterization mode requires only workload.characterization configuration")
     cases: dict[str, dict[str, Any]] = {}
     if not isinstance(value["cases"], list) or not value["cases"]:
         raise ParseError("spec.cases must be non-empty")
@@ -367,13 +440,22 @@ def validate_spec(spec: Any) -> tuple[dict[str, dict[str, Any]], list[dict[str, 
         if any(not isinstance(case[factor], str) for factor in ("policy", "kv_representation", "loading_mode", "restore", "prefault")):
             raise ParseError(f"{case_id} factors must be strings")
         target = case["kv_target_bytes"]
+        action_target = case["action_target_bytes"]
         if target is not None and (isinstance(target, bool) or not isinstance(target, int) or target <= 0):
             raise ParseError(f"{case_id}.kv_target_bytes is invalid")
-        if case["policy"] == "resident" and target is not None:
-            raise ParseError(f"{case_id}: resident target must be null")
-        if case["policy"] == "v2" and target is None:
-            raise ParseError(f"{case_id}: v2 target is missing")
+        if action_target is not None and (
+                isinstance(action_target, bool) or not isinstance(action_target, int) or action_target <= 0):
+            raise ParseError(f"{case_id}.action_target_bytes is invalid")
+        if case["policy"] == "resident":
+            if target is not None or action_target is not None:
+                raise ParseError(f"{case_id}: resident policy cannot have resident/action targets")
+        elif case["policy"] == "v2" and (target is None or action_target is None):
+            raise ParseError(
+                f"{case_id}: v2 policy requires explicit kv_target_bytes and action_target_bytes")
         cases[case_id] = case
+    action_targets = {case["action_target_bytes"] for case in cases.values() if case["policy"] == "v2"}
+    if len(action_targets) > 1:
+        raise ParseError("all v2 budget cases must use the same explicit action_target_bytes")
     sampler = exact(value["sampler"], {"interval_seconds"}, "spec.sampler")
     sampler_interval = require_finite_positive(sampler["interval_seconds"], "spec.sampler.interval_seconds")
     cgroup = exact(value["cgroup"], {"expected_memory_max"}, "spec.cgroup")
@@ -409,9 +491,13 @@ def validate_spec(spec: Any) -> tuple[dict[str, dict[str, Any]], list[dict[str, 
             "restore": case["restore"],
             "prefault": case["prefault"],
             "kv_target_bytes": case["kv_target_bytes"],
+            "action_target_bytes": case["action_target_bytes"],
         })
-    if value["run_kind"] == "formal" and (len({item["round"] for item in plan}) < 2 or workload["repeat"] < 2):
-        raise ParseError("formal run requires explicit multi-round plan and repeat >= 2")
+    if value["run_kind"] == "formal":
+        if len({item["round"] for item in plan}) < 2:
+            raise ParseError("formal run requires at least two independent rounds")
+        if value["run_mode"] == "qualification" and workload["repeat"] < 2:
+            raise ParseError("formal qualification run requires repeat >= 2")
     return cases, plan, workload
 
 
@@ -686,6 +772,11 @@ def validate_execution_environment(execution: dict[str, Any], case: dict[str, An
         raise ParseError(f"{label}: canonical pressure interval environment mismatch")
     if env.get("LLAMA_KV_PRESSURE_SAMPLER") != "1" or env.get("LLAMA_KV_RESUME_STAGE_TIMING") != "1":
         raise ParseError(f"{label}: canonical telemetry environment is incomplete")
+    expected_resident_observation = (
+        "1" if case["policy"] == "v2" and spec["run_mode"] == "qualification"
+        else "preflight")
+    if env.get("LLAMA_KV_G0_S1_RESIDENT_OBSERVATION") != expected_resident_observation:
+        raise ParseError(f"{label}: physical resident observation mode mismatch")
     basis = spec["pressure_basis"]
     if basis["authority"] == "rss_absolute":
         for key, expected in {
@@ -708,15 +799,35 @@ def validate_execution_environment(execution: dict[str, Any], case: dict[str, An
         )):
             raise ParseError(f"{label}: resident policy leaked a budget target")
     elif case["policy"] == "v2":
-        target = str(case["kv_target_bytes"])
+        resident_target = str(case["kv_target_bytes"])
+        action_target = str(case["action_target_bytes"])
         if env.get("LLAMA_KV_PRESSURE_UNIFIED_ACTION") != "1" or env.get("LLAMA_KV_PRESSURE_GOVERNOR_CLAIMANT_TRACE") != "1":
             raise ParseError(f"{label}: v2 policy did not enable unified action")
-        if env.get("LLAMA_KV_RESIDENT_TARGET_BYTES") != target or env.get("LLAMA_KV_RESIDENT_TARGET_SOURCE") != "env_static":
+        if env.get("LLAMA_KV_RESIDENT_TARGET_BYTES") != resident_target or env.get("LLAMA_KV_RESIDENT_TARGET_SOURCE") != "env_static":
             raise ParseError(f"{label}: v2 resident target environment mismatch")
-        if env.get("LLAMA_KV_PRESSURE_UNIFIED_ACTION_TARGET_BYTES") != target:
+        if env.get("LLAMA_KV_PRESSURE_UNIFIED_ACTION_TARGET_BYTES") != action_target:
             raise ParseError(f"{label}: v2 action target environment mismatch")
         if env.get("LLAMA_KV_PRESSURE_UNIFIED_ACTION_MAX_BLOCKS") != str(spec["max_blocks"]):
             raise ParseError(f"{label}: v2 action max-blocks environment mismatch")
+
+
+def validate_action_target_markers(
+        actions: list[dict[str, str]],
+        case: dict[str, Any],
+        spec: dict[str, Any],
+        label: str,
+) -> None:
+    if case["policy"] != "v2":
+        return
+    expected_action_target = int(case["action_target_bytes"])
+    expected_resident_target = int(case["kv_target_bytes"])
+    for action in actions:
+        if int(action["target_bytes"]) != expected_action_target:
+            raise ParseError(f"{label}: action marker target differs from action_target_bytes")
+        if int(action["max_blocks"]) != int(spec["max_blocks"]):
+            raise ParseError(f"{label}: action marker max_blocks differs from manifest")
+        if action["budget_target_enabled"] == "1" and int(action["budget_target_bytes"]) != expected_resident_target:
+            raise ParseError(f"{label}: action marker budget target differs from kv_target_bytes")
 
 
 def validate_responses(
@@ -739,6 +850,8 @@ def validate_responses(
             raise ParseError(f"{label}: response request_id is invalid")
         if not isinstance(record["measurement"], bool) or not isinstance(record["stream"], bool):
             raise ParseError(f"{label}: response boolean field is invalid")
+        if not isinstance(record["measurement_phase"], str) or not record["measurement_phase"]:
+            raise ParseError(f"{label}: response measurement phase is invalid")
         for key in ("sequence", "repeat_index", "n_predict", "started_mono_ns", "started_realtime_ns", "finished_mono_ns", "http_status", "body_bytes"):
             if isinstance(record[key], bool) or not isinstance(record[key], int) or record[key] < 0:
                 raise ParseError(f"{label}: response {key} is invalid")
@@ -775,7 +888,10 @@ def validate_responses(
     if not any(record["measurement"] for record in records):
         raise ParseError(f"{label}: no measurement response was recorded")
     for actual, expected in zip(records, request_plan):
-        for key in ("sequence", "request_id", "repeat_index", "measurement", "n_predict", "stream"):
+        for key in (
+            "sequence", "request_id", "repeat_index", "measurement", "measurement_phase",
+            "n_predict", "stream",
+        ):
             if actual[key] != expected[key]:
                 raise ParseError(f"{label}: response/order mismatch at sequence {expected['sequence']} field {key}")
     return records, service_failures
@@ -821,11 +937,11 @@ def response_statistics(records: list[dict[str, Any]]) -> dict[str, Any]:
             continue
         predicted_n = timings.get("predicted_n")
         predicted_ms = timings.get("predicted_ms")
+        predicted_per_second = timings.get("predicted_per_second")
         if isinstance(predicted_n, (int, float)) and predicted_n > 0 and isinstance(predicted_ms, (int, float)) and predicted_ms >= 0:
             tpot.append(float(predicted_ms) / float(predicted_n))
-            elapsed_s = (record["finished_mono_ns"] - record["started_mono_ns"]) / 1_000_000_000
-            if elapsed_s > 0:
-                throughput.append(float(predicted_n) / elapsed_s)
+        if isinstance(predicted_per_second, (int, float)) and predicted_per_second >= 0:
+            throughput.append(float(predicted_per_second))
     return {
         "request_count": len(measurement),
         "ttft_ms": summarize_metric(ttft, "ms"),
@@ -1124,6 +1240,579 @@ def validate_qualification_causality(
         f"{label}: qualification resume has no completed graph-allowed PREFETCH with positive restore timing")
 
 
+def validate_snapshot_reference(value: Any, expected_path: str, label: str) -> dict[str, Any]:
+    reference = exact(value, {"path", "captured_mono_ns"}, label)
+    if reference["path"] != expected_path:
+        raise ParseError(f"{label}: snapshot path mismatch")
+    require_nonnegative_int(reference["captured_mono_ns"], f"{label}.captured_mono_ns")
+    return reference
+
+
+def validate_characterization_record(
+        value: Any,
+        expected: dict[str, Any] | None,
+        case: dict[str, Any],
+        max_blocks: int,
+        label: str,
+) -> dict[str, Any]:
+    record = exact(
+        value,
+        {
+            "idle_seconds", "settle_timeout_seconds", "target_tolerance_bytes",
+            "resume_request_id", "requested_target_bytes", "action_target_bytes", "after_fill", "idle", "settle",
+            "settled", "resume", "after_measurement",
+        },
+        label,
+    )
+    if expected is None:
+        if any(record[key] is not None for key in record):
+            raise ParseError(f"{label}: non-characterization run contains characterization state")
+        return record
+    for key in (
+        "idle_seconds", "settle_timeout_seconds", "target_tolerance_bytes", "resume_request_id",
+    ):
+        if record[key] != expected[key]:
+            raise ParseError(f"{label}: {key} differs from manifest workload")
+    if record["requested_target_bytes"] != case["kv_target_bytes"]:
+        raise ParseError(f"{label}: requested target differs from the case factor")
+    if record["action_target_bytes"] != case["action_target_bytes"]:
+        raise ParseError(f"{label}: action target differs from the case factor")
+    validate_snapshot_reference(
+        record["after_fill"], "slots_after_fill.json", f"{label}.after_fill")
+    validate_snapshot_reference(
+        record["after_measurement"], "slots_after_measurement.json",
+        f"{label}.after_measurement",
+    )
+    if case["policy"] == "resident":
+        if any(record[key] is not None for key in ("idle", "settle", "settled", "resume")):
+            raise ParseError(f"{label}: resident characterization contains budget-settle state")
+        return record
+
+    idle = exact(
+        record["idle"],
+        {"started_mono_ns", "finished_mono_ns", "duration_ns", "stderr_start_offset"},
+        f"{label}.idle",
+    )
+    idle_started = require_nonnegative_int(
+        idle["started_mono_ns"], f"{label}.idle.started_mono_ns")
+    idle_finished = require_nonnegative_int(
+        idle["finished_mono_ns"], f"{label}.idle.finished_mono_ns")
+    idle_duration = require_nonnegative_int(idle["duration_ns"], f"{label}.idle.duration_ns")
+    require_nonnegative_int(idle["stderr_start_offset"], f"{label}.idle.stderr_start_offset")
+    minimum_idle_ns = int(float(expected["idle_seconds"]) * 1_000_000_000)
+    if (
+        idle_finished < idle_started
+        or idle_duration != idle_finished - idle_started
+        or idle_duration <= 0
+        or idle_duration + 1_000_000 < minimum_idle_ns
+    ):
+        raise ParseError(f"{label}: idle timing is missing, inconsistent, or too short")
+
+    settle = exact(
+        record["settle"],
+        {
+            "status", "started_mono_ns", "completed_mono_ns", "duration_ns",
+            "stderr_start_offset", "stderr_end_offset", "terminal_decision",
+            "physical_resident_bytes", "decision_ids", "offload_decision_ids",
+        },
+        f"{label}.settle",
+    )
+    if settle["status"] not in {"target_reached", "unmet_floor"}:
+        raise ParseError(f"{label}: completed characterization has no terminal settle state")
+    for key in (
+        "started_mono_ns", "completed_mono_ns", "duration_ns", "stderr_start_offset",
+        "stderr_end_offset",
+    ):
+        require_nonnegative_int(settle[key], f"{label}.settle.{key}")
+    require_nonnegative_int(
+        settle["physical_resident_bytes"], f"{label}.settle.physical_resident_bytes")
+    if (
+        settle["started_mono_ns"] < idle_finished
+        or settle["completed_mono_ns"] < settle["started_mono_ns"]
+        or settle["duration_ns"] != settle["completed_mono_ns"] - settle["started_mono_ns"]
+        or settle["stderr_start_offset"] != idle["stderr_start_offset"]
+        or settle["stderr_end_offset"] < settle["stderr_start_offset"]
+    ):
+        raise ParseError(f"{label}: settle timing or stderr window is inconsistent")
+    for key in ("decision_ids", "offload_decision_ids"):
+        values = settle[key]
+        if not isinstance(values, list) or any(
+                isinstance(item, bool) or not isinstance(item, int) or item < 0 for item in values):
+            raise ParseError(f"{label}.settle.{key} is invalid")
+        if len(values) != len(set(values)):
+            raise ParseError(f"{label}.settle.{key} contains duplicates")
+    if not set(settle["offload_decision_ids"]).issubset(set(settle["decision_ids"])):
+        raise ParseError(f"{label}: OFFLOAD decision list escapes settle decisions")
+    terminal = exact(
+        settle["terminal_decision"],
+        {
+            "decision_id", "decision_reason", "action_target_bytes", "max_blocks",
+            "budget_target_bytes", "budget_resident_bytes", "budget_observed_excess_bytes", "budget_debt_after_bytes",
+            "unmet_budget_bytes_after", "budget_transient_staging_bound_bytes",
+            "positive_offload", "positive_release",
+        },
+        f"{label}.settle.terminal_decision",
+    )
+    for key in (
+        "decision_id", "action_target_bytes", "max_blocks", "budget_target_bytes", "budget_resident_bytes",
+        "budget_observed_excess_bytes", "budget_debt_after_bytes",
+        "unmet_budget_bytes_after", "budget_transient_staging_bound_bytes",
+    ):
+        require_nonnegative_int(terminal[key], f"{label}.settle.terminal_decision.{key}")
+    if (
+        not isinstance(terminal["decision_reason"], str)
+        or not isinstance(terminal["positive_offload"], bool)
+        or not isinstance(terminal["positive_release"], bool)
+    ):
+        raise ParseError(f"{label}: terminal decision fields are malformed")
+    if (
+        terminal["action_target_bytes"] != case["action_target_bytes"]
+        or terminal["max_blocks"] != max_blocks
+        or terminal["budget_target_bytes"] != case["kv_target_bytes"]
+    ):
+        raise ParseError(f"{label}: terminal decision target fields disagree with the case")
+    if terminal["decision_id"] not in settle["decision_ids"]:
+        raise ParseError(f"{label}: terminal decision is absent from settle decision list")
+    validate_snapshot_reference(record["settled"], "slots_settled.json", f"{label}.settled")
+    resume = exact(
+        record["resume"],
+        {
+            "sequence", "request_id", "started_mono_ns", "finished_mono_ns",
+            "stderr_start_offset", "stderr_end_offset",
+        },
+        f"{label}.resume",
+    )
+    for key in (
+        "sequence", "started_mono_ns", "finished_mono_ns", "stderr_start_offset",
+        "stderr_end_offset",
+    ):
+        require_nonnegative_int(resume[key], f"{label}.resume.{key}")
+    if (
+        resume["request_id"] != expected["resume_request_id"]
+        or resume["started_mono_ns"] <= settle["completed_mono_ns"]
+        or resume["finished_mono_ns"] < resume["started_mono_ns"]
+        or resume["stderr_start_offset"] < settle["stderr_end_offset"]
+        or resume["stderr_end_offset"] < resume["stderr_start_offset"]
+    ):
+        raise ParseError(f"{label}: resume did not occur strictly after budget settle")
+    return record
+
+
+def authoritative_slot_resident(snapshot: dict[str, Any], label: str) -> dict[str, Any]:
+    value = snapshot.get("body_json")
+    if not isinstance(value, list):
+        raise ParseError(f"{label}: slot snapshot body is unavailable")
+    observations = [
+        slot["kv_resident"] for slot in value
+        if isinstance(slot, dict) and isinstance(slot.get("kv_resident"), dict)
+    ]
+    if not observations:
+        raise ParseError(f"{label}: physical resident observation is missing")
+    first = observations[0]
+    if any(item != first for item in observations[1:]):
+        raise ParseError(f"{label}: slots disagree on the global physical resident observation")
+    return first
+
+
+def characterization_budget_observations(
+        actions: list[dict[str, str]],
+        expected_source: str,
+        resident_target_bytes: int,
+        action_target_bytes: int,
+        max_blocks: int,
+        tolerance_bytes: int,
+        label: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    observations: list[dict[str, Any]] = []
+    terminal: dict[str, Any] | None = None
+    for action in actions:
+        if (
+            action["state"] != "NORMAL"
+            or action["source"] != expected_source
+            or action["sample_valid"] != "1"
+            or action["stale"] != "0"
+            or action["pressure_basis_valid"] != "1"
+            or action["budget_active"] != "1"
+            or action["budget_target_enabled"] != "1"
+            or action["budget_source"] != "env_static"
+            or int(action["target_bytes"]) != action_target_bytes
+            or int(action["max_blocks"]) != max_blocks
+            or int(action["budget_target_bytes"]) != resident_target_bytes
+            or action["budget_view_valid"] != "1"
+            or action["budget_resident_available"] != "1"
+            or action["idle"] != "1"
+        ):
+            continue
+        resident_bytes = int(action["budget_resident_bytes"])
+        observed_excess = max(0, resident_bytes - resident_target_bytes)
+        if int(action["budget_observed_excess_bytes"]) != observed_excess:
+            raise ParseError(f"{label}: target and observed physical resident are inconsistent")
+        positive_offload = (
+            action["offload_attempted"] == "1"
+            and action["outcome"] == "completed"
+            and action["state_changed"] == "1"
+            and action["io_failure"] == "0"
+            and int(action["blocks"]) > 0
+            and int(action["bytes"]) > 0
+            and int(action["relieved_bytes"]) > 0
+        )
+        positive_release = (
+            action["release_attempted"] == "1"
+            and action["outcome"] == "completed"
+            and action["state_changed"] == "1"
+            and action["io_failure"] == "0"
+            and int(action["blocks"]) > 0
+            and int(action["relieved_bytes"]) > 0
+        )
+        summary = {
+            "decision_id": int(action["decision_id"]),
+            "decision_reason": action["decision_reason"],
+            "action_target_bytes": action_target_bytes,
+            "max_blocks": max_blocks,
+            "budget_target_bytes": resident_target_bytes,
+            "budget_resident_bytes": resident_bytes,
+            "budget_observed_excess_bytes": observed_excess,
+            "budget_debt_after_bytes": int(action["budget_debt_after_bytes"]),
+            "unmet_budget_bytes_after": int(action["unmet_budget_bytes_after"]),
+            "budget_transient_staging_bound_bytes": int(
+                action["budget_transient_staging_bound_bytes"]),
+            "positive_offload": positive_offload,
+            "positive_release": positive_release,
+            "action": action,
+        }
+        observations.append(summary)
+        if (
+            (positive_offload or positive_release)
+            and summary["budget_debt_after_bytes"] == 0
+            and summary["unmet_budget_bytes_after"] == 0
+        ):
+            terminal = {"status": "debt_closed", **summary}
+            break
+        if (
+            action["decision_reason"] == "budget_target_satisfied"
+            and resident_bytes <= resident_target_bytes + tolerance_bytes
+            and observed_excess == 0
+            and summary["budget_debt_after_bytes"] == 0
+            and summary["unmet_budget_bytes_after"] == 0
+        ):
+            terminal = {"status": "target_reached", **summary}
+            break
+        if (
+            action["decision_reason"] == "budget_unmet_terminal"
+            and observed_excess > 0
+            and summary["budget_debt_after_bytes"] == observed_excess
+            and summary["unmet_budget_bytes_after"] == observed_excess
+        ):
+            terminal = {"status": "unmet_floor", **summary}
+            break
+    if terminal is None:
+        raise ParseError(f"{label}: no production target-closure or budget_unmet_terminal marker")
+    return observations, terminal
+
+
+def k2_statistics(io: dict[str, str]) -> dict[str, Any]:
+    return {
+        "enabled": int(io["k2_enabled"]),
+        "group_byte_cap": int(io["k2_group_byte_cap"]),
+        "pipeline_wall_us": int(io["k2_pipeline_wall_us"]),
+        "read_wait_us": int(io["k2_exposed_read_wait_us"]),
+        "pipeline_stall_us": int(io["k2_pipeline_stall_us"]),
+        "read_completed_ahead": int(io["k2_read_completed_ahead"]),
+        "validate_us": int(io["block_in_validate_us"]),
+        "read_us": int(io["block_in_read_us"]),
+        "unpack_us": int(io["block_in_unpack_us"]),
+        "commit_us": int(io["block_in_commit_us"]),
+        "prefault": {
+            "enabled": int(io["restore_prefault_enabled"]),
+            "groups": int(io["restore_prefault_groups"]),
+            "calls": int(io["restore_prefault_calls"]),
+            "us": int(io["restore_prefault_us"]),
+            "minor_faults": int(io["restore_prefault_minor_faults"]),
+            "major_faults": int(io["restore_prefault_major_faults"]),
+        },
+        "scatter": {
+            "groups": int(io["restore_scatter_groups"]),
+            "us": int(io["restore_scatter_us"]),
+            "fault_groups": int(io["restore_scatter_fault_groups"]),
+            "minor_faults": int(io["restore_scatter_minor_faults"]),
+            "major_faults": int(io["restore_scatter_major_faults"]),
+        },
+    }
+
+
+def validate_characterization_causality(
+        record: dict[str, Any],
+        responses: list[dict[str, Any]],
+        stderr_data: bytes,
+        case: dict[str, Any],
+        spec: dict[str, Any],
+        run_dir: pathlib.Path,
+        io: dict[str, str],
+        label: str,
+) -> dict[str, Any]:
+    warmup_count = len(spec["workload"]["warmup"])
+    if len(responses) <= warmup_count:
+        raise ParseError(f"{label}: characterization has no post-fill measurement")
+    warmup = responses[:warmup_count]
+    measurements = responses[warmup_count:]
+    if any(item["measurement"] for item in warmup) or any(
+            not item["measurement"] for item in measurements):
+        raise ParseError(f"{label}: fill and measurement responses are not separated")
+    if case["policy"] == "v2":
+        if measurements[0]["measurement_phase"] != "resume" or any(
+                item["measurement_phase"] != "post_resume_steady"
+                for item in measurements[1:]):
+            raise ParseError(
+                f"{label}: characterization measurements are not classified as resume then post-resume steady")
+    elif any(item["measurement_phase"] != "resident_steady" for item in measurements):
+        raise ParseError(f"{label}: Resident measurements are not classified as resident_steady")
+
+    after_fill_snapshot = validate_slot_snapshot(
+        run_dir / "slots_after_fill.json", f"{label}.slots_after_fill")
+    after_measurement_snapshot = validate_slot_snapshot(
+        run_dir / "slots_after_measurement.json", f"{label}.slots_after_measurement")
+    if (
+        record["after_fill"]["captured_mono_ns"] != after_fill_snapshot["captured_mono_ns"]
+        or record["after_measurement"]["captured_mono_ns"]
+            != after_measurement_snapshot["captured_mono_ns"]
+    ):
+        raise ParseError(f"{label}: characterization snapshot reference timestamp mismatch")
+    fill_finished = max(item["finished_mono_ns"] for item in warmup)
+    first_measurement = measurements[0]
+    if (
+        after_fill_snapshot["captured_mono_ns"] < fill_finished
+        or after_fill_snapshot["captured_mono_ns"] > first_measurement["started_mono_ns"]
+        or after_measurement_snapshot["captured_mono_ns"] < first_measurement["finished_mono_ns"]
+    ):
+        raise ParseError(f"{label}: fill/measurement physical snapshots are out of order")
+    resident_after_fill = authoritative_slot_resident(
+        after_fill_snapshot, f"{label}.slots_after_fill")
+    resident_after_measurement = authoritative_slot_resident(
+        after_measurement_snapshot, f"{label}.slots_after_measurement")
+
+    if case["policy"] == "resident":
+        return {
+            "status": "RESIDENT_BASELINE",
+            "requested_target_bytes": None,
+            "action_target_bytes": None,
+            "resume_measurement": None,
+            "post_resume_steady_measurements": [],
+            "resident_after_fill": resident_after_fill["resident_bytes"],
+            "resident_settled": resident_after_fill["resident_bytes"],
+            "resident_after_resume": resident_after_measurement["resident_bytes"],
+            "physical_relief_bytes": 0,
+            "budget_debt_after": 0,
+            "settle_time_seconds": None,
+            "unmet_budget_bytes": 0,
+            "offload": {
+                "actions": 0, "blocks": 0, "bytes": 0, "physical_relieved_bytes": 0,
+                "write_syscalls": int(io["backing_write_syscalls"]),
+                "bytes_written": int(io["bytes_written"]),
+            },
+            "resume": {
+                "restored_blocks": 0, "restored_bytes": 0,
+                "read_syscalls": int(io["backing_read_syscalls"]),
+                "bytes_read": int(io["bytes_read"]), "gate_us": None, "total_us": None,
+            },
+            "transient_staging_peak_bytes": int(io["k2_peak_staging_bytes"]),
+            "transient_staging_bound_bytes": int(io["k2_staging_bound_bytes"]),
+            "k2": k2_statistics(io),
+        }
+
+    settled_snapshot = validate_slot_snapshot(
+        run_dir / "slots_settled.json", f"{label}.slots_settled")
+    if record["settled"]["captured_mono_ns"] != settled_snapshot["captured_mono_ns"]:
+        raise ParseError(f"{label}: settled snapshot reference timestamp mismatch")
+    settled_resident = authoritative_slot_resident(settled_snapshot, f"{label}.slots_settled")
+    identity_keys = ("object_id", "generation", "page_size", "total_bytes", "total_pages")
+    if any(
+        resident_after_fill[key] != settled_resident[key]
+        or settled_resident[key] != resident_after_measurement[key]
+        for key in identity_keys
+    ):
+        raise ParseError(f"{label}: physical resident identity changed across characterization")
+    if settled_resident["resident_bytes"] > resident_after_fill["resident_bytes"]:
+        raise ParseError(f"{label}: settled resident exceeds after-fill B_full observation")
+
+    idle = record["idle"]
+    settle = record["settle"]
+    if idle["started_mono_ns"] < after_fill_snapshot["captured_mono_ns"]:
+        raise ParseError(f"{label}: V2 idle began before after-fill resident capture")
+    if (
+        settled_snapshot["captured_mono_ns"] < settle["completed_mono_ns"]
+        or settled_snapshot["captured_mono_ns"] > first_measurement["started_mono_ns"]
+    ):
+        raise ParseError(f"{label}: settled resident was not captured before resume")
+    resume = record["resume"]
+    if (
+        resume["sequence"] != first_measurement["sequence"]
+        or resume["request_id"] != first_measurement["request_id"]
+        or resume["started_mono_ns"] != first_measurement["started_mono_ns"]
+        or resume["finished_mono_ns"] != first_measurement["finished_mono_ns"]
+    ):
+        raise ParseError(f"{label}: resume record does not match first post-settle measurement")
+
+    settle_text = stderr_window(
+        stderr_data, settle["stderr_start_offset"], settle["stderr_end_offset"],
+        f"{label}.settle",
+    )
+    settle_actions = marker_records(
+        settle_text, "kv_pressure_unified_action", ACTION_REQUIRED,
+        f"{label}.settle.action",
+    )
+    for action in settle_actions:
+        validate_action_fields(action, f"{label}.settle.action")
+        boolean_fields(action, ACTION_BOOL, f"{label}.settle.action")
+    resident_target = int(case["kv_target_bytes"])
+    action_target = int(case["action_target_bytes"])
+    max_blocks = int(spec["max_blocks"])
+    tolerance = int(spec["workload"]["characterization"]["target_tolerance_bytes"])
+    observations, terminal = characterization_budget_observations(
+        settle_actions,
+        pressure_basis_source(spec["pressure_basis"]),
+        resident_target,
+        action_target,
+        max_blocks,
+        tolerance,
+        f"{label}.settle",
+    )
+    terminal_record = {key: value for key, value in terminal.items() if key not in {"status", "action"}}
+    expected_settle_status = (
+        "target_reached" if terminal["status"] in {"debt_closed", "target_reached"}
+        else "unmet_floor")
+    if (
+        settle["status"] != expected_settle_status
+        or settle["decision_ids"] != [item["decision_id"] for item in observations]
+        or settle["offload_decision_ids"] != [
+            item["decision_id"] for item in observations if item["positive_offload"]]
+        or settle["terminal_decision"] != terminal_record
+    ):
+        raise ParseError(f"{label}: runner settle record differs from production markers")
+    terminal_resident = terminal["budget_resident_bytes"]
+    if settle["physical_resident_bytes"] != settled_resident["resident_bytes"]:
+        raise ParseError(f"{label}: runner settled resident differs from the physical snapshot")
+    if terminal["status"] != "debt_closed" and abs(
+            settled_resident["resident_bytes"] - terminal_resident) > tolerance:
+        raise ParseError(f"{label}: settled physical resident differs from terminal budget view")
+    if terminal["status"] in {"debt_closed", "target_reached"}:
+        if (
+            settled_resident["resident_bytes"] > resident_target + tolerance
+            or terminal["budget_debt_after_bytes"] != 0
+            or terminal["unmet_budget_bytes_after"] != 0
+        ):
+            raise ParseError(f"{label}: target was declared reached without actual resident closure")
+        status = "TARGET_REACHED"
+    else:
+        actual_unmet = max(0, terminal_resident - resident_target)
+        if (
+            actual_unmet <= 0
+            or terminal["budget_debt_after_bytes"] != actual_unmet
+            or terminal["unmet_budget_bytes_after"] != actual_unmet
+        ):
+            raise ParseError(f"{label}: unmet floor marker does not preserve actual resident debt")
+        status = "UNMET_FLOOR"
+
+    resume_text = stderr_window(
+        stderr_data, resume["stderr_start_offset"], resume["stderr_end_offset"],
+        f"{label}.resume",
+    )
+    resume_events = marker_records(
+        resume_text, "kv_resume_order_event", RESUME_REQUIRED, f"{label}.resume.event")
+    for event in resume_events:
+        numeric_fields(
+            event, {"decision_id", "seq_id", "claimant_epoch", "transaction_id"},
+            f"{label}.resume.event")
+        boolean_fields(event, RESUME_BOOL, f"{label}.resume.event")
+    resume_timings = marker_records(
+        resume_text, "kv_resume_stage_timing", TIMING_REQUIRED, f"{label}.resume.timing")
+    for timing in resume_timings:
+        numeric_fields(timing, TIMING_REQUIRED, f"{label}.resume.timing")
+    positive_timing: dict[str, str] | None = None
+    for event in resume_events:
+        if (
+            event["phase"] != "prefetch"
+            or event["action"] != "prefetch"
+            or event["outcome"] != "completed"
+            or event["graph_allowed"] != "1"
+        ):
+            continue
+        key = (event["decision_id"], event["transaction_id"], event["seq_id"])
+        graph_gate = next((
+            item for item in resume_events
+            if item["phase"] == "graph_gate"
+            and item["action"] == "prefetch"
+            and item["outcome"] == "completed"
+            and item["graph_allowed"] == "1"
+            and (item["decision_id"], item["transaction_id"], item["seq_id"]) == key
+        ), None)
+        timing = next((
+            item for item in resume_timings
+            if (item["decision_id"], item["transaction_id"], item["seq_id"]) == key
+            and int(item["restored_blocks"]) > 0
+            and int(item["restored_bytes"]) > 0
+            and int(item["total_us"]) > 0
+        ), None)
+        if graph_gate is not None and timing is not None:
+            positive_timing = timing
+            break
+    positive_offloads = [item for item in observations if item["positive_offload"]]
+    if positive_offloads and positive_timing is None:
+        raise ParseError(f"{label}: OFFLOAD characterization has no positive resume restore timing")
+    resume_measurement = {
+        "sequence": first_measurement["sequence"],
+        "request_id": first_measurement["request_id"],
+        "repeat_index": first_measurement["repeat_index"],
+        "measurement_phase": first_measurement["measurement_phase"],
+    }
+    post_resume_steady_measurements = [
+        {
+            "sequence": item["sequence"],
+            "request_id": item["request_id"],
+            "repeat_index": item["repeat_index"],
+            "measurement_phase": item["measurement_phase"],
+        }
+        for item in measurements[1:]
+    ]
+
+    return {
+        "status": status,
+        "requested_target_bytes": resident_target,
+        "action_target_bytes": action_target,
+        "resume_measurement": resume_measurement,
+        "post_resume_steady_measurements": post_resume_steady_measurements,
+        "resident_after_fill": resident_after_fill["resident_bytes"],
+        "resident_settled": settled_resident["resident_bytes"],
+        "resident_after_resume": resident_after_measurement["resident_bytes"],
+        "physical_relief_bytes": (
+            resident_after_fill["resident_bytes"] - settled_resident["resident_bytes"]),
+        "budget_debt_after": terminal["budget_debt_after_bytes"],
+        "settle_time_seconds": settle["duration_ns"] / 1_000_000_000,
+        "unmet_budget_bytes": terminal["unmet_budget_bytes_after"],
+        "offload": {
+            "actions": len(positive_offloads),
+            "blocks": sum(int(item["action"]["blocks"]) for item in positive_offloads),
+            "bytes": sum(int(item["action"]["bytes"]) for item in positive_offloads),
+            "physical_relieved_bytes": sum(
+                int(item["action"]["relieved_bytes"]) for item in positive_offloads),
+            "write_syscalls": int(io["backing_write_syscalls"]),
+            "bytes_written": int(io["bytes_written"]),
+        },
+        "resume": {
+            "restored_blocks": int(positive_timing["restored_blocks"]) if positive_timing else 0,
+            "restored_bytes": int(positive_timing["restored_bytes"]) if positive_timing else 0,
+            "read_syscalls": int(io["backing_read_syscalls"]),
+            "bytes_read": int(io["bytes_read"]),
+            "gate_us": int(positive_timing["gate_us"]) if positive_timing else None,
+            "total_us": int(positive_timing["total_us"]) if positive_timing else None,
+        },
+        "transient_staging_peak_bytes": int(io["k2_peak_staging_bytes"]),
+        "transient_staging_bound_bytes": max(
+            [int(io["k2_staging_bound_bytes"])]
+            + [item["budget_transient_staging_bound_bytes"] for item in observations]),
+        "k2": k2_statistics(io),
+    }
+
+
 def parse_run(artifact: pathlib.Path, plan: dict[str, Any], case: dict[str, Any], workload: dict[str, Any], expected_execution_index: int, spec: dict[str, Any]) -> dict[str, Any]:
     run_dir = artifact / "runs" / plan["run_id"]
     label = f"{plan['run_id']}"
@@ -1138,13 +1827,15 @@ def parse_run(artifact: pathlib.Path, plan: dict[str, Any], case: dict[str, Any]
     if run["case"] != plan:
         raise ParseError(f"{label}: embedded case differs from planned factor")
     request_plan = run["request_plan"]
-    expected_plan = expanded_request_plan(workload, case)
+    expected_plan = expanded_request_plan(workload, case, spec["run_mode"])
     if request_plan != expected_plan:
         raise ParseError(f"{label}: request plan differs from manifest workload")
     execution = exact(read_json(run_dir / "execution.json"), EXECUTION_KEYS, f"{label}.execution")
     for key in ("run_id", "round", "run_order", "case_id"):
         if execution[key] != plan[key]:
             raise ParseError(f"{label}: execution identity mismatch at {key}")
+    if execution["run_mode"] != spec["run_mode"]:
+        raise ParseError(f"{label}: execution run mode differs from manifest spec")
     if execution["pressure_basis"] != spec["pressure_basis"]:
         raise ParseError(f"{label}: execution pressure basis differs from manifest spec")
     if isinstance(execution["execution_index"], bool) or not isinstance(execution["execution_index"], int) or execution["execution_index"] != expected_execution_index:
@@ -1210,7 +1901,7 @@ def parse_run(artifact: pathlib.Path, plan: dict[str, Any], case: dict[str, Any]
     if sampler_argv[7] != str(server_cgroup.get("memory_current_file") or ""):
         raise ParseError(f"{label}: sampler cgroup path does not match server cgroup")
     transaction_local_physical_authority = (
-        case["policy"] == "v2" and spec["run_kind"] == "qualification")
+        case["policy"] == "v2" and spec["run_mode"] == "qualification")
     slots_before = validate_slot_snapshot(
         run_dir / "slots_before.json",
         f"{label}.slots_before",
@@ -1234,7 +1925,18 @@ def parse_run(artifact: pathlib.Path, plan: dict[str, Any], case: dict[str, Any]
     if server_cleanup["exit_code"] != 0 or sampler_cleanup["exit_code"] != 0:
         raise ParseError(f"{label}: process exit code is non-zero")
     qualification = validate_qualification_record(
-        execution["qualification"], workload["qualification"], case, f"{label}.qualification")
+        execution["qualification"],
+        workload["qualification"] if spec["run_mode"] == "qualification" else None,
+        case,
+        f"{label}.qualification",
+    )
+    characterization = validate_characterization_record(
+        execution["characterization"],
+        workload["characterization"] if spec["run_mode"] == "characterization" else None,
+        case,
+        spec["max_blocks"],
+        f"{label}.characterization",
+    )
     for filename in ("server.stdout", "server.stderr", "sampler.stdout", "sampler.stderr"):
         if not (run_dir / filename).is_file():
             raise ParseError(f"{label}: missing {filename}")
@@ -1249,6 +1951,7 @@ def parse_run(artifact: pathlib.Path, plan: dict[str, Any], case: dict[str, Any]
     for action in actions:
         validate_action_fields(action, f"{label}.action")
         boolean_fields(action, ACTION_BOOL, f"{label}.action")
+    validate_action_target_markers(actions, case, spec, f"{label}.action")
     resident_observations = marker_records(
         stderr,
         "kv_g0_s1_resident_observation",
@@ -1279,16 +1982,28 @@ def parse_run(artifact: pathlib.Path, plan: dict[str, Any], case: dict[str, Any]
     expected_source = pressure_basis_source(spec["pressure_basis"])
     qualified_pairs = qualified_offload_pairs(actions, resident_observations, expected_source)
     qualification_round_trip: dict[str, Any] | None = None
-    if workload["qualification"] is not None and (
-            case["policy"] == "resident" or spec["run_kind"] == "qualification"):
+    characterization_metrics: dict[str, Any] | None = None
+    if spec["run_mode"] == "qualification":
         qualification_round_trip = validate_qualification_causality(
             qualification, records, stderr_data, case, spec, label)
+    else:
+        characterization_metrics = validate_characterization_causality(
+            characterization, records, stderr_data, case, spec, run_dir, io_last, label)
+        measurement_records = [record for record in records if record["measurement"]]
+        if case["policy"] == "v2":
+            characterization_metrics["performance"] = response_statistics(
+                [record for record in measurement_records if record["measurement_phase"] == "resume"])
+            characterization_metrics["post_resume_steady_performance"] = response_statistics(
+                [record for record in measurement_records if record["measurement_phase"] == "post_resume_steady"])
+        else:
+            characterization_metrics["performance"] = response_statistics(measurement_records)
+            characterization_metrics["post_resume_steady_performance"] = response_statistics([])
     if case["policy"] == "v2":
         if not actions:
             raise ParseError(f"{label}: missing mandatory kv_pressure_unified_action marker")
-        if not offload_actions:
-            raise ParseError(f"{label}: V2 has no offload_attempted=1 action")
-        if spec["run_kind"] == "qualification":
+        if spec["run_mode"] == "qualification":
+            if not offload_actions:
+                raise ParseError(f"{label}: V2 qualification has no offload_attempted=1 action")
             if not qualified_pairs:
                 raise ParseError(
                     f"{label}: V2 qualification has no matching successful OFFLOAD and transaction-local resident drop")
@@ -1303,23 +2018,22 @@ def parse_run(artifact: pathlib.Path, plan: dict[str, Any], case: dict[str, Any]
             if qualification_round_trip is None:
                 raise ParseError(f"{label}: V2 qualification round-trip evidence is missing")
         else:
-            for action in offload_actions:
-                if action["sample_valid"] != "1" or action["stale"] != "0" or action["pressure_basis_valid"] != "1":
-                    raise ParseError(f"{label}: V2 offload action lacks a valid pressure basis")
-                if action["state"] != "NORMAL" or action["source"] != expected_source:
-                    raise ParseError(f"{label}: V2 offload action is not backed by a NORMAL {expected_source} basis")
-                if action["budget_active"] != "1" or action["budget_target_enabled"] != "1" or action["budget_view_valid"] != "1" or action["budget_resident_available"] != "1":
-                    raise ParseError(f"{label}: V2 offload action lacks an active valid budget view")
-                if int(action["budget_observed_excess_bytes"]) <= 0 or int(action["budget_resident_bytes"]) <= int(action["budget_target_bytes"]):
-                    raise ParseError(f"{label}: V2 offload action lacks positive budget excess")
-                if action["outcome"] != "completed" or action["io_failure"] != "0" or action["state_changed"] != "1":
-                    raise ParseError(f"{label}: V2 offload action did not complete successfully")
-                if int(action["blocks"]) <= 0 or int(action["bytes"]) <= 0 or int(action["relieved_bytes"]) <= 0:
-                    raise ParseError(f"{label}: V2 offload action has no positive physical relief")
-                if int(action["shortfall_bytes"]) != 0:
-                    raise ParseError(f"{label}: V2 offload action has a shortfall")
-            if int(io_last["block_swap_out_calls"]) <= 0 or int(io_last["bytes_written"]) <= 0:
-                raise ParseError(f"{label}: V2 IO evidence has no swap-out/write")
+            if characterization_metrics is None:
+                raise ParseError(f"{label}: V2 characterization metrics are missing")
+            positive_offloads = characterization_metrics["offload"]["actions"]
+            if positive_offloads > 0 and (
+                int(io_last["block_swap_out_calls"]) <= 0
+                or int(io_last["backing_write_syscalls"]) <= 0
+                or int(io_last["bytes_written"]) <= 0
+            ):
+                raise ParseError(f"{label}: V2 characterization IO has no swap-out/write")
+            if positive_offloads > 0 and (
+                int(io_last["block_swap_in_calls"]) <= 0
+                or int(io_last["backing_read_syscalls"]) <= 0
+                or int(io_last["bytes_read"]) <= 0
+                or characterization_metrics["resume"]["restored_bytes"] <= 0
+            ):
+                raise ParseError(f"{label}: V2 characterization IO has no linked swap-in/read")
     else:
         if any(action["offload_attempted"] != "0" or action["release_attempted"] != "0" for action in actions):
             raise ParseError(f"{label}: resident case contains state-changing action evidence")
@@ -1329,7 +2043,7 @@ def parse_run(artifact: pathlib.Path, plan: dict[str, Any], case: dict[str, Any]
         )
         if any(int(io_last[key]) != 0 for key in resident_migration_fields):
             raise ParseError(f"{label}: resident case contains migration IO evidence")
-    if not (case["policy"] == "v2" and spec["run_kind"] == "qualification") \
+    if not (case["policy"] == "v2" and spec["run_mode"] == "qualification") \
             and int(io_last["block_swap_in_calls"]) > 0:
         if not resumes or not timings:
             raise ParseError(f"{label}: swap-in requires resume and timing markers")
@@ -1360,10 +2074,14 @@ def parse_run(artifact: pathlib.Path, plan: dict[str, Any], case: dict[str, Any]
         "resident_observations": resident_observations,
         "qualified_offload_pairs": qualified_pairs,
         "qualification_round_trip": qualification_round_trip,
+        "characterization": characterization_metrics,
         "resume_events": resumes,
         "resume_timings": timings,
         "io": io_last,
-        "statistics": response_statistics(records),
+        "statistics": (
+            characterization_metrics["performance"]
+            if characterization_metrics is not None else response_statistics(records)
+        ),
     }
 
 
@@ -1424,7 +2142,7 @@ def validate_manifest(artifact: pathlib.Path) -> tuple[dict[str, Any], dict[str,
             raise ParseError(f"manifest.run_results[{index}] status/error is malformed")
     status = manifest["runner_status"]
     if manifest["spec"]["run_kind"] == "formal" and manifest["spec"]["pressure_basis"]["authority"] != "cgroup_finite" and status != "UNSUPPORTED":
-        raise ParseError("formal V2 qualification requires real finite cgroup pressure authority")
+        raise ParseError("formal V2 run requires real finite cgroup pressure authority")
     if status not in {"run_in_progress", "run_complete", "run_incomplete", "UNSUPPORTED", "DRY_RUN"}:
         raise ParseError(f"unknown runner_status: {status}")
     if status == "UNSUPPORTED":
@@ -1481,6 +2199,90 @@ def slot_resident_values(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
         if isinstance(resident, dict):
             result.append(resident)
     return result
+
+
+def summarize_characterization(run_results: list[dict[str, Any]]) -> dict[str, Any]:
+    runs = [
+        {"run_id": item["run_id"], "case_id": item["case_id"], **item["characterization"]}
+        for item in run_results if item["characterization"] is not None
+    ]
+    resident_runs = [item for item in runs if item["status"] == "RESIDENT_BASELINE"]
+    v2_runs = [item for item in runs if item["status"] in {"TARGET_REACHED", "UNMET_FLOOR"}]
+    full_values = [item["resident_after_fill"] for item in resident_runs]
+    if full_values:
+        b_full = {
+            "status": "AVAILABLE",
+            "definition": "same-workload Resident after-fill physical resident",
+            "observations": [
+                {"run_id": item["run_id"], "bytes": item["resident_after_fill"]}
+                for item in resident_runs
+            ],
+            "min_bytes": min(full_values),
+            "max_bytes": max(full_values),
+            "p50_bytes": percentile([float(value) for value in full_values], 0.50),
+        }
+    else:
+        b_full = {
+            "status": "UNAVAILABLE",
+            "definition": "same-workload Resident after-fill physical resident",
+            "reason": "no Resident characterization case",
+            "observations": [],
+            "min_bytes": None,
+            "max_bytes": None,
+            "p50_bytes": None,
+        }
+
+    if v2_runs:
+        lowest_target = min(item["requested_target_bytes"] for item in v2_runs)
+        lowest_runs = [item for item in v2_runs if item["requested_target_bytes"] == lowest_target]
+        if lowest_runs and all(item["status"] == "UNMET_FLOOR" for item in lowest_runs):
+            floor_values = [item["resident_settled"] for item in lowest_runs]
+            b_floor = {
+                "status": "AVAILABLE",
+                "definition": "actual settled resident from the lowest explicit target with terminal unmet budget",
+                "requested_target_bytes": lowest_target,
+                "observations": [
+                    {
+                        "run_id": item["run_id"],
+                        "resident_settled": item["resident_settled"],
+                        "unmet_budget_bytes": item["unmet_budget_bytes"],
+                    }
+                    for item in lowest_runs
+                ],
+                "min_bytes": min(floor_values),
+                "max_bytes": max(floor_values),
+                "p50_bytes": percentile([float(value) for value in floor_values], 0.50),
+            }
+        else:
+            b_floor = {
+                "status": "UNAVAILABLE",
+                "definition": "actual settled resident from the lowest explicit target with terminal unmet budget",
+                "requested_target_bytes": lowest_target,
+                "reason": "lowest explicit target did not terminate as UNMET_FLOOR in every run",
+                "observations": [],
+                "min_bytes": None,
+                "max_bytes": None,
+                "p50_bytes": None,
+            }
+    else:
+        b_floor = {
+            "status": "UNAVAILABLE",
+            "definition": "actual settled resident from the lowest explicit target with terminal unmet budget",
+            "requested_target_bytes": None,
+            "reason": "no V2 characterization case",
+            "observations": [],
+            "min_bytes": None,
+            "max_bytes": None,
+            "p50_bytes": None,
+        }
+    status = "UNMET_FLOOR" if any(
+        item["status"] == "UNMET_FLOOR" for item in v2_runs) else "TARGET_REACHED"
+    return {
+        "status": status,
+        "runs": runs,
+        "b_full": b_full,
+        "b_reachable_floor": b_floor,
+    }
 
 
 def parse_artifact(artifact: pathlib.Path) -> tuple[str, dict[str, Any]]:
@@ -1551,13 +2353,24 @@ def parse_artifact(artifact: pathlib.Path) -> tuple[str, dict[str, Any]]:
             "io_cumulative_last": [item["io"] for item in run_results],
             "source_note": "per-action migration I/O is unavailable; cumulative IO marker is retained without attribution",
         }
+        characterization_summary = None
+        if manifest["spec"]["run_mode"] == "characterization":
+            if service_failures:
+                raise ParseError("characterization contains a service failure")
+            characterization_summary = summarize_characterization(run_results)
         success_verdict = "FORMAL_PASS" if manifest["spec"]["run_kind"] == "formal" else "QUALIFICATION_PASS"
+        result_verdict = (
+            characterization_summary["status"]
+            if characterization_summary is not None
+            else ("VALID_SERVICE_FAILURE" if service_failures else success_verdict)
+        )
         result = {
             "schema_version": SCHEMA_VERSION,
             "protocol": PROTOCOL,
             "artifact_id": manifest["artifact_id"],
             "run_kind": manifest["spec"]["run_kind"],
-            "verdict": "VALID_SERVICE_FAILURE" if service_failures else success_verdict,
+            "run_mode": manifest["spec"]["run_mode"],
+            "verdict": result_verdict,
             "errors": [],
             "service_failures": service_failures,
             "planned_runs": plan,
@@ -1577,6 +2390,7 @@ def parse_artifact(artifact: pathlib.Path) -> tuple[str, dict[str, Any]]:
                 for item in run_results
             ],
             "action_summary": action_summary,
+            "characterization": characterization_summary,
             "telemetry_gaps": TELEMETRY_GAPS,
         }
         return result["verdict"], result
@@ -1602,7 +2416,15 @@ def main() -> int:
     status, result = parse_artifact(artifact)
     write_verdict(artifact, status, result)
     print(json.dumps({"artifact": str(artifact), "status": status}))
-    return {"FORMAL_PASS": 0, "QUALIFICATION_PASS": 0, "DRY_RUN": 0, "UNSUPPORTED": 3, "VALID_SERVICE_FAILURE": 4}.get(status, 1)
+    return {
+        "FORMAL_PASS": 0,
+        "QUALIFICATION_PASS": 0,
+        "TARGET_REACHED": 0,
+        "UNMET_FLOOR": 0,
+        "DRY_RUN": 0,
+        "UNSUPPORTED": 3,
+        "VALID_SERVICE_FAILURE": 4,
+    }.get(status, 1)
 
 
 if __name__ == "__main__":

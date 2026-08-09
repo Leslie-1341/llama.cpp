@@ -41,7 +41,7 @@ def load_parser_module():
 ACTION_FIELDS = {
     "state": "NORMAL", "source": "RSS_ABSOLUTE", "sample_valid": "1", "stale": "0", "pressure_basis_valid": "1",
     "decision_id": "1", "episode": "0",
-    "target_bytes": "4096", "max_blocks": "64", "observed_excess_bytes": "4096", "debt_before_bytes": "4096",
+    "target_bytes": "8192", "max_blocks": "64", "observed_excess_bytes": "4096", "debt_before_bytes": "4096",
     "debt_after_bytes": "0", "budget_active": "1", "budget_target_enabled": "1", "budget_source": "env_static",
     "budget_target_bytes": "4096", "budget_basis_generation": "1", "budget_view_valid": "1",
     "budget_resident_available": "1", "budget_reclaimable_available": "1", "budget_resident_bytes": "8192",
@@ -58,9 +58,21 @@ ACTION_FIELDS = {
 }
 IO_FIELDS = {
     "block_swap_out_calls": "1", "block_swap_in_calls": "1", "backing_read_syscalls": "1", "backing_write_syscalls": "1",
-    "bytes_read": "4096", "bytes_written": "4096", "staging_buffer_bytes": "4096", "k2_enabled": "0",
+    "bytes_read": "4096", "bytes_written": "4096",
+    "avg_block_swap_out_latency_us": "1", "max_block_swap_out_latency_us": "1",
+    "avg_block_swap_in_latency_us": "1", "max_block_swap_in_latency_us": "1",
+    "staging_buffer_bytes": "4096", "k2_enabled": "0", "k2_group_byte_cap": "0",
     "k2_staging_bound_bytes": "0", "k2_peak_staging_groups": "0", "k2_peak_staging_bytes": "0", "k2_pipeline_wall_us": "0",
     "k2_exposed_read_wait_us": "0", "k2_pipeline_stall_us": "0", "k2_read_completed_ahead": "0",
+    "block_out_validate_us": "1", "avg_block_out_validate_us": "1",
+    "block_out_pack_us": "1", "avg_block_out_pack_us": "1",
+    "block_out_write_us": "1", "avg_block_out_write_us": "1",
+    "block_out_metadata_us": "1", "avg_block_out_metadata_us": "1",
+    "block_out_madvise_us": "1", "avg_block_out_madvise_us": "1",
+    "block_in_validate_us": "1", "avg_block_in_validate_us": "1",
+    "block_in_read_us": "2", "avg_block_in_read_us": "2",
+    "block_in_unpack_us": "3", "avg_block_in_unpack_us": "3",
+    "block_in_commit_us": "1", "avg_block_in_commit_us": "1",
     "restore_prefault_enabled": "0", "restore_prefault_groups": "0", "restore_prefault_calls": "0", "restore_prefault_us": "0",
     "restore_prefault_minor_faults": "0", "restore_prefault_major_faults": "0", "restore_scatter_groups": "1",
     "restore_scatter_us": "10", "restore_scatter_fault_groups": "0", "restore_scatter_minor_faults": "0",
@@ -87,9 +99,18 @@ class CanonicalBenchmarkTest(unittest.TestCase):
             offload_enabled = os.environ.get('LLAMA_KV_PAGED_SWAP') == '1'
             mode = os.environ.get('KV_SYNTHETIC_MODE', 'complete')
             expose_v2_resident = os.environ.get('KV_SYNTHETIC_V2_SLOTS_RESIDENT') == '1'
+            resident_target = int(os.environ.get('LLAMA_KV_RESIDENT_TARGET_BYTES', '4096') or '4096')
+            action_target = int(os.environ.get('LLAMA_KV_PRESSURE_UNIFIED_ACTION_TARGET_BYTES', '8192') or '8192')
+            action_max_blocks = int(os.environ.get('LLAMA_KV_PRESSURE_UNIFIED_ACTION_MAX_BLOCKS', '64') or '64')
             action_fields = {ACTION_FIELDS!r}
             io_fields = {IO_FIELDS!r}
-            state = {{'requests': 0, 'offload_emitted': False, 'prefetch_completed': False}}
+            state = {{
+                'requests': 0, 'offload_emitted': False, 'prefetch_completed': False,
+                'offload_count': 0, 'offloaded_bytes': 0,
+                'resident_bytes': 12288 if mode.startswith('characterization_') else 8192,
+            }}
+            characterization_mode = mode.startswith('characterization_')
+            k2_enabled = os.environ.get('LLAMA_KV_PAGED_RESTORE_K2') == '1'
             output_lock = threading.Lock()
 
             parser = argparse.ArgumentParser(add_help=False)
@@ -101,20 +122,72 @@ class CanonicalBenchmarkTest(unittest.TestCase):
                 with output_lock:
                     print(token + " " + " ".join(f"{{key}}={{value}}" for key, value in fields.items()), file=sys.stderr, flush=True)
 
-            def emit_offload_after_fill():
+            def resident_drop(decision_id, transaction_id, before_bytes, after_bytes):
+                total_bytes = 12288 if characterization_mode else 8192
+                return {{
+                    'source': 'paged_sample_mincore', 'action': 'offload',
+                    'decision_id': str(decision_id), 'seq_id': '0',
+                    'transaction_id': str(transaction_id), 'server_pid': str(os.getpid()),
+                    'before_available': '1', 'before_object_id': '1', 'before_generation': '1',
+                    'before_page_size': '4096', 'before_total_bytes': str(total_bytes),
+                    'before_resident_bytes': str(before_bytes),
+                    'before_total_pages': str(total_bytes // 4096),
+                    'before_resident_pages': str(before_bytes // 4096),
+                    'after_available': '1', 'after_object_id': '1', 'after_generation': '1',
+                    'after_page_size': '4096', 'after_total_bytes': str(total_bytes),
+                    'after_resident_bytes': str(after_bytes),
+                    'after_total_pages': str(total_bytes // 4096),
+                    'after_resident_pages': str(after_bytes // 4096),
+                }}
+
+            def characterization_action(decision_id, resident_bytes, debt_after, *, terminal=None):
+                values = dict(action_fields)
+                observed_excess = max(0, resident_bytes - resident_target)
+                values.update({{
+                    'decision_id': str(decision_id), 'target_bytes': str(action_target),
+                    'max_blocks': str(action_max_blocks),
+                    'observed_excess_bytes': str(observed_excess),
+                    'debt_before_bytes': str(observed_excess), 'debt_after_bytes': str(debt_after),
+                    'budget_target_bytes': str(resident_target), 'budget_resident_bytes': str(resident_bytes),
+                    'budget_observed_excess_bytes': str(observed_excess),
+                    'budget_debt_before_bytes': str(observed_excess),
+                    'budget_debt_after_bytes': str(debt_after),
+                    'budget_transient_staging_bound_bytes': '2048' if k2_enabled else '0',
+                    'sample_count': str(decision_id), 'idle': '1',
+                }})
+                if terminal is None:
+                    values.update({{
+                        'transaction_id': str(6 + decision_id), 'selected_seq_id': '0',
+                        'selected_claimant_epoch': '1', 'offload_attempted': '1',
+                        'release_attempted': '0', 'outcome': 'completed',
+                        'reason': 'target_shortfall' if debt_after else 'none',
+                        'blocks': '1', 'bytes': '4096', 'relieved_bytes': '4096',
+                        'shortfall_bytes': str(debt_after), 'io_failure': '0',
+                        'state_changed': '1', 'decision_reason': 'budget_offload_submitted',
+                        'unmet_budget_bytes_after': '0', 'soft_offload_armed_before': '1',
+                        'soft_offload_armed_after': '1' if debt_after else '0',
+                    }})
+                else:
+                    unmet = observed_excess if terminal == 'budget_unmet_terminal' else 0
+                    values.update({{
+                        'transaction_id': '0', 'selected_seq_id': '-1',
+                        'selected_claimant_epoch': '0', 'offload_attempted': '0',
+                        'release_attempted': '0', 'outcome': 'no_op', 'reason': 'none',
+                        'blocks': '0', 'bytes': '0', 'relieved_bytes': '0',
+                        'shortfall_bytes': '0', 'io_failure': '0', 'state_changed': '0',
+                        'decision_reason': terminal, 'unmet_budget_bytes_after': str(unmet),
+                        'budget_debt_after_bytes': str(unmet), 'debt_after_bytes': str(unmet),
+                        'evaluate_attempted': '0', 'evaluate_outcome': 'no_op',
+                        'soft_offload_armed_before': '0', 'soft_offload_armed_after': '0',
+                        'offload_armed_before': '0', 'offload_armed_after': '0',
+                    }})
+                return values
+
+            def emit_qualification_offload_after_fill():
                 time.sleep(0.08)
                 if not offload_enabled or mode == 'no_offload':
                     return
-                observation = {{
-                    'source': 'paged_sample_mincore', 'action': 'offload',
-                    'decision_id': '1', 'seq_id': '0', 'transaction_id': '7', 'server_pid': str(os.getpid()),
-                    'before_available': '1', 'before_object_id': '1', 'before_generation': '1',
-                    'before_page_size': '4096', 'before_total_bytes': '8192', 'before_resident_bytes': '8192',
-                    'before_total_pages': '2', 'before_resident_pages': '2',
-                    'after_available': '1', 'after_object_id': '1', 'after_generation': '1',
-                    'after_page_size': '4096', 'after_total_bytes': '8192', 'after_resident_bytes': '4096',
-                    'after_total_pages': '2', 'after_resident_pages': '1',
-                }}
+                observation = resident_drop(1, 7, 8192, 4096)
                 if mode == 'mismatch_decision':
                     observation['decision_id'] = '2'
                 elif mode == 'mismatch_transaction':
@@ -128,8 +201,41 @@ class CanonicalBenchmarkTest(unittest.TestCase):
                     emit_marker('kv_g0_s1_resident_observation', observation)
                 emit_marker('kv_pressure_unified_action', action_fields)
                 state['offload_emitted'] = True
+                state['offload_count'] = 1
+                state['offloaded_bytes'] = 4096
+                state['resident_bytes'] = 4096
+
+            def emit_characterization_after_fill():
+                time.sleep(0.08)
+                if not offload_enabled:
+                    return
+                before = state['resident_bytes']
+                after = before - 4096
+                emit_marker('kv_g0_s1_resident_observation', resident_drop(1, 7, before, after))
+                emit_marker('kv_pressure_unified_action', characterization_action(1, before, after - 4096))
+                state['resident_bytes'] = after
+                state['offload_emitted'] = True
+                state['offload_count'] += 1
+                state['offloaded_bytes'] += 4096
+                if mode in ('characterization_timeout', 'characterization_first_only'):
+                    return
+                time.sleep(0.05)
+                if mode == 'characterization_target':
+                    before = state['resident_bytes']
+                    after = before - 4096
+                    emit_marker('kv_g0_s1_resident_observation', resident_drop(2, 8, before, after))
+                    emit_marker('kv_pressure_unified_action', characterization_action(2, before, 0))
+                    state['resident_bytes'] = after
+                    state['offload_count'] += 1
+                    state['offloaded_bytes'] += 4096
+                elif mode == 'characterization_unmet':
+                    emit_marker('kv_pressure_unified_action', characterization_action(
+                        2, state['resident_bytes'], state['resident_bytes'] - 4096,
+                        terminal='budget_unmet_terminal'))
 
             def emit_resume_evidence():
+                decision_id = '4' if characterization_mode else '2'
+                transaction_id = '10' if characterization_mode else '8'
                 if mode == 'prefetch_noop':
                     outcome = 'no_op'
                     restored_blocks = '0'
@@ -137,18 +243,21 @@ class CanonicalBenchmarkTest(unittest.TestCase):
                     total_us = '0'
                 else:
                     outcome = 'completed'
-                    restored_blocks = '1'
-                    restored_bytes = '4096'
+                    restored = state['offloaded_bytes'] or 4096
+                    restored_blocks = str(restored // 4096)
+                    restored_bytes = str(restored)
                     total_us = '6'
                     state['prefetch_completed'] = True
+                    state['resident_bytes'] += restored
                 base = {{
-                    'decision_id': '2', 'seq_id': '0', 'claimant_epoch': '1', 'transaction_id': '8',
-                    'action': 'prefetch', 'outcome': outcome, 'reason': 'none', 'graph_allowed': '1',
+                    'decision_id': decision_id, 'seq_id': '0', 'claimant_epoch': '1',
+                    'transaction_id': transaction_id, 'action': 'prefetch',
+                    'outcome': outcome, 'reason': 'none', 'graph_allowed': '1',
                 }}
                 emit_marker('kv_resume_order_event', {{'phase': 'prefetch', **base}})
                 emit_marker('kv_resume_order_event', {{'phase': 'graph_gate', **base}})
                 emit_marker('kv_resume_stage_timing', {{
-                    'decision_id': '2', 'seq_id': '0', 'transaction_id': '8',
+                    'decision_id': decision_id, 'seq_id': '0', 'transaction_id': transaction_id,
                     'restored_blocks': restored_blocks, 'restored_bytes': restored_bytes,
                     'queue_us': '1', 'gate_us': '2', 'graph_us': '3', 'total_us': total_us,
                 }})
@@ -158,13 +267,21 @@ class CanonicalBenchmarkTest(unittest.TestCase):
                 for key in ('block_swap_out_calls', 'block_swap_in_calls', 'backing_read_syscalls', 'backing_write_syscalls', 'bytes_read', 'bytes_written'):
                     values[key] = '0'
                 if offload_enabled and state['offload_emitted']:
-                    values['block_swap_out_calls'] = '1'
-                    values['backing_write_syscalls'] = '1'
-                    values['bytes_written'] = '4096'
+                    values['block_swap_out_calls'] = str(state['offload_count'])
+                    values['backing_write_syscalls'] = str(state['offload_count'])
+                    values['bytes_written'] = str(state['offloaded_bytes'])
                 if offload_enabled and state['prefetch_completed'] and mode != 'swap_in_zero':
-                    values['block_swap_in_calls'] = '1'
-                    values['backing_read_syscalls'] = '1'
-                    values['bytes_read'] = '4096'
+                    values['block_swap_in_calls'] = str(max(1, state['offload_count']))
+                    values['backing_read_syscalls'] = str(max(1, state['offload_count']))
+                    values['bytes_read'] = str(state['offloaded_bytes'] or 4096)
+                if k2_enabled:
+                    values.update({{
+                        'k2_enabled': '1', 'k2_group_byte_cap': '2048',
+                        'k2_staging_bound_bytes': '2048', 'k2_peak_staging_groups': '1',
+                        'k2_peak_staging_bytes': '2048', 'k2_pipeline_wall_us': '11',
+                        'k2_exposed_read_wait_us': '4', 'k2_pipeline_stall_us': '2',
+                        'k2_read_completed_ahead': '1',
+                    }})
                 emit_marker('KV_PAGED_IO_STATS', values)
                 raise SystemExit(0)
 
@@ -177,11 +294,14 @@ class CanonicalBenchmarkTest(unittest.TestCase):
                         self.send_response(200); self.end_headers(); self.wfile.write(b'{{"status":"ok"}}'); return
                     if self.path == '/slots':
                         slot = {{'id': 0, 'is_processing': False}}
-                        if not offload_enabled or expose_v2_resident:
+                        if not offload_enabled or expose_v2_resident or characterization_mode:
+                            total_bytes = 12288 if characterization_mode else 8192
                             slot['kv_resident'] = {{
                                 'status': 'available', 'source': 'synthetic', 'object_id': 1, 'generation': 1,
-                                'page_size': 4096, 'total_bytes': 8192, 'resident_bytes': 8192,
-                                'total_pages': 2, 'resident_pages': 2,
+                                'page_size': 4096, 'total_bytes': total_bytes,
+                                'resident_bytes': state['resident_bytes'],
+                                'total_pages': total_bytes // 4096,
+                                'resident_pages': state['resident_bytes'] // 4096,
                             }}
                         encoded = json.dumps([slot]).encode()
                         self.send_response(200); self.send_header('Content-Type','application/json'); self.send_header('Content-Length', str(len(encoded))); self.end_headers(); self.wfile.write(encoded); return
@@ -193,12 +313,19 @@ class CanonicalBenchmarkTest(unittest.TestCase):
                     state['requests'] += 1
                     ordinal = state['requests']
                     print(f"synthetic_request ordinal={{ordinal}}", flush=True)
-                    if offload_enabled and ordinal == 2:
-                        threading.Thread(target=emit_offload_after_fill, daemon=True).start()
-                    elif offload_enabled and ordinal == 3:
+                    if offload_enabled and characterization_mode and ordinal == 1:
+                        threading.Thread(target=emit_characterization_after_fill, daemon=True).start()
+                    elif offload_enabled and not characterization_mode and ordinal == 2:
+                        threading.Thread(target=emit_qualification_offload_after_fill, daemon=True).start()
+                    elif offload_enabled and (
+                            (characterization_mode and ordinal == 2)
+                            or (not characterization_mode and ordinal == 3)):
                         emit_resume_evidence()
                     time.sleep(0.02)
-                    payload = {{"content":"ok", "timings":{{"predicted_n":2,"predicted_ms":4}}}}
+                    payload = {{
+                        "content":"ok",
+                        "timings":{{"predicted_n":2,"predicted_ms":4,"predicted_per_second":500.0}},
+                    }}
                     encoded = json.dumps(payload).encode()
                     self.send_response(200)
                     self.send_header('Content-Type', 'application/json')
@@ -218,10 +345,11 @@ class CanonicalBenchmarkTest(unittest.TestCase):
     def spec(self, *, policy: str = "v2") -> dict[str, object]:
         target = 4096 if policy == "v2" else None
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "protocol": "kv_offload_benchmark",
             "phase": "coarse_target",
             "run_kind": "qualification",
+            "run_mode": "qualification",
             "binary": str(self.fake_server),
             "model": str(self.model),
             "model_quantization": "synthetic",
@@ -242,6 +370,7 @@ class CanonicalBenchmarkTest(unittest.TestCase):
                     "offload_timeout_seconds": 1.0,
                     "resume_request_id": "request",
                 },
+                "characterization": None,
             },
             "cases": [{
                 "case_id": "case",
@@ -251,6 +380,7 @@ class CanonicalBenchmarkTest(unittest.TestCase):
                 "restore": "k1_sync",
                 "prefault": "off",
                 "kv_target_bytes": target,
+                "action_target_bytes": 8192 if policy == "v2" else None,
             }],
             "run_order": [{"round": 1, "run_order": 1, "case_id": "case"}],
             "sampler": {"interval_seconds": 1.0},
@@ -259,6 +389,26 @@ class CanonicalBenchmarkTest(unittest.TestCase):
             "health_timeout_seconds": 10,
             "request_timeout_seconds": 10,
         }
+
+    def characterization_spec(
+            self,
+            *,
+            policy: str = "v2",
+            mode: str = "characterization_target",
+            restore: str = "k2_pipeline",
+    ) -> dict[str, object]:
+        value = self.spec(policy=policy)
+        value["run_mode"] = "characterization"
+        value["environment"]["KV_SYNTHETIC_MODE"] = mode
+        value["workload"]["qualification"] = None
+        value["workload"]["characterization"] = {
+            "idle_seconds": 0.01,
+            "settle_timeout_seconds": 1.0,
+            "target_tolerance_bytes": 0,
+            "resume_request_id": "request",
+        }
+        value["cases"][0]["restore"] = restore
+        return value
 
     def write_spec(self, value: dict[str, object], name: str = "spec.json") -> pathlib.Path:
         path = self.root / name
@@ -292,6 +442,20 @@ class CanonicalBenchmarkTest(unittest.TestCase):
             value["environment"]["KV_SYNTHETIC_V2_SLOTS_RESIDENT"] = "1"
         spec = self.write_spec(value)
         artifact = self.root / f"real-{policy}-{mode}-{len(list(self.root.glob('real-*')))}"
+        runner = self.run_runner(spec, artifact)
+        self.assertEqual(runner.returncode, 0, runner.stderr)
+        return artifact
+
+    def run_characterization_artifact(
+            self,
+            *,
+            policy: str = "v2",
+            mode: str = "characterization_target",
+            restore: str = "k2_pipeline",
+    ) -> pathlib.Path:
+        value = self.characterization_spec(policy=policy, mode=mode, restore=restore)
+        spec = self.write_spec(value, f"{mode}-{policy}.json")
+        artifact = self.root / f"characterization-{policy}-{mode}-{len(list(self.root.glob('characterization-*')))}"
         runner = self.run_runner(spec, artifact)
         self.assertEqual(runner.returncode, 0, runner.stderr)
         return artifact
@@ -592,6 +756,212 @@ class CanonicalBenchmarkTest(unittest.TestCase):
         invalid_result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
         self.assertIn("migration IO", invalid_result["errors"][0])
 
+    def test_resident_characterization_records_b_full_without_migration(self) -> None:
+        artifact = self.run_characterization_artifact(
+            policy="resident", mode="characterization_resident", restore="k1_sync")
+        parsed = self.run_parser(artifact)
+        self.assertEqual(parsed.returncode, 0, parsed.stderr)
+        result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["verdict"], "TARGET_REACHED")
+        characterization = result["characterization"]
+        self.assertEqual(characterization["b_full"]["status"], "AVAILABLE")
+        self.assertEqual(characterization["b_full"]["observations"][0]["bytes"], 12288)
+        run = characterization["runs"][0]
+        self.assertEqual(run["status"], "RESIDENT_BASELINE")
+        self.assertEqual(run["resident_after_fill"], 12288)
+        self.assertEqual(run["physical_relief_bytes"], 0)
+        self.assertEqual(run["offload"]["actions"], 0)
+        self.assertEqual(run["offload"]["write_syscalls"], 0)
+        self.assertEqual(run["resume"]["read_syscalls"], 0)
+
+    def test_resident_target_change_does_not_change_action_target(self) -> None:
+        runner = load_runner_module()
+        first_value = self.characterization_spec()
+        first_spec, first_cases, _, _ = runner.validate_spec(first_value)
+        first_env = runner.runtime_environment(
+            first_spec, first_cases["case"], self.root / "first-backing")
+
+        second_value = json.loads(json.dumps(first_value))
+        second_value["cases"][0]["kv_target_bytes"] = 8192
+        second_spec, second_cases, _, _ = runner.validate_spec(second_value)
+        second_env = runner.runtime_environment(
+            second_spec, second_cases["case"], self.root / "second-backing")
+
+        self.assertEqual(first_env["LLAMA_KV_PRESSURE_UNIFIED_ACTION_TARGET_BYTES"], "8192")
+        self.assertEqual(second_env["LLAMA_KV_PRESSURE_UNIFIED_ACTION_TARGET_BYTES"], "8192")
+        self.assertEqual(first_env["LLAMA_KV_RESIDENT_TARGET_BYTES"], "4096")
+        self.assertEqual(second_env["LLAMA_KV_RESIDENT_TARGET_BYTES"], "8192")
+
+    def test_characterization_marks_resume_once_and_excludes_steady_repeats(self) -> None:
+        value = self.characterization_spec()
+        value["workload"]["repeat"] = 3
+        spec = self.write_spec(value, "characterization-repeats.json")
+        artifact = self.root / "characterization-repeats"
+        runner = self.run_runner(spec, artifact)
+        self.assertEqual(runner.returncode, 0, runner.stderr)
+        parsed = self.run_parser(artifact)
+        self.assertEqual(parsed.returncode, 0, parsed.stderr)
+
+        responses = [
+            json.loads(line) for line in next(artifact.glob("runs/*/responses.jsonl"))
+            .read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual(
+            [record["measurement_phase"] for record in responses],
+            ["fill", "resume", "post_resume_steady", "post_resume_steady"],
+        )
+        result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
+        run = result["characterization"]["runs"][0]
+        self.assertEqual(run["resume_measurement"]["measurement_phase"], "resume")
+        self.assertEqual(len(run["post_resume_steady_measurements"]), 2)
+        self.assertEqual(run["performance"]["e2e_ms"]["n"], 1)
+        self.assertEqual(run["performance"]["tpot_ms_per_token"]["n"], 1)
+        self.assertEqual(run["performance"]["throughput_tokens_per_second"]["n"], 1)
+        self.assertEqual(run["post_resume_steady_performance"]["e2e_ms"]["n"], 2)
+        self.assertEqual(result["statistics"]["by_case"]["case"]["runs"][0]["e2e_ms"]["n"], 1)
+
+    def test_formal_characterization_uses_independent_rounds_not_repeat(self) -> None:
+        runner = load_runner_module()
+        parser = load_parser_module()
+        value = self.characterization_spec()
+        value["run_kind"] = "formal"
+        value["workload"]["repeat"] = 1
+        value["run_order"] = [
+            {"round": 1, "run_order": 1, "case_id": "case"},
+            {"round": 2, "run_order": 1, "case_id": "case"},
+        ]
+        runner.validate_spec(value)
+        parser.validate_spec(value)
+        value["run_order"] = [{"round": 1, "run_order": 1, "case_id": "case"}]
+        with self.assertRaisesRegex(runner.RunnerError, "at least two independent rounds"):
+            runner.validate_spec(value)
+        with self.assertRaisesRegex(parser.ParseError, "at least two independent rounds"):
+            parser.validate_spec(value)
+
+    def test_characterization_waits_for_multiple_offloads_before_target_and_resume(self) -> None:
+        artifact = self.run_characterization_artifact()
+        manifest = json.loads((artifact / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["spec"]["cases"][0]["kv_target_bytes"], 4096)
+        self.assertEqual(manifest["spec"]["cases"][0]["action_target_bytes"], 8192)
+        self.assertEqual(manifest["planned_runs"][0]["kv_target_bytes"], 4096)
+        self.assertEqual(manifest["planned_runs"][0]["action_target_bytes"], 8192)
+        execution = json.loads(
+            next(artifact.glob("runs/*/execution.json")).read_text(encoding="utf-8"))
+        settle = execution["characterization"]["settle"]
+        resume = execution["characterization"]["resume"]
+        self.assertEqual(
+            execution["environment"]["LLAMA_KV_G0_S1_RESIDENT_OBSERVATION"], "preflight")
+        self.assertEqual(settle["status"], "target_reached")
+        self.assertEqual(settle["decision_ids"], [1, 2])
+        self.assertEqual(settle["offload_decision_ids"], [1, 2])
+        self.assertEqual(settle["physical_resident_bytes"], 4096)
+        self.assertGreater(resume["started_mono_ns"], settle["completed_mono_ns"])
+
+        parsed = self.run_parser(artifact)
+        self.assertEqual(parsed.returncode, 0, parsed.stderr)
+        result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["verdict"], "TARGET_REACHED")
+        run = result["characterization"]["runs"][0]
+        self.assertEqual(run["requested_target_bytes"], 4096)
+        self.assertEqual(run["action_target_bytes"], 8192)
+        self.assertEqual(run["resident_after_fill"], 12288)
+        self.assertEqual(run["resident_settled"], 4096)
+        self.assertEqual(run["physical_relief_bytes"], 8192)
+        self.assertEqual(run["budget_debt_after"], 0)
+        self.assertEqual(run["offload"]["actions"], 2)
+        self.assertEqual(run["offload"]["blocks"], 2)
+        self.assertEqual(run["offload"]["bytes"], 8192)
+        self.assertEqual(run["offload"]["write_syscalls"], 2)
+        self.assertEqual(run["resume"]["restored_blocks"], 2)
+        self.assertEqual(run["resume"]["restored_bytes"], 8192)
+        self.assertEqual(run["resume"]["read_syscalls"], 2)
+        self.assertEqual(run["resume"]["gate_us"], 2)
+        self.assertEqual(run["resume"]["total_us"], 6)
+        self.assertEqual(run["resident_after_resume"], 12288)
+        self.assertEqual(run["k2"]["pipeline_wall_us"], 11)
+        self.assertEqual(run["k2"]["read_us"], 2)
+        self.assertEqual(run["k2"]["unpack_us"], 3)
+        self.assertEqual(run["k2"]["prefault"]["us"], 0)
+        self.assertEqual(run["k2"]["scatter"]["us"], 10)
+        self.assertEqual(run["performance"]["ttft_ms"]["status"], "UNAVAILABLE")
+        self.assertEqual(run["performance"]["e2e_ms"]["status"], "AVAILABLE")
+        self.assertEqual(
+            run["performance"]["throughput_tokens_per_second"]["status"], "AVAILABLE")
+
+    def test_first_offload_is_not_a_characterization_terminal(self) -> None:
+        runner = load_runner_module()
+        first = ACTION_FIELDS | {
+            "decision_reason": "budget_offload_submitted",
+            "budget_resident_bytes": "12288",
+            "budget_observed_excess_bytes": "8192",
+            "budget_debt_after_bytes": "4096",
+            "debt_after_bytes": "4096",
+            "shortfall_bytes": "4096",
+        }
+        observations, terminal = runner.budget_settle_observations(
+            marker("kv_pressure_unified_action", first), "RSS_ABSOLUTE", 4096, 8192, 64, 0)
+        self.assertEqual([item["decision_id"] for item in observations], [1])
+        self.assertIsNone(terminal)
+
+    def test_unmet_terminal_is_valid_floor_with_actual_resident(self) -> None:
+        artifact = self.run_characterization_artifact(mode="characterization_unmet")
+        parsed = self.run_parser(artifact)
+        self.assertEqual(parsed.returncode, 0, parsed.stderr)
+        result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["verdict"], "UNMET_FLOOR")
+        run = result["characterization"]["runs"][0]
+        self.assertEqual(run["requested_target_bytes"], 4096)
+        self.assertEqual(run["resident_settled"], 8192)
+        self.assertEqual(run["unmet_budget_bytes"], 4096)
+        self.assertNotEqual(run["requested_target_bytes"], run["resident_settled"])
+        floor = result["characterization"]["b_reachable_floor"]
+        self.assertEqual(floor["status"], "AVAILABLE")
+        self.assertEqual(floor["requested_target_bytes"], 4096)
+        self.assertEqual(floor["observations"][0]["resident_settled"], 8192)
+
+    def test_characterization_timeout_is_invalid_and_never_resumes(self) -> None:
+        value = self.characterization_spec(mode="characterization_timeout")
+        value["workload"]["characterization"]["settle_timeout_seconds"] = 0.25
+        artifact = self.root / "characterization-timeout"
+        runner = self.run_runner(self.write_spec(value, "characterization-timeout.json"), artifact)
+        self.assertEqual(runner.returncode, 1, runner.stderr)
+        execution = json.loads(
+            next(artifact.glob("runs/*/execution.json")).read_text(encoding="utf-8"))
+        self.assertEqual(execution["characterization"]["settle"]["status"], "timeout")
+        self.assertEqual(execution["characterization"]["settle"]["offload_decision_ids"], [1])
+        self.assertIsNone(execution["characterization"]["resume"])
+        responses = next(artifact.glob("runs/*/responses.jsonl")).read_text(
+            encoding="utf-8").splitlines()
+        self.assertEqual(len(responses), 1)
+        parsed = self.run_parser(artifact)
+        self.assertNotEqual(parsed.returncode, 0)
+        result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["verdict"], "INVALID_ARTIFACT")
+
+    def test_transient_staging_is_not_subtracted_from_steady_target(self) -> None:
+        artifact = self.run_characterization_artifact()
+        parsed = self.run_parser(artifact)
+        self.assertEqual(parsed.returncode, 0, parsed.stderr)
+        run = json.loads((artifact / "result.json").read_text(
+            encoding="utf-8"))["characterization"]["runs"][0]
+        self.assertEqual(run["requested_target_bytes"], 4096)
+        self.assertEqual(run["resident_settled"], 4096)
+        self.assertEqual(run["transient_staging_peak_bytes"], 2048)
+        self.assertEqual(run["transient_staging_bound_bytes"], 2048)
+        self.assertEqual(run["status"], "TARGET_REACHED")
+
+    def test_requested_target_cannot_be_replaced_by_actual_resident(self) -> None:
+        artifact = self.run_characterization_artifact(mode="characterization_unmet")
+        execution_path = next(artifact.glob("runs/*/execution.json"))
+        execution = json.loads(execution_path.read_text(encoding="utf-8"))
+        execution["characterization"]["requested_target_bytes"] = 8192
+        execution_path.write_text(json.dumps(execution), encoding="utf-8")
+        parsed = self.run_parser(artifact)
+        self.assertNotEqual(parsed.returncode, 0)
+        result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["verdict"], "INVALID_ARTIFACT")
+        self.assertIn("requested target", result["errors"][0])
+
     def test_nonstreaming_first_byte_is_rejected_as_ttft(self) -> None:
         artifact = self.run_real_artifact()
         response = next(artifact.glob("runs/*/responses.jsonl"))
@@ -768,6 +1138,7 @@ class CanonicalBenchmarkTest(unittest.TestCase):
         spec_value["cases"].append({
             "case_id": "case-2", "policy": "resident", "kv_representation": "paged",
             "loading_mode": "exact", "restore": "k1_sync", "prefault": "off", "kv_target_bytes": None,
+            "action_target_bytes": None,
         })
         spec_value["run_order"].append({"round": 1, "run_order": 2, "case_id": "case-2"})
         spec = self.write_spec(spec_value, "plan.json")
@@ -813,6 +1184,7 @@ class CanonicalBenchmarkTest(unittest.TestCase):
         spec_value["cases"].append({
             "case_id": "case-2", "policy": "resident", "kv_representation": "paged",
             "loading_mode": "exact", "restore": "k1_sync", "prefault": "off", "kv_target_bytes": None,
+            "action_target_bytes": None,
         })
         spec_value["run_order"].append({"round": 1, "run_order": 2, "case_id": "case-2"})
         spec = self.write_spec(spec_value, "missing-case.json")

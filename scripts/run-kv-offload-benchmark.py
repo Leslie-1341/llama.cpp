@@ -30,13 +30,14 @@ RUNNER = pathlib.Path(__file__).resolve()
 PARSER = ROOT / "scripts" / "parse-kv-offload-benchmark.py"
 MEMORY_SAMPLER = ROOT / "scripts" / "kv-controlled-memory-sampler.sh"
 PROTOCOL = "kv_offload_benchmark"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SUPPORTED_POLICIES = {"resident", "v2"}
 SUPPORTED_KV_REPRESENTATIONS = {"paged"}
 SUPPORTED_LOADING_MODES = {"exact"}
 SUPPORTED_RESTORES = {"k1_sync", "k2_pipeline"}
 SUPPORTED_PREFAULTS = {"off", "r2"}
 SUPPORTED_RUN_KINDS = {"qualification", "formal"}
+SUPPORTED_RUN_MODES = {"qualification", "characterization"}
 CASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 SAMPLE_SCHEMA = "v2"
 DEFAULT_SAMPLE_INTERVAL = 0.10
@@ -311,7 +312,7 @@ def validate_pressure_authority(
     if spec["run_kind"] == "formal" and basis["authority"] != "cgroup_finite":
         raise UnsupportedPlan(
             "pre_workload_pressure_authority",
-            "formal V2 qualification requires real finite cgroup pressure authority",
+            "formal V2 run requires real finite cgroup pressure authority",
         )
     if basis["authority"] != "cgroup_finite":
         return
@@ -416,7 +417,11 @@ def normalize_pressure_basis(value: Any) -> dict[str, Any]:
 
 
 def normalize_workload(value: Any) -> dict[str, Any]:
-    workload = validate_mapping(value, {"warmup", "requests", "repeat", "qualification"}, "workload")
+    workload = validate_mapping(
+        value,
+        {"warmup", "requests", "repeat", "qualification", "characterization"},
+        "workload",
+    )
     if not isinstance(workload["warmup"], list) or not isinstance(workload["requests"], list):
         raise RunnerError("workload warmup/requests must be arrays")
     warmup = [normalize_request(item, f"workload.warmup[{i}]") for i, item in enumerate(workload["warmup"])]
@@ -429,6 +434,7 @@ def normalize_workload(value: Any) -> dict[str, Any]:
         raise RunnerError("workload.repeat must be in [1, 1000]")
     if not requests:
         raise RunnerError("workload.requests must contain at least one measurement request")
+
     qualification = workload["qualification"]
     if qualification is not None:
         qualification = validate_mapping(
@@ -454,7 +460,51 @@ def normalize_workload(value: Any) -> dict[str, Any]:
             "offload_timeout_seconds": offload_timeout_seconds,
             "resume_request_id": resume_request_id,
         }
-    return {"warmup": warmup, "requests": requests, "repeat": repeat, "qualification": qualification}
+
+    characterization = workload["characterization"]
+    if characterization is not None:
+        characterization = validate_mapping(
+            characterization,
+            {
+                "idle_seconds", "settle_timeout_seconds", "target_tolerance_bytes",
+                "resume_request_id",
+            },
+            "workload.characterization",
+        )
+        idle_seconds = require_finite_positive(
+            characterization["idle_seconds"], "workload.characterization.idle_seconds")
+        settle_timeout_seconds = require_finite_positive(
+            characterization["settle_timeout_seconds"],
+            "workload.characterization.settle_timeout_seconds",
+        )
+        tolerance = characterization["target_tolerance_bytes"]
+        if isinstance(tolerance, bool) or not isinstance(tolerance, int) or tolerance < 0:
+            raise RunnerError(
+                "workload.characterization.target_tolerance_bytes must be a non-negative integer")
+        resume_request_id = characterization["resume_request_id"]
+        if not isinstance(resume_request_id, str) or resume_request_id not in {
+                item["request_id"] for item in requests}:
+            raise RunnerError(
+                "workload.characterization.resume_request_id must reference a measurement request")
+        if resume_request_id != requests[0]["request_id"]:
+            raise RunnerError(
+                "workload.characterization.resume_request_id must be the first measurement request")
+        if not warmup:
+            raise RunnerError("characterization requires at least one warmup/fill request")
+        characterization = {
+            "idle_seconds": idle_seconds,
+            "settle_timeout_seconds": settle_timeout_seconds,
+            "target_tolerance_bytes": tolerance,
+            "resume_request_id": resume_request_id,
+        }
+
+    return {
+        "warmup": warmup,
+        "requests": requests,
+        "repeat": repeat,
+        "qualification": qualification,
+        "characterization": characterization,
+    }
 
 
 def normalize_cases(value: Any) -> dict[str, dict[str, Any]]:
@@ -464,7 +514,10 @@ def normalize_cases(value: Any) -> dict[str, dict[str, Any]]:
     for index, raw in enumerate(value):
         item = validate_mapping(
             raw,
-            {"case_id", "policy", "kv_representation", "loading_mode", "restore", "prefault", "kv_target_bytes"},
+            {
+                "case_id", "policy", "kv_representation", "loading_mode", "restore", "prefault",
+                "kv_target_bytes", "action_target_bytes",
+            },
             f"cases[{index}]",
         )
         case_id = item["case_id"]
@@ -476,13 +529,23 @@ def normalize_cases(value: Any) -> dict[str, dict[str, Any]]:
             if not isinstance(item[factor], str):
                 raise RunnerError(f"{case_id}.{factor} must be a string")
         target = item["kv_target_bytes"]
+        action_target = item["action_target_bytes"]
         if target is not None and (isinstance(target, bool) or not isinstance(target, int) or target <= 0):
             raise RunnerError(f"{case_id}.kv_target_bytes must be null or positive")
-        if item["policy"] == "resident" and target is not None:
-            raise RunnerError(f"{case_id}: resident policy cannot have a target")
-        if item["policy"] == "v2" and target is None:
-            raise RunnerError(f"{case_id}: v2 policy requires kv_target_bytes")
+        if action_target is not None and (
+                isinstance(action_target, bool) or not isinstance(action_target, int) or action_target <= 0):
+            raise RunnerError(f"{case_id}.action_target_bytes must be null or positive")
+        if item["policy"] == "resident":
+            if target is not None or action_target is not None:
+                raise RunnerError(f"{case_id}: resident policy cannot have resident/action targets")
+        elif item["policy"] == "v2" and (target is None or action_target is None):
+            raise RunnerError(
+                f"{case_id}: v2 policy requires explicit kv_target_bytes and action_target_bytes")
         cases[case_id] = dict(item)
+    action_targets = {case["action_target_bytes"] for case in cases.values() if case["policy"] == "v2"}
+    if len(action_targets) > 1:
+        raise RunnerError(
+            "all v2 budget cases must use the same explicit action_target_bytes")
     return cases
 
 
@@ -520,6 +583,7 @@ def normalize_plan(value: Any, cases: dict[str, dict[str, Any]]) -> list[dict[st
             "restore": case["restore"],
             "prefault": case["prefault"],
             "kv_target_bytes": case["kv_target_bytes"],
+            "action_target_bytes": case["action_target_bytes"],
         })
     return plan
 
@@ -531,7 +595,7 @@ def validate_spec(raw: Any) -> tuple[dict[str, Any], dict[str, dict[str, Any]], 
     spec = validate_mapping(
         raw,
         {
-            "schema_version", "protocol", "phase", "run_kind", "binary", "model", "model_quantization",
+            "schema_version", "protocol", "phase", "run_kind", "run_mode", "binary", "model", "model_quantization",
             "server_args", "environment", "pressure_basis", "workload", "cases", "run_order", "sampler",
             "cgroup", "max_blocks", "health_timeout_seconds", "request_timeout_seconds",
         },
@@ -543,6 +607,8 @@ def validate_spec(raw: Any) -> tuple[dict[str, Any], dict[str, dict[str, Any]], 
         raise RunnerError("spec.phase is invalid")
     if spec["run_kind"] not in SUPPORTED_RUN_KINDS:
         raise RunnerError("spec.run_kind is invalid")
+    if spec["run_mode"] not in SUPPORTED_RUN_MODES:
+        raise RunnerError("spec.run_mode is invalid")
     for key in ("binary", "model", "model_quantization"):
         if not isinstance(spec[key], str) or not spec[key]:
             raise RunnerError(f"spec.{key} must be a non-empty string")
@@ -568,11 +634,18 @@ def validate_spec(raw: Any) -> tuple[dict[str, Any], dict[str, dict[str, Any]], 
     workload = normalize_workload(spec["workload"])
     cases = normalize_cases(spec["cases"])
     plan = normalize_plan(spec["run_order"], cases)
-    if spec["run_kind"] == "qualification" and workload["qualification"] is None:
-        raise RunnerError("qualification run requires explicit idle/offload-barrier/resume configuration")
+    if spec["run_mode"] == "qualification":
+        if workload["qualification"] is None or workload["characterization"] is not None:
+            raise RunnerError(
+                "qualification mode requires only workload.qualification configuration")
+    elif workload["characterization"] is None or workload["qualification"] is not None:
+        raise RunnerError(
+            "characterization mode requires only workload.characterization configuration")
     if spec["run_kind"] == "formal":
-        if len({item["round"] for item in plan}) < 2 or workload["repeat"] < 2:
-            raise RunnerError("formal run requires explicit multi-round plan and repeat >= 2")
+        if len({item["round"] for item in plan}) < 2:
+            raise RunnerError("formal run requires at least two independent rounds")
+        if spec["run_mode"] == "qualification" and workload["repeat"] < 2:
+            raise RunnerError("formal qualification run requires repeat >= 2")
     normalized = dict(spec)
     normalized["pressure_basis"] = pressure_basis
     normalized["workload"] = workload
@@ -584,17 +657,21 @@ def validate_spec(raw: Any) -> tuple[dict[str, Any], dict[str, dict[str, Any]], 
     return normalized, cases, plan, workload
 
 
-def expanded_request_plan(workload: dict[str, Any], policy: str) -> list[dict[str, Any]]:
+def expanded_request_plan(
+        workload: dict[str, Any], policy: str, run_mode: str) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     sequence = 0
 
-    def append(item: dict[str, Any], request_id: str, repeat_index: int, measurement: bool) -> None:
+    def append(
+            item: dict[str, Any], request_id: str, repeat_index: int, measurement: bool,
+            measurement_phase: str) -> None:
         nonlocal sequence
         result.append({
             "sequence": sequence,
             "request_id": request_id,
             "repeat_index": repeat_index,
             "measurement": measurement,
+            "measurement_phase": measurement_phase,
             "n_predict": item["n_predict"],
             "prompt_sha256": sha256_bytes(item["prompt"].encode("utf-8")),
             "stream": item["stream"],
@@ -602,15 +679,23 @@ def expanded_request_plan(workload: dict[str, Any], policy: str) -> list[dict[st
         sequence += 1
 
     for item in workload["warmup"]:
-        append(item, item["request_id"], 0, False)
+        append(item, item["request_id"], 0, False, "fill")
     for repeat_index in range(1, workload["repeat"] + 1):
-        for item in workload["requests"]:
-            append(item, item["request_id"], repeat_index, True)
-    if workload["qualification"] is not None and policy == "v2":
+        for request_index, item in enumerate(workload["requests"]):
+            if run_mode == "characterization" and policy == "v2":
+                measurement_phase = (
+                    "resume" if repeat_index == 1 and request_index == 0
+                    else "post_resume_steady")
+            elif run_mode == "characterization":
+                measurement_phase = "resident_steady"
+            else:
+                measurement_phase = "qualification_measurement"
+            append(item, item["request_id"], repeat_index, True, measurement_phase)
+    if run_mode == "qualification" and workload["qualification"] is not None and policy == "v2":
         resume_request_id = workload["qualification"]["resume_request_id"]
         resume_request = next(
             item for item in workload["requests"] if item["request_id"] == resume_request_id)
-        append(resume_request, resume_request_id, 0, False)
+        append(resume_request, resume_request_id, 0, False, "qualification_resume")
     return result
 
 
@@ -629,7 +714,9 @@ def runtime_environment(
         "LLAMA_KV_PAGED_IO_STATS": "1",
         "LLAMA_KV_PAGED_PREFETCH_PHASE_TRACE": "0",
         "LLAMA_KV_RESUME_STAGE_TIMING": "1",
-        "LLAMA_KV_G0_S1_RESIDENT_OBSERVATION": "preflight" if case["policy"] == "resident" else "1",
+        "LLAMA_KV_G0_S1_RESIDENT_OBSERVATION": (
+            "1" if case["policy"] == "v2" and spec["run_mode"] == "qualification"
+            else "preflight"),
         "LLAMA_KV_PRESSURE_SAMPLE_INTERVAL_MS": "100",
         "LLAMA_KV_PRESSURE_LOG_INTERVAL_MS": "1000",
         "LLAMA_KV_PRESSURE_SAMPLER": "1",
@@ -658,13 +745,14 @@ def runtime_environment(
         ):
             env.pop(key, None)
     elif case["policy"] == "v2":
-        target = str(case["kv_target_bytes"])
+        resident_target = str(case["kv_target_bytes"])
+        action_target = str(case["action_target_bytes"])
         env.update({
             "LLAMA_KV_PRESSURE_UNIFIED_ACTION": "1",
             "LLAMA_KV_PRESSURE_GOVERNOR_CLAIMANT_TRACE": "1",
-            "LLAMA_KV_PRESSURE_UNIFIED_ACTION_TARGET_BYTES": target,
+            "LLAMA_KV_PRESSURE_UNIFIED_ACTION_TARGET_BYTES": action_target,
             "LLAMA_KV_PRESSURE_UNIFIED_ACTION_MAX_BLOCKS": str(spec["max_blocks"]),
-            "LLAMA_KV_RESIDENT_TARGET_BYTES": target,
+            "LLAMA_KV_RESIDENT_TARGET_BYTES": resident_target,
             "LLAMA_KV_RESIDENT_TARGET_SOURCE": "env_static",
         })
     return env
@@ -735,6 +823,24 @@ def capture_slots(port: int, path: pathlib.Path, timeout: float) -> dict[str, An
     return snapshot
 
 
+def captured_resident_bytes(snapshot: dict[str, Any]) -> int:
+    slots = snapshot.get("body_json")
+    if not isinstance(slots, list):
+        raise RunnerError("slot snapshot body is unavailable")
+    values: list[int] = []
+    for slot in slots:
+        resident = slot.get("kv_resident") if isinstance(slot, dict) else None
+        if not isinstance(resident, dict) or resident.get("status") != "available":
+            continue
+        value = resident.get("resident_bytes")
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise RunnerError("slot physical resident value is invalid")
+        values.append(value)
+    if not values or any(value != values[0] for value in values[1:]):
+        raise RunnerError("slot physical resident observation is missing or inconsistent")
+    return values[0]
+
+
 def request_completion(
         port: int,
         plan_item: dict[str, Any],
@@ -786,6 +892,7 @@ def request_completion(
         "request_id": plan_item["request_id"],
         "repeat_index": plan_item["repeat_index"],
         "measurement": plan_item["measurement"],
+        "measurement_phase": plan_item["measurement_phase"],
         "n_predict": plan_item["n_predict"],
         "stream": plan_item["stream"],
         "started_mono_ns": started_mono,
@@ -991,6 +1098,175 @@ def wait_real_offload_barrier(
         time.sleep(0.02)
 
 
+def budget_settle_observations(
+        text: str,
+        expected_source: str,
+        resident_target_bytes: int,
+        action_target_bytes: int,
+        max_blocks: int,
+        tolerance_bytes: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    observations: list[dict[str, Any]] = []
+    terminal: dict[str, Any] | None = None
+    seen_decisions: set[int] = set()
+    numeric_names = (
+        "decision_id", "target_bytes", "max_blocks", "budget_target_bytes", "budget_resident_bytes",
+        "budget_observed_excess_bytes", "budget_debt_after_bytes",
+        "unmet_budget_bytes_after", "budget_transient_staging_bound_bytes",
+        "blocks", "bytes", "relieved_bytes",
+    )
+    for line in text.splitlines():
+        fields = parse_marker_fields(line, "kv_pressure_unified_action")
+        if fields is None:
+            continue
+        values = {name: uint_marker_field(fields, name) for name in numeric_names}
+        if any(value is None for value in values.values()):
+            continue
+        decision_id = int(values["decision_id"])
+        if decision_id in seen_decisions:
+            continue
+        if (
+            fields.get("state") != "NORMAL"
+            or fields.get("source") != expected_source
+            or fields.get("sample_valid") != "1"
+            or fields.get("stale") != "0"
+            or fields.get("pressure_basis_valid") != "1"
+            or fields.get("budget_active") != "1"
+            or fields.get("budget_target_enabled") != "1"
+            or fields.get("budget_source") != "env_static"
+            or int(values["target_bytes"]) != action_target_bytes
+            or int(values["max_blocks"]) != max_blocks
+            or int(values["budget_target_bytes"]) != resident_target_bytes
+            or fields.get("budget_view_valid") != "1"
+            or fields.get("budget_resident_available") != "1"
+            or fields.get("idle") != "1"
+        ):
+            continue
+        resident_bytes = int(values["budget_resident_bytes"])
+        observed_excess = max(0, resident_bytes - resident_target_bytes)
+        if int(values["budget_observed_excess_bytes"]) != observed_excess:
+            continue
+        positive_offload = (
+            fields.get("offload_attempted") == "1"
+            and fields.get("outcome") == "completed"
+            and fields.get("state_changed") == "1"
+            and fields.get("io_failure") == "0"
+            and int(values["blocks"]) > 0
+            and int(values["bytes"]) > 0
+            and int(values["relieved_bytes"]) > 0
+        )
+        positive_release = (
+            fields.get("release_attempted") == "1"
+            and fields.get("outcome") == "completed"
+            and fields.get("state_changed") == "1"
+            and fields.get("io_failure") == "0"
+            and int(values["blocks"]) > 0
+            and int(values["relieved_bytes"]) > 0
+        )
+        summary = {
+            "decision_id": decision_id,
+            "decision_reason": fields.get("decision_reason"),
+            "action_target_bytes": action_target_bytes,
+            "max_blocks": max_blocks,
+            "budget_target_bytes": resident_target_bytes,
+            "budget_resident_bytes": resident_bytes,
+            "budget_observed_excess_bytes": observed_excess,
+            "budget_debt_after_bytes": int(values["budget_debt_after_bytes"]),
+            "unmet_budget_bytes_after": int(values["unmet_budget_bytes_after"]),
+            "budget_transient_staging_bound_bytes": int(
+                values["budget_transient_staging_bound_bytes"]),
+            "positive_offload": positive_offload,
+            "positive_release": positive_release,
+        }
+        observations.append(summary)
+        seen_decisions.add(decision_id)
+        if (
+            (positive_offload or positive_release)
+            and summary["budget_debt_after_bytes"] == 0
+            and summary["unmet_budget_bytes_after"] == 0
+        ):
+            terminal = {"status": "debt_closed", **summary}
+            break
+        if (
+            fields.get("decision_reason") == "budget_target_satisfied"
+            and resident_bytes <= resident_target_bytes + tolerance_bytes
+            and observed_excess == 0
+            and summary["budget_debt_after_bytes"] == 0
+            and summary["unmet_budget_bytes_after"] == 0
+        ):
+            terminal = {"status": "target_reached", **summary}
+            break
+        if (
+            fields.get("decision_reason") == "budget_unmet_terminal"
+            and observed_excess > 0
+            and summary["budget_debt_after_bytes"] == observed_excess
+            and summary["unmet_budget_bytes_after"] == observed_excess
+        ):
+            terminal = {"status": "unmet_floor", **summary}
+            break
+    return observations, terminal
+
+
+def wait_budget_settle(
+        stderr_path: pathlib.Path,
+        start_offset: int,
+        timeout_seconds: float,
+        expected_source: str,
+        resident_target_bytes: int,
+        action_target_bytes: int,
+        max_blocks: int,
+        tolerance_bytes: int,
+        server: subprocess.Popen[bytes],
+) -> dict[str, Any]:
+    started_mono_ns = time.monotonic_ns()
+    deadline = time.monotonic() + timeout_seconds
+    last_complete_offset = start_offset
+    while True:
+        text, complete_offset = complete_stderr_suffix(stderr_path, start_offset)
+        last_complete_offset = max(last_complete_offset, complete_offset)
+        observations, terminal = budget_settle_observations(
+            text,
+            expected_source,
+            resident_target_bytes,
+            action_target_bytes,
+            max_blocks,
+            tolerance_bytes,
+        )
+        if terminal is not None:
+            completed_mono_ns = time.monotonic_ns()
+            return {
+                "status": terminal.pop("status"),
+                "started_mono_ns": started_mono_ns,
+                "completed_mono_ns": completed_mono_ns,
+                "duration_ns": completed_mono_ns - started_mono_ns,
+                "stderr_start_offset": start_offset,
+                "stderr_end_offset": complete_offset,
+                "terminal_decision": terminal,
+                "physical_resident_bytes": None,
+                "decision_ids": [item["decision_id"] for item in observations],
+                "offload_decision_ids": [
+                    item["decision_id"] for item in observations if item["positive_offload"]],
+            }
+        if server.poll() is not None:
+            raise RunnerError("server exited while waiting for the budget settle marker")
+        if time.monotonic() >= deadline:
+            completed_mono_ns = time.monotonic_ns()
+            return {
+                "status": "timeout",
+                "started_mono_ns": started_mono_ns,
+                "completed_mono_ns": completed_mono_ns,
+                "duration_ns": completed_mono_ns - started_mono_ns,
+                "stderr_start_offset": start_offset,
+                "stderr_end_offset": last_complete_offset,
+                "terminal_decision": None,
+                "physical_resident_bytes": None,
+                "decision_ids": [item["decision_id"] for item in observations],
+                "offload_decision_ids": [
+                    item["decision_id"] for item in observations if item["positive_offload"]],
+            }
+        time.sleep(0.02)
+
+
 def process_group_alive(pgid: int) -> bool:
     try:
         os.killpg(pgid, 0)
@@ -1066,7 +1342,7 @@ def run_one(
     backing_dir = run_dir / "backing"
     raw_dir.mkdir(parents=True)
     backing_dir.mkdir()
-    request_plan = expanded_request_plan(workload, case["policy"])
+    request_plan = expanded_request_plan(workload, case["policy"], spec["run_mode"])
     dump(run_dir / "run.json", {
         "run_id": run["run_id"],
         "round": run["round"],
@@ -1091,10 +1367,12 @@ def run_one(
     sampler_identity_record: dict[str, Any] | None = None
     server_cgroup: dict[str, Any] | None = None
     runner_cgroup = cgroup_identity(os.getpid())
-    sampler_cgroup_dir = ""
     request_loop_started = False
     request_records: list[dict[str, Any]] = []
-    qualification_config = workload["qualification"]
+    qualification_config = (
+        workload["qualification"] if spec["run_mode"] == "qualification" else None)
+    characterization_config = (
+        workload["characterization"] if spec["run_mode"] == "characterization" else None)
     qualification_record: dict[str, Any] = {
         "idle_seconds": (
             qualification_config["idle_seconds"] if qualification_config is not None else None),
@@ -1107,13 +1385,33 @@ def run_one(
         "offload_barrier": None,
         "resume": None,
     }
+    characterization_record: dict[str, Any] = {
+        "idle_seconds": (
+            characterization_config["idle_seconds"] if characterization_config is not None else None),
+        "settle_timeout_seconds": (
+            characterization_config["settle_timeout_seconds"]
+            if characterization_config is not None else None),
+        "target_tolerance_bytes": (
+            characterization_config["target_tolerance_bytes"]
+            if characterization_config is not None else None),
+        "resume_request_id": (
+            characterization_config["resume_request_id"]
+            if characterization_config is not None else None),
+        "requested_target_bytes": (
+            case["kv_target_bytes"] if characterization_config is not None else None),
+        "action_target_bytes": (
+            case["action_target_bytes"] if characterization_config is not None else None),
+        "after_fill": None,
+        "idle": None,
+        "settle": None,
+        "settled": None,
+        "resume": None,
+        "after_measurement": None,
+    }
     lifecycle_error: str | None = None
     server_exit: int | None = None
     sampler_exit: int | None = None
-    stop_signal: str | None = None
-    sampler_stop_signal: str | None = None
     server_handle = None
-    sampler_handle = None
     server_cleanup: dict[str, Any] = {
         "pid": None, "pgid": None, "exit_code": None, "stop_requested": False,
         "stop_signal": None, "term_timed_out": False, "kill_timed_out": False,
@@ -1124,6 +1422,10 @@ def run_one(
         "stop_signal": None, "term_timed_out": False, "kill_timed_out": False,
         "pgid_check_complete": False, "residual_process": False,
     }
+
+    def snapshot_reference(filename: str, snapshot: dict[str, Any]) -> dict[str, Any]:
+        return {"path": filename, "captured_mono_ns": snapshot["captured_mono_ns"]}
+
     try:
         server_handle = stdout_path.open("wb")
         server_err_handle = stderr_path.open("wb")
@@ -1145,11 +1447,10 @@ def run_one(
         if spec["pressure_basis"]["authority"] == "cgroup_finite" and not finite_memory_limit(
                 server_cgroup.get("memory_max")):
             raise RunnerError("server cgroup does not provide a finite pressure authority")
-        sampler_cgroup_dir = server_cgroup.get("path") or ""
         current_file = server_cgroup.get("memory_current_file") or ""
         sampler_env = dict(os.environ)
         sampler_env["KV_CONTROLLED_SAMPLE_SCHEMA"] = SAMPLE_SCHEMA
-        sampler_env["KV_CONTROLLED_CGROUP_DIR"] = sampler_cgroup_dir
+        sampler_env["KV_CONTROLLED_CGROUP_DIR"] = server_cgroup.get("path") or ""
         sampler_command = [
             "bash", str(MEMORY_SAMPLER), "--sample-process", str(server.pid),
             str(samples_path), str(backing_dir), str(spec["sampler"]["interval_seconds"]), current_file,
@@ -1168,11 +1469,11 @@ def run_one(
         wait_health(port, server, spec["health_timeout_seconds"])
         capture_slots(port, run_dir / "slots_before.json", spec["request_timeout_seconds"])
         request_loop_started = True
-        request_by_id = {item["request_id"]: item for item in workload["warmup"] + workload["requests"]}
-        resume_planned = qualification_config is not None and case["policy"] == "v2"
-        fill_plan = request_plan[:-1] if resume_planned else request_plan
+        request_by_id = {
+            item["request_id"]: item for item in workload["warmup"] + workload["requests"]}
+
         with responses_path.open("w", encoding="utf-8") as responses:
-            for item in fill_plan:
+            def issue(item: dict[str, Any]) -> dict[str, Any]:
                 request = request_by_id.get(item["request_id"])
                 if request is None:
                     raise RunnerError(f"missing request body for {item['request_id']}")
@@ -1181,7 +1482,15 @@ def run_one(
                 responses.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
                 responses.flush()
                 request_records.append(record)
-            if qualification_config is not None:
+                return record
+
+            if spec["run_mode"] == "qualification":
+                resume_planned = qualification_config is not None and case["policy"] == "v2"
+                fill_plan = request_plan[:-1] if resume_planned else request_plan
+                for item in fill_plan:
+                    issue(item)
+                if qualification_config is None:
+                    raise RunnerError("qualification configuration is missing")
                 stderr_start_offset = stderr_path.stat().st_size
                 idle_started_mono_ns = time.monotonic_ns()
                 time.sleep(qualification_config["idle_seconds"])
@@ -1205,18 +1514,13 @@ def run_one(
                         raise RunnerError(
                             "qualification timed out waiting for a real OFFLOAD with transaction-local resident drop")
                     resume_item = request_plan[-1]
-                    resume_request = request_by_id[qualification_config["resume_request_id"]]
                     while time.monotonic_ns() <= barrier["completed_mono_ns"]:
                         time.sleep(0)
                     resume_stderr_start_offset = stderr_path.stat().st_size
-                    record = request_completion(
-                        port, resume_item, resume_request, raw_dir, spec["request_timeout_seconds"])
+                    record = issue(resume_item)
                     resume_stderr_end_offset = stderr_path.stat().st_size
                     if record["started_mono_ns"] <= barrier["completed_mono_ns"]:
                         raise RunnerError("qualification resume did not start after the OFFLOAD barrier")
-                    responses.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
-                    responses.flush()
-                    request_records.append(record)
                     qualification_record["resume"] = {
                         "sequence": record["sequence"],
                         "request_id": record["request_id"],
@@ -1225,6 +1529,93 @@ def run_one(
                         "stderr_start_offset": resume_stderr_start_offset,
                         "stderr_end_offset": resume_stderr_end_offset,
                     }
+            else:
+                if characterization_config is None:
+                    raise RunnerError("characterization configuration is missing")
+                warmup_plan = request_plan[:len(workload["warmup"])]
+                measurement_plan = request_plan[len(workload["warmup"]):]
+                for item in warmup_plan:
+                    issue(item)
+                after_fill = capture_slots(
+                    port, run_dir / "slots_after_fill.json", spec["request_timeout_seconds"])
+                characterization_record["after_fill"] = snapshot_reference(
+                    "slots_after_fill.json", after_fill)
+
+                if case["policy"] == "v2":
+                    stderr_start_offset = stderr_path.stat().st_size
+                    idle_started_mono_ns = time.monotonic_ns()
+                    time.sleep(characterization_config["idle_seconds"])
+                    idle_finished_mono_ns = time.monotonic_ns()
+                    characterization_record["idle"] = {
+                        "started_mono_ns": idle_started_mono_ns,
+                        "finished_mono_ns": idle_finished_mono_ns,
+                        "duration_ns": idle_finished_mono_ns - idle_started_mono_ns,
+                        "stderr_start_offset": stderr_start_offset,
+                    }
+                    settle = wait_budget_settle(
+                        stderr_path,
+                        stderr_start_offset,
+                        characterization_config["settle_timeout_seconds"],
+                        pressure_basis_source(spec["pressure_basis"]),
+                        int(case["kv_target_bytes"]),
+                        int(case["action_target_bytes"]),
+                        int(spec["max_blocks"]),
+                        characterization_config["target_tolerance_bytes"],
+                        server,
+                    )
+                    characterization_record["settle"] = settle
+                    if settle["status"] == "timeout":
+                        raise RunnerError(
+                            "characterization timed out waiting for target closure or budget_unmet_terminal")
+                    settled = capture_slots(
+                        port, run_dir / "slots_settled.json", spec["request_timeout_seconds"])
+                    settled_resident_bytes = captured_resident_bytes(settled)
+                    settle["physical_resident_bytes"] = settled_resident_bytes
+                    target_bytes = int(case["kv_target_bytes"])
+                    tolerance_bytes = characterization_config["target_tolerance_bytes"]
+                    if settle["status"] in {"debt_closed", "target_reached"}:
+                        if settled_resident_bytes > target_bytes + tolerance_bytes:
+                            raise RunnerError(
+                                "budget debt closed without actual physical resident target closure")
+                        settle["status"] = "target_reached"
+                    elif (
+                        settled_resident_bytes <= target_bytes
+                        or abs(
+                            settled_resident_bytes
+                            - settle["terminal_decision"]["budget_resident_bytes"])
+                            > tolerance_bytes
+                    ):
+                        raise RunnerError(
+                            "budget_unmet_terminal differs from actual settled physical resident")
+                    characterization_record["settled"] = snapshot_reference(
+                        "slots_settled.json", settled)
+
+                if not measurement_plan:
+                    raise RunnerError("characterization measurement plan is empty")
+                first_item = measurement_plan[0]
+                resume_stderr_start_offset = stderr_path.stat().st_size
+                first_record = issue(first_item)
+                resume_stderr_end_offset = stderr_path.stat().st_size
+                if case["policy"] == "v2":
+                    settle = characterization_record["settle"]
+                    if first_record["started_mono_ns"] <= settle["completed_mono_ns"]:
+                        raise RunnerError(
+                            "characterization resume started before budget settle completed")
+                    characterization_record["resume"] = {
+                        "sequence": first_record["sequence"],
+                        "request_id": first_record["request_id"],
+                        "started_mono_ns": first_record["started_mono_ns"],
+                        "finished_mono_ns": first_record["finished_mono_ns"],
+                        "stderr_start_offset": resume_stderr_start_offset,
+                        "stderr_end_offset": resume_stderr_end_offset,
+                    }
+                after_measurement = capture_slots(
+                    port, run_dir / "slots_after_measurement.json", spec["request_timeout_seconds"])
+                characterization_record["after_measurement"] = snapshot_reference(
+                    "slots_after_measurement.json", after_measurement)
+                for item in measurement_plan[1:]:
+                    issue(item)
+
         capture_slots(port, run_dir / "slots_after.json", spec["request_timeout_seconds"])
     except (OSError, RunnerError, subprocess.SubprocessError) as exc:
         lifecycle_error = str(exc)
@@ -1232,11 +1623,9 @@ def run_one(
         if sampler is not None:
             sampler_cleanup = terminate_process(sampler, "sampler", 5.0)
             sampler_exit = sampler_cleanup["exit_code"]
-            sampler_stop_signal = sampler_cleanup["stop_signal"]
         if server is not None:
             server_cleanup = terminate_process(server, "server", 10.0)
             server_exit = server_cleanup["exit_code"]
-            stop_signal = server_cleanup["stop_signal"]
         for handle in (
             locals().get("server_handle"), locals().get("server_err_handle"),
             locals().get("sampler_stdout_handle"), locals().get("sampler_stderr_handle"),
@@ -1259,6 +1648,7 @@ def run_one(
         "run_order": run["run_order"],
         "case_id": run["case_id"],
         "execution_index": execution_index,
+        "run_mode": spec["run_mode"],
         "argv": argv,
         "environment": env,
         "server_identity": server_identity_record,
@@ -1275,6 +1665,7 @@ def run_one(
         "request_loop_started": request_loop_started,
         "request_count": len(request_records),
         "qualification": qualification_record,
+        "characterization": characterization_record,
     }
     dump(run_dir / "execution.json", execution)
     if not responses_path.exists():
@@ -1403,7 +1794,7 @@ def execute(spec_path: pathlib.Path, output: pathlib.Path, dry_run: bool) -> int
         manifest["dry_run"] = {
             "workload_started": False,
             "request_plans": {
-                case_id: expanded_request_plan(workload, case["policy"])
+                case_id: expanded_request_plan(workload, case["policy"], spec["run_mode"])
                 for case_id, case in cases.items()
             },
         }
