@@ -15,7 +15,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT = pathlib.Path(__file__).resolve()
 PROTOCOL = "kv_offload_benchmark"
 SCHEMA_VERSION = 2
-SUPPORTED_POLICIES = {"resident", "v2"}
+SUPPORTED_POLICIES = {"resident", "release_only", "v2"}
+BUDGET_POLICIES = {"release_only", "v2"}
 SUPPORTED_KV_REPRESENTATIONS = {"paged"}
 SUPPORTED_LOADING_MODES = {"exact"}
 SUPPORTED_RESTORES = {"k1_sync", "k2_pipeline"}
@@ -387,6 +388,8 @@ def expanded_request_plan(
                 measurement_phase = (
                     "resume" if repeat_index == 1 and request_index == 0
                     else "post_resume_steady")
+            elif run_mode == "characterization" and case["policy"] == "release_only":
+                measurement_phase = "release_only_steady"
             elif run_mode == "characterization":
                 measurement_phase = "resident_steady"
             else:
@@ -449,13 +452,16 @@ def validate_spec(spec: Any) -> tuple[dict[str, dict[str, Any]], list[dict[str, 
         if case["policy"] == "resident":
             if target is not None or action_target is not None:
                 raise ParseError(f"{case_id}: resident policy cannot have resident/action targets")
-        elif case["policy"] == "v2" and (target is None or action_target is None):
+        elif case["policy"] in BUDGET_POLICIES and (target is None or action_target is None):
             raise ParseError(
-                f"{case_id}: v2 policy requires explicit kv_target_bytes and action_target_bytes")
+                f"{case_id}: {case['policy']} policy requires explicit kv_target_bytes and action_target_bytes")
         cases[case_id] = case
-    action_targets = {case["action_target_bytes"] for case in cases.values() if case["policy"] == "v2"}
+    action_targets = {
+        case["action_target_bytes"] for case in cases.values()
+        if case["policy"] in BUDGET_POLICIES
+    }
     if len(action_targets) > 1:
-        raise ParseError("all v2 budget cases must use the same explicit action_target_bytes")
+        raise ParseError("all budget cases must use the same explicit action_target_bytes")
     sampler = exact(value["sampler"], {"interval_seconds"}, "spec.sampler")
     sampler_interval = require_finite_positive(sampler["interval_seconds"], "spec.sampler.interval_seconds")
     cgroup = exact(value["cgroup"], {"expected_memory_max"}, "spec.cgroup")
@@ -493,6 +499,8 @@ def validate_spec(spec: Any) -> tuple[dict[str, dict[str, Any]], list[dict[str, 
             "kv_target_bytes": case["kv_target_bytes"],
             "action_target_bytes": case["action_target_bytes"],
         })
+    if any(item["policy"] == "release_only" for item in plan) and value["run_mode"] != "characterization":
+        raise ParseError("release_only policy is available only in characterization mode")
     if value["run_kind"] == "formal":
         if len({item["round"] for item in plan}) < 2:
             raise ParseError("formal run requires at least two independent rounds")
@@ -555,7 +563,8 @@ def marker_records(text: str, token: str, required: set[str], label: str) -> lis
     return result
 
 
-def is_qualifying_offload_action(action: dict[str, str], expected_source: str) -> bool:
+def is_qualifying_offload_action(
+        action: dict[str, str], expected_source: str, allow_shortfall: bool = False) -> bool:
     return (
         action["state"] == "NORMAL"
         and action["source"] == expected_source
@@ -570,7 +579,7 @@ def is_qualifying_offload_action(action: dict[str, str], expected_source: str) -
         and int(action["blocks"]) > 0
         and int(action["bytes"]) > 0
         and int(action["relieved_bytes"]) > 0
-        and int(action["shortfall_bytes"]) == 0
+        and (allow_shortfall or int(action["shortfall_bytes"]) == 0)
         and action["io_failure"] == "0"
     )
 
@@ -591,6 +600,7 @@ def qualified_offload_pairs(
         actions: list[dict[str, str]],
         observations: list[dict[str, str]],
         expected_source: str,
+        allow_shortfall: bool = False,
 ) -> list[dict[str, Any]]:
     observations_by_key: dict[tuple[str, str, str], list[dict[str, str]]] = {}
     for observation in observations:
@@ -601,7 +611,7 @@ def qualified_offload_pairs(
         observations_by_key.setdefault(key, []).append(observation)
     result: list[dict[str, Any]] = []
     for action in actions:
-        if not is_qualifying_offload_action(action, expected_source):
+        if not is_qualifying_offload_action(action, expected_source, allow_shortfall):
             continue
         key = (action["decision_id"], action["transaction_id"], action["selected_seq_id"])
         for observation in observations_by_key.get(key, []):
@@ -750,7 +760,7 @@ def validate_execution_environment(execution: dict[str, Any], case: dict[str, An
     if env.get("LLAMA_KV_PAGED") != "1" or env.get("LLAMA_KV_PAGED_INGRAPH") != "1":
         raise ParseError(f"{label}: paged runtime is not explicitly enabled")
     for key, expected in {
-        "LLAMA_KV_PAGED_SWAP": "0" if case["policy"] == "resident" else "1",
+        "LLAMA_KV_PAGED_SWAP": "1" if case["policy"] == "v2" else "0",
         "LLAMA_KV_PAGED_SWAP_EXPLICIT_ONLY": "1",
         "LLAMA_KV_PAGED_MINCORE": "1",
         "LLAMA_KV_PAGED_IO_STATS": "1",
@@ -772,9 +782,7 @@ def validate_execution_environment(execution: dict[str, Any], case: dict[str, An
         raise ParseError(f"{label}: canonical pressure interval environment mismatch")
     if env.get("LLAMA_KV_PRESSURE_SAMPLER") != "1" or env.get("LLAMA_KV_RESUME_STAGE_TIMING") != "1":
         raise ParseError(f"{label}: canonical telemetry environment is incomplete")
-    expected_resident_observation = (
-        "1" if case["policy"] == "v2" and spec["run_mode"] == "qualification"
-        else "preflight")
+    expected_resident_observation = "1" if case["policy"] == "v2" else "preflight"
     if env.get("LLAMA_KV_G0_S1_RESIDENT_OBSERVATION") != expected_resident_observation:
         raise ParseError(f"{label}: physical resident observation mode mismatch")
     basis = spec["pressure_basis"]
@@ -798,17 +806,17 @@ def validate_execution_environment(execution: dict[str, Any], case: dict[str, An
             "LLAMA_KV_PRESSURE_UNIFIED_ACTION_TARGET_BYTES", "LLAMA_KV_PRESSURE_UNIFIED_ACTION_MAX_BLOCKS",
         )):
             raise ParseError(f"{label}: resident policy leaked a budget target")
-    elif case["policy"] == "v2":
+    elif case["policy"] in BUDGET_POLICIES:
         resident_target = str(case["kv_target_bytes"])
         action_target = str(case["action_target_bytes"])
         if env.get("LLAMA_KV_PRESSURE_UNIFIED_ACTION") != "1" or env.get("LLAMA_KV_PRESSURE_GOVERNOR_CLAIMANT_TRACE") != "1":
-            raise ParseError(f"{label}: v2 policy did not enable unified action")
+            raise ParseError(f"{label}: {case['policy']} policy did not enable unified action")
         if env.get("LLAMA_KV_RESIDENT_TARGET_BYTES") != resident_target or env.get("LLAMA_KV_RESIDENT_TARGET_SOURCE") != "env_static":
-            raise ParseError(f"{label}: v2 resident target environment mismatch")
+            raise ParseError(f"{label}: {case['policy']} resident target environment mismatch")
         if env.get("LLAMA_KV_PRESSURE_UNIFIED_ACTION_TARGET_BYTES") != action_target:
-            raise ParseError(f"{label}: v2 action target environment mismatch")
+            raise ParseError(f"{label}: {case['policy']} action target environment mismatch")
         if env.get("LLAMA_KV_PRESSURE_UNIFIED_ACTION_MAX_BLOCKS") != str(spec["max_blocks"]):
-            raise ParseError(f"{label}: v2 action max-blocks environment mismatch")
+            raise ParseError(f"{label}: {case['policy']} action max-blocks environment mismatch")
 
 
 def validate_action_target_markers(
@@ -817,7 +825,7 @@ def validate_action_target_markers(
         spec: dict[str, Any],
         label: str,
 ) -> None:
-    if case["policy"] != "v2":
+    if case["policy"] not in BUDGET_POLICIES:
         return
     expected_action_target = int(case["action_target_bytes"])
     expected_resident_target = int(case["kv_target_bytes"])
@@ -1260,7 +1268,7 @@ def validate_characterization_record(
         {
             "idle_seconds", "settle_timeout_seconds", "target_tolerance_bytes",
             "resume_request_id", "requested_target_bytes", "action_target_bytes", "after_fill", "idle", "settle",
-            "settled", "resume", "after_measurement",
+            "release_settled", "settled", "resume", "after_measurement",
         },
         label,
     )
@@ -1284,7 +1292,7 @@ def validate_characterization_record(
         f"{label}.after_measurement",
     )
     if case["policy"] == "resident":
-        if any(record[key] is not None for key in ("idle", "settle", "settled", "resume")):
+        if any(record[key] is not None for key in ("idle", "settle", "release_settled", "settled", "resume")):
             raise ParseError(f"{label}: resident characterization contains budget-settle state")
         return record
 
@@ -1313,11 +1321,13 @@ def validate_characterization_record(
         {
             "status", "started_mono_ns", "completed_mono_ns", "duration_ns",
             "stderr_start_offset", "stderr_end_offset", "terminal_decision",
-            "physical_resident_bytes", "decision_ids", "offload_decision_ids",
+            "physical_resident_bytes", "release_settle", "release_boundary", "decision_ids", "offload_decision_ids",
         },
         f"{label}.settle",
     )
-    if settle["status"] not in {"target_reached", "unmet_floor"}:
+    if settle["status"] not in {
+        "target_reached", "unmet_floor", "release_settled", "release_no_candidate",
+    }:
         raise ParseError(f"{label}: completed characterization has no terminal settle state")
     for key in (
         "started_mono_ns", "completed_mono_ns", "duration_ns", "stderr_start_offset",
@@ -1334,6 +1344,49 @@ def validate_characterization_record(
         or settle["stderr_end_offset"] < settle["stderr_start_offset"]
     ):
         raise ParseError(f"{label}: settle timing or stderr window is inconsistent")
+    if case["policy"] == "v2":
+        validate_snapshot_reference(
+            settle["release_settle"], "slots_release_settled.json", f"{label}.settle.release_settle")
+        boundary = exact(
+            settle["release_boundary"],
+            {
+                "status", "decision_id", "budget_resident_bytes", "budget_debt_after_bytes",
+                "unmet_budget_bytes_after", "state_changed", "bytes", "relieved_bytes",
+                "soft_offload_armed_after",
+            },
+            f"{label}.settle.release_boundary",
+        )
+        if boundary["status"] not in {"release_no_candidate", "release_settled"}:
+            raise ParseError(f"{label}: invalid RELEASE phase-boundary status")
+        for key in (
+            "decision_id", "budget_resident_bytes", "budget_debt_after_bytes",
+            "unmet_budget_bytes_after", "bytes", "relieved_bytes",
+        ):
+            require_nonnegative_int(boundary[key], f"{label}.settle.release_boundary.{key}")
+        if not isinstance(boundary["state_changed"], bool) or not isinstance(
+                boundary["soft_offload_armed_after"], bool):
+            raise ParseError(f"{label}: RELEASE phase-boundary boolean is malformed")
+        if boundary["status"] == "release_no_candidate":
+            if (
+                boundary["state_changed"]
+                or boundary["bytes"] != 0
+                or boundary["relieved_bytes"] != 0
+                or boundary["budget_debt_after_bytes"] <= 0
+                or boundary["unmet_budget_bytes_after"] != 0
+                or not boundary["soft_offload_armed_after"]
+            ):
+                raise ParseError(f"{label}: RELEASE no_candidate boundary is not an armed soft-budget terminal")
+        elif (
+            not boundary["state_changed"]
+            or boundary["bytes"] <= 0
+            or boundary["relieved_bytes"] <= 0
+            or boundary["budget_debt_after_bytes"] != 0
+            or boundary["unmet_budget_bytes_after"] != 0
+            or boundary["soft_offload_armed_after"]
+        ):
+            raise ParseError(f"{label}: RELEASE target closure boundary is inconsistent")
+    elif settle["release_settle"] is not None or settle["release_boundary"] is not None:
+        raise ParseError(f"{label}: release_only settle contains an intermediate release boundary")
     for key in ("decision_ids", "offload_decision_ids"):
         values = settle[key]
         if not isinstance(values, list) or any(
@@ -1349,6 +1402,7 @@ def validate_characterization_record(
             "decision_id", "decision_reason", "action_target_bytes", "max_blocks",
             "budget_target_bytes", "budget_resident_bytes", "budget_observed_excess_bytes", "budget_debt_after_bytes",
             "unmet_budget_bytes_after", "budget_transient_staging_bound_bytes",
+            "soft_offload_armed_before", "soft_offload_armed_after",
             "positive_offload", "positive_release",
         },
         f"{label}.settle.terminal_decision",
@@ -1363,6 +1417,8 @@ def validate_characterization_record(
         not isinstance(terminal["decision_reason"], str)
         or not isinstance(terminal["positive_offload"], bool)
         or not isinstance(terminal["positive_release"], bool)
+        or terminal["soft_offload_armed_before"] not in {"0", "1"}
+        or terminal["soft_offload_armed_after"] not in {"0", "1"}
     ):
         raise ParseError(f"{label}: terminal decision fields are malformed")
     if (
@@ -1374,6 +1430,13 @@ def validate_characterization_record(
     if terminal["decision_id"] not in settle["decision_ids"]:
         raise ParseError(f"{label}: terminal decision is absent from settle decision list")
     validate_snapshot_reference(record["settled"], "slots_settled.json", f"{label}.settled")
+    validate_snapshot_reference(record["release_settled"], "slots_settled.json" if case["policy"] == "release_only" else "slots_release_settled.json", f"{label}.release_settled")
+    if case["policy"] == "release_only":
+        if record["release_settled"] != record["settled"]:
+            raise ParseError(f"{label}: release_only release/settled snapshots differ")
+        if record["resume"] is not None:
+            raise ParseError(f"{label}: release_only characterization contains a resume")
+        return record
     resume = exact(
         record["resume"],
         {
@@ -1414,6 +1477,48 @@ def authoritative_slot_resident(snapshot: dict[str, Any], label: str) -> dict[st
     return first
 
 
+def release_boundary_status(action: dict[str, str]) -> str | None:
+    if action["release_attempted"] != "1" or action["offload_attempted"] != "0":
+        return None
+    if (
+        action["outcome"] == "no_op"
+        and action["reason"] == "no_candidate"
+        and action["state_changed"] == "0"
+        and action["io_failure"] == "0"
+        and int(action["blocks"]) == 0
+        and int(action["bytes"]) == 0
+        and int(action["relieved_bytes"]) == 0
+        and action["transaction_id"] == "0"
+        and int(action["budget_debt_after_bytes"]) > 0
+        and int(action["unmet_budget_bytes_after"]) == 0
+        and action["soft_offload_armed_after"] == "1"
+    ):
+        return "release_no_candidate"
+    if (
+        action["outcome"] == "completed"
+        and action["state_changed"] == "1"
+        and action["io_failure"] == "0"
+        and int(action["blocks"]) > 0
+        and int(action["bytes"]) > 0
+        and int(action["relieved_bytes"]) > 0
+        and int(action["budget_debt_after_bytes"]) == 0
+        and int(action["unmet_budget_bytes_after"]) == 0
+        and action["soft_offload_armed_after"] == "0"
+    ):
+        return "release_settled"
+    return None
+
+
+def release_boundary_from_actions(
+        actions: list[dict[str, str]],
+) -> tuple[int, str, dict[str, str]] | None:
+    for index, action in enumerate(actions):
+        status = release_boundary_status(action)
+        if status is not None:
+            return index, status, action
+    return None
+
+
 def characterization_budget_observations(
         actions: list[dict[str, str]],
         expected_source: str,
@@ -1422,6 +1527,7 @@ def characterization_budget_observations(
         max_blocks: int,
         tolerance_bytes: int,
         label: str,
+        release_only: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     observations: list[dict[str, Any]] = []
     terminal: dict[str, Any] | None = None
@@ -1464,6 +1570,7 @@ def characterization_budget_observations(
             and int(action["blocks"]) > 0
             and int(action["relieved_bytes"]) > 0
         )
+        release_no_candidate = release_only and release_boundary_status(action) == "release_no_candidate"
         summary = {
             "decision_id": int(action["decision_id"]),
             "decision_reason": action["decision_reason"],
@@ -1476,17 +1583,25 @@ def characterization_budget_observations(
             "unmet_budget_bytes_after": int(action["unmet_budget_bytes_after"]),
             "budget_transient_staging_bound_bytes": int(
                 action["budget_transient_staging_bound_bytes"]),
+            "soft_offload_armed_before": action["soft_offload_armed_before"],
+            "soft_offload_armed_after": action["soft_offload_armed_after"],
             "positive_offload": positive_offload,
             "positive_release": positive_release,
             "action": action,
         }
         observations.append(summary)
+        if release_no_candidate:
+            terminal = {"status": "release_no_candidate", **summary}
+            break
         if (
             (positive_offload or positive_release)
             and summary["budget_debt_after_bytes"] == 0
             and summary["unmet_budget_bytes_after"] == 0
         ):
-            terminal = {"status": "debt_closed", **summary}
+            terminal = {
+                "status": "release_settled" if release_only else "debt_closed",
+                **summary,
+            }
             break
         if (
             action["decision_reason"] == "budget_target_satisfied"
@@ -1549,6 +1664,7 @@ def validate_characterization_causality(
         run_dir: pathlib.Path,
         io: dict[str, str],
         label: str,
+        qualified_pairs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     warmup_count = len(spec["workload"]["warmup"])
     if len(responses) <= warmup_count:
@@ -1564,6 +1680,9 @@ def validate_characterization_causality(
                 for item in measurements[1:]):
             raise ParseError(
                 f"{label}: characterization measurements are not classified as resume then post-resume steady")
+    elif case["policy"] == "release_only":
+        if any(item["measurement_phase"] != "release_only_steady" for item in measurements):
+            raise ParseError(f"{label}: RELEASE-only measurements are not classified as release_only_steady")
     elif any(item["measurement_phase"] != "resident_steady" for item in measurements):
         raise ParseError(f"{label}: Resident measurements are not classified as resident_steady")
 
@@ -1593,20 +1712,161 @@ def validate_characterization_causality(
     if case["policy"] == "resident":
         return {
             "status": "RESIDENT_BASELINE",
+            "performance_eligible": True,
+            "release_terminal": None,
             "requested_target_bytes": None,
             "action_target_bytes": None,
             "resume_measurement": None,
             "post_resume_steady_measurements": [],
             "resident_after_fill": resident_after_fill["resident_bytes"],
+            "resident_after_release_settle": None,
+            "resident_after_offload_settle": None,
             "resident_settled": resident_after_fill["resident_bytes"],
             "resident_after_resume": resident_after_measurement["resident_bytes"],
+            "release_physical_relief_bytes": 0,
+            "release_physical_relief_authority": "none",
+            "offload_physical_relief_bytes": 0,
+            "offload_physical_relief_authority": "none",
+            "total_physical_relief_bytes": 0,
+            "total_physical_relief_authority": "sum_of_authorities",
             "physical_relief_bytes": 0,
+            "memory_saved_bytes": 0,
+            "memory_saved_ratio": 0.0,
             "budget_debt_after": 0,
             "settle_time_seconds": None,
             "unmet_budget_bytes": 0,
+            "release": {
+                "actions": 0, "blocks": 0, "bytes": 0,
+                "physical_relieved_bytes": 0,
+            },
             "offload": {
                 "actions": 0, "blocks": 0, "bytes": 0, "physical_relieved_bytes": 0,
                 "write_syscalls": int(io["backing_write_syscalls"]),
+                "bytes_written": int(io["bytes_written"]),
+            },
+            "resume": {
+                "restored_blocks": 0, "restored_bytes": 0,
+                "read_syscalls": int(io["backing_read_syscalls"]),
+                "bytes_read": int(io["bytes_read"]), "gate_us": None, "total_us": None,
+            },
+            "transient_staging_peak_bytes": int(io["k2_peak_staging_bytes"]),
+            "transient_staging_bound_bytes": int(io["k2_staging_bound_bytes"]),
+            "k2": k2_statistics(io),
+        }
+
+    if case["policy"] == "release_only":
+        settled_snapshot = validate_slot_snapshot(
+            run_dir / "slots_settled.json", f"{label}.slots_settled")
+        if record["settled"]["captured_mono_ns"] != settled_snapshot["captured_mono_ns"]:
+            raise ParseError(f"{label}: settled snapshot reference timestamp mismatch")
+        if record["release_settled"]["captured_mono_ns"] != settled_snapshot["captured_mono_ns"]:
+            raise ParseError(f"{label}: release settled snapshot reference timestamp mismatch")
+        settled_resident = authoritative_slot_resident(settled_snapshot, f"{label}.slots_settled")
+        identity_keys = ("object_id", "generation", "page_size", "total_bytes", "total_pages")
+        if any(
+            resident_after_fill[key] != settled_resident[key]
+            or settled_resident[key] != resident_after_measurement[key]
+            for key in identity_keys
+        ):
+            raise ParseError(f"{label}: physical resident identity changed across RELEASE-only characterization")
+        if settled_resident["resident_bytes"] > resident_after_fill["resident_bytes"]:
+            raise ParseError(f"{label}: RELEASE-only settled resident exceeds after-fill resident")
+        idle = record["idle"]
+        settle = record["settle"]
+        if (
+            settled_snapshot["captured_mono_ns"] < settle["completed_mono_ns"]
+            or settled_snapshot["captured_mono_ns"] > first_measurement["started_mono_ns"]
+        ):
+            raise ParseError(f"{label}: RELEASE-only settled resident was not captured before measurement")
+        settle_text = stderr_window(
+            stderr_data, settle["stderr_start_offset"], settle["stderr_end_offset"],
+            f"{label}.settle",
+        )
+        settle_actions = marker_records(
+            settle_text, "kv_pressure_unified_action", ACTION_REQUIRED,
+            f"{label}.settle.action",
+        )
+        for action in settle_actions:
+            validate_action_fields(action, f"{label}.settle.action")
+            boolean_fields(action, ACTION_BOOL, f"{label}.settle.action")
+        observations, terminal = characterization_budget_observations(
+            settle_actions,
+            pressure_basis_source(spec["pressure_basis"]),
+            int(case["kv_target_bytes"]),
+            int(case["action_target_bytes"]),
+            int(spec["max_blocks"]),
+            int(spec["workload"]["characterization"]["target_tolerance_bytes"]),
+            f"{label}.settle",
+            release_only=True,
+        )
+        terminal_record = {key: value for key, value in terminal.items() if key not in {"status", "action"}}
+        if (
+            settle["status"] != terminal["status"]
+            or settle["decision_ids"] != [item["decision_id"] for item in observations]
+            or settle["offload_decision_ids"]
+            or settle["terminal_decision"] != terminal_record
+        ):
+            raise ParseError(f"{label}: RELEASE-only settle record differs from production markers")
+        tolerance = int(spec["workload"]["characterization"]["target_tolerance_bytes"])
+        if terminal["status"] == "release_settled":
+            if (
+                settled_resident["resident_bytes"] > int(case["kv_target_bytes"]) + tolerance
+                or terminal["budget_debt_after_bytes"] != 0
+                or terminal["unmet_budget_bytes_after"] != 0
+                or terminal["soft_offload_armed_after"] != "0"
+            ):
+                raise ParseError(f"{label}: RELEASE-only target closure lacks physical resident closure")
+        elif terminal["status"] == "release_no_candidate":
+            if abs(
+                settled_resident["resident_bytes"] - terminal["budget_resident_bytes"]
+            ) > tolerance:
+                raise ParseError(f"{label}: RELEASE no_candidate differs from settled physical resident")
+        else:
+            raise ParseError(f"{label}: invalid RELEASE-only terminal status")
+        release_actions = [
+            item["action"] for item in observations if item["action"]["release_attempted"] == "1"
+        ]
+        release_physical_relief = (
+            resident_after_fill["resident_bytes"] - settled_resident["resident_bytes"])
+        performance_eligible = terminal["status"] == "release_settled"
+        return {
+            "status": "RELEASE_SETTLED" if performance_eligible else "RELEASE_FLOOR_PROBE",
+            "release_terminal": terminal["status"],
+            "release_probe_kind": "target_point" if performance_eligible else "floor_probe",
+            "performance_eligible": performance_eligible,
+            "requested_target_bytes": int(case["kv_target_bytes"]),
+            "action_target_bytes": int(case["action_target_bytes"]),
+            "action_target_bytes": int(case["action_target_bytes"]),
+            "resume_measurement": None,
+            "post_resume_steady_measurements": [],
+            "resident_after_fill": resident_after_fill["resident_bytes"],
+            "resident_after_release_settle": settled_resident["resident_bytes"],
+            "resident_after_offload_settle": None,
+            "resident_settled": settled_resident["resident_bytes"],
+            "resident_after_resume": settled_resident["resident_bytes"],
+            "release_physical_relief_bytes": release_physical_relief,
+            "release_physical_relief_authority": "phase_boundary_slots",
+            "offload_physical_relief_bytes": 0,
+            "offload_physical_relief_authority": "not_applicable",
+            "total_physical_relief_bytes": release_physical_relief,
+            "total_physical_relief_authority": "sum_of_authorities",
+            "physical_relief_bytes": release_physical_relief,
+            "memory_saved_bytes": release_physical_relief,
+            "memory_saved_ratio": (
+                release_physical_relief / resident_after_fill["resident_bytes"]
+                if resident_after_fill["resident_bytes"] else None),
+            "budget_debt_after": terminal["budget_debt_after_bytes"],
+            "settle_time_seconds": settle["duration_ns"] / 1_000_000_000,
+            "unmet_budget_bytes": terminal["unmet_budget_bytes_after"],
+            "release": {
+                "actions": len(release_actions),
+                "blocks": sum(int(item["blocks"]) for item in release_actions),
+                "bytes": sum(int(item["bytes"]) for item in release_actions),
+                "physical_relieved_bytes": release_physical_relief,
+            },
+            "offload": {
+                "actions": 0, "blocks": 0, "bytes": 0,
+                "physical_relieved_bytes": 0, "write_syscalls": int(io["backing_write_syscalls"]),
                 "bytes_written": int(io["bytes_written"]),
             },
             "resume": {
@@ -1624,25 +1884,37 @@ def validate_characterization_causality(
     if record["settled"]["captured_mono_ns"] != settled_snapshot["captured_mono_ns"]:
         raise ParseError(f"{label}: settled snapshot reference timestamp mismatch")
     settled_resident = authoritative_slot_resident(settled_snapshot, f"{label}.slots_settled")
+    release_snapshot = validate_slot_snapshot(
+        run_dir / "slots_release_settled.json", f"{label}.slots_release_settled")
+    if record["release_settled"]["captured_mono_ns"] != release_snapshot["captured_mono_ns"]:
+        raise ParseError(f"{label}: release settled snapshot reference timestamp mismatch")
+    release_resident = authoritative_slot_resident(
+        release_snapshot, f"{label}.slots_release_settled")
     identity_keys = ("object_id", "generation", "page_size", "total_bytes", "total_pages")
     if any(
-        resident_after_fill[key] != settled_resident[key]
+        resident_after_fill[key] != release_resident[key]
+        or release_resident[key] != settled_resident[key]
         or settled_resident[key] != resident_after_measurement[key]
         for key in identity_keys
     ):
         raise ParseError(f"{label}: physical resident identity changed across characterization")
-    if settled_resident["resident_bytes"] > resident_after_fill["resident_bytes"]:
-        raise ParseError(f"{label}: settled resident exceeds after-fill B_full observation")
+    if release_resident["resident_bytes"] > resident_after_fill["resident_bytes"]:
+        raise ParseError(f"{label}: RELEASE settle exceeds after-fill B_full observation")
+    if settled_resident["resident_bytes"] > release_resident["resident_bytes"]:
+        raise ParseError(f"{label}: OFFLOAD settle exceeds RELEASE settle resident")
 
     idle = record["idle"]
     settle = record["settle"]
     if idle["started_mono_ns"] < after_fill_snapshot["captured_mono_ns"]:
         raise ParseError(f"{label}: V2 idle began before after-fill resident capture")
     if (
-        settled_snapshot["captured_mono_ns"] < settle["completed_mono_ns"]
+        release_snapshot["captured_mono_ns"] < after_fill_snapshot["captured_mono_ns"]
+        or release_snapshot["captured_mono_ns"] > settled_snapshot["captured_mono_ns"]
+        or release_snapshot["captured_mono_ns"] > first_measurement["started_mono_ns"]
+        or settled_snapshot["captured_mono_ns"] < settle["completed_mono_ns"]
         or settled_snapshot["captured_mono_ns"] > first_measurement["started_mono_ns"]
     ):
-        raise ParseError(f"{label}: settled resident was not captured before resume")
+        raise ParseError(f"{label}: RELEASE/OFFLOAD resident phases are out of order")
     resume = record["resume"]
     if (
         resume["sequence"] != first_measurement["sequence"]
@@ -1677,6 +1949,41 @@ def validate_characterization_causality(
         f"{label}.settle",
     )
     terminal_record = {key: value for key, value in terminal.items() if key not in {"status", "action"}}
+    boundary_entry = release_boundary_from_actions(settle_actions)
+    if boundary_entry is None:
+        raise ParseError(f"{label}: V2 has no valid RELEASE phase boundary")
+    boundary_index, boundary_status, boundary_action = boundary_entry
+    recorded_boundary = settle["release_boundary"]
+    if (
+        recorded_boundary["status"] != boundary_status
+        or recorded_boundary["decision_id"] != int(boundary_action["decision_id"])
+        or recorded_boundary["budget_resident_bytes"] != int(boundary_action["budget_resident_bytes"])
+        or recorded_boundary["budget_debt_after_bytes"] != int(boundary_action["budget_debt_after_bytes"])
+        or recorded_boundary["unmet_budget_bytes_after"] != int(boundary_action["unmet_budget_bytes_after"])
+        or recorded_boundary["state_changed"] != (boundary_action["state_changed"] == "1")
+        or recorded_boundary["bytes"] != int(boundary_action["bytes"])
+        or recorded_boundary["relieved_bytes"] != int(boundary_action["relieved_bytes"])
+        or recorded_boundary["soft_offload_armed_after"] != (boundary_action["soft_offload_armed_after"] == "1")
+    ):
+        raise ParseError(f"{label}: recorded RELEASE phase boundary differs from production marker")
+    tolerance = int(spec["workload"]["characterization"]["target_tolerance_bytes"])
+    if abs(
+        release_resident["resident_bytes"] - recorded_boundary["budget_resident_bytes"]
+    ) > tolerance:
+        raise ParseError(
+            f"{label}: slots RELEASE snapshot disagrees with marker phase-boundary resident")
+    positive_action_indices = [
+        index for index, action in enumerate(settle_actions)
+        if is_qualifying_offload_action(
+            action, pressure_basis_source(spec["pressure_basis"]), allow_shortfall=True)
+    ]
+    if positive_action_indices and min(positive_action_indices) <= boundary_index:
+        raise ParseError(
+            f"{label}: first positive OFFLOAD overlaps or precedes the RELEASE boundary")
+    if positive_action_indices and boundary_status != "release_no_candidate":
+        raise ParseError(
+            f"{label}: V2 OFFLOAD lacks the required RELEASE no_candidate boundary")
+
     expected_settle_status = (
         "target_reached" if terminal["status"] in {"debt_closed", "target_reached"}
         else "unmet_floor")
@@ -1756,8 +2063,50 @@ def validate_characterization_causality(
             positive_timing = timing
             break
     positive_offloads = [item for item in observations if item["positive_offload"]]
+    release_actions = [
+        item["action"] for item in observations if item["action"]["release_attempted"] == "1"
+    ]
+    offload_pairs = qualified_pairs or []
+    all_positive_actions = [
+        action for action in marker_records(
+            stderr_data.decode("utf-8", errors="replace"),
+            "kv_pressure_unified_action", ACTION_REQUIRED, f"{label}.all_action")
+        if is_qualifying_offload_action(
+            action, pressure_basis_source(spec["pressure_basis"]), allow_shortfall=True)
+    ]
+    if len(all_positive_actions) != len(positive_offloads):
+        raise ParseError(
+            f"{label}: positive OFFLOAD exists outside the settled phase window")
+    if positive_offloads and len(offload_pairs) != len(positive_offloads):
+        raise ParseError(
+            f"{label}: every positive OFFLOAD must have a transaction-local mincore resident drop")
+    positive_keys = {
+        (
+            int(item["action"]["decision_id"]),
+            int(item["action"]["transaction_id"]),
+            int(item["action"]["selected_seq_id"]),
+        )
+        for item in positive_offloads
+    }
+    pair_keys = {
+        (item["decision_id"], item["transaction_id"], item["seq_id"])
+        for item in offload_pairs
+    }
+    if pair_keys != positive_keys:
+        raise ParseError(f"{label}: transaction-local OFFLOAD pairs do not match settled actions")
     if positive_offloads and positive_timing is None:
         raise ParseError(f"{label}: OFFLOAD characterization has no positive resume restore timing")
+    if not release_actions and positive_offloads:
+        raise ParseError(f"{label}: V2 OFFLOAD was not preceded by a Unified RELEASE decision")
+    release_physical_relief = (
+        resident_after_fill["resident_bytes"] - recorded_boundary["budget_resident_bytes"])
+    offload_physical_relief = sum(item["resident_drop_bytes"] for item in offload_pairs)
+    total_physical_relief = release_physical_relief + offload_physical_relief
+    settled_physical_relief = (
+        resident_after_fill["resident_bytes"] - settled_resident["resident_bytes"])
+    if total_physical_relief != settled_physical_relief:
+        raise ParseError(
+            f"{label}: RELEASE plus OFFLOAD physical relief violates resident conservation")
     resume_measurement = {
         "sequence": first_measurement["sequence"],
         "request_id": first_measurement["request_id"],
@@ -1776,23 +2125,46 @@ def validate_characterization_causality(
 
     return {
         "status": status,
+        "performance_eligible": True,
+        "release_terminal": terminal["status"],
         "requested_target_bytes": resident_target,
         "action_target_bytes": action_target,
         "resume_measurement": resume_measurement,
         "post_resume_steady_measurements": post_resume_steady_measurements,
         "resident_after_fill": resident_after_fill["resident_bytes"],
+        "resident_after_release_settle": release_resident["resident_bytes"],
+        "resident_after_offload_settle": (
+            settled_resident["resident_bytes"] if positive_offloads else None),
         "resident_settled": settled_resident["resident_bytes"],
         "resident_after_resume": resident_after_measurement["resident_bytes"],
-        "physical_relief_bytes": (
+        "release_physical_relief_bytes": release_physical_relief,
+        "release_physical_relief_authority": "phase_boundary_budget_marker",
+        "offload_physical_relief_bytes": offload_physical_relief,
+        "offload_physical_relief_authority": "transaction_local_mincore",
+        "total_physical_relief_bytes": total_physical_relief,
+        "total_physical_relief_authority": "sum_of_authorities",
+        "physical_relief_bytes": total_physical_relief,
+        "memory_saved_bytes": (
             resident_after_fill["resident_bytes"] - settled_resident["resident_bytes"]),
+        "memory_saved_ratio": (
+            (resident_after_fill["resident_bytes"] - settled_resident["resident_bytes"])
+            / resident_after_fill["resident_bytes"]
+            if resident_after_fill["resident_bytes"] else None),
         "budget_debt_after": terminal["budget_debt_after_bytes"],
         "settle_time_seconds": settle["duration_ns"] / 1_000_000_000,
         "unmet_budget_bytes": terminal["unmet_budget_bytes_after"],
+        "release": {
+            "actions": len(release_actions),
+            "blocks": sum(int(item["blocks"]) for item in release_actions),
+            "bytes": sum(int(item["bytes"]) for item in release_actions),
+            "physical_relieved_bytes": release_physical_relief,
+        },
         "offload": {
             "actions": len(positive_offloads),
             "blocks": sum(int(item["action"]["blocks"]) for item in positive_offloads),
             "bytes": sum(int(item["action"]["bytes"]) for item in positive_offloads),
-            "physical_relieved_bytes": sum(
+            "physical_relieved_bytes": offload_physical_relief,
+            "action_relieved_bytes": sum(
                 int(item["action"]["relieved_bytes"]) for item in positive_offloads),
             "write_syscalls": int(io["backing_write_syscalls"]),
             "bytes_written": int(io["bytes_written"]),
@@ -1980,7 +2352,12 @@ def parse_run(artifact: pathlib.Path, plan: dict[str, Any], case: dict[str, Any]
     io_last = io_records[-1]
     offload_actions = [action for action in actions if action["offload_attempted"] == "1"]
     expected_source = pressure_basis_source(spec["pressure_basis"])
-    qualified_pairs = qualified_offload_pairs(actions, resident_observations, expected_source)
+    qualified_pairs = qualified_offload_pairs(
+        actions,
+        resident_observations,
+        expected_source,
+        allow_shortfall=spec["run_mode"] == "characterization",
+    )
     qualification_round_trip: dict[str, Any] | None = None
     characterization_metrics: dict[str, Any] | None = None
     if spec["run_mode"] == "qualification":
@@ -1988,13 +2365,19 @@ def parse_run(artifact: pathlib.Path, plan: dict[str, Any], case: dict[str, Any]
             qualification, records, stderr_data, case, spec, label)
     else:
         characterization_metrics = validate_characterization_causality(
-            characterization, records, stderr_data, case, spec, run_dir, io_last, label)
+            characterization, records, stderr_data, case, spec, run_dir, io_last, label,
+            qualified_pairs)
         measurement_records = [record for record in records if record["measurement"]]
         if case["policy"] == "v2":
             characterization_metrics["performance"] = response_statistics(
                 [record for record in measurement_records if record["measurement_phase"] == "resume"])
             characterization_metrics["post_resume_steady_performance"] = response_statistics(
                 [record for record in measurement_records if record["measurement_phase"] == "post_resume_steady"])
+        elif case["policy"] == "release_only":
+            characterization_metrics["performance"] = response_statistics(
+                [record for record in measurement_records if record["measurement_phase"] == "release_only_steady"]
+                if characterization_metrics["performance_eligible"] else [])
+            characterization_metrics["post_resume_steady_performance"] = response_statistics([])
         else:
             characterization_metrics["performance"] = response_statistics(measurement_records)
             characterization_metrics["post_resume_steady_performance"] = response_statistics([])
@@ -2034,6 +2417,22 @@ def parse_run(artifact: pathlib.Path, plan: dict[str, Any], case: dict[str, Any]
                 or characterization_metrics["resume"]["restored_bytes"] <= 0
             ):
                 raise ParseError(f"{label}: V2 characterization IO has no linked swap-in/read")
+    elif case["policy"] == "release_only":
+        if not actions:
+            raise ParseError(f"{label}: RELEASE-only is missing the Unified RELEASE marker")
+        release_actions = [action for action in actions if action["release_attempted"] == "1"]
+        if not release_actions:
+            raise ParseError(f"{label}: RELEASE-only did not execute or close a Unified RELEASE path")
+        if any(action["offload_attempted"] != "0" for action in actions):
+            raise ParseError(f"{label}: RELEASE-only contains OFFLOAD action evidence")
+        migration_fields = (
+            "block_swap_out_calls", "block_swap_in_calls", "backing_read_syscalls",
+            "backing_write_syscalls", "bytes_read", "bytes_written",
+        )
+        if any(int(io_last[key]) != 0 for key in migration_fields):
+            raise ParseError(f"{label}: RELEASE-only contains swap or backing IO evidence")
+        if resumes or timings:
+            raise ParseError(f"{label}: RELEASE-only contains PREFETCH/resume evidence")
     else:
         if any(action["offload_attempted"] != "0" or action["release_attempted"] != "0" for action in actions):
             raise ParseError(f"{label}: resident case contains state-changing action evidence")
@@ -2062,6 +2461,8 @@ def parse_run(artifact: pathlib.Path, plan: dict[str, Any], case: dict[str, Any]
     return {
         "run_id": plan["run_id"],
         "case_id": plan["case_id"],
+        "round": plan["round"],
+        "policy": plan["policy"],
         "server_exit_code": server_cleanup["exit_code"],
         "sampler_exit_code": sampler_cleanup["exit_code"],
         "samples": samples,
@@ -2083,6 +2484,18 @@ def parse_run(artifact: pathlib.Path, plan: dict[str, Any], case: dict[str, Any]
             if characterization_metrics is not None else response_statistics(records)
         ),
     }
+
+
+def validate_formal_pressure_authority(
+        spec: dict[str, Any], plan: list[dict[str, Any]], runner_status: str,
+) -> None:
+    if (
+        runner_status != "UNSUPPORTED"
+        and spec["run_kind"] == "formal"
+        and any(item["policy"] in BUDGET_POLICIES for item in plan)
+        and spec["pressure_basis"]["authority"] != "cgroup_finite"
+    ):
+        raise ParseError("formal budget run requires real finite cgroup pressure authority")
 
 
 def validate_manifest(artifact: pathlib.Path) -> tuple[dict[str, Any], dict[str, dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
@@ -2141,8 +2554,7 @@ def validate_manifest(artifact: pathlib.Path) -> tuple[dict[str, Any], dict[str,
         if result["status"] not in {"complete", "incomplete"} or (result["error"] is not None and not isinstance(result["error"], str)):
             raise ParseError(f"manifest.run_results[{index}] status/error is malformed")
     status = manifest["runner_status"]
-    if manifest["spec"]["run_kind"] == "formal" and manifest["spec"]["pressure_basis"]["authority"] != "cgroup_finite" and status != "UNSUPPORTED":
-        raise ParseError("formal V2 run requires real finite cgroup pressure authority")
+    validate_formal_pressure_authority(manifest["spec"], plan, status)
     if status not in {"run_in_progress", "run_complete", "run_incomplete", "UNSUPPORTED", "DRY_RUN"}:
         raise ParseError(f"unknown runner_status: {status}")
     if status == "UNSUPPORTED":
@@ -2201,12 +2613,153 @@ def slot_resident_values(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     return result
 
 
-def summarize_characterization(run_results: list[dict[str, Any]]) -> dict[str, Any]:
+def performance_delta(
+        candidate: dict[str, Any],
+        baseline: dict[str, Any],
+        candidate_phase: str,
+) -> dict[str, Any]:
+    metrics = {
+        "ttft_ms": "ms",
+        "tpot_ms_per_token": "ms/token",
+        "e2e_ms": "ms",
+        "throughput_tokens_per_second": "tokens/s",
+    }
+    result: dict[str, Any] = {
+        "status": "UNAVAILABLE",
+        "candidate_phase": candidate_phase,
+        "baseline_phase": "resident_steady",
+        "metrics": {},
+        "reason": "no corresponding available measurement metric",
+    }
+    for name, unit in metrics.items():
+        candidate_metric = candidate.get(name, {})
+        baseline_metric = baseline.get(name, {})
+        if (
+            candidate_metric.get("status") == "AVAILABLE"
+            and baseline_metric.get("status") == "AVAILABLE"
+            and candidate_metric.get("p50") is not None
+            and baseline_metric.get("p50") is not None
+        ):
+            result["metrics"][name] = {
+                "unit": unit,
+                "candidate_p50": candidate_metric["p50"],
+                "baseline_p50": baseline_metric["p50"],
+                "delta_p50": candidate_metric["p50"] - baseline_metric["p50"],
+            }
+    if result["metrics"]:
+        result["status"] = "AVAILABLE"
+        result.pop("reason")
+    return result
+
+
+def characterization_comparisons(
+        runs: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    resident_by_round: dict[int, list[dict[str, Any]]] = {}
+    for item in runs:
+        if item["status"] == "RESIDENT_BASELINE":
+            resident_by_round.setdefault(item.get("round", 0), []).append(item)
+    comparisons: list[dict[str, Any]] = []
+    for item in runs:
+        if item["status"] == "RESIDENT_BASELINE":
+            continue
+        policy = item.get("policy")
+        if policy not in BUDGET_POLICIES:
+            continue
+        round_id = item.get("round", 0)
+        baselines = resident_by_round.get(round_id, [])
+        comparison: dict[str, Any] = {
+            "round": round_id,
+            "candidate_run_id": item["run_id"],
+            "policy": policy,
+            "baseline_run_id": None,
+            "memory_saved_bytes": None,
+            "memory_saved_ratio": None,
+            "performance_delta": {
+                "status": "UNAVAILABLE",
+                "candidate_phase": (
+                    "release_only_steady" if policy == "release_only"
+                    else "post_resume_steady"),
+                "baseline_phase": "resident_steady",
+                "metrics": {},
+                "reason": "no unique Resident baseline in the same round",
+            },
+        }
+        if len(baselines) == 1:
+            baseline = baselines[0]
+            comparison["baseline_run_id"] = baseline["run_id"]
+            saved = baseline["resident_after_fill"] - item["resident_settled"]
+            comparison["memory_saved_bytes"] = saved
+            comparison["memory_saved_ratio"] = (
+                saved / baseline["resident_after_fill"]
+                if baseline["resident_after_fill"] else None)
+            candidate_performance = (
+                item.get("performance", {}) if policy == "release_only"
+                else item.get("post_resume_steady_performance", {}))
+            comparison["performance_delta"] = performance_delta(
+                candidate_performance,
+                baseline.get("performance", {}),
+                "release_only_steady" if policy == "release_only" else "post_resume_steady",
+            )
+        comparisons.append(comparison)
+
+    aggregates: dict[str, Any] = {}
+    for policy in ("release_only", "v2"):
+        selected = [item for item in comparisons if item["policy"] == policy]
+        memory_values = [item["memory_saved_bytes"] for item in selected if item["memory_saved_bytes"] is not None]
+        ratio_values = [item["memory_saved_ratio"] for item in selected if item["memory_saved_ratio"] is not None]
+        metric_values: dict[str, list[float]] = {}
+        for item in selected:
+            for name, value in item["performance_delta"].get("metrics", {}).items():
+                metric_values.setdefault(name, []).append(float(value["delta_p50"]))
+        aggregates[policy] = {
+            "n": len(selected),
+            "memory_saved_bytes": {
+                "status": "AVAILABLE" if memory_values else "UNAVAILABLE",
+                "min": min(memory_values) if memory_values else None,
+                "max": max(memory_values) if memory_values else None,
+                "p50": percentile([float(value) for value in memory_values], 0.50),
+            },
+            "memory_saved_ratio": {
+                "status": "AVAILABLE" if ratio_values else "UNAVAILABLE",
+                "min": min(ratio_values) if ratio_values else None,
+                "max": max(ratio_values) if ratio_values else None,
+                "p50": percentile([float(value) for value in ratio_values], 0.50),
+            },
+            "performance_delta_p50": {
+                name: {
+                    "status": "AVAILABLE",
+                    "min": min(values),
+                    "max": max(values),
+                    "p50": percentile(values, 0.50),
+                }
+                for name, values in metric_values.items()
+            },
+        }
+    return comparisons, aggregates
+
+
+def summarize_characterization(
+        run_results: list[dict[str, Any]], run_kind: str | None = None,
+) -> dict[str, Any]:
     runs = [
-        {"run_id": item["run_id"], "case_id": item["case_id"], **item["characterization"]}
+        {
+            "run_id": item["run_id"],
+            "case_id": item["case_id"],
+            "round": item.get("round"),
+            "policy": item.get("policy"),
+            **item["characterization"],
+        }
         for item in run_results if item["characterization"] is not None
     ]
     resident_runs = [item for item in runs if item["status"] == "RESIDENT_BASELINE"]
+    release_runs = [item for item in runs if item.get("policy") == "release_only"]
+    release_floor_runs = [
+        item for item in release_runs if item.get("release_terminal") == "release_no_candidate"
+    ]
+    release_target_runs = [
+        item for item in release_runs if item.get("release_terminal") == "release_settled"
+    ]
     v2_runs = [item for item in runs if item["status"] in {"TARGET_REACHED", "UNMET_FLOOR"}]
     full_values = [item["resident_after_fill"] for item in resident_runs]
     if full_values:
@@ -2231,6 +2784,57 @@ def summarize_characterization(run_results: list[dict[str, Any]]) -> dict[str, A
             "max_bytes": None,
             "p50_bytes": None,
         }
+
+    release_values = [item["resident_after_release_settle"] for item in release_floor_runs]
+    rounds = {item.get("round") for item in runs}
+    formal_floor_complete = True
+    if run_kind == "formal":
+        formal_floor_complete = bool(release_runs) and all(
+            any(
+                item.get("round") == round_id
+                and item.get("release_terminal") == "release_no_candidate"
+                for item in release_runs
+            )
+            for round_id in rounds
+        ) and len(release_floor_runs) == len(release_runs)
+    if release_values and formal_floor_complete:
+        b_release_floor = {
+            "status": "AVAILABLE",
+            "definition": "same-workload RELEASE-only settled physical resident after a real Unified RELEASE no_candidate floor probe",
+            "observations": [
+                {
+                    "run_id": item["run_id"],
+                    "resident_after_release_settle": item["resident_after_release_settle"],
+                    "release_terminal": item["release_terminal"],
+                }
+                for item in release_floor_runs
+            ],
+            "min_bytes": min(release_values),
+            "max_bytes": max(release_values),
+            "p50_bytes": percentile([float(value) for value in release_values], 0.50),
+        }
+    else:
+        reason = "no RELEASE-only no_candidate floor probe"
+        if run_kind == "formal" and release_runs and not formal_floor_complete:
+            reason = "formal floor probe is not release_no_candidate in every round"
+        b_release_floor = {
+            "status": "UNAVAILABLE",
+            "definition": "same-workload RELEASE-only settled physical resident after a real Unified RELEASE no_candidate floor probe",
+            "reason": reason,
+            "observations": [],
+            "min_bytes": None,
+            "max_bytes": None,
+            "p50_bytes": None,
+        }
+    release_target_points = [
+        {
+            "run_id": item["run_id"],
+            "resident_after_release_settle": item["resident_after_release_settle"],
+            "requested_target_bytes": item["requested_target_bytes"],
+            "release_terminal": item["release_terminal"],
+        }
+        for item in release_target_runs
+    ]
 
     if v2_runs:
         lowest_target = min(item["requested_target_bytes"] for item in v2_runs)
@@ -2275,13 +2879,28 @@ def summarize_characterization(run_results: list[dict[str, Any]]) -> dict[str, A
             "max_bytes": None,
             "p50_bytes": None,
         }
-    status = "UNMET_FLOOR" if any(
-        item["status"] == "UNMET_FLOOR" for item in v2_runs) else "TARGET_REACHED"
+    status = (
+        "UNMET_FLOOR" if any(item["status"] == "UNMET_FLOOR" for item in v2_runs)
+        else "TARGET_REACHED" if v2_runs
+        else "RELEASE_FLOOR_PROBE" if release_floor_runs
+        else "RELEASE_SETTLED" if release_runs
+        else "TARGET_REACHED"
+    )
+    comparisons, comparison_aggregate = characterization_comparisons(runs)
     return {
         "status": status,
         "runs": runs,
         "b_full": b_full,
+        "b_release_floor": b_release_floor,
+        "release_target_points": release_target_points,
         "b_reachable_floor": b_floor,
+        "baseline_ladder": {
+            "resident_b_full": b_full,
+            "release_only_b_release_floor": b_release_floor,
+            "v2_b_reachable_floor": b_floor,
+        },
+        "comparisons": comparisons,
+        "comparison_aggregate": comparison_aggregate,
     }
 
 
@@ -2324,7 +2943,24 @@ def parse_artifact(artifact: pathlib.Path) -> tuple[str, dict[str, Any]]:
                 "run_id": item["run_id"],
                 "authority": (
                     "transaction_local_mincore"
-                    if item["qualified_offload_pairs"] else "slots_pre_post"),
+                    if item["qualified_offload_pairs"]
+                    else "phase_boundary_release"
+                    if item["characterization"] is not None
+                    and item["policy"] in BUDGET_POLICIES
+                    else "slots_pre_post"),
+                "release_physical_relief_bytes": (
+                    item["characterization"]["release_physical_relief_bytes"]
+                    if item["characterization"] is not None else 0),
+                "offload_physical_relief_bytes": (
+                    item["characterization"]["offload_physical_relief_bytes"]
+                    if item["characterization"] is not None else 0),
+                "release_authority": (
+                    item["characterization"]["release_physical_relief_authority"]
+                    if item["characterization"] is not None else "not_applicable"),
+                "offload_authority": (
+                    item["characterization"]["offload_physical_relief_authority"]
+                    if item["characterization"] is not None else (
+                        "transaction_local_mincore" if item["qualified_offload_pairs"] else "not_applicable")),
                 "slots_before": slot_resident_values(item["slots_before"]),
                 "slots_after": slot_resident_values(item["slots_after"]),
                 "transaction_local_offload": item["qualified_offload_pairs"],
@@ -2336,12 +2972,29 @@ def parse_artifact(artifact: pathlib.Path) -> tuple[str, dict[str, Any]]:
             }
             for item in run_results
         ]
+        characterization_runs = [
+            item["characterization"] for item in run_results if item["characterization"] is not None
+        ]
         action_summary = {
             "unified_action_records": sum(len(item["actions"]) for item in run_results),
             "release_attempts": sum(sum(int(action["release_attempted"]) for action in item["actions"]) for item in run_results),
             "offload_attempts": sum(sum(int(action["offload_attempted"]) for action in item["actions"]) for item in run_results),
             "offload_bytes": sum(sum(int(action["bytes"]) for action in item["actions"] if action["offload_attempted"] == "1") for item in run_results),
             "release_bytes": sum(sum(int(action["bytes"]) for action in item["actions"] if action["release_attempted"] == "1") for item in run_results),
+            "release_blocks": sum(item["release"]["blocks"] for item in characterization_runs),
+            "offload_blocks": sum(item["offload"]["blocks"] for item in characterization_runs),
+            "release_physical_relief_bytes": sum(item["release_physical_relief_bytes"] for item in characterization_runs),
+            "offload_physical_relief_bytes": sum(item["offload_physical_relief_bytes"] for item in characterization_runs),
+            "total_physical_relief_bytes": sum(item["total_physical_relief_bytes"] for item in characterization_runs),
+            "physical_relief_authority": {
+                "release": "per_run_phase_boundary",
+                "offload": "transaction_local_mincore",
+                "total": "release_plus_offload",
+            },
+            "backing_bytes_written": sum(item["offload"]["bytes_written"] for item in characterization_runs),
+            "backing_bytes_read": sum(item["resume"]["bytes_read"] for item in characterization_runs),
+            "resume_restored_bytes": sum(item["resume"]["restored_bytes"] for item in characterization_runs),
+            "staging_peak_bytes": max([item["transient_staging_peak_bytes"] for item in characterization_runs] or [0]),
             "budget_excess_bytes": [
                 int(action["budget_observed_excess_bytes"])
                 for item in run_results for action in item["actions"]
@@ -2357,7 +3010,8 @@ def parse_artifact(artifact: pathlib.Path) -> tuple[str, dict[str, Any]]:
         if manifest["spec"]["run_mode"] == "characterization":
             if service_failures:
                 raise ParseError("characterization contains a service failure")
-            characterization_summary = summarize_characterization(run_results)
+            characterization_summary = summarize_characterization(
+                run_results, manifest["spec"]["run_kind"])
         success_verdict = "FORMAL_PASS" if manifest["spec"]["run_kind"] == "formal" else "QUALIFICATION_PASS"
         result_verdict = (
             characterization_summary["status"]
@@ -2420,6 +3074,8 @@ def main() -> int:
         "FORMAL_PASS": 0,
         "QUALIFICATION_PASS": 0,
         "TARGET_REACHED": 0,
+        "RELEASE_SETTLED": 0,
+        "RELEASE_FLOOR_PROBE": 0,
         "UNMET_FLOOR": 0,
         "DRY_RUN": 0,
         "UNSUPPORTED": 3,

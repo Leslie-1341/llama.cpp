@@ -97,6 +97,8 @@ class CanonicalBenchmarkTest(unittest.TestCase):
             from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
             offload_enabled = os.environ.get('LLAMA_KV_PAGED_SWAP') == '1'
+            unified_enabled = os.environ.get('LLAMA_KV_PRESSURE_UNIFIED_ACTION') == '1'
+            release_only_enabled = unified_enabled and not offload_enabled
             mode = os.environ.get('KV_SYNTHETIC_MODE', 'complete')
             expose_v2_resident = os.environ.get('KV_SYNTHETIC_V2_SLOTS_RESIDENT') == '1'
             resident_target = int(os.environ.get('LLAMA_KV_RESIDENT_TARGET_BYTES', '4096') or '4096')
@@ -106,6 +108,7 @@ class CanonicalBenchmarkTest(unittest.TestCase):
             io_fields = {IO_FIELDS!r}
             state = {{
                 'requests': 0, 'offload_emitted': False, 'prefetch_completed': False,
+                'release_emitted': False, 'release_count': 0, 'released_bytes': 0,
                 'offload_count': 0, 'offloaded_bytes': 0,
                 'resident_bytes': 12288 if mode.startswith('characterization_') else 8192,
             }}
@@ -183,6 +186,88 @@ class CanonicalBenchmarkTest(unittest.TestCase):
                     }})
                 return values
 
+            def characterization_release_action(
+                    decision_id, resident_bytes, *, no_candidate=False, released_bytes=None):
+                values = dict(action_fields)
+                observed_excess = max(0, resident_bytes - resident_target)
+                values.update({{
+                    'decision_id': str(decision_id), 'target_bytes': str(action_target),
+                    'max_blocks': str(action_max_blocks),
+                    'observed_excess_bytes': str(observed_excess),
+                    'debt_before_bytes': str(observed_excess),
+                    'budget_target_bytes': str(resident_target),
+                    'budget_resident_bytes': str(resident_bytes),
+                    'budget_observed_excess_bytes': str(observed_excess),
+                    'budget_debt_before_bytes': str(observed_excess),
+                    'sample_count': str(decision_id), 'idle': '1',
+                    'release_attempted': '1', 'offload_attempted': '0',
+                    'offload_armed_before': '0', 'offload_armed_after': '0',
+                }})
+                if no_candidate:
+                    values.update({{
+                        'transaction_id': '0', 'selected_seq_id': '-1',
+                        'selected_claimant_epoch': '0', 'outcome': 'no_op',
+                        'reason': 'no_candidate', 'blocks': '0', 'bytes': '0',
+                        'relieved_bytes': '0', 'shortfall_bytes': str(observed_excess),
+                        'io_failure': '0', 'state_changed': '0',
+                        'decision_reason': 'budget_release_submitted',
+                        'debt_after_bytes': str(observed_excess),
+                        'budget_debt_after_bytes': str(observed_excess),
+                        'unmet_budget_bytes_after': '0',
+                        'soft_offload_armed_before': '0', 'soft_offload_armed_after': '1',
+                        'offload_armed_before': '0', 'offload_armed_after': '1',
+                    }})
+                else:
+                    released = (
+                        max(0, resident_bytes - resident_target)
+                        if released_bytes is None else released_bytes)
+                    remaining = max(0, resident_bytes - released - resident_target)
+                    values.update({{
+                        'transaction_id': str(20 + decision_id), 'selected_seq_id': '-1',
+                        'selected_claimant_epoch': '0', 'outcome': 'completed',
+                        'reason': 'target_satisfied' if remaining == 0 else 'target_shortfall',
+                        'blocks': str(released // 4096), 'bytes': str(released),
+                        'relieved_bytes': str(released),
+                        'shortfall_bytes': str(remaining), 'io_failure': '0',
+                        'state_changed': '1', 'decision_reason': 'budget_release_submitted',
+                        'debt_after_bytes': str(remaining),
+                        'budget_debt_after_bytes': str(remaining),
+                        'unmet_budget_bytes_after': '0',
+                        'soft_offload_armed_before': '0', 'soft_offload_armed_after': '0',
+                    }})
+                return values
+
+            def characterization_soft_offload_unsupported(decision_id, resident_bytes):
+                values = dict(action_fields)
+                observed_excess = max(0, resident_bytes - resident_target)
+                values.update({{
+                    'decision_id': str(decision_id), 'target_bytes': str(action_target),
+                    'max_blocks': str(action_max_blocks),
+                    'observed_excess_bytes': str(observed_excess),
+                    'debt_before_bytes': str(observed_excess),
+                    'debt_after_bytes': str(observed_excess),
+                    'budget_target_bytes': str(resident_target),
+                    'budget_resident_bytes': str(resident_bytes),
+                    'budget_observed_excess_bytes': str(observed_excess),
+                    'budget_debt_before_bytes': str(observed_excess),
+                    'budget_debt_after_bytes': str(observed_excess),
+                    'budget_transient_staging_bound_bytes': '2048' if k2_enabled else '0',
+                    'sample_count': str(decision_id), 'idle': '1',
+                    'transaction_id': '0', 'selected_seq_id': '-1',
+                    'selected_claimant_epoch': '0', 'offload_attempted': '0',
+                    'release_attempted': '0', 'outcome': 'no_op',
+                    'reason': 'offload_unsupported', 'blocks': '0', 'bytes': '0',
+                    'relieved_bytes': '0', 'shortfall_bytes': str(observed_excess),
+                    'io_failure': '0', 'state_changed': '0',
+                    'decision_reason': 'budget_offload_unsupported',
+                    'unmet_budget_bytes_after': '0',
+                    'soft_offload_armed_before': '1', 'soft_offload_armed_after': '1',
+                    'offload_armed_before': '0', 'offload_armed_after': '0',
+                    'evaluate_attempted': '1', 'evaluate_outcome': 'no_op',
+                    'evaluate_reason': 'offload_unsupported',
+                }})
+                return values
+
             def emit_qualification_offload_after_fill():
                 time.sleep(0.08)
                 if not offload_enabled or mode == 'no_offload':
@@ -207,12 +292,63 @@ class CanonicalBenchmarkTest(unittest.TestCase):
 
             def emit_characterization_after_fill():
                 time.sleep(0.08)
+                if release_only_enabled:
+                    if mode == 'characterization_release_no_candidate':
+                        emit_marker(
+                            'kv_pressure_unified_action',
+                            characterization_release_action(1, state['resident_bytes'], no_candidate=True))
+                        state['release_emitted'] = True
+                        state['release_count'] = 1
+                        time.sleep(0.02)
+                        emit_marker(
+                            'kv_pressure_unified_action',
+                            characterization_soft_offload_unsupported(2, state['resident_bytes']))
+                        return
+                    before = state['resident_bytes']
+                    after = resident_target
+                    emit_marker(
+                        'kv_pressure_unified_action',
+                        characterization_release_action(1, before))
+                    state['resident_bytes'] = after
+                    state['release_emitted'] = True
+                    state['release_count'] = max(1, (before - after) // 4096)
+                    state['released_bytes'] = before - after
+                    return
                 if not offload_enabled:
                     return
+                if mode != 'characterization_release_then_offload':
+                    emit_marker(
+                        'kv_pressure_unified_action',
+                        characterization_release_action(1, state['resident_bytes'], no_candidate=True))
+                    state['release_emitted'] = True
+                    state['release_count'] = 1
+                if mode == 'characterization_release_then_offload':
+                    before = state['resident_bytes']
+                    emit_marker(
+                        'kv_pressure_unified_action',
+                        characterization_release_action(1, before, released_bytes=4096))
+                    state['resident_bytes'] = before - 4096
+                    state['release_count'] = 1
+                    state['released_bytes'] = 4096
+                    time.sleep(0.02)
+                    emit_marker(
+                        'kv_pressure_unified_action',
+                        characterization_release_action(2, state['resident_bytes'], no_candidate=True))
+                    time.sleep(0.02)
+                    before = state['resident_bytes']
+                    after = before - 4096
+                    emit_marker('kv_g0_s1_resident_observation', resident_drop(3, 9, before, after))
+                    emit_marker('kv_pressure_unified_action', characterization_action(3, before, 0))
+                    state['resident_bytes'] = after
+                    state['offload_emitted'] = True
+                    state['offload_count'] = 1
+                    state['offloaded_bytes'] = 4096
+                    return
+                time.sleep(0.02)
                 before = state['resident_bytes']
                 after = before - 4096
-                emit_marker('kv_g0_s1_resident_observation', resident_drop(1, 7, before, after))
-                emit_marker('kv_pressure_unified_action', characterization_action(1, before, after - 4096))
+                emit_marker('kv_g0_s1_resident_observation', resident_drop(2, 8, before, after))
+                emit_marker('kv_pressure_unified_action', characterization_action(2, before, after - 4096))
                 state['resident_bytes'] = after
                 state['offload_emitted'] = True
                 state['offload_count'] += 1
@@ -223,14 +359,14 @@ class CanonicalBenchmarkTest(unittest.TestCase):
                 if mode == 'characterization_target':
                     before = state['resident_bytes']
                     after = before - 4096
-                    emit_marker('kv_g0_s1_resident_observation', resident_drop(2, 8, before, after))
-                    emit_marker('kv_pressure_unified_action', characterization_action(2, before, 0))
+                    emit_marker('kv_g0_s1_resident_observation', resident_drop(3, 9, before, after))
+                    emit_marker('kv_pressure_unified_action', characterization_action(3, before, 0))
                     state['resident_bytes'] = after
                     state['offload_count'] += 1
                     state['offloaded_bytes'] += 4096
                 elif mode == 'characterization_unmet':
                     emit_marker('kv_pressure_unified_action', characterization_action(
-                        2, state['resident_bytes'], state['resident_bytes'] - 4096,
+                        3, state['resident_bytes'], state['resident_bytes'] - 4096,
                         terminal='budget_unmet_terminal'))
 
             def emit_resume_evidence():
@@ -313,7 +449,7 @@ class CanonicalBenchmarkTest(unittest.TestCase):
                     state['requests'] += 1
                     ordinal = state['requests']
                     print(f"synthetic_request ordinal={{ordinal}}", flush=True)
-                    if offload_enabled and characterization_mode and ordinal == 1:
+                    if (offload_enabled or release_only_enabled) and characterization_mode and ordinal == 1:
                         threading.Thread(target=emit_characterization_after_fill, daemon=True).start()
                     elif offload_enabled and not characterization_mode and ordinal == 2:
                         threading.Thread(target=emit_qualification_offload_after_fill, daemon=True).start()
@@ -343,7 +479,7 @@ class CanonicalBenchmarkTest(unittest.TestCase):
         self.temp.cleanup()
 
     def spec(self, *, policy: str = "v2") -> dict[str, object]:
-        target = 4096 if policy == "v2" else None
+        target = 4096 if policy in {"release_only", "v2"} else None
         return {
             "schema_version": 2,
             "protocol": "kv_offload_benchmark",
@@ -380,7 +516,7 @@ class CanonicalBenchmarkTest(unittest.TestCase):
                 "restore": "k1_sync",
                 "prefault": "off",
                 "kv_target_bytes": target,
-                "action_target_bytes": 8192 if policy == "v2" else None,
+                "action_target_bytes": 8192 if policy in {"release_only", "v2"} else None,
             }],
             "run_order": [{"round": 1, "run_order": 1, "case_id": "case"}],
             "sampler": {"interval_seconds": 1.0},
@@ -769,10 +905,274 @@ class CanonicalBenchmarkTest(unittest.TestCase):
         run = characterization["runs"][0]
         self.assertEqual(run["status"], "RESIDENT_BASELINE")
         self.assertEqual(run["resident_after_fill"], 12288)
+        self.assertIsNone(run["resident_after_release_settle"])
+        self.assertIsNone(run["resident_after_offload_settle"])
+        self.assertEqual(run["release_physical_relief_bytes"], 0)
+        self.assertEqual(run["offload_physical_relief_bytes"], 0)
+        self.assertEqual(run["total_physical_relief_bytes"], 0)
         self.assertEqual(run["physical_relief_bytes"], 0)
         self.assertEqual(run["offload"]["actions"], 0)
         self.assertEqual(run["offload"]["write_syscalls"], 0)
         self.assertEqual(run["resume"]["read_syscalls"], 0)
+
+    def test_release_only_characterization_records_release_without_swap_io(self) -> None:
+        artifact = self.run_characterization_artifact(
+            policy="release_only", mode="characterization_release", restore="k1_sync")
+        parsed = self.run_parser(artifact)
+        self.assertEqual(parsed.returncode, 0, parsed.stderr)
+        result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["verdict"], "RELEASE_SETTLED")
+        run = result["characterization"]["runs"][0]
+        self.assertEqual(run["release_terminal"], "release_settled")
+        self.assertEqual(run["resident_after_fill"], 12288)
+        self.assertEqual(run["resident_after_release_settle"], 4096)
+        self.assertIsNone(run["resident_after_offload_settle"])
+        self.assertEqual(run["release_physical_relief_bytes"], 8192)
+        self.assertEqual(run["offload_physical_relief_bytes"], 0)
+        self.assertEqual(run["total_physical_relief_bytes"], 8192)
+        self.assertEqual(run["release"]["actions"], 1)
+        self.assertEqual(run["release"]["blocks"], 2)
+        self.assertEqual(run["offload"]["actions"], 0)
+        self.assertEqual(run["resume"]["restored_bytes"], 0)
+        self.assertTrue(run["performance_eligible"])
+        self.assertEqual(run["performance"]["e2e_ms"]["n"], 1)
+        self.assertEqual(result["characterization"]["b_release_floor"]["status"], "UNAVAILABLE")
+        self.assertEqual(len(result["characterization"]["release_target_points"]), 1)
+        execution = json.loads(next(artifact.glob("runs/*/execution.json")).read_text(encoding="utf-8"))
+        env = execution["environment"]
+        self.assertEqual(env["LLAMA_KV_PAGED_SWAP"], "0")
+        self.assertEqual(env["LLAMA_KV_PRESSURE_UNIFIED_ACTION"], "1")
+        self.assertNotIn("kv_g0_s1_resident_observation", next(artifact.glob("runs/*/server.stderr")).read_text(encoding="utf-8"))
+        io = result["restore_observations"][0]["io"]
+        for field in (
+            "block_swap_out_calls", "block_swap_in_calls", "backing_write_syscalls",
+            "backing_read_syscalls", "bytes_written", "bytes_read",
+        ):
+            self.assertEqual(int(io[field]), 0)
+
+    def test_release_only_no_candidate_is_valid_zero_relief(self) -> None:
+        artifact = self.run_characterization_artifact(
+            policy="release_only", mode="characterization_release_no_candidate", restore="k1_sync")
+        parsed = self.run_parser(artifact)
+        self.assertEqual(parsed.returncode, 0, parsed.stderr)
+        result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
+        run = result["characterization"]["runs"][0]
+        self.assertEqual(result["verdict"], "RELEASE_FLOOR_PROBE")
+        self.assertEqual(run["status"], "RELEASE_FLOOR_PROBE")
+        self.assertEqual(run["release_terminal"], "release_no_candidate")
+        self.assertFalse(run["performance_eligible"])
+        self.assertEqual(run["performance"]["e2e_ms"]["status"], "UNAVAILABLE")
+        self.assertEqual(run["resident_after_release_settle"], 12288)
+        self.assertEqual(run["release_physical_relief_bytes"], 0)
+        self.assertEqual(run["total_physical_relief_bytes"], 0)
+        self.assertEqual(result["characterization"]["b_release_floor"]["p50_bytes"], 12288)
+        self.assertEqual(result["characterization"]["b_reachable_floor"]["status"], "UNAVAILABLE")
+        stderr = next(artifact.glob("runs/*/server.stderr")).read_text(encoding="utf-8")
+        self.assertIn("decision_reason=budget_offload_unsupported", stderr)
+        self.assertIn("soft_offload_armed_before=1", stderr)
+
+    def test_release_floor_probe_performance_delta_is_unavailable(self) -> None:
+        value = self.characterization_spec(
+            policy="resident", mode="characterization_release_no_candidate", restore="k1_sync")
+        value["cases"] = [
+            dict(value["cases"][0], case_id="resident", policy="resident", kv_target_bytes=None, action_target_bytes=None),
+            dict(value["cases"][0], case_id="release", policy="release_only", kv_target_bytes=4096, action_target_bytes=8192),
+        ]
+        value["run_order"] = [
+            {"round": 1, "run_order": 1, "case_id": "resident"},
+            {"round": 1, "run_order": 2, "case_id": "release"},
+        ]
+        artifact = self.root / "release-floor-performance"
+        runner = self.run_runner(self.write_spec(value, "release-floor-performance.json"), artifact)
+        self.assertEqual(runner.returncode, 0, runner.stderr)
+        parsed = self.run_parser(artifact)
+        self.assertEqual(parsed.returncode, 0, parsed.stderr)
+        result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
+        comparison = next(
+            item for item in result["characterization"]["comparisons"]
+            if item["policy"] == "release_only")
+        self.assertEqual(comparison["performance_delta"]["status"], "UNAVAILABLE")
+        self.assertEqual(comparison["performance_delta"]["candidate_phase"], "release_only_steady")
+        self.assertEqual(result["characterization"]["comparison_aggregate"]["release_only"]["performance_delta_p50"], {})
+
+    def test_release_only_multi_round_aggregate_is_observation_based(self) -> None:
+        value = self.characterization_spec(
+            policy="release_only", mode="characterization_release_no_candidate", restore="k1_sync")
+        value["run_order"] = [
+            {"round": 1, "run_order": 1, "case_id": "case"},
+            {"round": 2, "run_order": 1, "case_id": "case"},
+        ]
+        artifact = self.root / "release-only-multi-round"
+        runner = self.run_runner(self.write_spec(value, "release-only-multi-round.json"), artifact)
+        self.assertEqual(runner.returncode, 0, runner.stderr)
+        parsed = self.run_parser(artifact)
+        self.assertEqual(parsed.returncode, 0, parsed.stderr)
+        result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
+        characterization = result["characterization"]
+        self.assertEqual(result["statistics"]["runs"], 2)
+        self.assertEqual(len(characterization["b_release_floor"]["observations"]), 2)
+        self.assertEqual(characterization["b_release_floor"]["min_bytes"], 12288)
+        self.assertEqual(characterization["b_release_floor"]["max_bytes"], 12288)
+        self.assertEqual(characterization["b_release_floor"]["p50_bytes"], 12288)
+        self.assertEqual(len(characterization["runs"]), 2)
+        parser = load_parser_module()
+        wrapped = [
+            {
+                "run_id": item["run_id"], "case_id": item["case_id"],
+                "round": item["round"], "policy": item["policy"],
+                "characterization": item,
+            }
+            for item in characterization["runs"]
+        ]
+        self.assertEqual(
+            parser.summarize_characterization(wrapped, "formal")["b_release_floor"]["status"],
+            "AVAILABLE")
+        wrapped[1]["characterization"]["release_terminal"] = "release_settled"
+        self.assertEqual(
+            parser.summarize_characterization(wrapped, "formal")["b_release_floor"]["status"],
+            "UNAVAILABLE")
+
+    def test_v2_splits_release_and_offload_physical_relief(self) -> None:
+        artifact = self.run_characterization_artifact(
+            mode="characterization_release_then_offload", restore="k1_sync")
+        parsed = self.run_parser(artifact)
+        self.assertEqual(parsed.returncode, 0, parsed.stderr)
+        result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
+        run = result["characterization"]["runs"][0]
+        self.assertEqual(run["resident_after_release_settle"], 8192)
+        self.assertEqual(run["resident_after_offload_settle"], 4096)
+        self.assertEqual(run["release_physical_relief_bytes"], 4096)
+        self.assertEqual(run["offload_physical_relief_bytes"], 4096)
+        self.assertEqual(run["total_physical_relief_bytes"], 8192)
+        self.assertEqual(run["total_physical_relief_bytes"], run["release_physical_relief_bytes"] + run["offload_physical_relief_bytes"])
+        self.assertEqual(run["offload"]["physical_relieved_bytes"], 4096)
+        self.assertEqual(run["offload"]["action_relieved_bytes"], 4096)
+        self.assertEqual(run["release_physical_relief_authority"], "phase_boundary_budget_marker")
+        self.assertEqual(run["offload_physical_relief_authority"], "transaction_local_mincore")
+        self.assertEqual(
+            run["total_physical_relief_bytes"],
+            run["resident_after_fill"] - run["resident_after_offload_settle"],
+        )
+
+        stderr_path = next(artifact.glob("runs/*/server.stderr"))
+        lines = stderr_path.read_text(encoding="utf-8").splitlines()
+        for index, line in enumerate(lines):
+            if "offload_attempted=1" in line:
+                tokens = line.split()
+                tokens[tokens.index("bytes=4096")] = "bytes=9999"
+                lines[index] = " ".join(tokens)
+                break
+        stderr_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        parsed = self.run_parser(artifact)
+        self.assertEqual(parsed.returncode, 0, parsed.stderr)
+        tampered = json.loads((artifact / "result.json").read_text(encoding="utf-8"))["characterization"]["runs"][0]
+        self.assertEqual(tampered["release_physical_relief_bytes"], 4096)
+        self.assertEqual(tampered["offload_physical_relief_bytes"], 4096)
+
+    def test_v2_total_physical_relief_requires_conservation(self) -> None:
+        artifact = self.run_characterization_artifact(
+            mode="characterization_release_then_offload", restore="k1_sync")
+        stderr_path = next(artifact.glob("runs/*/server.stderr"))
+        lines = stderr_path.read_text(encoding="utf-8").splitlines()
+        for index, line in enumerate(lines):
+            if "kv_g0_s1_resident_observation" in line and "decision_id=3" in line:
+                lines[index] = line.replace("after_resident_bytes=4096", "after_resident_bytes=2048") \
+                    .replace("after_resident_pages=1", "after_resident_pages=0")
+                break
+        stderr_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        parsed = self.run_parser(artifact)
+        self.assertNotEqual(parsed.returncode, 0)
+        result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["verdict"], "INVALID_ARTIFACT")
+        self.assertIn("conservation", result["errors"][0])
+
+    def test_v2_offload_before_release_boundary_is_invalid(self) -> None:
+        artifact = self.run_characterization_artifact(
+            mode="characterization_release_then_offload", restore="k1_sync")
+        stderr_path = next(artifact.glob("runs/*/server.stderr"))
+        lines = stderr_path.read_text(encoding="utf-8").splitlines()
+        release_index = next(
+            index for index, line in enumerate(lines)
+            if "kv_pressure_unified_action" in line
+            and "decision_id=2" in line
+            and "release_attempted=1" in line)
+        release_line = lines.pop(release_index)
+        offload_action_index = next(
+            index for index, line in enumerate(lines)
+            if "kv_pressure_unified_action" in line
+            and "decision_id=3" in line
+            and "offload_attempted=1" in line)
+        lines.insert(offload_action_index + 1, release_line)
+        stderr_text = "\n".join(lines) + "\n"
+        stderr_path.write_text(stderr_text, encoding="utf-8")
+        execution_path = next(artifact.glob("runs/*/execution.json"))
+        execution = json.loads(execution_path.read_text(encoding="utf-8"))
+        settle = execution["characterization"]["settle"]
+        end_offset = len(stderr_text.encode("utf-8"))
+        settle["stderr_end_offset"] = end_offset
+        settle["decision_ids"] = [1, 3]
+        settle["offload_decision_ids"] = [3]
+        execution["characterization"]["resume"]["stderr_start_offset"] = end_offset
+        execution["characterization"]["resume"]["stderr_end_offset"] = end_offset
+        execution_path.write_text(json.dumps(execution), encoding="utf-8")
+        parsed = self.run_parser(artifact)
+        self.assertNotEqual(parsed.returncode, 0)
+        result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["verdict"], "INVALID_ARTIFACT")
+        self.assertIn("overlaps", result["errors"][0])
+
+    def test_release_only_swap_io_or_prefetch_is_invalid(self) -> None:
+        artifact = self.run_characterization_artifact(
+            policy="release_only", mode="characterization_release", restore="k1_sync")
+        stderr_path = next(artifact.glob("runs/*/server.stderr"))
+        stderr_path.write_text(
+            stderr_path.read_text(encoding="utf-8").replace("bytes_written=0", "bytes_written=1", 1),
+            encoding="utf-8")
+        parsed = self.run_parser(artifact)
+        self.assertNotEqual(parsed.returncode, 0)
+        result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["verdict"], "INVALID_ARTIFACT")
+
+        artifact = self.run_characterization_artifact(
+            policy="release_only", mode="characterization_release", restore="k1_sync")
+        stderr_path = next(artifact.glob("runs/*/server.stderr"))
+        with stderr_path.open("a", encoding="utf-8") as stream:
+            stream.write("kv_resume_order_event phase=prefetch decision_id=2 seq_id=0 claimant_epoch=1 transaction_id=1 action=prefetch outcome=completed reason=none graph_allowed=1\\n")
+        parsed = self.run_parser(artifact)
+        self.assertNotEqual(parsed.returncode, 0)
+        result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["verdict"], "INVALID_ARTIFACT")
+
+    def test_characterization_aggregate_uses_three_layer_baseline_and_phase_delta(self) -> None:
+        value = self.characterization_spec(policy="resident", mode="characterization_release_then_offload", restore="k1_sync")
+        value["cases"] = [
+            dict(value["cases"][0], case_id="resident", policy="resident", kv_target_bytes=None, action_target_bytes=None),
+            dict(value["cases"][0], case_id="release", policy="release_only", kv_target_bytes=4096, action_target_bytes=8192),
+            dict(value["cases"][0], case_id="v2", policy="v2", kv_target_bytes=4096, action_target_bytes=8192),
+        ]
+        value["run_order"] = [
+            {"round": 1, "run_order": 1, "case_id": "resident"},
+            {"round": 1, "run_order": 2, "case_id": "release"},
+            {"round": 1, "run_order": 3, "case_id": "v2"},
+        ]
+        value["workload"]["repeat"] = 2
+        artifact = self.root / "characterization-three-layer"
+        runner = self.run_runner(self.write_spec(value, "three-layer.json"), artifact)
+        self.assertEqual(runner.returncode, 0, runner.stderr)
+        parsed = self.run_parser(artifact)
+        self.assertEqual(parsed.returncode, 0, parsed.stderr)
+        result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
+        characterization = result["characterization"]
+        self.assertEqual(characterization["b_full"]["p50_bytes"], 12288)
+        self.assertEqual(characterization["b_release_floor"]["status"], "UNAVAILABLE")
+        self.assertEqual(len(characterization["release_target_points"]), 1)
+        self.assertEqual(characterization["release_target_points"][0]["resident_after_release_settle"], 4096)
+        self.assertEqual(characterization["b_reachable_floor"]["status"], "UNAVAILABLE")
+        self.assertEqual(characterization["baseline_ladder"]["resident_b_full"]["p50_bytes"], 12288)
+        comparisons = {item["policy"]: item for item in characterization["comparisons"]}
+        self.assertEqual(comparisons["release_only"]["performance_delta"]["candidate_phase"], "release_only_steady")
+        self.assertEqual(comparisons["v2"]["performance_delta"]["candidate_phase"], "post_resume_steady")
+        self.assertEqual(result["action_summary"]["total_physical_relief_bytes"], result["action_summary"]["release_physical_relief_bytes"] + result["action_summary"]["offload_physical_relief_bytes"])
 
     def test_resident_target_change_does_not_change_action_target(self) -> None:
         runner = load_runner_module()
@@ -850,10 +1250,10 @@ class CanonicalBenchmarkTest(unittest.TestCase):
         settle = execution["characterization"]["settle"]
         resume = execution["characterization"]["resume"]
         self.assertEqual(
-            execution["environment"]["LLAMA_KV_G0_S1_RESIDENT_OBSERVATION"], "preflight")
+            execution["environment"]["LLAMA_KV_G0_S1_RESIDENT_OBSERVATION"], "1")
         self.assertEqual(settle["status"], "target_reached")
-        self.assertEqual(settle["decision_ids"], [1, 2])
-        self.assertEqual(settle["offload_decision_ids"], [1, 2])
+        self.assertEqual(settle["decision_ids"], [1, 2, 3])
+        self.assertEqual(settle["offload_decision_ids"], [2, 3])
         self.assertEqual(settle["physical_resident_bytes"], 4096)
         self.assertGreater(resume["started_mono_ns"], settle["completed_mono_ns"])
 
@@ -928,7 +1328,7 @@ class CanonicalBenchmarkTest(unittest.TestCase):
         execution = json.loads(
             next(artifact.glob("runs/*/execution.json")).read_text(encoding="utf-8"))
         self.assertEqual(execution["characterization"]["settle"]["status"], "timeout")
-        self.assertEqual(execution["characterization"]["settle"]["offload_decision_ids"], [1])
+        self.assertEqual(execution["characterization"]["settle"]["offload_decision_ids"], [2])
         self.assertIsNone(execution["characterization"]["resume"])
         responses = next(artifact.glob("runs/*/responses.jsonl")).read_text(
             encoding="utf-8").splitlines()
@@ -1020,6 +1420,24 @@ class CanonicalBenchmarkTest(unittest.TestCase):
         self.assertEqual(parsed.returncode, 3, parsed.stderr)
         verdict = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
         self.assertEqual(verdict["verdict"], "UNSUPPORTED")
+
+    def test_formal_release_only_requires_finite_cgroup_authority(self) -> None:
+        value = self.characterization_spec(
+            policy="release_only", mode="characterization_release_no_candidate", restore="k1_sync")
+        value["run_kind"] = "formal"
+        value["run_order"] = [
+            {"round": 1, "run_order": 1, "case_id": "case"},
+            {"round": 2, "run_order": 1, "case_id": "case"},
+        ]
+        runner = load_runner_module()
+        spec, _, plan, _ = runner.validate_spec(value)
+        with self.assertRaisesRegex(runner.UnsupportedPlan, "formal budget"):
+            runner.validate_pressure_authority(spec, plan)
+        parser = load_parser_module()
+        with self.assertRaisesRegex(parser.ParseError, "formal budget"):
+            parser.validate_formal_pressure_authority(
+                spec, plan, "run_complete")
+        parser.validate_formal_pressure_authority(spec, plan, "UNSUPPORTED")
 
     def test_process_identity_startup_transient_retries_and_timeout_fails_closed(self) -> None:
         runner = load_runner_module()

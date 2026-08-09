@@ -23,7 +23,7 @@ import sys
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 RUNNER = pathlib.Path(__file__).resolve()
@@ -31,7 +31,8 @@ PARSER = ROOT / "scripts" / "parse-kv-offload-benchmark.py"
 MEMORY_SAMPLER = ROOT / "scripts" / "kv-controlled-memory-sampler.sh"
 PROTOCOL = "kv_offload_benchmark"
 SCHEMA_VERSION = 2
-SUPPORTED_POLICIES = {"resident", "v2"}
+SUPPORTED_POLICIES = {"resident", "release_only", "v2"}
+BUDGET_POLICIES = {"release_only", "v2"}
 SUPPORTED_KV_REPRESENTATIONS = {"paged"}
 SUPPORTED_LOADING_MODES = {"exact"}
 SUPPORTED_RESTORES = {"k1_sync", "k2_pipeline"}
@@ -306,13 +307,13 @@ def finite_memory_limit(value: Any) -> bool:
 
 def validate_pressure_authority(
         spec: dict[str, Any], plan: list[dict[str, Any]]) -> None:
-    if not any(item["policy"] == "v2" for item in plan):
+    if not any(item["policy"] in BUDGET_POLICIES for item in plan):
         return
     basis = spec["pressure_basis"]
     if spec["run_kind"] == "formal" and basis["authority"] != "cgroup_finite":
         raise UnsupportedPlan(
             "pre_workload_pressure_authority",
-            "formal V2 run requires real finite cgroup pressure authority",
+            "formal budget run requires real finite cgroup pressure authority",
         )
     if basis["authority"] != "cgroup_finite":
         return
@@ -538,14 +539,17 @@ def normalize_cases(value: Any) -> dict[str, dict[str, Any]]:
         if item["policy"] == "resident":
             if target is not None or action_target is not None:
                 raise RunnerError(f"{case_id}: resident policy cannot have resident/action targets")
-        elif item["policy"] == "v2" and (target is None or action_target is None):
+        elif item["policy"] in BUDGET_POLICIES and (target is None or action_target is None):
             raise RunnerError(
-                f"{case_id}: v2 policy requires explicit kv_target_bytes and action_target_bytes")
+                f"{case_id}: {item['policy']} policy requires explicit kv_target_bytes and action_target_bytes")
         cases[case_id] = dict(item)
-    action_targets = {case["action_target_bytes"] for case in cases.values() if case["policy"] == "v2"}
+    action_targets = {
+        case["action_target_bytes"] for case in cases.values()
+        if case["policy"] in BUDGET_POLICIES
+    }
     if len(action_targets) > 1:
         raise RunnerError(
-            "all v2 budget cases must use the same explicit action_target_bytes")
+            "all budget cases must use the same explicit action_target_bytes")
     return cases
 
 
@@ -634,6 +638,8 @@ def validate_spec(raw: Any) -> tuple[dict[str, Any], dict[str, dict[str, Any]], 
     workload = normalize_workload(spec["workload"])
     cases = normalize_cases(spec["cases"])
     plan = normalize_plan(spec["run_order"], cases)
+    if any(item["policy"] == "release_only" for item in plan) and spec["run_mode"] != "characterization":
+        raise RunnerError("release_only policy is available only in characterization mode")
     if spec["run_mode"] == "qualification":
         if workload["qualification"] is None or workload["characterization"] is not None:
             raise RunnerError(
@@ -686,6 +692,8 @@ def expanded_request_plan(
                 measurement_phase = (
                     "resume" if repeat_index == 1 and request_index == 0
                     else "post_resume_steady")
+            elif run_mode == "characterization" and policy == "release_only":
+                measurement_phase = "release_only_steady"
             elif run_mode == "characterization":
                 measurement_phase = "resident_steady"
             else:
@@ -708,15 +716,14 @@ def runtime_environment(
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "LLAMA_KV_PAGED": "1",
         "LLAMA_KV_PAGED_INGRAPH": "1",
-        "LLAMA_KV_PAGED_SWAP": "0" if case["policy"] == "resident" else "1",
+        "LLAMA_KV_PAGED_SWAP": "1" if case["policy"] == "v2" else "0",
         "LLAMA_KV_PAGED_SWAP_EXPLICIT_ONLY": "1",
         "LLAMA_KV_PAGED_MINCORE": "1",
         "LLAMA_KV_PAGED_IO_STATS": "1",
         "LLAMA_KV_PAGED_PREFETCH_PHASE_TRACE": "0",
         "LLAMA_KV_RESUME_STAGE_TIMING": "1",
         "LLAMA_KV_G0_S1_RESIDENT_OBSERVATION": (
-            "1" if case["policy"] == "v2" and spec["run_mode"] == "qualification"
-            else "preflight"),
+            "1" if case["policy"] == "v2" else "preflight"),
         "LLAMA_KV_PRESSURE_SAMPLE_INTERVAL_MS": "100",
         "LLAMA_KV_PRESSURE_LOG_INTERVAL_MS": "1000",
         "LLAMA_KV_PRESSURE_SAMPLER": "1",
@@ -744,7 +751,7 @@ def runtime_environment(
             "LLAMA_KV_PRESSURE_UNIFIED_ACTION_MAX_BLOCKS",
         ):
             env.pop(key, None)
-    elif case["policy"] == "v2":
+    elif case["policy"] in BUDGET_POLICIES:
         resident_target = str(case["kv_target_bytes"])
         action_target = str(case["action_target_bytes"])
         env.update({
@@ -1105,6 +1112,7 @@ def budget_settle_observations(
         action_target_bytes: int,
         max_blocks: int,
         tolerance_bytes: int,
+        release_only: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     observations: list[dict[str, Any]] = []
     terminal: dict[str, Any] | None = None
@@ -1163,6 +1171,22 @@ def budget_settle_observations(
             and int(values["blocks"]) > 0
             and int(values["relieved_bytes"]) > 0
         )
+        release_no_candidate = (
+            release_only
+            and fields.get("release_attempted") == "1"
+            and fields.get("offload_attempted") == "0"
+            and fields.get("outcome") == "no_op"
+            and fields.get("reason") == "no_candidate"
+            and fields.get("state_changed") == "0"
+            and fields.get("io_failure") == "0"
+            and int(values["blocks"]) == 0
+            and int(values["bytes"]) == 0
+            and int(values["relieved_bytes"]) == 0
+            and fields.get("transaction_id") == "0"
+            and int(values["budget_debt_after_bytes"]) > 0
+            and int(values["unmet_budget_bytes_after"]) == 0
+            and fields.get("soft_offload_armed_after") == "1"
+        )
         summary = {
             "decision_id": decision_id,
             "decision_reason": fields.get("decision_reason"),
@@ -1175,17 +1199,25 @@ def budget_settle_observations(
             "unmet_budget_bytes_after": int(values["unmet_budget_bytes_after"]),
             "budget_transient_staging_bound_bytes": int(
                 values["budget_transient_staging_bound_bytes"]),
+            "soft_offload_armed_before": fields.get("soft_offload_armed_before"),
+            "soft_offload_armed_after": fields.get("soft_offload_armed_after"),
             "positive_offload": positive_offload,
             "positive_release": positive_release,
         }
         observations.append(summary)
         seen_decisions.add(decision_id)
+        if release_no_candidate:
+            terminal = {"status": "release_no_candidate", **summary}
+            break
         if (
             (positive_offload or positive_release)
             and summary["budget_debt_after_bytes"] == 0
             and summary["unmet_budget_bytes_after"] == 0
         ):
-            terminal = {"status": "debt_closed", **summary}
+            terminal = {
+                "status": "release_settled" if release_only else "debt_closed",
+                **summary,
+            }
             break
         if (
             fields.get("decision_reason") == "budget_target_satisfied"
@@ -1207,6 +1239,84 @@ def budget_settle_observations(
     return observations, terminal
 
 
+def release_settle_boundary(
+        text: str,
+        expected_source: str,
+        resident_target_bytes: int,
+        action_target_bytes: int,
+        max_blocks: int,
+) -> dict[str, Any] | None:
+    for line in text.splitlines():
+        fields = parse_marker_fields(line, "kv_pressure_unified_action")
+        if fields is None:
+            continue
+        values = {
+            key: uint_marker_field(fields, key)
+            for key in (
+                "decision_id", "target_bytes", "max_blocks", "budget_target_bytes",
+                "budget_resident_bytes", "budget_debt_after_bytes",
+                "unmet_budget_bytes_after", "blocks", "bytes", "relieved_bytes",
+            )
+        }
+        if any(value is None for value in values.values()):
+            continue
+        if (
+            fields.get("state") != "NORMAL"
+            or fields.get("source") != expected_source
+            or fields.get("sample_valid") != "1"
+            or fields.get("stale") != "0"
+            or fields.get("pressure_basis_valid") != "1"
+            or fields.get("budget_active") != "1"
+            or fields.get("budget_target_enabled") != "1"
+            or fields.get("budget_source") != "env_static"
+            or int(values["target_bytes"]) != action_target_bytes
+            or int(values["max_blocks"]) != max_blocks
+            or int(values["budget_target_bytes"]) != resident_target_bytes
+            or fields.get("budget_view_valid") != "1"
+            or fields.get("budget_resident_available") != "1"
+            or fields.get("idle") != "1"
+            or fields.get("release_attempted") != "1"
+            or fields.get("offload_attempted") != "0"
+        ):
+            continue
+        no_candidate = (
+            fields.get("outcome") == "no_op"
+            and fields.get("reason") == "no_candidate"
+            and fields.get("state_changed") == "0"
+            and fields.get("io_failure") == "0"
+            and int(values["blocks"]) == 0
+            and int(values["bytes"]) == 0
+            and int(values["relieved_bytes"]) == 0
+            and fields.get("transaction_id") == "0"
+            and int(values["budget_debt_after_bytes"]) > 0
+            and int(values["unmet_budget_bytes_after"]) == 0
+            and fields.get("soft_offload_armed_after") == "1"
+        )
+        target_closed = (
+            fields.get("outcome") == "completed"
+            and fields.get("state_changed") == "1"
+            and fields.get("io_failure") == "0"
+            and int(values["blocks"]) > 0
+            and int(values["relieved_bytes"]) > 0
+            and int(values["budget_debt_after_bytes"]) == 0
+            and int(values["unmet_budget_bytes_after"]) == 0
+            and fields.get("soft_offload_armed_after") == "0"
+        )
+        if no_candidate or target_closed:
+            return {
+                "status": "release_no_candidate" if no_candidate else "release_settled",
+                "decision_id": int(values["decision_id"]),
+                "budget_resident_bytes": int(values["budget_resident_bytes"]),
+                "budget_debt_after_bytes": int(values["budget_debt_after_bytes"]),
+                "unmet_budget_bytes_after": int(values["unmet_budget_bytes_after"]),
+                "state_changed": fields.get("state_changed") == "1",
+                "bytes": int(values["bytes"]),
+                "relieved_bytes": int(values["relieved_bytes"]),
+                "soft_offload_armed_after": fields.get("soft_offload_armed_after") == "1",
+            }
+    return None
+
+
 def wait_budget_settle(
         stderr_path: pathlib.Path,
         start_offset: int,
@@ -1217,10 +1327,15 @@ def wait_budget_settle(
         max_blocks: int,
         tolerance_bytes: int,
         server: subprocess.Popen[bytes],
+        *,
+        release_only: bool = False,
+        capture_release_settle: Callable[[], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     started_mono_ns = time.monotonic_ns()
     deadline = time.monotonic() + timeout_seconds
     last_complete_offset = start_offset
+    release_settle: dict[str, Any] | None = None
+    release_boundary: dict[str, Any] | None = None
     while True:
         text, complete_offset = complete_stderr_suffix(stderr_path, start_offset)
         last_complete_offset = max(last_complete_offset, complete_offset)
@@ -1231,7 +1346,22 @@ def wait_budget_settle(
             action_target_bytes,
             max_blocks,
             tolerance_bytes,
+            release_only=release_only,
         )
+        boundary = release_settle_boundary(
+            text,
+            expected_source,
+            resident_target_bytes,
+            action_target_bytes,
+            max_blocks,
+        )
+        if (
+            capture_release_settle is not None
+            and release_settle is None
+            and boundary is not None
+        ):
+            release_settle = capture_release_settle()
+            release_boundary = boundary
         if terminal is not None:
             completed_mono_ns = time.monotonic_ns()
             return {
@@ -1243,6 +1373,8 @@ def wait_budget_settle(
                 "stderr_end_offset": complete_offset,
                 "terminal_decision": terminal,
                 "physical_resident_bytes": None,
+                "release_settle": release_settle,
+                "release_boundary": release_boundary,
                 "decision_ids": [item["decision_id"] for item in observations],
                 "offload_decision_ids": [
                     item["decision_id"] for item in observations if item["positive_offload"]],
@@ -1260,6 +1392,8 @@ def wait_budget_settle(
                 "stderr_end_offset": last_complete_offset,
                 "terminal_decision": None,
                 "physical_resident_bytes": None,
+                "release_settle": release_settle,
+                "release_boundary": release_boundary,
                 "decision_ids": [item["decision_id"] for item in observations],
                 "offload_decision_ids": [
                     item["decision_id"] for item in observations if item["positive_offload"]],
@@ -1404,6 +1538,7 @@ def run_one(
         "after_fill": None,
         "idle": None,
         "settle": None,
+        "release_settled": None,
         "settled": None,
         "resume": None,
         "after_measurement": None,
@@ -1552,6 +1687,14 @@ def run_one(
                         "duration_ns": idle_finished_mono_ns - idle_started_mono_ns,
                         "stderr_start_offset": stderr_start_offset,
                     }
+                    def capture_release_settle() -> dict[str, Any]:
+                        snapshot = capture_slots(
+                            port,
+                            run_dir / "slots_release_settled.json",
+                            spec["request_timeout_seconds"],
+                        )
+                        return snapshot_reference("slots_release_settled.json", snapshot)
+
                     settle = wait_budget_settle(
                         stderr_path,
                         stderr_start_offset,
@@ -1562,6 +1705,7 @@ def run_one(
                         int(spec["max_blocks"]),
                         characterization_config["target_tolerance_bytes"],
                         server,
+                        capture_release_settle=capture_release_settle,
                     )
                     characterization_record["settle"] = settle
                     if settle["status"] == "timeout":
@@ -1587,6 +1731,70 @@ def run_one(
                     ):
                         raise RunnerError(
                             "budget_unmet_terminal differs from actual settled physical resident")
+                    characterization_record["release_settled"] = settle["release_settle"]
+                    if (
+                        characterization_record["release_settled"] is None
+                        or settle["release_boundary"] is None
+                    ):
+                        raise RunnerError(
+                            "V2 characterization has no production RELEASE settle boundary")
+                    characterization_record["settled"] = snapshot_reference(
+                        "slots_settled.json", settled)
+
+                elif case["policy"] == "release_only":
+                    stderr_start_offset = stderr_path.stat().st_size
+                    idle_started_mono_ns = time.monotonic_ns()
+                    time.sleep(characterization_config["idle_seconds"])
+                    idle_finished_mono_ns = time.monotonic_ns()
+                    characterization_record["idle"] = {
+                        "started_mono_ns": idle_started_mono_ns,
+                        "finished_mono_ns": idle_finished_mono_ns,
+                        "duration_ns": idle_finished_mono_ns - idle_started_mono_ns,
+                        "stderr_start_offset": stderr_start_offset,
+                    }
+                    settle = wait_budget_settle(
+                        stderr_path,
+                        stderr_start_offset,
+                        characterization_config["settle_timeout_seconds"],
+                        pressure_basis_source(spec["pressure_basis"]),
+                        int(case["kv_target_bytes"]),
+                        int(case["action_target_bytes"]),
+                        int(spec["max_blocks"]),
+                        characterization_config["target_tolerance_bytes"],
+                        server,
+                        release_only=True,
+                    )
+                    characterization_record["settle"] = settle
+                    if settle["status"] == "timeout":
+                        raise RunnerError(
+                            "release_only characterization timed out waiting for Unified RELEASE closure")
+                    settled = capture_slots(
+                        port, run_dir / "slots_settled.json", spec["request_timeout_seconds"])
+                    settled_resident_bytes = captured_resident_bytes(settled)
+                    settle["physical_resident_bytes"] = settled_resident_bytes
+                    terminal = settle["terminal_decision"]
+                    if terminal is None:
+                        raise RunnerError("release_only characterization has no terminal RELEASE decision")
+                    tolerance_bytes = characterization_config["target_tolerance_bytes"]
+                    if settle["status"] == "release_settled":
+                        if (
+                            settled_resident_bytes > int(case["kv_target_bytes"]) + tolerance_bytes
+                            or terminal["budget_debt_after_bytes"] != 0
+                            or terminal["unmet_budget_bytes_after"] != 0
+                        ):
+                            raise RunnerError(
+                                "Unified RELEASE reported closure without actual physical resident closure")
+                    elif settle["status"] == "release_no_candidate":
+                        if abs(
+                            settled_resident_bytes - terminal["budget_resident_bytes"]
+                        ) > tolerance_bytes:
+                            raise RunnerError(
+                                "RELEASE no_candidate terminal differs from actual settled physical resident")
+                    else:
+                        raise RunnerError(
+                            f"unexpected release_only settle status: {settle['status']}")
+                    characterization_record["release_settled"] = snapshot_reference(
+                        "slots_settled.json", settled)
                     characterization_record["settled"] = snapshot_reference(
                         "slots_settled.json", settled)
 
