@@ -302,7 +302,9 @@ server_kv_pressure_action_result server_kv_pressure_execute_unified_action(
     auto & observation = result.observation;
     observation.pressure_state = telemetry.state;
     observation.pressure_source = telemetry.source;
+    observation.sample_valid = telemetry.sample_valid;
     observation.stale = telemetry.stale;
+    observation.pressure_basis_valid = telemetry.pressure_basis_valid;
     observation.idle = idle;
     observation.sample_count = sample_count;
     observation.decision_id = decision_id;
@@ -446,7 +448,9 @@ server_kv_pressure_action_result server_kv_pressure_execute_governor(
     auto & observation = result.observation;
     observation.pressure_state = pressure.state;
     observation.pressure_source = pressure.source;
+    observation.sample_valid = pressure.sample_valid;
     observation.stale = pressure.stale;
+    observation.pressure_basis_valid = pressure.pressure_basis_valid;
     observation.sample_count = pressure.sample_count;
     observation.decision_id = pressure.decision_id;
     observation.target_bytes = config.target_bytes;
@@ -1048,7 +1052,9 @@ std::string server_kv_pressure_unified_action_format_marker(
     out << "kv_pressure_unified_action"
         << " state=" << kv_pressure_state_name(observation.pressure_state)
         << " source=" << kv_pressure_source_name(observation.pressure_source)
+        << " sample_valid=" << (observation.sample_valid ? 1 : 0)
         << " stale=" << (observation.stale ? 1 : 0)
+        << " pressure_basis_valid=" << (observation.pressure_basis_valid ? 1 : 0)
         << " decision_id=" << observation.decision_id
         << " episode=" << result.episode
         << " target_bytes=" << observation.target_bytes

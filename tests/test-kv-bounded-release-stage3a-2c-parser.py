@@ -92,7 +92,7 @@ class ParserArtifactTest(unittest.TestCase):
             "write_mapping_fatal": 0,
             "active_nonresident_fatal": 0,
         }
-        return "KV_PAGED_RELEASE_STATS " + " ".join(f"{k}={v}" for k, v in values.items()) + "\n"
+        return "KV_PAGED_BOUNDED_RELEASE_STATS " + " ".join(f"{k}={v}" for k, v in values.items()) + "\n"
 
     @staticmethod
     def base_env() -> dict[str, str]:
@@ -207,6 +207,12 @@ class ParserArtifactTest(unittest.TestCase):
     def test_valid_baseline_passes(self) -> None:
         result = self.run_parser()
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_retired_release_stats_marker_fails_closed(self) -> None:
+        path = self.art / "bounded_off" / "server.stderr"
+        path.write_text(path.read_text().replace(
+            "KV_PAGED_BOUNDED_RELEASE_STATS", "KV_PAGED_RELEASE_STATS"))
+        self.assert_failure("OFF: KV_PAGED_RELEASE_STATS is retired")
 
     def test_off_bounded_source_nonzero_fails_for_that_counter(self) -> None:
         path = self.art / "bounded_off" / "server.stderr"

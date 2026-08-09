@@ -102,7 +102,9 @@ struct server_kv_pressure_action_ops {
 struct server_kv_pressure_action_observation {
     kv_pressure_state pressure_state = kv_pressure_state::NORMAL;
     kv_pressure_source pressure_source = kv_pressure_source::NONE;
+    bool sample_valid = false;
     bool stale = false;
+    bool pressure_basis_valid = false;
     bool idle = false;
     uint64_t sample_count = 0;
     uint64_t decision_id = 0;

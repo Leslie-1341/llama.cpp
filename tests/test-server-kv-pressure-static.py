@@ -126,7 +126,10 @@ class ServerKvPressureStaticTest(unittest.TestCase):
 
     def test_dry_run_scanner_is_const_and_readonly(self):
         """The dry-run scanner must be declared const and must NOT call madvise or mutate KV state."""
-        dry_fn = function_body(self.core, "paged_release_blocks_bounded_dry_run")
+        dry_fn = function_body(
+            self.core,
+            "llama_kv_bounded_release_result llama_kv_cache::paged_release_blocks_bounded_dry_run(",
+        )
         # Must be declared const on the method
         self.assertIn(") const", self.core_h.split("paged_release_blocks_bounded_dry_run")[1].split("{")[0])
         # Must NOT call destructive operations or write to KV state.

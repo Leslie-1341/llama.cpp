@@ -6263,7 +6263,7 @@ void llama_kv_cache::paged_log_stats() const {
             "identity_fail=%llu mapping_oob_fail=%llu logical_mapping_fail=%llu write_resolve_fail=%llu "
             "row_idx_fail=%llu row_mapping_fatal=%llu write_mapping_fatal=%llu "
             "active_nonresident_fatal=%llu input_setup_fatal=%llu shadow_mismatch=%llu shadow_fail=%llu "
-            "release_madvise_fail=%llu mincore_failures=%llu "
+            "mincore_failures=%llu "
             "mincore_enabled=%d mincore_samples=%llu mincore_before_last=%llu mincore_after_last=%llu "
             "mincore_post_graph_last=%llu mincore_released_total_last=%llu mincore_drop_max=%llu "
             "mincore_reaccess_last=%llu mincore_reaccess_total_last=%llu\n",

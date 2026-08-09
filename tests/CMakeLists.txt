@@ -223,6 +223,10 @@ if (UNIX)
             ARGS ${PROJECT_SOURCE_DIR}/tests/test-kv-governor-g0-s1-parser.py LABEL python)
         llama_test_cmd(python3 NAME test-kv-bounded-release-stage3a-2c-parser
             ARGS ${PROJECT_SOURCE_DIR}/tests/test-kv-bounded-release-stage3a-2c-parser.py LABEL python)
+        llama_test_cmd(python3 NAME test-kv-offload-benchmark
+            ARGS ${PROJECT_SOURCE_DIR}/tests/test-kv-offload-benchmark.py LABEL python)
+        llama_test_cmd(python3 NAME test-kv-server-b0-b2-baseline-parser
+            ARGS ${PROJECT_SOURCE_DIR}/tests/test-kv-server-b0-b2-baseline-parser.py LABEL python)
         llama_test_cmd(python3 NAME test-runner-bounded-release-stage3a-2c
             ARGS ${PROJECT_SOURCE_DIR}/tests/test-runner-bounded-release-stage3a-2c.py LABEL python)
     endif()
