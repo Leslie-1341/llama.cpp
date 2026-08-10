@@ -50,6 +50,36 @@ static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
 
+// KV F16 Compatibility Gate: the single authority for which KV element types
+// the three paged capability gates admit.
+//
+// Scope of the allowlist (what this helper actually guards):
+//   G1  paged_layers_supported   -> destructive RELEASE (paged row-idx reclaim);
+//   G2  paged_ingraph_gather_supported -> in-graph gather path selection;
+//   G3  paged_shift > 0          -> non-identity mapping construction.
+// Only native F16 and F32 K/V are admitted; BF16, the 8/4/6-bit quants and any
+// other type stay out of those three paths. This is an explicit allowlist --
+// do NOT widen it to !ggml_is_quantized(), which silently admits future/odd
+// types.
+//
+// Out of scope (intentionally unchanged by this gate): OFFLOAD/PREFETCH and the
+// K1/K2/R2 swap plumbing operate on raw K/V row bytes (nb[1]/ggml_row_size) and
+// keep their existing type-agnostic semantics regardless of this allowlist;
+// this helper does NOT gate them and this change does not alter their runtime
+// behaviour. (.can_offload/.can_prefetch in execute_action reflect that raw-
+// byte swap capability and are deliberately not routed through G1.)
+//
+// Evidence boundary (not changed here): the in-graph gather path goes through
+// ggml_get_rows, whose F16 source kernel (ggml_compute_forward_get_rows_f16)
+// writes an F32 destination and performs an F16->F32 conversion. So under F16
+// the gather is a path-selection + element conversion, NOT a pure byte copy,
+// and attention receives the gathered K/V as F32. Correctness of F16 gather
+// therefore depends on that upstream ggml kernel, which is out of scope for
+// this compatibility gate and is left untouched here.
+static bool llama_kv_paged_type_supported(enum ggml_type t) {
+    return t == GGML_TYPE_F16 || t == GGML_TYPE_F32;
+}
+
 static uint64_t llama_paged_timing_now_us() {
     using clock = std::chrono::steady_clock;
     return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
@@ -965,8 +995,12 @@ llama_kv_cache::llama_kv_cache(
         } else {
             kv_paged_enabled = true;
             paged_block_size = (uint32_t) block_size_env;
-            if (shift_env > 0 && (type_k != GGML_TYPE_F32 || type_v != GGML_TYPE_F32)) {
-                LLAMA_LOG_WARN("%s: KV paged non-identity mapping requires F32 K/V cache "
+            // G3: paged non-identity mapping (paged_shift > 0) gate. Admits the
+            // same KV element types as the other paged capability gates via
+            // llama_kv_paged_type_supported (F16/F32). Any other type falls back
+            // to identity mapping.
+            if (shift_env > 0 && (!llama_kv_paged_type_supported(type_k) || !llama_kv_paged_type_supported(type_v))) {
+                LLAMA_LOG_WARN("%s: KV paged non-identity mapping requires F16/F32 K/V cache "
                         "(type_k=%s, type_v=%s) - using identity mapping\n",
                         __func__, ggml_type_name(type_k), ggml_type_name(type_v));
                 paged_shift = 0;
@@ -1408,10 +1442,15 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    // G1: paged_layers_supported gates the destructive RELEASE path (paged
+    // row-idx reclaim) and feeds paged_row_idx_enabled / the unified RELEASE
+    // capability. OFFLOAD/PREFETCH stay type-agnostic raw-byte swap and are
+    // NOT gated by G1 (see llama_kv_paged_type_supported). Admits F16/F32 K/V.
     paged_layers_supported = !layers.empty();
     for (const auto & layer : layers) {
         paged_layers_supported = paged_layers_supported && layer.k && layer.v &&
-            layer.k->type == GGML_TYPE_F32 && layer.v->type == GGML_TYPE_F32;
+            llama_kv_paged_type_supported(layer.k->type) &&
+            llama_kv_paged_type_supported(layer.v->type);
     }
 
     // Cleanup-C2: identity fast-path `.release` is driven by the
@@ -6114,13 +6153,15 @@ bool llama_kv_cache::paged_ingraph_gather_supported(int32_t il) const {
 
     const int32_t ikv = map_layer_ids.at(il);
     const auto & layer = layers[ikv];
+    // G2: in-graph gather gate. Admits the same KV element types as the other
+    // paged capability gates via llama_kv_paged_type_supported (F16/F32).
     const bool supported = n_stream == 1 && !v_trans &&
         layer.k && layer.v &&
-        layer.k->type == GGML_TYPE_F32 &&
-        layer.v->type == GGML_TYPE_F32;
+        llama_kv_paged_type_supported(layer.k->type) &&
+        llama_kv_paged_type_supported(layer.v->type);
 
     if (!supported && !paged_ingraph_warned) {
-        LLAMA_LOG_WARN("%s: KV paged in-graph gather requires n_stream==1, !v_trans, and F32 K/V cache "
+        LLAMA_LOG_WARN("%s: KV paged in-graph gather requires n_stream==1, !v_trans, and F16/F32 K/V cache "
                 "(n_stream=%u, v_trans=%d, k_type=%s, v_type=%s) - falling back to continuous K/V views\n",
                 __func__, n_stream, (int) v_trans,
                 layer.k ? ggml_type_name(layer.k->type) : "none",

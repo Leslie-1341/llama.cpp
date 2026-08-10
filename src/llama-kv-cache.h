@@ -534,6 +534,21 @@ public:
         uint8_t  state = 0;  // cast to paged_block_state (UNUSED=0)
     } mutable paged_release_bounded_test_block_state_override;
 
+    // Test-only read accessors for the F16 compatibility-gate telemetry. These
+    // expose private paged counters/flags so tests can hard-assert that a gate
+    // path was genuinely selected (not merely admitted), eliminating false-green
+    // fallback. They mirror the same fields logged by paged_log_stats(); no new
+    // production state is introduced.
+    bool paged_test_read_non_identity_enabled() const {
+        return paged_non_identity_enabled;
+    }
+    uint64_t paged_test_read_block_mapping_changed() const {
+        return paged_block_mapping_changed;
+    }
+    uint64_t paged_test_read_ingraph_gather_layers() const {
+        return paged_ingraph_gather_layers;
+    }
+
     // Test-only read accessors for post-ABORT state invariance verification.
     // Returns paged_block_state cast to uint8_t, or UINT8_MAX if block is out of range.
     uint8_t paged_release_bounded_test_read_block_state(uint32_t block) const {
@@ -1138,7 +1153,7 @@ private:
     bool     kv_paged_warned   = false;
     bool     paged_ingraph_enabled = true;
     bool     paged_row_idx_enabled = false;
-    bool     paged_layers_supported = false;  // unified: non-empty && all layers have K/V F32 tensors
+    bool     paged_layers_supported = false;  // unified: non-empty && all layers have K/V F16/F32 tensors
     bool     paged_nonidentity_probe_requested = false;
     bool     paged_identity_fast_path_enabled = false;
     uint32_t paged_identity_fast_path_layers = 0;
