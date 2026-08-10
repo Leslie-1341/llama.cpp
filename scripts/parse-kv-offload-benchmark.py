@@ -15,8 +15,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT = pathlib.Path(__file__).resolve()
 PROTOCOL = "kv_offload_benchmark"
 SCHEMA_VERSION = 2
-SUPPORTED_POLICIES = {"resident", "release_only", "v2"}
-BUDGET_POLICIES = {"release_only", "v2"}
+SUPPORTED_POLICIES = {"resident", "release_only", "v2", "idle_age", "v3"}
+BUDGET_POLICIES = {"release_only", "v2", "idle_age", "v3"}
+SWAP_POLICIES = {"v2", "idle_age", "v3"}
 SUPPORTED_KV_REPRESENTATIONS = {"paged"}
 SUPPORTED_LOADING_MODES = {"exact"}
 SUPPORTED_RESTORES = {"k1_sync", "k2_pipeline"}
@@ -113,6 +114,37 @@ ACTION_BOOL = {
     "budget_reclaimable_available", "soft_offload_armed_before", "soft_offload_armed_after",
     "offload_armed_before", "offload_armed_after", "evaluate_attempted", "release_attempted",
     "offload_attempted", "io_failure", "state_changed", "idle",
+}
+ACTION_V3_NUMERIC = {
+    "action_elapsed_us", "physical_relief_bytes", "physical_object_id", "physical_generation",
+}
+ACTION_V3_BOOL = {"physical_relief_available"}
+ACTION_V3_POLICIES = {"v2", "idle_age", "lru", "v3"}
+# V3 marker authority.  The format marker emits `policy=` and `decision_fallback=`
+# (empty when the decision was fully cost-aware / non-V3), so they are required by the
+# V3 audit even though the legacy V2 marker never carried them.
+ACTION_V3_MARKER_REQUIRED = {"policy", "decision_fallback"}
+ACTION_V3_PHYSICAL_FEEDBACK = {"action_elapsed_us", "physical_relief_available",
+                               "physical_relief_bytes", "physical_object_id", "physical_generation"}
+# Per-claimant score schema, in the exact field order emitted by
+# server_kv_pressure_unified_action_format_marker(): 32 fields ending with fallback_reason.
+# cost_aware is "1"/"0"; fallback_reason is a bare token ("none" when cost-aware).
+SCORE_FIELDS = (
+    "seq_id", "eligible", "exclusion", "total", "idle_age_score", "logical_kv_score",
+    "reclaimable_score", "lcp_n_past_penalty", "io_cost_penalty", "failure_penalty", "rank",
+    "cost_aware", "physical_estimate_available", "physical_estimate_authoritative",
+    "estimated_physical_bytes", "reuse_probability_ppm", "expected_offload_write_cost_us",
+    "expected_restore_gate_cost_us", "expected_cost_us", "churn_penalty_us", "raw_idle_age_us",
+    "raw_answer_tokens", "raw_lcp_hint_tokens", "physical_object_id", "physical_generation",
+    "actual_relief_bytes", "resident_lease_until_sample", "round_trip_count",
+    "last_offload_bytes", "last_restore_bytes", "fallback_reason",
+)
+SCORE_NUMERIC_FIELDS = {f for f in SCORE_FIELDS if f != "exclusion" and f != "fallback_reason"}
+SCORE_BOOL_FIELDS = {"eligible", "cost_aware", "physical_estimate_available",
+                     "physical_estimate_authoritative"}
+V3_FALLBACK_REASONS = {
+    "none", "physical_unavailable", "physical_not_authoritative", "write_cost_unavailable",
+    "restore_cost_unavailable", "no_reuse_evidence",
 }
 RESUME_BOOL = {"graph_allowed"}
 IO_BOOL = {"k2_enabled", "restore_prefault_enabled"}
@@ -412,7 +444,7 @@ def expanded_request_plan(
         append(item, item["request_id"], 0, False, "fill")
     for repeat_index in range(1, workload["repeat"] + 1):
         for request_index, item in enumerate(workload["requests"]):
-            if run_mode == "characterization" and case["policy"] == "v2":
+            if run_mode == "characterization" and case["policy"] in SWAP_POLICIES:
                 measurement_phase = (
                     "resume" if repeat_index == 1 and request_index == 0
                     else "post_resume_steady")
@@ -423,7 +455,7 @@ def expanded_request_plan(
             else:
                 measurement_phase = "qualification_measurement"
             append(item, item["request_id"], repeat_index, True, measurement_phase)
-    if run_mode == "qualification" and workload["qualification"] is not None and case["policy"] == "v2":
+    if run_mode == "qualification" and workload["qualification"] is not None and case["policy"] in SWAP_POLICIES:
         resume_request_id = workload["qualification"]["resume_request_id"]
         resume_request = next(
             item for item in workload["requests"] if item["request_id"] == resume_request_id)
@@ -680,6 +712,10 @@ def numeric_fields(fields: dict[str, str], names: set[str], label: str) -> None:
 
 def validate_action_fields(fields: dict[str, str], label: str) -> None:
     numeric_fields(fields, ACTION_NUMERIC, label)
+    numeric_fields(fields, ACTION_V3_NUMERIC, label)
+    boolean_fields(fields, ACTION_V3_BOOL, label)
+    if "policy" in fields and fields["policy"] not in ACTION_V3_POLICIES:
+        raise ParseError(f"{label}: unsupported policy marker {fields['policy']!r}")
     selected_seq_id = fields["selected_seq_id"]
     if not SIGNED_INT.fullmatch(selected_seq_id) or int(selected_seq_id) < -1:
         raise ParseError(f"{label}: selected_seq_id must be -1 or a non-negative integer")
@@ -696,6 +732,129 @@ def boolean_fields(fields: dict[str, str], names: set[str], label: str) -> None:
     for key in names:
         if key in fields and fields[key] not in {"0", "1"}:
             raise ParseError(f"{label}: {key} is not a boolean marker")
+
+
+def _parse_v3_score_records(scores_value: str, label: str) -> list[dict[str, str]]:
+    # `scores=` is "none" when no claimants were scored, otherwise a `;`-separated
+    # list of `:`-separated per-claimant field groups matching SCORE_FIELDS order.
+    if scores_value == "none":
+        return []
+    records: list[dict[str, str]] = []
+    for index, group in enumerate(scores_value.split(";")):
+        cells = group.split(":")
+        if len(cells) != len(SCORE_FIELDS):
+            raise ParseError(
+                f"{label}: score[{index}] has {len(cells)} fields, expected {len(SCORE_FIELDS)}")
+        records.append(dict(zip(SCORE_FIELDS, cells)))
+    return records
+
+
+def validate_action_v3_audit(action: dict[str, str], case: dict[str, Any], label: str) -> None:
+    # Canonical V3 tightening (review-fix item 4): a V3 decision marker must carry
+    # a single comparable ranking authority.  Fail-closed when the cost feedback or
+    # per-claimant audit record is absent instead of silently passing it through.
+    if case.get("policy") != "v3":
+        return
+    if "policy" in action and action["policy"] != "v3":
+        raise ParseError(f"{label}: policy marker {action['policy']!r} does not match V3 case")
+    for key in ACTION_V3_MARKER_REQUIRED - set(action):
+        raise ParseError(f"{label}: missing V3 marker field {key!r}")
+    if action["policy"] != "v3":
+        raise ParseError(f"{label}: policy marker must be 'v3' for V3 case")
+
+    # Determine whether this marker captured a state-changing OFFLOAD selected a
+    # claimant; a no-op decision (claimant_no_candidate / not_pressure / evaluate
+    # rejection / pure release) needs no physical feedback or victim score audit.
+    is_offload = action["offload_attempted"] == "1"
+    state_changed = is_offload and action["state_changed"] == "1"
+
+    for key in ACTION_V3_PHYSICAL_FEEDBACK - set(action):
+        raise ParseError(f"{label}: missing V3 physical feedback field {key!r}")
+
+    score_records = _parse_v3_score_records(action.get("scores", "none"), label)
+    if not is_offload:
+        return
+
+    selected_seq_id = int(action["selected_seq_id"])
+    if selected_seq_id < 0:
+        raise ParseError(f"{label}: OFFLOAD attempted without a non-negative selected_seq_id")
+
+    selected_score: dict[str, str] | None = None
+    seen_selected = False
+    eligible_before: list[int] = []
+    for record in score_records:
+        for key in SCORE_NUMERIC_FIELDS:
+            value = record[key]
+            if not UINT.fullmatch(value):
+                raise ParseError(f"{label}: score {key} is not a non-negative integer")
+        for key in SCORE_BOOL_FIELDS:
+            if record[key] not in {"0", "1"}:
+                raise ParseError(f"{label}: score {key} is not a boolean")
+        if record["fallback_reason"] not in V3_FALLBACK_REASONS:
+            raise ParseError(
+                f"{label}: score fallback_reason {record['fallback_reason']!r} is not a known V3 reason")
+        if record["exclusion"] not in {
+            "none", "active", "protected", "shared", "write_open", "fail_stop", "exhausted",
+            "epoch_mismatch", "stale_generation", "resident_lease", "no_physical_relief", "empty"}:
+            raise ParseError(f"{label}: score exclusion {record['exclusion']!r} is unknown")
+        if record["cost_aware"] == "1" and record["fallback_reason"] != "none":
+            raise ParseError(f"{label}: cost-aware claimant must carry no fallback reason")
+        if record["cost_aware"] == "0" and record["fallback_reason"] == "none" and record["eligible"] == "1":
+            raise ParseError(f"{label}: eligible non-cost-aware claimant must record a fallback reason")
+        if int(record["rank"]) != len(eligible_before):
+            raise ParseError(f"{label}: score rank {record['rank']} is out of order")
+        seq_id = int(record["seq_id"])
+        if record["eligible"] == "1":
+            eligible_before.append(seq_id)
+            if seq_id == selected_seq_id:
+                selected_score = record
+                seen_selected = True
+    if not eligible_before:
+        raise ParseError(f"{label}: OFFLOAD attempted but no eligible claimant score was emitted")
+    if not seen_selected:
+        raise ParseError(
+            f"{label}: selected_seq_id={selected_seq_id} has no eligible claimant score")
+
+    # The selected victim must carry either a cost-aware authority or an explicit
+    # fallback reason so the decision is auditable.  A bare INT_MAX/4 placeholder
+    # would be silently unranked — fail-closed instead.
+    if selected_score["cost_aware"] == "1":
+        if selected_score["estimated_physical_bytes"] == "0":
+            raise ParseError(f"{label}: cost-aware selected claimant reports zero physical bytes")
+        if int(selected_score["expected_cost_us"]) <= 0:
+            raise ParseError(f"{label}: cost-aware selected claimant has no expected cost")
+    elif selected_score["fallback_reason"] == "none":
+        raise ParseError(f"{label}: selected claimant score is neither cost-aware nor fallback-tagged")
+
+    # Marker-level `decision_fallback` must agree with the per-claimant score
+    # authority so the canonical audit cannot certify a mixed-evidence decision
+    # as fully cost-aware, nor a fully cost-aware decision as fallen back.
+    marker_fallback = action["decision_fallback"]
+    eligible_records = [r for r in score_records if r["eligible"] == "1"]
+    eligible_non_cost_aware = [r for r in eligible_records if r["cost_aware"] == "0"]
+    if marker_fallback == "none":
+        if eligible_non_cost_aware:
+            raise ParseError(
+                f"{label}: marker decision_fallback=none but eligible non-cost-aware claimant "
+                f"{eligible_non_cost_aware[0]['seq_id']} carries a fallback reason")
+    else:
+        if not any(r["fallback_reason"] == marker_fallback for r in eligible_non_cost_aware):
+            raise ParseError(
+                f"{label}: marker decision_fallback={marker_fallback!r} is not carried by any "
+                f"eligible non-cost-aware claimant")
+        if not eligible_non_cost_aware:
+            raise ParseError(
+                f"{label}: marker decision_fallback={marker_fallback!r} but no eligible "
+                f"non-cost-aware claimant exists to justify the fallback")
+
+    if state_changed:
+        # Physical feedback is the V3 production signal: when an OFFLOAD actually
+        # moved KV, the marker must record the action wall time and physical
+        # lineage so the next decision can compare cost against actual relief.
+        if int(action["action_elapsed_us"]) == 0:
+            raise ParseError(f"{label}: state-changing OFFLOAD reports zero action_elapsed_us")
+        if int(action["physical_object_id"]) == 0 or int(action["physical_generation"]) == 0:
+            raise ParseError(f"{label}: state-changing OFFLOAD missing physical lineage feedback")
 
 
 def marker_records(text: str, token: str, required: set[str], label: str) -> list[dict[str, str]]:
@@ -906,7 +1065,7 @@ def validate_execution_environment(execution: dict[str, Any], case: dict[str, An
     if env.get("LLAMA_KV_PAGED") != "1" or env.get("LLAMA_KV_PAGED_INGRAPH") != "1":
         raise ParseError(f"{label}: paged runtime is not explicitly enabled")
     for key, expected in {
-        "LLAMA_KV_PAGED_SWAP": "1" if case["policy"] == "v2" else "0",
+        "LLAMA_KV_PAGED_SWAP": "1" if case["policy"] in SWAP_POLICIES else "0",
         "LLAMA_KV_PAGED_SWAP_EXPLICIT_ONLY": "1",
         "LLAMA_KV_PAGED_MINCORE": "1",
         "LLAMA_KV_PAGED_IO_STATS": "1",
@@ -928,9 +1087,11 @@ def validate_execution_environment(execution: dict[str, Any], case: dict[str, An
         raise ParseError(f"{label}: canonical pressure interval environment mismatch")
     if env.get("LLAMA_KV_PRESSURE_SAMPLER") != "1" or env.get("LLAMA_KV_RESUME_STAGE_TIMING") != "1":
         raise ParseError(f"{label}: canonical telemetry environment is incomplete")
+    if case["policy"] in SWAP_POLICIES and env.get("LLAMA_KV_PRESSURE_POLICY", "v2") != case["policy"]:
+        raise ParseError(f"{label}: policy environment does not match case")
     expected_resident_observation = (
-        "both" if case["policy"] == "v2" and spec["run_mode"] == "characterization"
-        else "1" if case["policy"] == "v2" else "preflight")
+        "both" if case["policy"] in SWAP_POLICIES and spec["run_mode"] == "characterization"
+        else "1" if case["policy"] in SWAP_POLICIES else "preflight")
     if env.get("LLAMA_KV_G0_S1_RESIDENT_OBSERVATION") != expected_resident_observation:
         raise ParseError(f"{label}: physical resident observation mode mismatch")
     basis = spec["pressure_basis"]
@@ -984,6 +1145,8 @@ def validate_action_target_markers(
             raise ParseError(f"{label}: action marker max_blocks differs from manifest")
         if action["budget_target_enabled"] == "1" and int(action["budget_target_bytes"]) != expected_resident_target:
             raise ParseError(f"{label}: action marker budget target differs from kv_target_bytes")
+    for action in actions:
+        validate_action_v3_audit(action, case, label)
 
 
 def validate_responses(
@@ -1320,6 +1483,7 @@ def validate_qualification_causality(
     for action in barrier_actions:
         validate_action_fields(action, f"{label}.offload_barrier.action")
         boolean_fields(action, ACTION_BOOL, f"{label}.offload_barrier.action")
+        validate_action_v3_audit(action, case, f"{label}.offload_barrier.action")
     barrier_observations = marker_records(
         barrier_text,
         "kv_g0_s1_resident_observation",
@@ -1464,7 +1628,7 @@ def validate_characterization_record(
         require_nonnegative_int(settle[key], f"{label}.settle.{key}")
     physical_resident_bytes = settle["physical_resident_bytes"]
     if physical_resident_bytes is None:
-        if not (case["policy"] == "v2" and settle["status"] == "unmet_floor"):
+        if not (case["policy"] in SWAP_POLICIES and settle["status"] == "unmet_floor"):
             raise ParseError(f"{label}: settled physical resident observation is missing")
     else:
         require_nonnegative_int(
@@ -1477,7 +1641,7 @@ def validate_characterization_record(
         or settle["stderr_end_offset"] < settle["stderr_start_offset"]
     ):
         raise ParseError(f"{label}: settle timing or stderr window is inconsistent")
-    if case["policy"] == "v2":
+    if case["policy"] in SWAP_POLICIES:
         validate_snapshot_reference(
             settle["release_settle"], "slots_release_settled.json", f"{label}.settle.release_settle")
         boundary = exact(
@@ -1928,7 +2092,7 @@ def validate_characterization_causality(
     if any(item["measurement"] for item in warmup) or any(
             not item["measurement"] for item in measurements):
         raise ParseError(f"{label}: fill and measurement responses are not separated")
-    if case["policy"] == "v2":
+    if case["policy"] in SWAP_POLICIES:
         if measurements[0]["measurement_phase"] != "resume" or any(
                 item["measurement_phase"] != "post_resume_steady"
                 for item in measurements[1:]):
@@ -1943,12 +2107,12 @@ def validate_characterization_causality(
     after_fill_snapshot = validate_slot_snapshot(
         run_dir / "slots_after_fill.json",
         f"{label}.slots_after_fill",
-        require_resident=case["policy"] != "v2",
+        require_resident=case["policy"] not in SWAP_POLICIES,
     )
     after_measurement_snapshot = validate_slot_snapshot(
         run_dir / "slots_after_measurement.json",
         f"{label}.slots_after_measurement",
-        require_resident=case["policy"] != "v2",
+        require_resident=case["policy"] not in SWAP_POLICIES,
     )
     if (
         record["after_fill"]["captured_mono_ns"] != after_fill_snapshot["captured_mono_ns"]
@@ -1964,7 +2128,7 @@ def validate_characterization_causality(
         or after_measurement_snapshot["captured_mono_ns"] < first_measurement["finished_mono_ns"]
     ):
         raise ParseError(f"{label}: fill/measurement physical snapshots are out of order")
-    if case["policy"] == "v2":
+    if case["policy"] in SWAP_POLICIES:
         resident_after_fill = optional_authoritative_slot_resident(
             after_fill_snapshot, f"{label}.slots_after_fill")
         resident_after_measurement = optional_authoritative_slot_resident(
@@ -2055,6 +2219,7 @@ def validate_characterization_causality(
         for action in settle_actions:
             validate_action_fields(action, f"{label}.settle.action")
             boolean_fields(action, ACTION_BOOL, f"{label}.settle.action")
+            validate_action_v3_audit(action, case, f"{label}.settle.action")
         observations, terminal = characterization_budget_observations(
             settle_actions,
             pressure_basis_source(spec["pressure_basis"]),
@@ -2201,6 +2366,7 @@ def validate_characterization_causality(
     for action in settle_actions:
         validate_action_fields(action, f"{label}.settle.action")
         boolean_fields(action, ACTION_BOOL, f"{label}.settle.action")
+        validate_action_v3_audit(action, case, f"{label}.settle.action")
     resident_target = int(case["kv_target_bytes"])
     action_target = int(case["action_target_bytes"])
     max_blocks = int(spec["max_blocks"])
@@ -2650,7 +2816,7 @@ def parse_run(artifact: pathlib.Path, plan: dict[str, Any], case: dict[str, Any]
         f"{label}.characterization",
     )
     allow_missing_v2_run_resident = (
-        case["policy"] == "v2"
+        case["policy"] in SWAP_POLICIES
         and (
             spec["run_mode"] == "qualification"
             or (
@@ -2747,7 +2913,7 @@ def parse_run(artifact: pathlib.Path, plan: dict[str, Any], case: dict[str, Any]
             characterization, records, stderr_data, case, spec, run_dir, io_last, label,
             qualified_pairs)
         measurement_records = [record for record in records if record["measurement"]]
-        if case["policy"] == "v2":
+        if case["policy"] in SWAP_POLICIES:
             characterization_metrics["performance"] = response_statistics(
                 [record for record in measurement_records if record["measurement_phase"] == "resume"])
             characterization_metrics["post_resume_steady_performance"] = response_statistics(
@@ -2760,7 +2926,7 @@ def parse_run(artifact: pathlib.Path, plan: dict[str, Any], case: dict[str, Any]
         else:
             characterization_metrics["performance"] = response_statistics(measurement_records)
             characterization_metrics["post_resume_steady_performance"] = response_statistics([])
-    if case["policy"] == "v2":
+    if case["policy"] in SWAP_POLICIES:
         if not actions:
             raise ParseError(f"{label}: missing mandatory kv_pressure_unified_action marker")
         if spec["run_mode"] == "qualification":
@@ -2833,7 +2999,7 @@ def parse_run(artifact: pathlib.Path, plan: dict[str, Any], case: dict[str, Any]
         )
         if any(int(io_last[key]) != 0 for key in resident_migration_fields):
             raise ParseError(f"{label}: resident case contains migration IO evidence")
-    if not (case["policy"] == "v2" and spec["run_mode"] == "qualification") \
+    if not (case["policy"] in SWAP_POLICIES and spec["run_mode"] == "qualification") \
             and int(io_last["block_swap_in_calls"]) > 0:
         if not resumes or not timings:
             raise ParseError(f"{label}: swap-in requires resume and timing markers")
@@ -3179,7 +3345,7 @@ def curve_point(
         actual_authority = item.get("resident_settled_authority")
         steady = item.get("post_resume_steady_performance") or {}
         eligible = (
-            policy == "v2"
+            policy in SWAP_POLICIES
             and item.get("status") == "TARGET_REACHED"
             and isinstance(actual, int)
             and actual_authority == "slots_physical"

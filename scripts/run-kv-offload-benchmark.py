@@ -31,8 +31,9 @@ PARSER = ROOT / "scripts" / "parse-kv-offload-benchmark.py"
 MEMORY_SAMPLER = ROOT / "scripts" / "kv-controlled-memory-sampler.sh"
 PROTOCOL = "kv_offload_benchmark"
 SCHEMA_VERSION = 2
-SUPPORTED_POLICIES = {"resident", "release_only", "v2"}
-BUDGET_POLICIES = {"release_only", "v2"}
+SUPPORTED_POLICIES = {"resident", "release_only", "v2", "idle_age", "v3"}
+BUDGET_POLICIES = {"release_only", "v2", "idle_age", "v3"}
+SWAP_POLICIES = {"v2", "idle_age", "v3"}
 SUPPORTED_KV_REPRESENTATIONS = {"paged"}
 SUPPORTED_LOADING_MODES = {"exact"}
 SUPPORTED_RESTORES = {"k1_sync", "k2_pipeline"}
@@ -819,7 +820,7 @@ def expanded_request_plan(
         append(item, item["request_id"], 0, False, "fill")
     for repeat_index in range(1, workload["repeat"] + 1):
         for request_index, item in enumerate(workload["requests"]):
-            if run_mode == "characterization" and policy == "v2":
+            if run_mode == "characterization" and policy in SWAP_POLICIES:
                 measurement_phase = (
                     "resume" if repeat_index == 1 and request_index == 0
                     else "post_resume_steady")
@@ -830,7 +831,7 @@ def expanded_request_plan(
             else:
                 measurement_phase = "qualification_measurement"
             append(item, item["request_id"], repeat_index, True, measurement_phase)
-    if run_mode == "qualification" and workload["qualification"] is not None and policy == "v2":
+    if run_mode == "qualification" and workload["qualification"] is not None and policy in SWAP_POLICIES:
         resume_request_id = workload["qualification"]["resume_request_id"]
         resume_request = next(
             item for item in workload["requests"] if item["request_id"] == resume_request_id)
@@ -847,17 +848,20 @@ def runtime_environment(
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "LLAMA_KV_PAGED": "1",
         "LLAMA_KV_PAGED_INGRAPH": "1",
-        "LLAMA_KV_PAGED_SWAP": "1" if case["policy"] == "v2" else "0",
+        "LLAMA_KV_PAGED_SWAP": "1" if case["policy"] in SWAP_POLICIES else "0",
         "LLAMA_KV_PAGED_SWAP_EXPLICIT_ONLY": "1",
         "LLAMA_KV_PAGED_MINCORE": "1",
         "LLAMA_KV_PAGED_IO_STATS": "1",
         "LLAMA_KV_PAGED_PREFETCH_PHASE_TRACE": "0",
         "LLAMA_KV_RESUME_STAGE_TIMING": "1",
         "LLAMA_KV_G0_S1_RESIDENT_OBSERVATION": (
-            "both" if case["policy"] == "v2" and spec["run_mode"] == "characterization"
-            else "1" if case["policy"] == "v2" else "preflight"),
+            "both" if case["policy"] in SWAP_POLICIES and spec["run_mode"] == "characterization"
+            else "1" if case["policy"] in SWAP_POLICIES else "preflight"),
         "LLAMA_KV_PRESSURE_SAMPLE_INTERVAL_MS": "100",
         "LLAMA_KV_PRESSURE_LOG_INTERVAL_MS": "1000",
+        # The manifest environment may override this for V3 controlled A/B;
+        # the default keeps canonical V2 behavior unchanged.
+        "LLAMA_KV_PRESSURE_POLICY": case["policy"] if case["policy"] in SWAP_POLICIES else "v2",
         "LLAMA_KV_PRESSURE_SAMPLER": "1",
         "LLAMA_KV_PAGED_RESTORE_K2": "1" if case["restore"] == "k2_pipeline" else "0",
         "LLAMA_KV_PAGED_RESTORE_PREFAULT_PROBE": "1" if case["prefault"] == "r2" else "0",
@@ -1764,7 +1768,7 @@ def run_one(
                 return record
 
             if spec["run_mode"] == "qualification":
-                resume_planned = qualification_config is not None and case["policy"] == "v2"
+                resume_planned = qualification_config is not None and case["policy"] in SWAP_POLICIES
                 fill_plan = request_plan[:-1] if resume_planned else request_plan
                 for item in fill_plan:
                     issue(item)
@@ -1780,7 +1784,7 @@ def run_one(
                     "duration_ns": idle_finished_mono_ns - idle_started_mono_ns,
                     "stderr_start_offset": stderr_start_offset,
                 }
-                if case["policy"] == "v2":
+                if case["policy"] in SWAP_POLICIES:
                     barrier = wait_real_offload_barrier(
                         stderr_path,
                         stderr_start_offset,
@@ -1820,7 +1824,7 @@ def run_one(
                 characterization_record["after_fill"] = snapshot_reference(
                     "slots_after_fill.json", after_fill)
 
-                if case["policy"] == "v2":
+                if case["policy"] in SWAP_POLICIES:
                     stderr_start_offset = stderr_path.stat().st_size
                     idle_started_mono_ns = time.monotonic_ns()
                     time.sleep(characterization_config["idle_seconds"])
@@ -1954,7 +1958,7 @@ def run_one(
                 resume_stderr_start_offset = stderr_path.stat().st_size
                 first_record = issue(first_item)
                 resume_stderr_end_offset = stderr_path.stat().st_size
-                if case["policy"] == "v2":
+                if case["policy"] in SWAP_POLICIES:
                     settle = characterization_record["settle"]
                     if first_record["started_mono_ns"] <= settle["completed_mono_ns"]:
                         raise RunnerError(

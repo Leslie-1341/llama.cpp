@@ -735,6 +735,130 @@ int main(int /*argc*/, char ** /*argv*/) {
         }
     }
 
+    // -------------------------------------------------------------------------
+    // BV10: Claimant physical view attribution — page-semantic agreement with
+    //       paged_madvise_block.  `estimated_exclusive_resident_bytes` must
+    //       only count pages that lie wholly inside a block's byte range and
+    //       belong to exactly one live sequence, so it never packages a shared
+    //       or partial-page region as expected physical relief.
+    //
+    //       The sampler is platform-gated (mincore); when unavailable every
+    //       view must read available=false / authoritative=false with zero
+    //       bytes rather than a fabricated estimate (fail-closed).
+    // -------------------------------------------------------------------------
+    {
+        // BV10a: exclusive RESIDENT attribution after a real offload→prefetch
+        // round trip.  sample_kv_claimant_physical_views must agree with the
+        // authoritative budget view on object_id / generation and report a
+        // non-zero exclusive resident estimate for the live single-owner seq.
+        // The offload->prefetch round trip needs paged swap enabled, as in BV3.
+        setenv("LLAMA_KV_PAGED_SWAP", "1", 1);
+        ContextGuard g10a;
+        if (!g10a.init(model, cparams)) {
+            CHECK(false, "BV10a: context creation failed");
+        } else {
+            std::vector<llama_token> prompt(16, 41);
+            int rc = decode_prompt(g10a.ctx, prompt);
+            CHECK(rc == 0, "BV10a: decode ok");
+
+            const auto view_pre = g10a.kv->sample_kv_physical_budget_view();
+            const auto offload = g10a.kv->execute_action(
+                    {llama_kv_action::offload, 10001, 0, UINT64_MAX, 1, false});
+            CHECK(offload.state_changed, "BV10a: setup offload swapped a block");
+            const auto prefetch = g10a.kv->execute_action(
+                    {llama_kv_action::prefetch, 10002, 0, 0, 1, true});
+            CHECK(prefetch.state_changed, "BV10a: prefetch restored the block");
+
+            const auto views = g10a.kv->sample_kv_claimant_physical_views({0});
+            CHECK(views.size() == 1, "BV10a: one view per requested seq_id");
+            const auto & v = views[0];
+            CHECK(v.seq_id == 0, "BV10a: view preserves requested seq_id order");
+            if (view_pre.resident_available) {
+                // mincore-capable platform: attribution must be authoritative.
+                CHECK(v.available && v.authoritative && !v.shared,
+                        "BV10a: exclusive single-owner view is available+authoritative");
+                CHECK(v.object_id == view_pre.object_id && v.generation == view_pre.generation,
+                        "BV10a: claimant view identity matches budget view");
+                CHECK(v.exclusive_resident_blocks >= 1,
+                        "BV10a: at least one exclusive RESIDENT block attributed");
+                CHECK(v.estimated_exclusive_resident_bytes > 0,
+                        "BV10a: exclusive estimate is non-zero for resident single-owner KV");
+                std::fprintf(stderr,
+                        "BV10a exclusive resident: blocks=%u bytes=%llu obj=%llu gen=%llu OK\n",
+                        v.exclusive_resident_blocks,
+                        (unsigned long long) v.estimated_exclusive_resident_bytes,
+                        (unsigned long long) v.object_id,
+                        (unsigned long long) v.generation);
+            } else {
+                // mincore unavailable: fail-closed — no fabricated relief.
+                CHECK(!v.available && !v.authoritative && !v.shared &&
+                        v.estimated_exclusive_resident_bytes == 0 &&
+                        v.exclusive_resident_blocks == 0,
+                        "BV10a: fail-closed zero attribution when mincore unavailable");
+                std::fprintf(stderr, "BV10a fail-closed (mincore unavailable) OK\n");
+            }
+        }
+        // Restore the swap-disabled default so BV10b/BV10c (and any later test)
+        // start from the same paged layout state, matching BV3's teardown.
+        setenv("LLAMA_KV_PAGED_SWAP", "0", 1);
+    }
+
+    {
+        // BV10b: shared ownership via seq_cp(0,1) must NOT be packaged as
+        // exclusive physical relief.  Both claimant views report shared=true
+        // and zero exclusive resident bytes/blocks.
+        ContextGuard g10b;
+        if (!g10b.init(model, cparams)) {
+            CHECK(false, "BV10b: context creation failed");
+        } else {
+            std::vector<llama_token> prompt(16, 42);
+            int rc = decode_prompt(g10b.ctx, prompt);
+            CHECK(rc == 0, "BV10b: decode ok");
+            llama_memory_seq_cp(g10b.mem, 0, 1, -1, -1);
+            const auto v_pre = g10b.kv->sample_kv_physical_budget_view();
+            CHECK(v_pre.valid && v_pre.n_shared_blocks == v_pre.n_owned_blocks &&
+                    v_pre.n_shared_blocks > 0, "BV10b: blocks are shared after seq_cp");
+
+            const auto views = g10b.kv->sample_kv_claimant_physical_views({0, 1});
+            CHECK(views.size() == 2, "BV10b: two views for two seq_ids");
+            for (const auto & v : views) {
+                CHECK(v.seq_id == 0 || v.seq_id == 1, "BV10b: view seq_id is requested");
+                if (v_pre.resident_available) {
+                    CHECK(v.available && v.authoritative && v.shared,
+                            "BV10b: shared claimant view flagged shared+authoritative");
+                    CHECK(v.estimated_exclusive_resident_bytes == 0,
+                            "BV10b: shared blocks contribute zero exclusive relief");
+                    CHECK(v.exclusive_resident_blocks == 0,
+                            "BV10b: no exclusive resident block on a shared claimant");
+                } else {
+                    CHECK(!v.available,
+                            "BV10b: shared view fail-closed when mincore unavailable");
+                }
+            }
+            std::fprintf(stderr, "BV10b shared attribution: seq0 shared=%d seq1 shared=%d bytes=0 OK\n",
+                    views[0].shared ? 1 : 0, views[1].shared ? 1 : 0);
+        }
+    }
+
+    {
+        // BV10c: missing / out-of-range sequence ids return fail-closed defaults
+        // and the view vector preserves the requested seq_id order.
+        ContextGuard g10c;
+        if (!g10c.init(model, cparams)) {
+            CHECK(false, "BV10c: context creation failed");
+        } else {
+            std::vector<llama_token> prompt(16, 43);
+            int rc = decode_prompt(g10c.ctx, prompt);
+            CHECK(rc == 0, "BV10c: decode ok");
+            const auto views = g10c.kv->sample_kv_claimant_physical_views({0, 99, 1});
+            CHECK(views.size() == 3, "BV10c: one view per requested id, in order");
+            CHECK(views[0].seq_id == 0 && views[1].seq_id == 99 && views[2].seq_id == 1,
+                    "BV10c: view vector preserves requested seq_id order");
+            std::fprintf(stderr, "BV10c ordering: ids=%d,%d,%d OK\n",
+                    views[0].seq_id, views[1].seq_id, views[2].seq_id);
+        }
+    }
+
     llama_model_free(model);
     llama_backend_free();
 

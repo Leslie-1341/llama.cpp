@@ -389,6 +389,8 @@ public:
     llama_kv_action_result execute_action(const llama_kv_action_request & request) override;
     llama_kv_runtime_capability get_kv_runtime_capability() const override;
     llama_kv_runtime_claimant get_kv_runtime_claimant(llama_seq_id seq_id) const override;
+    std::vector<llama_kv_claimant_physical_view> sample_kv_claimant_physical_views(
+            const std::vector<llama_seq_id> & seq_ids) const override;
     llama_kv_bounded_release_result bounded_release_dry_run(
             uint64_t target_bytes, uint32_t max_scan_blocks) override;
     llama_kv_release_status paged_release_status() const override;

@@ -3087,6 +3087,197 @@ llama_kv_runtime_claimant llama_kv_cache::get_kv_runtime_claimant(llama_seq_id s
     return result;
 }
 
+std::vector<llama_kv_claimant_physical_view>
+llama_kv_cache::sample_kv_claimant_physical_views(
+        const std::vector<llama_seq_id> & seq_ids) const {
+    std::vector<llama_kv_claimant_physical_view> result(seq_ids.size());
+    for (size_t i = 0; i < seq_ids.size(); ++i) {
+        result[i].seq_id = seq_ids[i];
+    }
+
+#if defined(__linux__)
+    const bool paged_layout_valid = kv_paged_enabled && !v_trans && n_stream == 1 &&
+        paged_block_size != 0 && paged_n_blocks != 0 &&
+        paged_block_states.size() == paged_n_blocks && !v_cells.empty() &&
+        !layers.empty();
+    if (!paged_layout_valid || paged_write_context_invalid || !paged_mincore_enabled || seq_ids.empty()) {
+        return result;
+    }
+
+    const long page_size_l = sysconf(_SC_PAGESIZE);
+    if (page_size_l <= 0 || paged_resident_object_id == 0 || paged_resident_generation == 0) {
+        return result;
+    }
+    const uint64_t page_size = (uint64_t) page_size_l;
+
+    uint64_t bytes_per_cell = 0;
+    for (const auto & layer : layers) {
+        if (!layer.k_stream.empty() && layer.k_stream[0]) {
+            bytes_per_cell += layer.k_stream[0]->nb[1];
+        }
+        if (layer.v && !layer.v_stream.empty() && layer.v_stream[0]) {
+            bytes_per_cell += layer.v_stream[0]->nb[1];
+        }
+    }
+    if (bytes_per_cell == 0 || paged_swap_sizes.size() != paged_kv_size) {
+        return result;
+    }
+
+    std::vector<uint64_t> swapped_bytes(paged_n_blocks, 0);
+    for (uint32_t cell = 0; cell < paged_kv_size; ++cell) {
+        const uint64_t size = paged_swap_sizes[cell];
+        if (size > bytes_per_cell) {
+            return result;
+        }
+        if (size == 0) {
+            continue;
+        }
+        const uint32_t block = cell / paged_block_size;
+        if (block >= paged_n_blocks ||
+                (paged_block_states[block] != paged_block_state::SWAPPED &&
+                 paged_block_states[block] != paged_block_state::RESIDENT)) {
+            return result;
+        }
+        if (paged_block_states[block] == paged_block_state::SWAPPED) {
+            swapped_bytes[block] += size;
+        }
+    }
+
+    // Sample each K/V tensor once and attribute resident page overlap to the
+    // physical blocks.  Candidate ranking never invokes mincore itself.
+    std::vector<uint64_t> resident_bytes(paged_n_blocks, 0);
+    bool sample_ok = true;
+    uint64_t sampled_tensor_count = 0;
+    const uintptr_t pg = (uintptr_t) page_size;
+    const auto sample_tensor = [&](ggml_tensor * tensor) {
+        if (!tensor || !tensor->data) {
+            return;
+        }
+        const uint64_t row_size = tensor->nb[1];
+        if (row_size == 0) {
+            return;
+        }
+        const uintptr_t lo = (uintptr_t) tensor->data;
+        const uintptr_t hi = lo + (uintptr_t) ggml_nbytes(tensor);
+        const uintptr_t begin = (lo + pg - 1) & ~(pg - 1);
+        const uintptr_t end = hi & ~(pg - 1);
+        if (end <= begin) {
+            return;
+        }
+        const size_t page_count = (size_t) ((end - begin) / pg);
+        std::vector<unsigned char> pages(page_count);
+        if (mincore((void *) begin, end - begin, pages.data()) != 0) {
+            paged_mincore_failures += 1;
+            sample_ok = false;
+            return;
+        }
+        sampled_tensor_count += 1;
+
+        for (uint32_t block = 0; block < paged_n_blocks; ++block) {
+            const uint64_t cell_begin = (uint64_t) block * paged_block_size;
+            const uint64_t cell_end = std::min<uint64_t>(
+                    cell_begin + paged_block_size, paged_kv_size);
+            const uintptr_t block_lo = lo + (uintptr_t) cell_begin * row_size;
+            const uintptr_t block_hi = lo + (uintptr_t) cell_end * row_size;
+            if (block_hi <= begin || block_lo >= end) {
+                continue;
+            }
+            const uintptr_t clip_lo = std::max(block_lo, begin);
+            const uintptr_t clip_hi = std::min(block_hi, end);
+            const size_t first_page = (size_t) ((clip_lo - begin) / pg);
+            const size_t last_page = std::min(
+                    page_count, (size_t) ((clip_hi - begin + pg - 1) / pg));
+            for (size_t page = first_page; page < last_page; ++page) {
+                if ((pages[page] & 1u) == 0) {
+                    continue;
+                }
+                const uintptr_t page_lo = begin + (uintptr_t) page * pg;
+                const uintptr_t page_hi = page_lo + pg;
+                // paged_madvise_block only releases pages that lie wholly within
+                // the block's page-aligned range; a partial page at either edge is
+                // either shared with a neighbour or not advisory-reclaimable and
+                // must not be packaged as expected physical relief.  Attribute the
+                // full page only when it is fully enclosed by the block bytes.
+                if (page_lo >= block_lo && page_hi <= block_hi) {
+                    resident_bytes[block] += (uint64_t) pg;
+                }
+            }
+        }
+    };
+
+    paged_mincore_sample_calls += 1;
+    for (const auto & layer : layers) {
+        sample_tensor(layer.k_stream.empty() ? nullptr : layer.k_stream[0]);
+        sample_tensor((!layer.v || layer.v_stream.empty()) ? nullptr : layer.v_stream[0]);
+    }
+    if (!sample_ok || sampled_tensor_count == 0) {
+        return result;
+    }
+
+    std::vector<int32_t> first_owner(paged_n_blocks, -1);
+    std::vector<uint8_t> shared_blocks(paged_n_blocks, 0);
+    std::vector<std::vector<uint8_t>> candidate_owns(
+            seq_ids.size(), std::vector<uint8_t>(paged_n_blocks, 0));
+    for (const auto & cells : v_cells) {
+        for (uint32_t logical_cell = 0; logical_cell < cells.used_max_p1(); ++logical_cell) {
+            if (cells.is_empty(logical_cell)) {
+                continue;
+            }
+            const uint32_t physical_cell = paged_resolve(logical_cell);
+            if (physical_cell == PAGED_BLOCK_INVALID ||
+                    physical_cell / paged_block_size >= paged_n_blocks) {
+                return result;
+            }
+            const uint32_t block = physical_cell / paged_block_size;
+            for (uint32_t seq = 0; seq < LLAMA_MAX_SEQ; ++seq) {
+                if (!cells.seq_has(logical_cell, (llama_seq_id) seq)) {
+                    continue;
+                }
+                if (first_owner[block] < 0) {
+                    first_owner[block] = (int32_t) seq;
+                } else if (first_owner[block] != (int32_t) seq) {
+                    shared_blocks[block] = 1;
+                }
+            }
+            if (cells.seq_count(logical_cell) != 1) {
+                shared_blocks[block] = 1;
+            }
+            for (size_t i = 0; i < seq_ids.size(); ++i) {
+                if (seq_ids[i] >= 0 && cells.seq_has(logical_cell, seq_ids[i])) {
+                    candidate_owns[i][block] = 1;
+                }
+            }
+        }
+    }
+
+    for (size_t i = 0; i < result.size(); ++i) {
+        auto & view = result[i];
+        view.valid = true;
+        view.available = true;
+        view.authoritative = true;
+        view.object_id = paged_resident_object_id;
+        view.generation = paged_resident_generation;
+        for (uint32_t block = 0; block < paged_n_blocks; ++block) {
+            if (!candidate_owns[i][block]) {
+                continue;
+            }
+            if (shared_blocks[block]) {
+                view.shared = true;
+                continue;
+            }
+            if (paged_block_states[block] == paged_block_state::RESIDENT) {
+                view.exclusive_resident_blocks += 1;
+                view.estimated_exclusive_resident_bytes += resident_bytes[block];
+            } else if (paged_block_states[block] == paged_block_state::SWAPPED) {
+                view.swapped_blocks += 1;
+                view.estimated_swapped_bytes += swapped_bytes[block];
+            }
+        }
+    }
+#endif
+    return result;
+}
+
 llama_kv_action_result llama_kv_cache::execute_action(
         const llama_kv_action_request & request) {
     llama_kv_action_result result;
@@ -3101,6 +3292,10 @@ llama_kv_action_result llama_kv_cache::execute_action(
 
     result.capability.context_invalid = paged_write_context_invalid;
     result.capability.write_transaction_open = write_transaction_open;
+    if (paged_layout_valid) {
+        result.physical_object_id = paged_resident_object_id;
+        result.physical_generation = paged_resident_generation;
+    }
     result.capability.can_prefetch = swap_ready && !paged_write_context_invalid && !write_transaction_open;
     result.capability.can_release = paged_layout_valid && paged_ingraph_enabled &&
         paged_layers_supported && paged_row_idx_enabled && !paged_write_context_invalid &&

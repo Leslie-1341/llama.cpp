@@ -56,6 +56,22 @@ bool parse_required_uint32_env(const char * name, uint32_t & value, std::string 
     return true;
 }
 
+bool parse_optional_uint32_env(
+        const char * name, uint32_t & value, std::string & error) {
+    if (!std::getenv(name)) {
+        return true;
+    }
+    return parse_required_uint32_env(name, value, error);
+}
+
+bool parse_optional_uint64_env(
+        const char * name, uint64_t & value, std::string & error) {
+    if (!std::getenv(name)) {
+        return true;
+    }
+    return parse_required_uint64_env(name, value, error);
+}
+
 const char * outcome_name(llama_kv_action_outcome outcome) {
     switch (outcome) {
     case llama_kv_action_outcome::completed:       return "completed";
@@ -148,6 +164,9 @@ const char * exclusion_name(server_kv_claimant_exclusion exclusion) {
     case server_kv_claimant_exclusion::fail_stop:              return "fail_stop";
     case server_kv_claimant_exclusion::exhausted:              return "exhausted";
     case server_kv_claimant_exclusion::epoch_mismatch:          return "epoch_mismatch";
+    case server_kv_claimant_exclusion::stale_generation:        return "stale_generation";
+    case server_kv_claimant_exclusion::resident_lease:          return "resident_lease";
+    case server_kv_claimant_exclusion::no_physical_relief:      return "no_physical_relief";
     case server_kv_claimant_exclusion::empty:                  return "empty";
     }
     return "unknown";
@@ -158,7 +177,8 @@ server_kv_claimant_score score_claimant(
         const llama_kv_action_result & evaluation,
         uint32_t failure_count,
         uint64_t current_epoch,
-        bool exhausted) {
+        bool exhausted,
+        bool require_legacy_bytes = true) {
     server_kv_claimant_score score;
     score.seq_id = claimant.seq_id;
     if (evaluation.capability.write_transaction_open) {
@@ -189,7 +209,8 @@ server_kv_claimant_score score_claimant(
         score.exclusion = server_kv_claimant_exclusion::shared;
         return score;
     }
-    if (claimant.seq_id < 0 || claimant.reclaimable_bytes == 0 || claimant.logical_kv_tokens == 0) {
+    if (claimant.seq_id < 0 || claimant.logical_kv_tokens == 0 ||
+            (require_legacy_bytes && claimant.reclaimable_bytes == 0)) {
         score.exclusion = server_kv_claimant_exclusion::empty;
         return score;
     }
@@ -211,7 +232,165 @@ server_kv_claimant_score score_claimant(
     return score;
 }
 
+uint64_t saturating_cost_add(uint64_t lhs, uint64_t rhs) {
+    return rhs > std::numeric_limits<uint64_t>::max() - lhs
+        ? std::numeric_limits<uint64_t>::max()
+        : lhs + rhs;
+}
+
+// V3 decision authority: returns the first non-empty fallback_reason seen on
+// any eligible claimant, or nullptr when every eligible claimant is cost-aware.
+// A mixed decision (some cost-aware, some fallback) must NOT be ranked with a
+// single comparator that mixes µs-per-byte cost against idle-age scores, so the
+// caller falls back to a uniform idle-age / LRU authority when this is non-null.
+const char * v3_decision_fallback_reason(const std::vector<server_kv_claimant_score> & scores) {
+    for (const auto & score : scores) {
+        if (!score.eligible) {
+            continue;
+        }
+        if (!score.cost_aware && score.fallback_reason &&
+                std::string(score.fallback_reason) != "none") {
+            return score.fallback_reason;
+        }
+    }
+    return nullptr;
+}
+
+bool v3_score_less(const server_kv_claimant_score & lhs, const server_kv_claimant_score & rhs) {
+    // cost-aware ranking: lower expected future cost per physical byte first.
+    return lhs.total < rhs.total;
+}
+
+bool idle_age_score_greater(
+        const server_kv_claimant_score & lhs, const server_kv_claimant_score & rhs) {
+    // idle-age / LRU authority used by both idle_age policy and V3 decision
+    // fallback: higher idle_age_score (older / colder) first.
+    return lhs.idle_age_score > rhs.idle_age_score;
+}
+
+uint64_t estimate_reuse_probability_ppm(
+        const server_kv_claimant_snapshot & claimant,
+        const server_kv_claimant_history & history) {
+    if (history.last_restore_bytes > 0) {
+        return history.last_restore_gate_us > 0 ? 1000000 : 0;
+    }
+    if (claimant.logical_kv_tokens == 0 || claimant.lcp_n_past_hint_tokens == 0) {
+        return 0;
+    }
+    const uint64_t numerator = std::min<uint64_t>(
+            claimant.lcp_n_past_hint_tokens, claimant.logical_kv_tokens);
+    return std::min<uint64_t>(1000000, (numerator * 1000000) /
+            claimant.logical_kv_tokens);
+}
+
+server_kv_claimant_score score_claimant_v3(
+        const server_kv_claimant_snapshot & claimant,
+        const llama_kv_action_result & evaluation,
+        uint32_t failure_count,
+        uint64_t current_epoch,
+        bool exhausted,
+        const server_kv_pressure_snapshot & pressure,
+        uint64_t sample_count,
+        uint64_t churn_penalty_us) {
+    server_kv_claimant_score score = score_claimant(
+            claimant, evaluation, failure_count, current_epoch, exhausted, false);
+    score.physical_estimate_available = claimant.physical_estimate_available;
+    score.physical_estimate_authoritative = claimant.physical_estimate_authoritative;
+    score.estimated_physical_bytes = claimant.estimated_exclusive_resident_bytes;
+    score.raw_idle_age_us = claimant.idle_age_us;
+    score.raw_answer_tokens = claimant.answer_tokens;
+    score.raw_lcp_hint_tokens = claimant.lcp_n_past_hint_tokens;
+    score.physical_object_id = claimant.physical_object_id;
+    score.physical_generation = claimant.physical_generation;
+    score.actual_relief_bytes = claimant.history.last_actual_relief_bytes;
+    score.resident_lease_until_sample = claimant.history.resident_lease_until_sample;
+    score.round_trip_count = claimant.history.round_trip_count;
+    score.last_offload_bytes = claimant.history.last_offload_bytes;
+    score.last_restore_bytes = claimant.history.last_restore_bytes;
+    if (!score.eligible) {
+        return score;
+    }
+    score.reuse_probability_ppm = estimate_reuse_probability_ppm(claimant, claimant.history);
+    if (claimant.history.resident_lease_until_sample > sample_count) {
+        score.eligible = false;
+        score.exclusion = server_kv_claimant_exclusion::resident_lease;
+        return score;
+    }
+    if (claimant.physical_estimate_available && pressure.kv_physical_view_available &&
+            (claimant.physical_object_id != pressure.kv_object_id ||
+             claimant.physical_generation != pressure.kv_generation)) {
+        score.eligible = false;
+        score.exclusion = server_kv_claimant_exclusion::stale_generation;
+        return score;
+    }
+    if (!claimant.physical_estimate_available) {
+        score.fallback_reason = "physical_unavailable";
+        score.total = score.idle_age_score;
+        return score;
+    }
+    if (!claimant.physical_estimate_authoritative) {
+        score.fallback_reason = "physical_not_authoritative";
+        score.total = score.idle_age_score;
+        return score;
+    }
+    if (claimant.estimated_exclusive_resident_bytes == 0) {
+        score.eligible = false;
+        score.exclusion = server_kv_claimant_exclusion::no_physical_relief;
+        return score;
+    }
+    if (claimant.history.last_offload_time_us == 0) {
+        score.fallback_reason = "write_cost_unavailable";
+        score.total = score.idle_age_score;
+        return score;
+    }
+    if (score.reuse_probability_ppm > 0 && claimant.history.last_restore_gate_us == 0) {
+        score.fallback_reason = "restore_cost_unavailable";
+        score.total = score.idle_age_score;
+        return score;
+    }
+    if (score.reuse_probability_ppm == 0 && claimant.history.last_restore_bytes == 0 &&
+            claimant.lcp_n_past_hint_tokens == 0) {
+        score.fallback_reason = "no_reuse_evidence";
+        score.total = score.idle_age_score;
+        return score;
+    }
+
+    score.cost_aware = true;
+    score.expected_offload_write_cost_us = claimant.history.last_offload_time_us;
+    score.expected_restore_gate_cost_us = claimant.history.last_restore_gate_us;
+    score.churn_penalty_us = churn_penalty_us >
+            std::numeric_limits<uint64_t>::max() /
+                std::max<uint32_t>(claimant.history.round_trip_count, 1)
+        ? std::numeric_limits<uint64_t>::max()
+        : churn_penalty_us * claimant.history.round_trip_count;
+    const uint64_t restore_cost = score.reuse_probability_ppm > 0 &&
+            score.expected_restore_gate_cost_us > 0
+        ? (score.expected_restore_gate_cost_us * score.reuse_probability_ppm) / 1000000
+        : 0;
+    score.expected_cost_us = saturating_cost_add(
+            saturating_cost_add(score.expected_offload_write_cost_us, restore_cost),
+            score.churn_penalty_us);
+    const uint64_t scaled_cost = score.expected_cost_us >
+            std::numeric_limits<uint64_t>::max() / 1000000
+        ? std::numeric_limits<uint64_t>::max()
+        : score.expected_cost_us * 1000000;
+    score.total = scaled_cost > (uint64_t) std::numeric_limits<int64_t>::max()
+        ? std::numeric_limits<int64_t>::max()
+        : (int64_t) (scaled_cost / claimant.estimated_exclusive_resident_bytes);
+    score.fallback_reason = "none";
+    return score;
+}
+
 } // namespace
+
+const char * server_kv_pressure_policy_name(server_kv_pressure_policy policy) {
+    switch (policy) {
+    case server_kv_pressure_policy::v2:       return "v2";
+    case server_kv_pressure_policy::idle_age: return "idle_age";
+    case server_kv_pressure_policy::v3:       return "v3";
+    }
+    return "unknown";
+}
 
 server_kv_pressure_unified_action_startup_decision
 server_kv_pressure_unified_action_startup_decide_from_env() {
@@ -257,6 +436,30 @@ server_kv_pressure_unified_action_startup_decide_from_env() {
     if (config.max_blocks == 0) {
         decision.status = server_kv_pressure_unified_action_startup_status::invalid;
         decision.error = "LLAMA_KV_PRESSURE_UNIFIED_ACTION_MAX_BLOCKS must be greater than zero";
+        return decision;
+    }
+
+    const char * policy = std::getenv("LLAMA_KV_PRESSURE_POLICY");
+    if (policy) {
+        if (std::strcmp(policy, "v2") == 0) {
+            config.policy = server_kv_pressure_policy::v2;
+        } else if (std::strcmp(policy, "idle_age") == 0 || std::strcmp(policy, "lru") == 0) {
+            config.policy = server_kv_pressure_policy::idle_age;
+        } else if (std::strcmp(policy, "v3") == 0) {
+            config.policy = server_kv_pressure_policy::v3;
+        } else {
+            decision.status = server_kv_pressure_unified_action_startup_status::invalid;
+            decision.error = "LLAMA_KV_PRESSURE_POLICY must be v2, idle_age, lru, or v3";
+            return decision;
+        }
+    }
+    if (!parse_optional_uint32_env(
+                "LLAMA_KV_PRESSURE_RESIDENT_LEASE_SAMPLES",
+                config.resident_lease_samples, decision.error) ||
+            !parse_optional_uint64_env(
+                "LLAMA_KV_PRESSURE_CHURN_PENALTY_US",
+                config.churn_penalty_us, decision.error)) {
+        decision.status = server_kv_pressure_unified_action_startup_status::invalid;
         return decision;
     }
 
@@ -377,6 +580,7 @@ void server_kv_governor_state::reset() {
     claimant_epochs_.clear();
     exhausted_claimants_.clear();
     failure_counts_.clear();
+    claimant_history_.clear();
     // V2 step1: clear soft budget state too — handles sleeping/reload boundaries.
     budget_debt_bytes_ = 0;
     budget_basis_generation_ = 0;
@@ -403,11 +607,153 @@ void server_kv_governor_state::invalidate_claimant(llama_seq_id seq_id) {
     claimant_epochs_[seq_id] = next_epoch == 0 ? 1 : next_epoch;
     exhausted_claimants_.erase(seq_id);
     failure_counts_.erase(seq_id);
+    // Ordinary turn rollover must not discard cost evidence that still
+    // describes the live KV lineage.  Migrate the history epoch so
+    // claimant_history(seq, next_epoch) resolves; object_id / generation still
+    // guard the cost evidence against a real lineage change.
+    auto it = claimant_history_.find(seq_id);
+    if (it != claimant_history_.end() && it->second.epoch != 0) {
+        it->second.epoch = next_epoch;
+    }
+}
+
+void server_kv_governor_state::clear_claimant_lineage(llama_seq_id seq_id) {
+    if (seq_id < 0) {
+        return;
+    }
+    const uint64_t next_epoch = saturating_add(claimant_epoch(seq_id), 1);
+    claimant_epochs_[seq_id] = next_epoch == 0 ? 1 : next_epoch;
+    exhausted_claimants_.erase(seq_id);
+    failure_counts_.erase(seq_id);
+    claimant_history_.erase(seq_id);
+}
+
+server_kv_claimant_history server_kv_governor_state::claimant_history(
+        llama_seq_id seq_id, uint64_t epoch) const {
+    const auto it = claimant_history_.find(seq_id);
+    if (it == claimant_history_.end() ||
+            (it->second.epoch != 0 && it->second.epoch != epoch)) {
+        return {};
+    }
+    return it->second;
+}
+
+void server_kv_governor_state::record_offload_feedback(
+        const server_kv_claimant_snapshot & claimant,
+        const llama_kv_action_result & action,
+        uint64_t sample_count) {
+    if (claimant.seq_id < 0 || claimant.epoch == 0 ||
+            claimant.epoch != claimant_epoch(claimant.seq_id) ||
+            action.action != llama_kv_action::offload ||
+            !action.state_changed || action.blocks == 0 || action.bytes == 0) {
+        return;
+    }
+    auto & history = claimant_history_[claimant.seq_id];
+    if (history.epoch != 0 && history.epoch != claimant.epoch) {
+        history = {};
+    }
+    if (history.object_id != 0 && claimant.physical_object_id != 0 &&
+            (history.object_id != claimant.physical_object_id ||
+             history.generation != claimant.physical_generation)) {
+        history = {};
+    }
+    if (claimant.physical_object_id != 0 &&
+            (action.physical_object_id != claimant.physical_object_id ||
+             action.physical_generation != claimant.physical_generation)) {
+        return;
+    }
+    if (history.object_id != 0 &&
+            (action.physical_object_id == 0 || action.physical_generation == 0 ||
+             history.object_id != action.physical_object_id ||
+             history.generation != action.physical_generation)) {
+        history = {};
+    }
+    history.epoch = claimant.epoch;
+    history.object_id = claimant.physical_object_id != 0
+        ? claimant.physical_object_id : action.physical_object_id;
+    history.generation = claimant.physical_generation != 0
+        ? claimant.physical_generation : action.physical_generation;
+    history.last_offload_sample = sample_count;
+    history.last_offload_bytes = action.bytes;
+    history.last_offload_time_us = action.action_elapsed_us;
+    history.last_transition_sample = sample_count;
+    if (action.physical_relief_available) {
+        history.last_actual_relief_bytes = action.physical_relief_bytes;
+    }
+}
+
+void server_kv_governor_state::record_restore_feedback(
+        llama_seq_id seq_id,
+        uint64_t epoch,
+        const llama_kv_action_result & action,
+        uint64_t gate_us,
+        uint64_t sample_count,
+        uint32_t resident_lease_samples) {
+    if (seq_id < 0 || epoch == 0 || epoch != claimant_epoch(seq_id) ||
+            action.action != llama_kv_action::prefetch ||
+            !action.state_changed || action.blocks == 0 || action.bytes == 0) {
+        return;
+    }
+    auto & history = claimant_history_[seq_id];
+    if (history.epoch != 0 && history.epoch != epoch) {
+        return;
+    }
+    if (history.epoch != 0 &&
+            (action.physical_object_id == 0 || action.physical_generation == 0 ||
+             history.object_id != action.physical_object_id ||
+             history.generation != action.physical_generation)) {
+        return;
+    }
+    history.epoch = epoch;
+    if (history.object_id == 0 && action.physical_object_id != 0 &&
+            action.physical_generation != 0) {
+        history.object_id = action.physical_object_id;
+        history.generation = action.physical_generation;
+    }
+    const bool round_trip = history.last_offload_sample > history.last_restore_sample;
+    history.last_restore_sample = sample_count;
+    history.last_restore_bytes = action.bytes;
+    history.last_restore_gate_us = gate_us;
+    if (round_trip) {
+        history.round_trip_count = std::min<uint32_t>(
+                history.round_trip_count + 1, std::numeric_limits<uint32_t>::max());
+    }
+    history.last_transition_sample = sample_count;
+    history.resident_lease_until_sample = saturating_add(
+            sample_count, resident_lease_samples);
+}
+
+void server_kv_governor_state::record_resume_feedback(
+        llama_seq_id seq_id,
+        const llama_kv_action_result & action,
+        uint64_t gate_us,
+        uint64_t sample_count,
+        uint32_t resident_lease_samples) {
+    if (seq_id < 0) {
+        return;
+    }
+    const uint64_t epoch = claimant_epoch(seq_id);
+    const auto history = claimant_history(seq_id, epoch);
+    if (history.epoch != 0 &&
+            (action.physical_object_id == 0 || action.physical_generation == 0 ||
+             history.object_id != action.physical_object_id ||
+             history.generation != action.physical_generation)) {
+        // A physical generation mismatch means the previous cost evidence no
+        // longer describes the live KV object: hard-clear the lineage instead
+        // of migrating it across the epoch rollover.
+        clear_claimant_lineage(seq_id);
+        return;
+    }
+    exhausted_claimants_.erase(seq_id);
+    failure_counts_.erase(seq_id);
+    record_restore_feedback(
+            seq_id, epoch, action, gate_us, sample_count, resident_lease_samples);
 }
 
 void server_kv_governor_state::invalidate_all_claimants() {
     exhausted_claimants_.clear();
     failure_counts_.clear();
+    claimant_history_.clear();
     for (auto & entry : claimant_epochs_) {
         const uint64_t next_epoch = saturating_add(entry.second, 1);
         entry.second = next_epoch == 0 ? 1 : next_epoch;
@@ -445,6 +791,7 @@ server_kv_pressure_action_result server_kv_pressure_execute_governor(
         const std::vector<server_kv_claimant_snapshot> & claimants,
         const server_kv_budget_view & budget_view) {
     server_kv_pressure_action_result result;
+    result.policy = config.policy;
     auto & observation = result.observation;
     observation.pressure_state = pressure.state;
     observation.pressure_source = pressure.source;
@@ -697,15 +1044,47 @@ server_kv_pressure_action_result server_kv_pressure_execute_governor(
                 const auto exhausted_it = state.exhausted_claimants_.find(claimant.seq_id);
                 const bool exhausted = exhausted_it != state.exhausted_claimants_.end() &&
                     exhausted_it->second == current_epoch;
-                result.scores.push_back(score_claimant(
-                        claimant, result.evaluation, failure_count, current_epoch, exhausted));
+                auto score = config.policy == server_kv_pressure_policy::v3
+                    ? score_claimant_v3(
+                            claimant, result.evaluation, failure_count, current_epoch, exhausted,
+                            pressure, pressure.sample_count, config.churn_penalty_us)
+                    : score_claimant(
+                            claimant, result.evaluation, failure_count, current_epoch, exhausted);
+                if (config.policy == server_kv_pressure_policy::idle_age && score.eligible) {
+                    score.total = score.idle_age_score;
+                }
+                result.scores.push_back(score);
+            }
+            const bool v3_policy = config.policy == server_kv_pressure_policy::v3;
+            const char * decision_fallback = v3_policy
+                ? v3_decision_fallback_reason(result.scores) : nullptr;
+            if (v3_policy) {
+                result.decision_fallback_reason = decision_fallback ? decision_fallback : "";
             }
             std::sort(result.scores.begin(), result.scores.end(),
-                    [](const server_kv_claimant_score & lhs, const server_kv_claimant_score & rhs) {
+                    [v3_policy, decision_fallback](const server_kv_claimant_score & lhs,
+                                                    const server_kv_claimant_score & rhs) {
                         if (lhs.eligible != rhs.eligible) return lhs.eligible > rhs.eligible;
-                        if (lhs.total != rhs.total) return lhs.total > rhs.total;
+                        if (!v3_policy) {
+                            // v2 / idle_age: legacy descending total, identical authority.
+                            if (lhs.total != rhs.total) return lhs.total > rhs.total;
+                            return lhs.seq_id < rhs.seq_id;
+                        }
+                        // V3: a mixed-evidence decision falls back to a single
+                        // idle-age / LRU authority so cost-aware µs-per-byte and
+                        // idle_age_score are never compared directly.
+                        if (decision_fallback) {
+                            if (lhs.idle_age_score != rhs.idle_age_score) {
+                                return idle_age_score_greater(lhs, rhs);
+                            }
+                            return lhs.seq_id < rhs.seq_id;
+                        }
+                        if (lhs.total != rhs.total) return v3_score_less(lhs, rhs);
                         return lhs.seq_id < rhs.seq_id;
                     });
+            for (size_t rank = 0; rank < result.scores.size(); ++rank) {
+                result.scores[rank].rank = (uint32_t) rank;
+            }
             const auto selected = std::find_if(
                     result.scores.begin(), result.scores.end(),
                     [](const server_kv_claimant_score & score) { return score.eligible; });
@@ -739,6 +1118,17 @@ server_kv_pressure_action_result server_kv_pressure_execute_governor(
                 });
                 const bool matches = result.offload.action == llama_kv_action::offload &&
                     result.offload.decision_id == pressure.decision_id;
+                if (matches && result.offload.state_changed) {
+                    const auto claimant_it = std::find_if(
+                            claimants.begin(), claimants.end(),
+                            [selected](const server_kv_claimant_snapshot & item) {
+                                return item.seq_id == selected->seq_id;
+                            });
+                    if (claimant_it != claimants.end()) {
+                        state.record_offload_feedback(
+                                *claimant_it, result.offload, pressure.sample_count);
+                    }
+                }
                 const bool protected_or_shared = matches &&
                     (result.offload.reason == llama_kv_action_reason::protected_sequence ||
                      result.offload.reason == llama_kv_action_reason::shared_block);
@@ -947,15 +1337,44 @@ server_kv_pressure_action_result server_kv_pressure_execute_governor(
             const auto exhausted_it = state.exhausted_claimants_.find(claimant.seq_id);
             const bool exhausted = exhausted_it != state.exhausted_claimants_.end() &&
                 exhausted_it->second == current_epoch;
-            result.scores.push_back(score_claimant(
-                    claimant, result.evaluation, failure_count, current_epoch, exhausted));
+            auto score = config.policy == server_kv_pressure_policy::v3
+                ? score_claimant_v3(
+                        claimant, result.evaluation, failure_count, current_epoch, exhausted,
+                        pressure, pressure.sample_count, config.churn_penalty_us)
+                : score_claimant(
+                        claimant, result.evaluation, failure_count, current_epoch, exhausted);
+            if (config.policy == server_kv_pressure_policy::idle_age && score.eligible) {
+                score.total = score.idle_age_score;
+            }
+            result.scores.push_back(score);
+        }
+        const bool v3_policy = config.policy == server_kv_pressure_policy::v3;
+        const char * decision_fallback = v3_policy
+            ? v3_decision_fallback_reason(result.scores) : nullptr;
+        if (v3_policy) {
+            result.decision_fallback_reason = decision_fallback ? decision_fallback : "";
         }
         std::sort(result.scores.begin(), result.scores.end(),
-                [](const server_kv_claimant_score & lhs, const server_kv_claimant_score & rhs) {
+                [v3_policy, decision_fallback](const server_kv_claimant_score & lhs,
+                                                const server_kv_claimant_score & rhs) {
                     if (lhs.eligible != rhs.eligible) return lhs.eligible > rhs.eligible;
-                    if (lhs.total != rhs.total) return lhs.total > rhs.total;
+                    if (!v3_policy) {
+                        if (lhs.total != rhs.total) return lhs.total > rhs.total;
+                        return lhs.seq_id < rhs.seq_id;
+                    }
+                    // V3 mixed-evidence decision falls back to idle-age / LRU.
+                    if (decision_fallback) {
+                        if (lhs.idle_age_score != rhs.idle_age_score) {
+                            return idle_age_score_greater(lhs, rhs);
+                        }
+                        return lhs.seq_id < rhs.seq_id;
+                    }
+                    if (lhs.total != rhs.total) return v3_score_less(lhs, rhs);
                     return lhs.seq_id < rhs.seq_id;
                 });
+        for (size_t rank = 0; rank < result.scores.size(); ++rank) {
+            result.scores[rank].rank = (uint32_t) rank;
+        }
 
         const auto selected = std::find_if(
                 result.scores.begin(), result.scores.end(),
@@ -986,6 +1405,17 @@ server_kv_pressure_action_result server_kv_pressure_execute_governor(
             const bool offload_matches_decision =
                 result.offload.action == llama_kv_action::offload &&
                 result.offload.decision_id == pressure.decision_id;
+            if (offload_matches_decision && result.offload.state_changed) {
+                const auto claimant_it = std::find_if(
+                        claimants.begin(), claimants.end(),
+                        [selected](const server_kv_claimant_snapshot & item) {
+                            return item.seq_id == selected->seq_id;
+                        });
+                if (claimant_it != claimants.end()) {
+                    state.record_offload_feedback(
+                            *claimant_it, result.offload, pressure.sample_count);
+                }
+            }
             const bool offload_progressed = offload_matches_decision &&
                 !result.offload.io_failure && result.offload.state_changed &&
                 result.offload.relieved_bytes > 0;
@@ -1050,6 +1480,10 @@ std::string server_kv_pressure_unified_action_format_marker(
     const auto & action = observation.offload_attempted ? result.offload : result.release;
     std::ostringstream out;
     out << "kv_pressure_unified_action"
+        << " policy=" << server_kv_pressure_policy_name(result.policy)
+        << " decision_fallback="
+        << (result.decision_fallback_reason && result.decision_fallback_reason[0]
+                ? result.decision_fallback_reason : "none")
         << " state=" << kv_pressure_state_name(observation.pressure_state)
         << " source=" << kv_pressure_source_name(observation.pressure_source)
         << " sample_valid=" << (observation.sample_valid ? 1 : 0)
@@ -1099,6 +1533,11 @@ std::string server_kv_pressure_unified_action_format_marker(
         << " bytes=" << action.bytes
         << " relieved_bytes=" << action.relieved_bytes
         << " shortfall_bytes=" << action.shortfall_bytes
+        << " action_elapsed_us=" << action.action_elapsed_us
+        << " physical_relief_available=" << (action.physical_relief_available ? 1 : 0)
+        << " physical_relief_bytes=" << action.physical_relief_bytes
+        << " physical_object_id=" << action.physical_object_id
+        << " physical_generation=" << action.physical_generation
         << " io_failure=" << (action.io_failure ? 1 : 0)
         << " io_errno=" << action.io_errno
         << " state_changed=" << (action.state_changed ? 1 : 0)
@@ -1140,7 +1579,28 @@ std::string server_kv_pressure_unified_action_format_marker(
                 << score.reclaimable_score << ':'
                 << score.lcp_n_past_penalty << ':'
                 << score.io_cost_penalty << ':'
-                << score.failure_penalty;
+                << score.failure_penalty << ':'
+                << score.rank << ':'
+                << (score.cost_aware ? 1 : 0) << ':'
+                << (score.physical_estimate_available ? 1 : 0) << ':'
+                << (score.physical_estimate_authoritative ? 1 : 0) << ':'
+                << score.estimated_physical_bytes << ':'
+                << score.reuse_probability_ppm << ':'
+                << score.expected_offload_write_cost_us << ':'
+                << score.expected_restore_gate_cost_us << ':'
+                << score.expected_cost_us << ':'
+                << score.churn_penalty_us << ':'
+                << score.raw_idle_age_us << ':'
+                << score.raw_answer_tokens << ':'
+                << score.raw_lcp_hint_tokens << ':'
+                << score.physical_object_id << ':'
+                << score.physical_generation << ':'
+                << score.actual_relief_bytes << ':'
+                << score.resident_lease_until_sample << ':'
+                << score.round_trip_count << ':'
+                << score.last_offload_bytes << ':'
+                << score.last_restore_bytes << ':'
+                << (score.fallback_reason ? score.fallback_reason : "none");
         }
     }
     return out.str();

@@ -507,7 +507,7 @@ class CanonicalBenchmarkTest(unittest.TestCase):
         self.temp.cleanup()
 
     def spec(self, *, policy: str = "v2") -> dict[str, object]:
-        target = 4096 if policy in {"release_only", "v2"} else None
+        target = 4096 if policy in {"release_only", "v2", "idle_age", "v3"} else None
         return {
             "schema_version": 2,
             "protocol": "kv_offload_benchmark",
@@ -546,7 +546,7 @@ class CanonicalBenchmarkTest(unittest.TestCase):
                 "restore": "k1_sync",
                 "prefault": "off",
                 "kv_target_bytes": target,
-                "action_target_bytes": 8192 if policy in {"release_only", "v2"} else None,
+                "action_target_bytes": 8192 if policy in {"release_only", "v2", "idle_age", "v3"} else None,
             }],
             "run_order": [{"round": 1, "run_order": 1, "case_id": "case"}],
             "sampler": {"interval_seconds": 1.0},
@@ -800,6 +800,137 @@ class CanonicalBenchmarkTest(unittest.TestCase):
             "shortfall_bytes": "0",
         })
         validate(noop)
+
+    def test_v3_audit_fail_closed_on_missing_marker_physical_and_score_evidence(self) -> None:
+        # Canonical V3 tightening regression guard: a V3 decision marker must
+        # carry (a) policy/decision_fallback marker fields, (b) physical
+        # feedback fields, (c) a per-claimant score schema with cost-aware /
+        # fallback tagging that agrees with the marker-level authority, and
+        # (d) a selected victim that is auditable.  Each branch must fail-closed
+        # so a mixed or evidence-less decision can never be certified valid.
+        parser = load_parser_module()
+        v3_case = {"policy": "v3"}
+
+        def v3_score(seq_id: str, eligible: str, rank: str, *, cost_aware: bool,
+                     exclusion: str = "none", fallback_reason: str = "none",
+                     physical_bytes: str = "4096", expected_cost: str = "150",
+                     physical_object_id: str = "11", physical_generation: str = "3") -> str:
+            cells = {f: "0" for f in parser.SCORE_FIELDS}
+            cells.update({
+                "seq_id": seq_id, "eligible": eligible, "exclusion": exclusion,
+                "total": "10", "idle_age_score": "1000", "logical_kv_score": "1",
+                "reclaimable_score": "0", "lcp_n_past_penalty": "0",
+                "io_cost_penalty": "0", "failure_penalty": "0", "rank": rank,
+                "cost_aware": "1" if cost_aware else "0",
+                "physical_estimate_available": "1" if cost_aware else "0",
+                "physical_estimate_authoritative": "1" if cost_aware else "0",
+                "estimated_physical_bytes": physical_bytes,
+                "reuse_probability_ppm": "500000" if cost_aware else "0",
+                "expected_offload_write_cost_us": "100" if cost_aware else "0",
+                "expected_restore_gate_cost_us": "50" if cost_aware else "0",
+                "expected_cost_us": expected_cost if cost_aware else "0",
+                "churn_penalty_us": "1000" if cost_aware else "0",
+                "raw_idle_age_us": "1000", "raw_answer_tokens": "64",
+                "raw_lcp_hint_tokens": "64",
+                "physical_object_id": physical_object_id,
+                "physical_generation": physical_generation,
+                "actual_relief_bytes": "4096" if cost_aware else "0",
+                "resident_lease_until_sample": "6" if cost_aware else "0",
+                "round_trip_count": "1" if cost_aware else "0",
+                "last_offload_bytes": "4096" if cost_aware else "0",
+                "last_restore_bytes": "4096" if cost_aware else "0",
+                "fallback_reason": fallback_reason,
+            })
+            return ":".join(cells[f] for f in parser.SCORE_FIELDS)
+
+        def base_action(scores: str, *, decision_fallback: str = "none") -> dict[str, str]:
+            action = dict(ACTION_FIELDS)
+            action.update({
+                "policy": "v3", "decision_fallback": decision_fallback,
+                "action_elapsed_us": "120",
+                "physical_relief_available": "1", "physical_relief_bytes": "4096",
+                "physical_object_id": "11", "physical_generation": "3",
+                "scores": scores,
+            })
+            return action
+
+        def audit(action: dict[str, str]) -> None:
+            fields = parser.marker_records(
+                marker("kv_pressure_unified_action", action),
+                "kv_pressure_unified_action", parser.ACTION_REQUIRED, "act")[0]
+            parser.validate_action_fields(fields, "act")
+            parser.validate_action_v3_audit(fields, v3_case, "act")
+
+        # Happy path: fully cost-aware decision.
+        victim = v3_score("0", "1", "0", cost_aware=True)
+        other = v3_score("1", "0", "1", cost_aware=False, exclusion="empty", fallback_reason="none")
+        audit(base_action(f"{victim};{other}", decision_fallback="none"))
+
+        # Happy path: mixed decision falls back to idle-age; the fallback victim
+        # is selected and the marker documents the fallback reason.
+        fb_victim = v3_score("0", "1", "0", cost_aware=False,
+                             fallback_reason="physical_unavailable", physical_bytes="0",
+                             expected_cost="0", physical_object_id="0", physical_generation="0")
+        audit(base_action(f"{fb_victim};{other}", decision_fallback="physical_unavailable"))
+
+        # (a) Missing marker field fails closed.
+        for missing in ("policy", "decision_fallback"):
+            with self.subTest(missing=missing):
+                action = base_action(victim, decision_fallback="none")
+                action.pop(missing)
+                with self.assertRaisesRegex(parser.ParseError, f"missing V3 marker field {missing!r}"):
+                    audit(action)
+
+        # Missing physical feedback field fails closed.
+        for missing in ("action_elapsed_us", "physical_relief_available", "physical_object_id"):
+            with self.subTest(missing=missing):
+                action = base_action(victim, decision_fallback="none")
+                action.pop(missing)
+                with self.assertRaisesRegex(parser.ParseError, "missing V3 physical feedback field"):
+                    audit(action)
+
+        # (c1) Score schema with the wrong field count fails closed.
+        bad_count = base_action("0:1:none", decision_fallback="none")
+        with self.assertRaisesRegex(parser.ParseError, "score\\[0\\] has 3 fields"):
+            audit(bad_count)
+
+        # (c2) cost-aware claimant must not carry a fallback reason.
+        mixed = v3_score("0", "1", "0", cost_aware=True, fallback_reason="physical_unavailable")
+        with self.assertRaisesRegex(parser.ParseError, "cost-aware claimant must carry no fallback reason"):
+            audit(base_action(f"{mixed};{other}", decision_fallback="physical_unavailable"))
+
+        # (c3) eligible non-cost-aware claimant must record a fallback reason.
+        bare = v3_score("0", "1", "0", cost_aware=False, fallback_reason="none")
+        with self.assertRaisesRegex(parser.ParseError, "eligible non-cost-aware claimant must record a fallback reason"):
+            audit(base_action(f"{bare};{other}", decision_fallback="none"))
+
+        # (d) A claimant with history must NOT win just because it carries cost
+        # evidence when the decision falls back to idle-age: an historical but
+        # warm claimant is selected over a colder fallback claimant — fail
+        # closed because the marker claims "none" but a fallback score exists.
+        historical = v3_score("0", "1", "0", cost_aware=True)
+        cold_fallback = v3_score("1", "1", "1", cost_aware=False,
+                                 fallback_reason="physical_unavailable")
+        with self.assertRaisesRegex(parser.ParseError, "carries a fallback reason"):
+            audit(base_action(f"{historical};{cold_fallback}", decision_fallback="none"))
+
+        # Conversely, marker fallback is spurious when no eligible non-cost-aware
+        # claimant carries it — the decision authority is not auditable.
+        with self.assertRaisesRegex(parser.ParseError, "not carried by any eligible non-cost-aware"):
+            audit(base_action(f"{victim};{other}", decision_fallback="physical_unavailable"))
+
+        # (e) selected_seq_id without any eligible score fails closed.
+        lone_excluded = v3_score("2", "0", "0", cost_aware=False, exclusion="empty", fallback_reason="none")
+        no_eligible = base_action(lone_excluded, decision_fallback="none")
+        no_eligible["selected_seq_id"] = "0"
+        with self.assertRaisesRegex(parser.ParseError, "no eligible claimant score was emitted"):
+            audit(no_eligible)
+
+        # (f) state-changing OFFLOAD missing physical lineage fails closed.
+        no_lineage = base_action(victim, decision_fallback="none")
+        no_lineage["physical_object_id"] = "0"
+        with self.assertRaisesRegex(parser.ParseError, "missing physical lineage"):
+            audit(no_lineage)
 
     def test_v2_requires_normal_valid_basis_and_budget_excess(self) -> None:
         artifact = self.run_real_artifact()
@@ -2107,20 +2238,18 @@ class CanonicalBenchmarkTest(unittest.TestCase):
         result = self.run_runner(self.write_spec(value), self.root / "no-measurement", dry_run=True)
         self.assertEqual(result.returncode, 2, result.stderr)
 
-    def test_unimplemented_policy_is_unsupported_before_workload(self) -> None:
+    def test_v3_policy_is_supported_before_workload(self) -> None:
         value = self.spec(policy="v3")
-        value["cases"][0]["kv_target_bytes"] = None
-        spec = self.write_spec(value, "unsupported.json")
-        artifact = self.root / "unsupported"
+        spec = self.write_spec(value, "v3.json")
+        artifact = self.root / "v3"
         runner = self.run_runner(spec, artifact, dry_run=True)
-        self.assertEqual(runner.returncode, 3, runner.stderr)
+        self.assertEqual(runner.returncode, 0, runner.stderr)
         manifest = json.loads((artifact / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["runner_status"], "UNSUPPORTED")
-        self.assertFalse(any((artifact / "runs").iterdir()))
+        self.assertEqual(manifest["runner_status"], "DRY_RUN")
         parsed = self.run_parser(artifact)
-        self.assertEqual(parsed.returncode, 3, parsed.stderr)
+        self.assertEqual(parsed.returncode, 0, parsed.stderr)
         result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
-        self.assertEqual(result["verdict"], "UNSUPPORTED")
+        self.assertEqual(result["verdict"], "DRY_RUN")
 
     def test_unimplemented_factor_is_unsupported_before_workload(self) -> None:
         for field, value in (("kv_representation", "quantized"), ("loading_mode", "selective"), ("restore", "k3"), ("prefault", "r3")):

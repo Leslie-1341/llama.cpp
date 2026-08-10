@@ -47,6 +47,14 @@ struct server_kv_budget_view {
     uint64_t transient_staging_bound_bytes = 0;  // advisory; not subtracted from target
 };
 
+enum class server_kv_pressure_policy : uint8_t {
+    v2,
+    idle_age,
+    v3,
+};
+
+const char * server_kv_pressure_policy_name(server_kv_pressure_policy policy);
+
 struct server_kv_pressure_unified_action_config {
     static constexpr uint32_t DEFAULT_MAX_BLOCKS = 64;
     static constexpr uint32_t DEFAULT_BUDGET_UNMET_BACKOFF_SAMPLES = 16;
@@ -57,6 +65,11 @@ struct server_kv_pressure_unified_action_config {
     uint32_t cooldown_samples = 1;
     uint32_t io_failure_backoff_samples = 4;
     uint32_t max_failure_penalty = 8;
+
+    // V3 policy is opt-in; v2 preserves the existing score and action order.
+    server_kv_pressure_policy policy = server_kv_pressure_policy::v2;
+    uint32_t resident_lease_samples = 1;
+    uint64_t churn_penalty_us = 1000;
 
     // V2 step1: soft budget target (independent from pressure).  When
     // budget_target_enabled && budget_target_bytes > 0, the Governor derives
@@ -125,7 +138,26 @@ enum class server_kv_claimant_exclusion : uint8_t {
     fail_stop,
     exhausted,
     epoch_mismatch,
+    stale_generation,
+    resident_lease,
+    no_physical_relief,
     empty,
+};
+
+struct server_kv_claimant_history {
+    uint64_t epoch = 0;
+    uint64_t object_id = 0;
+    uint64_t generation = 0;
+    uint64_t last_offload_sample = 0;
+    uint64_t last_restore_sample = 0;
+    uint64_t last_offload_bytes = 0;
+    uint64_t last_offload_time_us = 0;
+    uint64_t last_actual_relief_bytes = 0;
+    uint64_t last_restore_bytes = 0;
+    uint64_t last_restore_gate_us = 0;
+    uint64_t resident_lease_until_sample = 0;
+    uint64_t last_transition_sample = 0;
+    uint32_t round_trip_count = 0;
 };
 
 struct server_kv_pressure_snapshot {
@@ -139,6 +171,9 @@ struct server_kv_pressure_snapshot {
     uint64_t pressure_basis_generation = 0;
     uint64_t sample_count = 0;
     uint64_t decision_id = 0;
+    bool kv_physical_view_available = false;
+    uint64_t kv_object_id = 0;
+    uint64_t kv_generation = 0;
 };
 
 struct server_kv_claimant_snapshot {
@@ -153,6 +188,19 @@ struct server_kv_claimant_snapshot {
     uint64_t reclaimable_bytes = 0;
     uint64_t lcp_n_past_hint_tokens = 0;
     uint64_t io_cost_bytes = 0;
+
+    // V3 decision-scoped feature view.  The legacy fields above remain for
+    // V2 compatibility; V3 never treats them as physical bytes.
+    uint64_t answer_tokens = 0;
+    uint64_t physical_object_id = 0;
+    uint64_t physical_generation = 0;
+    bool physical_estimate_available = false;
+    bool physical_estimate_authoritative = false;
+    uint64_t estimated_exclusive_resident_bytes = 0;
+    uint64_t estimated_swapped_bytes = 0;
+    uint32_t exclusive_resident_blocks = 0;
+    uint32_t swapped_blocks = 0;
+    server_kv_claimant_history history;
 };
 
 struct server_kv_claimant_score {
@@ -166,6 +214,28 @@ struct server_kv_claimant_score {
     int64_t io_cost_penalty = 0;
     int64_t failure_penalty = 0;
     int64_t total = 0;
+
+    uint32_t rank = 0;
+    bool cost_aware = false;
+    bool physical_estimate_available = false;
+    bool physical_estimate_authoritative = false;
+    uint64_t estimated_physical_bytes = 0;
+    uint64_t reuse_probability_ppm = 0;
+    uint64_t expected_offload_write_cost_us = 0;
+    uint64_t expected_restore_gate_cost_us = 0;
+    uint64_t expected_cost_us = 0;
+    uint64_t churn_penalty_us = 0;
+    uint64_t raw_idle_age_us = 0;
+    uint64_t raw_answer_tokens = 0;
+    uint64_t raw_lcp_hint_tokens = 0;
+    uint64_t physical_object_id = 0;
+    uint64_t physical_generation = 0;
+    uint64_t actual_relief_bytes = 0;
+    uint64_t resident_lease_until_sample = 0;
+    uint32_t round_trip_count = 0;
+    uint64_t last_offload_bytes = 0;
+    uint64_t last_restore_bytes = 0;
+    const char * fallback_reason = "none";
 };
 
 struct server_kv_claimant_runtime_observation {
@@ -183,8 +253,35 @@ public:
     void reset();
     uint64_t claimant_epoch(llama_seq_id seq_id) const;
     bool claimant_exhausted(llama_seq_id seq_id, uint64_t epoch) const;
+    // Ordinary turn rollover: advances the claimant epoch and clears
+    // exhausted / failure state while migrating claimant_history to the new
+    // epoch so offload/restore cost, actual relief and churn signals survive
+    // across turns as long as the KV lineage is unchanged.
     void invalidate_claimant(llama_seq_id seq_id);
+    // Hard invalidation for real prompt / object / generation loss: advances
+    // the epoch AND erases history (cost / churn / lease) — the previous cost
+    // evidence no longer describes the live KV object.
+    void clear_claimant_lineage(llama_seq_id seq_id);
     void invalidate_all_claimants();
+
+    server_kv_claimant_history claimant_history(llama_seq_id seq_id, uint64_t epoch) const;
+    void record_offload_feedback(
+            const server_kv_claimant_snapshot & claimant,
+            const llama_kv_action_result & action,
+            uint64_t sample_count);
+    void record_restore_feedback(
+            llama_seq_id seq_id,
+            uint64_t epoch,
+            const llama_kv_action_result & action,
+            uint64_t gate_us,
+            uint64_t sample_count,
+            uint32_t resident_lease_samples);
+    void record_resume_feedback(
+            llama_seq_id seq_id,
+            const llama_kv_action_result & action,
+            uint64_t gate_us,
+            uint64_t sample_count,
+            uint32_t resident_lease_samples);
 
     uint64_t pressure_debt_bytes() const { return pressure_debt_bytes_; }
     uint64_t episode() const { return episode_; }
@@ -218,6 +315,7 @@ private:
     std::map<llama_seq_id, uint64_t> claimant_epochs_;
     std::map<llama_seq_id, uint64_t> exhausted_claimants_;
     std::map<llama_seq_id, uint32_t> failure_counts_;
+    std::map<llama_seq_id, server_kv_claimant_history> claimant_history_;
 
     // V2 step1: soft budget debt state — independent of pressure_* and never
     // shares backoff/cooldown with the pressure chain.  Reset on basis
@@ -243,6 +341,12 @@ struct server_kv_pressure_action_result {
     uint64_t next_action_sample = 0;
     llama_seq_id selected_seq_id = -1;
     uint64_t selected_claimant_epoch = 0;
+    server_kv_pressure_policy policy = server_kv_pressure_policy::v2;
+    // V3 decision authority: when any eligible claimant in this decision lacks
+    // cost evidence, the whole decision falls back to a single idle-age / LRU
+    // ranking authority so scores remain comparable.  Empty when cost-aware
+    // ranking was used, or the policy is v2 / idle_age.
+    const char * decision_fallback_reason = "";
     std::vector<server_kv_claimant_runtime_observation> runtime_claimants;
     std::vector<server_kv_claimant_score> scores;
 

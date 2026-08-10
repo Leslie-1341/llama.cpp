@@ -81,17 +81,19 @@ class UnifiedPressureActionStaticTest(unittest.TestCase):
         self.assertIn("kv_g0_s1_resident_observation = resident_observation_both", init)
         self.assertIn("kv_g0_s1_resident_preflight = resident_observation_both", init)
 
-        callback_start = CONTEXT.index("[mem, observe_resident = kv_g0_s1_resident_observation]")
+        callback_start = CONTEXT.index("observe_resident = kv_g0_s1_resident_observation")
         callback_end = CONTEXT.index("} : server_kv_pressure_action_ops {}", callback_start)
         callback = CONTEXT[callback_start:callback_end]
         self.assertIn("request.action != llama_kv_action::offload", callback)
         self.assertLess(
             callback.index("const auto before = mem->sample_kv_resident()"),
-            callback.index("const auto action_result = mem->execute_action(request)"))
+            callback.index("auto action_result = mem->execute_action(request)"))
         self.assertLess(
-            callback.index("const auto action_result = mem->execute_action(request)"),
+            callback.index("auto action_result = mem->execute_action(request)"),
             callback.index("const auto after = mem->sample_kv_resident()"))
         self.assertIn("action_result, (uint64_t) ::getpid(), before, after", callback)
+        self.assertIn("physical_relief_available", callback)
+        self.assertIn("action_elapsed_us", callback)
 
         formatter_start = CONTEXT.index("format_kv_g0_s1_resident_observation(")
         formatter_end = CONTEXT.index("// state diagram:", formatter_start)
@@ -134,6 +136,7 @@ class UnifiedPressureActionStaticTest(unittest.TestCase):
         self.assertNotIn("llama_kv_action::offload", legacy)
         self.assertIn("llama_kv_action::release", governor)
         self.assertIn("llama_kv_action::offload", governor)
+        self.assertNotIn("llama_kv_action::prefetch", governor)
         self.assertIn("if (!state.offload_armed_)", governor)
         self.assertIn("result.release.reason == llama_kv_action_reason::no_candidate", governor)
         for physical_detail in (
@@ -160,7 +163,8 @@ class UnifiedPressureActionStaticTest(unittest.TestCase):
             self.assertIn(token, ACTION_H + ACTION_CPP)
         self.assertGreaterEqual(CONTEXT.count("kv_governor_state.reset();"), 2)
         self.assertIn("server_kv_pressure_execute_governor", CONTEXT)
-        self.assertIn("const server_kv_pressure_snapshot pressure_snapshot", CONTEXT)
+        self.assertIn("server_kv_pressure_snapshot pressure_snapshot", CONTEXT)
+        self.assertIn("sample_kv_claimant_physical_views", CONTEXT)
         self.assertIn("std::vector<server_kv_claimant_snapshot> claimant_snapshots", CONTEXT)
         self.assertIn("std::vector<server_kv_claimant_runtime_observation> runtime_claimants", CONTEXT)
         self.assertIn("LLAMA_KV_PRESSURE_GOVERNOR_CLAIMANT_TRACE", CONTEXT)
@@ -245,7 +249,6 @@ class UnifiedPressureActionStaticTest(unittest.TestCase):
         self.assertIn("if (!state.soft_offload_armed_)", ACTION_CPP)
         self.assertIn("result.release.reason == llama_kv_action_reason::no_candidate", ACTION_CPP)
         self.assertIn("llama_kv_action::offload", ACTION_CPP)
-        self.assertNotIn("llama_kv_action::prefetch", ACTION_CPP)
         governor = ACTION_CPP[
             ACTION_CPP.index("server_kv_pressure_execute_governor("):
             ACTION_CPP.index("server_kv_pressure_unified_action_format_marker(")]

@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include <cstdint>
+#include <vector>
 
 enum class llama_kv_action : uint8_t {
     noop,
@@ -103,6 +104,23 @@ struct llama_kv_runtime_claimant {
     uint32_t swapped_blocks = 0;
     uint32_t shared_blocks = 0;
     uint32_t blocked_blocks = 0;
+};
+
+// One batch physical view for server-side claimant ranking.  The core keeps
+// ownership/state and mincore authoritative; only aggregate per-sequence
+// quantities cross the interface.  No block table or cell mapping is exposed.
+struct llama_kv_claimant_physical_view {
+    llama_seq_id seq_id = -1;
+    bool valid = false;
+    bool available = false;
+    bool authoritative = false;
+    bool shared = false;
+    uint64_t object_id = 0;
+    uint64_t generation = 0;
+    uint64_t estimated_exclusive_resident_bytes = 0;
+    uint64_t estimated_swapped_bytes = 0;
+    uint32_t exclusive_resident_blocks = 0;
+    uint32_t swapped_blocks = 0;
 };
 
 // A read-only, whole-KV mincore sample.  `available` distinguishes a valid
@@ -216,5 +234,13 @@ struct llama_kv_action_result {
     uint64_t bytes = 0;
     uint64_t relieved_bytes = 0;
     uint64_t shortfall_bytes = 0;
+    // Action-local feedback.  `physical_relief_bytes` is populated only when
+    // a before/after physical sample has the same object and generation;
+    // advised/logical bytes are never silently promoted to physical relief.
+    uint64_t action_elapsed_us = 0;
+    uint64_t physical_relief_bytes = 0;
+    bool physical_relief_available = false;
+    uint64_t physical_object_id = 0;
+    uint64_t physical_generation = 0;
     llama_kv_action_capability capability;
 };

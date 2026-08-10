@@ -9,6 +9,7 @@
 #include <map>
 #include <memory>
 #include <functional>
+#include <vector>
 
 struct llama_ubatch;
 
@@ -195,6 +196,14 @@ struct llama_memory_i {
     virtual llama_kv_runtime_claimant get_kv_runtime_claimant(llama_seq_id seq_id) const {
         GGML_UNUSED(seq_id);
         return {};
+    }
+
+    // One read-only batch sample for the claimant ids supplied by the server.
+    // Implementations must aggregate ownership/state and share one physical
+    // residency pass; callers must not infer physical bytes from logical state.
+    virtual std::vector<llama_kv_claimant_physical_view>
+    sample_kv_claimant_physical_views(const std::vector<llama_seq_id> & seq_ids) const {
+        return std::vector<llama_kv_claimant_physical_view>(seq_ids.size());
     }
 
     // Dry-run bounded release: read-only evaluation of would-be release candidates
