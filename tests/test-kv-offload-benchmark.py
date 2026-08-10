@@ -2,6 +2,7 @@
 """Synthetic tests for the canonical Formal OFFLOAD Benchmark evidence spine."""
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -101,6 +102,7 @@ class CanonicalBenchmarkTest(unittest.TestCase):
             release_only_enabled = unified_enabled and not offload_enabled
             mode = os.environ.get('KV_SYNTHETIC_MODE', 'complete')
             expose_v2_resident = os.environ.get('KV_SYNTHETIC_V2_SLOTS_RESIDENT') == '1'
+            omit_v2_resident = os.environ.get('KV_SYNTHETIC_OMIT_V2_SLOTS_RESIDENT') == '1'
             resident_target = int(os.environ.get('LLAMA_KV_RESIDENT_TARGET_BYTES', '4096') or '4096')
             action_target = int(os.environ.get('LLAMA_KV_PRESSURE_UNIFIED_ACTION_TARGET_BYTES', '8192') or '8192')
             action_max_blocks = int(os.environ.get('LLAMA_KV_PRESSURE_UNIFIED_ACTION_MAX_BLOCKS', '64') or '64')
@@ -372,11 +374,11 @@ class CanonicalBenchmarkTest(unittest.TestCase):
             def emit_resume_evidence():
                 decision_id = '4' if characterization_mode else '2'
                 transaction_id = '10' if characterization_mode else '8'
-                if mode == 'prefetch_noop':
+                if mode in ('prefetch_noop', 'characterization_release_noop_prefetch'):
                     outcome = 'no_op'
                     restored_blocks = '0'
                     restored_bytes = '0'
-                    total_us = '0'
+                    total_us = '6'
                 else:
                     outcome = 'completed'
                     restored = state['offloaded_bytes'] or 4096
@@ -410,13 +412,29 @@ class CanonicalBenchmarkTest(unittest.TestCase):
                     values['block_swap_in_calls'] = str(max(1, state['offload_count']))
                     values['backing_read_syscalls'] = str(max(1, state['offload_count']))
                     values['bytes_read'] = str(state['offloaded_bytes'] or 4096)
+                if not (offload_enabled and state['prefetch_completed']):
+                    for key in (
+                            'block_in_validate_us', 'avg_block_in_validate_us',
+                            'block_in_read_us', 'avg_block_in_read_us',
+                            'block_in_unpack_us', 'avg_block_in_unpack_us',
+                            'block_in_commit_us', 'avg_block_in_commit_us',
+                            'restore_prefault_groups', 'restore_prefault_calls',
+                            'restore_prefault_us', 'restore_prefault_minor_faults',
+                            'restore_prefault_major_faults', 'restore_scatter_groups',
+                            'restore_scatter_us', 'restore_scatter_fault_groups',
+                            'restore_scatter_minor_faults', 'restore_scatter_major_faults',
+                    ):
+                        values[key] = '0'
                 if k2_enabled:
                     values.update({{
                         'k2_enabled': '1', 'k2_group_byte_cap': '2048',
-                        'k2_staging_bound_bytes': '2048', 'k2_peak_staging_groups': '1',
-                        'k2_peak_staging_bytes': '2048', 'k2_pipeline_wall_us': '11',
-                        'k2_exposed_read_wait_us': '4', 'k2_pipeline_stall_us': '2',
-                        'k2_read_completed_ahead': '1',
+                        'k2_staging_bound_bytes': '2048',
+                        'k2_peak_staging_groups': '1' if state['prefetch_completed'] else '0',
+                        'k2_peak_staging_bytes': '2048' if state['prefetch_completed'] else '0',
+                        'k2_pipeline_wall_us': '11' if state['prefetch_completed'] else '0',
+                        'k2_exposed_read_wait_us': '4' if state['prefetch_completed'] else '0',
+                        'k2_pipeline_stall_us': '2' if state['prefetch_completed'] else '0',
+                        'k2_read_completed_ahead': '1' if state['prefetch_completed'] else '0',
                     }})
                 emit_marker('KV_PAGED_IO_STATS', values)
                 raise SystemExit(0)
@@ -430,7 +448,8 @@ class CanonicalBenchmarkTest(unittest.TestCase):
                         self.send_response(200); self.end_headers(); self.wfile.write(b'{{"status":"ok"}}'); return
                     if self.path == '/slots':
                         slot = {{'id': 0, 'is_processing': False}}
-                        if not offload_enabled or expose_v2_resident or characterization_mode:
+                        if (not offload_enabled or expose_v2_resident or characterization_mode) and not (
+                                offload_enabled and omit_v2_resident):
                             total_bytes = 12288 if characterization_mode else 8192
                             slot['kv_resident'] = {{
                                 'status': 'available', 'source': 'synthetic', 'object_id': 1, 'generation': 1,
@@ -451,6 +470,8 @@ class CanonicalBenchmarkTest(unittest.TestCase):
                     print(f"synthetic_request ordinal={{ordinal}}", flush=True)
                     if (offload_enabled or release_only_enabled) and characterization_mode and ordinal == 1:
                         threading.Thread(target=emit_characterization_after_fill, daemon=True).start()
+                    elif release_only_enabled and characterization_mode and ordinal == 2 and mode == 'characterization_release_noop_prefetch':
+                        emit_resume_evidence()
                     elif offload_enabled and not characterization_mode and ordinal == 2:
                         threading.Thread(target=emit_qualification_offload_after_fill, daemon=True).start()
                     elif offload_enabled and (
@@ -490,7 +511,10 @@ class CanonicalBenchmarkTest(unittest.TestCase):
             "model": str(self.model),
             "model_quantization": "synthetic",
             "server_args": [],
-            "environment": {"KV_SYNTHETIC_MODE": "complete"},
+            "environment": {
+                "KV_SYNTHETIC_MODE": "complete",
+                "KV_SYNTHETIC_V2_SLOTS_RESIDENT": "1",
+            },
             "pressure_basis": {
                 "authority": "rss_absolute",
                 "low_water_kb": 64 * 1024 * 1024,
@@ -570,12 +594,14 @@ class CanonicalBenchmarkTest(unittest.TestCase):
             *,
             policy: str = "v2",
             mode: str = "complete",
-            expose_v2_resident: bool = False,
+            expose_v2_resident: bool = True,
     ) -> pathlib.Path:
         value = self.spec(policy=policy)
         value["environment"]["KV_SYNTHETIC_MODE"] = mode
         if expose_v2_resident:
             value["environment"]["KV_SYNTHETIC_V2_SLOTS_RESIDENT"] = "1"
+        else:
+            value["environment"].pop("KV_SYNTHETIC_V2_SLOTS_RESIDENT", None)
         spec = self.write_spec(value)
         artifact = self.root / f"real-{policy}-{mode}-{len(list(self.root.glob('real-*')))}"
         runner = self.run_runner(spec, artifact)
@@ -595,6 +621,21 @@ class CanonicalBenchmarkTest(unittest.TestCase):
         runner = self.run_runner(spec, artifact)
         self.assertEqual(runner.returncode, 0, runner.stderr)
         return artifact
+
+    def remove_slot_resident(self, artifact: pathlib.Path, filename: str) -> None:
+        snapshot_path = next(artifact.glob(f"runs/*/{filename}"))
+        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        body_path = snapshot_path.parent / snapshot["body_path"]
+        body = json.loads(body_path.read_text(encoding="utf-8"))
+        for slot in body:
+            if isinstance(slot, dict):
+                slot.pop("kv_resident", None)
+        raw = json.dumps(body).encode("utf-8")
+        body_path.write_bytes(raw)
+        snapshot["body_json"] = body
+        snapshot["body_bytes"] = len(raw)
+        snapshot["body_sha256"] = hashlib.sha256(raw).hexdigest()
+        snapshot_path.write_text(json.dumps(snapshot), encoding="utf-8")
 
     def run_incomplete_artifact(self, mode: str) -> tuple[pathlib.Path, subprocess.CompletedProcess[str]]:
         value = self.spec()
@@ -859,17 +900,15 @@ class CanonicalBenchmarkTest(unittest.TestCase):
         self.assertEqual(result["verdict"], "INVALID_ARTIFACT")
         self.assertIn("completed graph-allowed PREFETCH", result["errors"][0])
 
-    def test_v2_transaction_local_drop_is_authoritative_without_slot_resident(self) -> None:
-        artifact = self.run_real_artifact()
+    def test_v2_qualification_missing_slot_resident_is_invalid(self) -> None:
+        artifact = self.run_real_artifact(expose_v2_resident=False)
         slots_before = json.loads(next(artifact.glob("runs/*/slots_before.json")).read_text(encoding="utf-8"))
         self.assertNotIn("kv_resident", slots_before["body_json"][0])
         parsed = self.run_parser(artifact)
-        self.assertEqual(parsed.returncode, 0, parsed.stderr)
+        self.assertNotEqual(parsed.returncode, 0)
         result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
-        self.assertEqual(result["verdict"], "QUALIFICATION_PASS")
-        physical = result["physical_observations"][0]
-        self.assertEqual(physical["authority"], "transaction_local_mincore")
-        self.assertEqual(physical["transaction_local_offload"][0]["resident_drop_bytes"], 4096)
+        self.assertEqual(result["verdict"], "INVALID_ARTIFACT")
+        self.assertIn("no valid physical resident observation", result["errors"][0])
 
     def test_resident_no_swap_in_does_not_require_resume(self) -> None:
         artifact = self.run_real_artifact(policy="resident")
@@ -1047,7 +1086,7 @@ class CanonicalBenchmarkTest(unittest.TestCase):
         self.assertEqual(run["total_physical_relief_bytes"], run["release_physical_relief_bytes"] + run["offload_physical_relief_bytes"])
         self.assertEqual(run["offload"]["physical_relieved_bytes"], 4096)
         self.assertEqual(run["offload"]["action_relieved_bytes"], 4096)
-        self.assertEqual(run["release_physical_relief_authority"], "phase_boundary_budget_marker")
+        self.assertEqual(run["release_physical_relief_authority"], "phase_boundary_slots")
         self.assertEqual(run["offload_physical_relief_authority"], "transaction_local_mincore")
         self.assertEqual(
             run["total_physical_relief_bytes"],
@@ -1142,6 +1181,50 @@ class CanonicalBenchmarkTest(unittest.TestCase):
         self.assertNotEqual(parsed.returncode, 0)
         result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
         self.assertEqual(result["verdict"], "INVALID_ARTIFACT")
+
+    def test_release_only_noop_prefetch_passes_but_positive_restore_fails(self) -> None:
+        artifact = self.run_characterization_artifact(
+            policy="release_only", mode="characterization_release_noop_prefetch", restore="k1_sync")
+        parsed = self.run_parser(artifact)
+        self.assertEqual(parsed.returncode, 0, parsed.stderr)
+        result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["verdict"], "RELEASE_SETTLED")
+        self.assertEqual(result["characterization"]["runs"][0]["resume"]["restored_bytes"], 0)
+        stderr_path = next(artifact.glob("runs/*/server.stderr"))
+        stderr = stderr_path.read_text(encoding="utf-8")
+        self.assertIn("phase=prefetch", stderr)
+        self.assertIn("outcome=no_op", stderr)
+        self.assertIn("restored_blocks=0", stderr)
+        self.assertIn("restored_bytes=0", stderr)
+
+        positive = self.run_characterization_artifact(
+            policy="release_only", mode="characterization_release_noop_prefetch", restore="k1_sync")
+        positive_stderr = next(positive.glob("runs/*/server.stderr"))
+        positive_text = positive_stderr.read_text(encoding="utf-8")
+        positive_stderr.write_text(
+            positive_text.replace("restored_blocks=0", "restored_blocks=1", 1)
+            .replace("restored_bytes=0", "restored_bytes=4096", 1),
+            encoding="utf-8",
+        )
+        invalid = self.run_parser(positive)
+        self.assertNotEqual(invalid.returncode, 0)
+        invalid_result = json.loads((positive / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(invalid_result["verdict"], "INVALID_ARTIFACT")
+        self.assertIn("positive restore", invalid_result["errors"][0])
+
+        activity = self.run_characterization_artifact(
+            policy="release_only", mode="characterization_release_noop_prefetch", restore="k2_pipeline")
+        activity_stderr = next(activity.glob("runs/*/server.stderr"))
+        activity_text = activity_stderr.read_text(encoding="utf-8")
+        activity_stderr.write_text(
+            activity_text.replace("restore_scatter_groups=0", "restore_scatter_groups=1", 1),
+            encoding="utf-8",
+        )
+        activity_invalid = self.run_parser(activity)
+        self.assertNotEqual(activity_invalid.returncode, 0)
+        activity_result = json.loads((activity / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(activity_result["verdict"], "INVALID_ARTIFACT")
+        self.assertIn("positive restore activity", activity_result["errors"][0])
 
     def test_characterization_aggregate_uses_three_layer_baseline_and_phase_delta(self) -> None:
         value = self.characterization_spec(policy="resident", mode="characterization_release_then_offload", restore="k1_sync")
@@ -1314,10 +1397,164 @@ class CanonicalBenchmarkTest(unittest.TestCase):
         self.assertEqual(run["resident_settled"], 8192)
         self.assertEqual(run["unmet_budget_bytes"], 4096)
         self.assertNotEqual(run["requested_target_bytes"], run["resident_settled"])
+        self.assertGreater(run["resume"]["restored_bytes"], 0)
+        io = result["restore_observations"][0]["io"]
+        for field in ("block_swap_in_calls", "backing_read_syscalls", "bytes_read"):
+            self.assertGreater(int(io[field]), 0)
+        execution = json.loads(
+            next(artifact.glob("runs/*/execution.json")).read_text(encoding="utf-8"))
+        self.assertIsNotNone(execution["characterization"]["resume"])
+        self.assertEqual(execution["request_count"], 2)
         floor = result["characterization"]["b_reachable_floor"]
         self.assertEqual(floor["status"], "AVAILABLE")
         self.assertEqual(floor["requested_target_bytes"], 4096)
         self.assertEqual(floor["observations"][0]["resident_settled"], 8192)
+
+    def test_unmet_floor_requires_positive_swap_in_read_and_restore(self) -> None:
+        for field, replacement in (
+            ("block_swap_in_calls", "0"),
+            ("backing_read_syscalls", "0"),
+            ("bytes_read", "0"),
+            ("restored_blocks", "0"),
+            ("restored_bytes", "0"),
+        ):
+            with self.subTest(field=field):
+                artifact = self.run_characterization_artifact(mode="characterization_unmet")
+                stderr_path = next(artifact.glob("runs/*/server.stderr"))
+                text = stderr_path.read_text(encoding="utf-8")
+                old_value = {
+                    "restored_blocks": "1", "restored_bytes": "4096", "bytes_read": "4096",
+                }.get(field, "1")
+                stderr_path.write_text(
+                    text.replace(f"{field}={old_value}", f"{field}={replacement}", 1),
+                    encoding="utf-8",
+                )
+                parsed = self.run_parser(artifact)
+                self.assertNotEqual(parsed.returncode, 0)
+                result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
+                self.assertEqual(result["verdict"], "INVALID_ARTIFACT")
+
+    def test_unmet_floor_resumes_without_slot_resident_snapshot(self) -> None:
+        value = self.characterization_spec(mode="characterization_unmet")
+        value["environment"]["KV_SYNTHETIC_OMIT_V2_SLOTS_RESIDENT"] = "1"
+        spec = self.write_spec(value, "characterization-unmet-no-slot-resident.json")
+        artifact = self.root / "characterization-unmet-no-slot-resident"
+        runner = self.run_runner(spec, artifact)
+        self.assertEqual(runner.returncode, 0, runner.stderr)
+        execution = json.loads(
+            next(artifact.glob("runs/*/execution.json")).read_text(encoding="utf-8"))
+        self.assertEqual(execution["request_count"], 2)
+        self.assertIsNone(execution["characterization"]["settle"]["physical_resident_bytes"])
+        self.assertIsNotNone(execution["characterization"]["resume"])
+        self.assertEqual(
+            len(next(artifact.glob("runs/*/responses.jsonl")).read_text(encoding="utf-8").splitlines()),
+            2,
+        )
+        parsed = self.run_parser(artifact)
+        self.assertEqual(parsed.returncode, 0, parsed.stderr)
+        result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["verdict"], "UNMET_FLOOR")
+        run = result["characterization"]["runs"][0]
+        self.assertIsNone(run["resident_after_fill"])
+        self.assertIsNone(run["resident_after_release_settle"])
+        self.assertIsNone(run["resident_settled"])
+        self.assertIsNone(run["resident_after_resume"])
+        self.assertEqual(
+            run["resident_views"],
+            {"after_fill": None, "after_release_settle": None, "settled": None, "after_resume": None},
+        )
+        self.assertEqual(
+            run["budget_resident_views"]["after_fill"]["authority"], "budget_view_marker")
+        self.assertEqual(
+            run["budget_resident_views"]["settled"]["authority"], "budget_view_marker")
+        self.assertIsNone(run["release_physical_relief_bytes"])
+        self.assertEqual(run["offload_physical_relief_bytes"], 4096)
+        self.assertIsNone(run["total_physical_relief_bytes"])
+        self.assertEqual(
+            run["release_physical_relief_authority"],
+            "unavailable_no_independent_physical_authority",
+        )
+        self.assertEqual(run["offload_physical_relief_authority"], "transaction_local_mincore")
+        self.assertIsNone(run["physical_relief_bytes"])
+        self.assertGreater(run["resume"]["restored_bytes"], 0)
+        self.assertEqual(
+            result["characterization"]["b_reachable_floor"]["status"], "UNAVAILABLE")
+        self.assertEqual(
+            result["action_summary"]["total_physical_relief_bytes"], None)
+
+    def test_v2_marker_fallback_cannot_create_formal_physical_relief(self) -> None:
+        value = self.characterization_spec(mode="characterization_unmet")
+        value["environment"]["KV_SYNTHETIC_OMIT_V2_SLOTS_RESIDENT"] = "1"
+        artifact = self.root / "characterization-unmet-marker-authority"
+        runner = self.run_runner(self.write_spec(value, "marker-authority.json"), artifact)
+        self.assertEqual(runner.returncode, 0, runner.stderr)
+        parsed = self.run_parser(artifact)
+        self.assertEqual(parsed.returncode, 0, parsed.stderr)
+        result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
+        run = result["characterization"]["runs"][0]
+        self.assertIsNone(run["release_physical_relief_bytes"])
+        self.assertIsNone(run["total_physical_relief_bytes"])
+        self.assertEqual(run["offload_physical_relief_authority"], "transaction_local_mincore")
+        self.assertEqual(
+            result["physical_observations"][0]["authority"],
+            "transaction_local_mincore_only",
+        )
+        self.assertEqual(
+            run["budget_resident_views"]["after_fill"],
+            {"authority": "budget_view_marker", "resident_bytes": 12288},
+        )
+        self.assertEqual(
+            run["budget_resident_views"]["settled"],
+            {"authority": "budget_view_marker", "resident_bytes": 8192},
+        )
+
+    def test_v2_partial_resident_missing_is_invalid(self) -> None:
+        artifact = self.run_characterization_artifact(mode="characterization_unmet")
+        self.remove_slot_resident(artifact, "slots_release_settled.json")
+        parsed = self.run_parser(artifact)
+        self.assertNotEqual(parsed.returncode, 0)
+        result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["verdict"], "INVALID_ARTIFACT")
+        self.assertIn("partially missing", result["errors"][0])
+
+    def test_v2_target_reached_resident_missing_is_invalid(self) -> None:
+        artifact = self.run_characterization_artifact(mode="characterization_target")
+        self.remove_slot_resident(artifact, "slots_before.json")
+        parsed = self.run_parser(artifact)
+        self.assertNotEqual(parsed.returncode, 0)
+        result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["verdict"], "INVALID_ARTIFACT")
+        self.assertIn("no valid physical resident observation", result["errors"][0])
+
+    def test_v2_unrelated_positive_prefetch_cannot_satisfy_unmet_floor(self) -> None:
+        artifact = self.run_characterization_artifact(mode="characterization_unmet")
+        stderr_path = next(artifact.glob("runs/*/server.stderr"))
+        lines = stderr_path.read_text(encoding="utf-8").splitlines()
+        for index, line in enumerate(lines):
+            if "kv_resume_order_event" in line or "kv_resume_stage_timing" in line:
+                lines[index] = line.replace("seq_id=0", "seq_id=7", 1)
+        stderr_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        parsed = self.run_parser(artifact)
+        self.assertNotEqual(parsed.returncode, 0)
+        result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["verdict"], "INVALID_ARTIFACT")
+        self.assertIn("not selected", result["errors"][0])
+
+    def test_release_only_claimant_epoch_mismatch_is_invalid(self) -> None:
+        artifact = self.run_characterization_artifact(
+            policy="release_only", mode="characterization_release_noop_prefetch", restore="k1_sync")
+        stderr_path = next(artifact.glob("runs/*/server.stderr"))
+        lines = stderr_path.read_text(encoding="utf-8").splitlines()
+        for index, line in enumerate(lines):
+            if "kv_resume_order_event" in line and "phase=prefetch" in line:
+                lines[index] = line.replace("claimant_epoch=1", "claimant_epoch=2", 1)
+                break
+        stderr_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        parsed = self.run_parser(artifact)
+        self.assertNotEqual(parsed.returncode, 0)
+        result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["verdict"], "INVALID_ARTIFACT")
+        self.assertIn("paired graph gate", result["errors"][0])
 
     def test_characterization_timeout_is_invalid_and_never_resumes(self) -> None:
         value = self.characterization_spec(mode="characterization_timeout")

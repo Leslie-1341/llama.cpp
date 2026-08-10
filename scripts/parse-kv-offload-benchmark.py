@@ -106,6 +106,16 @@ TIMING_REQUIRED = {
     "decision_id", "seq_id", "transaction_id", "restored_blocks", "restored_bytes", "queue_us",
     "gate_us", "graph_us", "total_us",
 }
+RESTORE_ACTIVITY_FIELDS = {
+    "block_in_validate_us", "avg_block_in_validate_us", "block_in_read_us", "avg_block_in_read_us",
+    "block_in_unpack_us", "avg_block_in_unpack_us", "block_in_commit_us", "avg_block_in_commit_us",
+    "restore_prefault_groups", "restore_prefault_calls", "restore_prefault_us",
+    "restore_prefault_minor_faults", "restore_prefault_major_faults", "restore_scatter_groups",
+    "restore_scatter_us", "restore_scatter_fault_groups", "restore_scatter_minor_faults",
+    "restore_scatter_major_faults", "k2_peak_staging_groups", "k2_peak_staging_bytes",
+    "k2_pipeline_wall_us", "k2_exposed_read_wait_us", "k2_pipeline_stall_us",
+    "k2_read_completed_ahead",
+}
 IO_REQUIRED = {
     "block_swap_out_calls", "block_swap_in_calls", "backing_read_syscalls", "backing_write_syscalls",
     "bytes_read", "bytes_written", "avg_block_swap_out_latency_us", "max_block_swap_out_latency_us",
@@ -619,6 +629,7 @@ def qualified_offload_pairs(
                 "decision_id": int(action["decision_id"]),
                 "transaction_id": int(action["transaction_id"]),
                 "seq_id": int(action["selected_seq_id"]),
+                "selected_claimant_epoch": int(action["selected_claimant_epoch"]),
                 "before_object_id": int(observation["before_object_id"]),
                 "before_generation": int(observation["before_generation"]),
                 "before_resident_bytes": int(observation["before_resident_bytes"]),
@@ -1074,7 +1085,7 @@ def validate_qualification_record(
         {
             "status", "started_mono_ns", "completed_mono_ns", "duration_ns",
             "stderr_start_offset", "stderr_end_offset", "decision_id", "transaction_id", "seq_id",
-            "before_object_id", "before_generation", "before_resident_bytes", "after_object_id",
+            "selected_claimant_epoch", "before_object_id", "before_generation", "before_resident_bytes", "after_object_id",
             "after_generation", "after_resident_bytes", "resident_drop_bytes",
         },
         f"{label}.offload_barrier",
@@ -1083,7 +1094,8 @@ def validate_qualification_record(
         raise ParseError(f"{label}: real OFFLOAD barrier did not pass")
     for key in (
         "started_mono_ns", "completed_mono_ns", "duration_ns", "stderr_start_offset",
-        "stderr_end_offset", "decision_id", "transaction_id", "seq_id", "before_object_id",
+        "stderr_end_offset", "decision_id", "transaction_id", "seq_id", "selected_claimant_epoch",
+        "before_object_id",
         "before_generation", "before_resident_bytes", "after_object_id", "after_generation",
         "after_resident_bytes", "resident_drop_bytes",
     ):
@@ -1096,6 +1108,7 @@ def validate_qualification_record(
         or barrier["stderr_end_offset"] < barrier["stderr_start_offset"]
         or barrier["before_object_id"] != barrier["after_object_id"]
         or barrier["before_generation"] != barrier["after_generation"]
+        or barrier["selected_claimant_epoch"] <= 0
         or barrier["after_resident_bytes"] >= barrier["before_resident_bytes"]
         or barrier["resident_drop_bytes"]
             != barrier["before_resident_bytes"] - barrier["after_resident_bytes"]
@@ -1186,8 +1199,8 @@ def validate_qualification_causality(
     barrier_fields = {
         key: barrier[key]
         for key in (
-            "decision_id", "transaction_id", "seq_id", "before_object_id", "before_generation",
-            "before_resident_bytes", "after_object_id", "after_generation", "after_resident_bytes",
+            "decision_id", "transaction_id", "seq_id", "selected_claimant_epoch",
+            "before_object_id", "before_generation", "before_resident_bytes", "after_object_id", "after_generation", "after_resident_bytes",
             "resident_drop_bytes",
         )
     }
@@ -1211,41 +1224,19 @@ def validate_qualification_causality(
         resume_text, "kv_resume_stage_timing", TIMING_REQUIRED, f"{label}.qualification_timing")
     for timing in resume_timings:
         numeric_fields(timing, TIMING_REQUIRED, f"{label}.qualification_timing")
-    for prefetch in resume_events:
-        if (
-            prefetch["phase"] != "prefetch"
-            or prefetch["action"] != "prefetch"
-            or prefetch["outcome"] != "completed"
-            or prefetch["graph_allowed"] != "1"
-            or int(prefetch["seq_id"]) != barrier["seq_id"]
-        ):
-            continue
-        key = (prefetch["decision_id"], prefetch["transaction_id"], prefetch["seq_id"])
-        graph_gate = next((
-            event for event in resume_events
-            if event["phase"] == "graph_gate"
-            and event["action"] == "prefetch"
-            and event["outcome"] == "completed"
-            and event["graph_allowed"] == "1"
-            and (event["decision_id"], event["transaction_id"], event["seq_id"]) == key
-        ), None)
-        timing = next((
-            item for item in resume_timings
-            if (item["decision_id"], item["transaction_id"], item["seq_id"]) == key
-            and int(item["restored_blocks"]) > 0
-            and int(item["restored_bytes"]) > 0
-            and int(item["total_us"]) > 0
-        ), None)
-        if graph_gate is not None and timing is not None:
-            return {
-                "offload": barrier_fields,
-                "prefetch": prefetch,
-                "graph_gate": graph_gate,
-                "timing": timing,
-                "resume_request": resume,
-            }
-    raise ParseError(
-        f"{label}: qualification resume has no completed graph-allowed PREFETCH with positive restore timing")
+    evidence = validate_resume_restore_evidence(
+        resume_events,
+        resume_timings,
+        {barrier["seq_id"]: {barrier["selected_claimant_epoch"]}},
+        f"{label}.qualification_resume",
+    )
+    return {
+        "offload": barrier_fields,
+        "prefetch": evidence["prefetch"],
+        "graph_gate": evidence["graph_gate"],
+        "timing": evidence["timing"],
+        "resume_request": resume,
+    }
 
 
 def validate_snapshot_reference(value: Any, expected_path: str, label: str) -> dict[str, Any]:
@@ -1334,8 +1325,13 @@ def validate_characterization_record(
         "stderr_end_offset",
     ):
         require_nonnegative_int(settle[key], f"{label}.settle.{key}")
-    require_nonnegative_int(
-        settle["physical_resident_bytes"], f"{label}.settle.physical_resident_bytes")
+    physical_resident_bytes = settle["physical_resident_bytes"]
+    if physical_resident_bytes is None:
+        if not (case["policy"] == "v2" and settle["status"] == "unmet_floor"):
+            raise ParseError(f"{label}: settled physical resident observation is missing")
+    else:
+        require_nonnegative_int(
+            physical_resident_bytes, f"{label}.settle.physical_resident_bytes")
     if (
         settle["started_mono_ns"] < idle_finished
         or settle["completed_mono_ns"] < settle["started_mono_ns"]
@@ -1461,7 +1457,8 @@ def validate_characterization_record(
     return record
 
 
-def authoritative_slot_resident(snapshot: dict[str, Any], label: str) -> dict[str, Any]:
+def optional_authoritative_slot_resident(
+        snapshot: dict[str, Any], label: str) -> dict[str, Any] | None:
     value = snapshot.get("body_json")
     if not isinstance(value, list):
         raise ParseError(f"{label}: slot snapshot body is unavailable")
@@ -1470,11 +1467,18 @@ def authoritative_slot_resident(snapshot: dict[str, Any], label: str) -> dict[st
         if isinstance(slot, dict) and isinstance(slot.get("kv_resident"), dict)
     ]
     if not observations:
-        raise ParseError(f"{label}: physical resident observation is missing")
+        return None
     first = observations[0]
     if any(item != first for item in observations[1:]):
         raise ParseError(f"{label}: slots disagree on the global physical resident observation")
     return first
+
+
+def authoritative_slot_resident(snapshot: dict[str, Any], label: str) -> dict[str, Any]:
+    resident = optional_authoritative_slot_resident(snapshot, label)
+    if resident is None:
+        raise ParseError(f"{label}: physical resident observation is missing")
+    return resident
 
 
 def release_boundary_status(action: dict[str, str]) -> str | None:
@@ -1625,6 +1629,119 @@ def characterization_budget_observations(
     return observations, terminal
 
 
+def resume_event_base_key(event: dict[str, str]) -> tuple[str, str, str]:
+    return event["decision_id"], event["transaction_id"], event["seq_id"]
+
+
+def resume_event_key(event: dict[str, str]) -> tuple[str, str, str, str]:
+    return (*resume_event_base_key(event), event["claimant_epoch"])
+
+
+def validate_resume_restore_evidence(
+        resumes: list[dict[str, str]],
+        timings: list[dict[str, str]],
+        selected_offload_epochs: dict[int, set[int]],
+        label: str,
+) -> dict[str, dict[str, str]]:
+    if not resumes or not timings:
+        raise ParseError(f"{label}: positive resume requires order and timing markers")
+
+    phases_by_key: dict[tuple[str, str, str, str], set[str]] = {}
+    events_by_base: dict[tuple[str, str, str], dict[str, dict[str, str]]] = {}
+    for event in resumes:
+        if (
+            event["action"] != "prefetch"
+            or event["outcome"] != "completed"
+            or event["graph_allowed"] != "1"
+            or event["phase"] not in {"prefetch", "graph_gate"}
+        ):
+            raise ParseError(
+                f"{label}: resume contains no completed graph-allowed PREFETCH evidence")
+        full_key = resume_event_key(event)
+        phases = phases_by_key.setdefault(full_key, set())
+        if event["phase"] in phases:
+            raise ParseError(f"{label}: PREFETCH phase is duplicated")
+        phases.add(event["phase"])
+        base_key = resume_event_base_key(event)
+        event_by_phase = events_by_base.setdefault(base_key, {})
+        if event["phase"] in event_by_phase:
+            raise ParseError(f"{label}: resume PREFETCH key is duplicated")
+        event_by_phase[event["phase"]] = event
+
+    if any(phases != {"prefetch", "graph_gate"} for phases in phases_by_key.values()):
+        raise ParseError(f"{label}: PREFETCH lacks a paired graph gate with the same claimant epoch")
+    if len({full_key[:3] for full_key in phases_by_key}) != len(phases_by_key):
+        raise ParseError(f"{label}: resume key has multiple claimant epochs")
+
+    timings_by_key: dict[tuple[str, str, str], dict[str, str]] = {}
+    for timing in timings:
+        key = (timing["decision_id"], timing["transaction_id"], timing["seq_id"])
+        if key in timings_by_key:
+            raise ParseError(f"{label}: resume timing key is duplicated")
+        timings_by_key[key] = timing
+    if set(timings_by_key) != set(events_by_base):
+        raise ParseError(f"{label}: PREFETCH, graph_gate, and timing keys do not match")
+
+    positive: list[dict[str, dict[str, str]]] = []
+    for base_key, events in events_by_base.items():
+        timing = timings_by_key[base_key]
+        if (
+            int(timing["restored_blocks"]) <= 0
+            or int(timing["restored_bytes"]) <= 0
+            or int(timing["total_us"]) <= 0
+        ):
+            raise ParseError(f"{label}: completed PREFETCH lacks positive restore timing")
+        prefetch = events["prefetch"]
+        seq_id = int(prefetch["seq_id"])
+        if seq_id not in selected_offload_epochs:
+            raise ParseError(
+                f"{label}: positive PREFETCH seq_id is not selected by this round's OFFLOAD actions")
+        if int(prefetch["claimant_epoch"]) not in selected_offload_epochs[seq_id]:
+            raise ParseError(
+                f"{label}: positive PREFETCH claimant_epoch does not match the selected OFFLOAD claimant")
+        positive.append({"prefetch": prefetch, "graph_gate": events["graph_gate"], "timing": timing})
+
+    if not positive:
+        raise ParseError(f"{label}: no positive resume restore evidence")
+    return positive[0]
+
+
+def validate_release_only_noop_restore(
+        resumes: list[dict[str, str]], timings: list[dict[str, str]], label: str) -> None:
+    if not resumes and not timings:
+        return
+    phases_by_key: dict[tuple[str, str, str, str], set[str]] = {}
+    for event in resumes:
+        if (
+            event["action"] != "prefetch"
+            or event["outcome"] != "no_op"
+            or event["graph_allowed"] != "1"
+            or event["phase"] not in {"prefetch", "graph_gate"}
+        ):
+            raise ParseError(
+                f"{label}: RELEASE-only contains positive or malformed PREFETCH evidence")
+        key = resume_event_key(event)
+        phases = phases_by_key.setdefault(key, set())
+        if event["phase"] in phases:
+            raise ParseError(f"{label}: RELEASE-only PREFETCH phase is duplicated")
+        phases.add(event["phase"])
+    if any(phases != {"prefetch", "graph_gate"} for phases in phases_by_key.values()):
+        raise ParseError(f"{label}: RELEASE-only PREFETCH lacks a paired graph gate")
+    if len({key[:3] for key in phases_by_key}) != len(phases_by_key):
+        raise ParseError(f"{label}: RELEASE-only PREFETCH key has multiple claimant epochs")
+
+    timings_by_key: dict[tuple[str, str, str], dict[str, str]] = {}
+    for timing in timings:
+        key = (timing["decision_id"], timing["transaction_id"], timing["seq_id"])
+        if key in timings_by_key:
+            raise ParseError(f"{label}: RELEASE-only restore timing is duplicated")
+        if int(timing["restored_blocks"]) != 0 or int(timing["restored_bytes"]) != 0:
+            raise ParseError(f"{label}: RELEASE-only contains positive restore evidence")
+        timings_by_key[key] = timing
+    if set(timings_by_key) != {key[:3] for key in phases_by_key}:
+        raise ParseError(f"{label}: RELEASE-only PREFETCH timing does not match no-op markers")
+
+
 def k2_statistics(io: dict[str, str]) -> dict[str, Any]:
     return {
         "enabled": int(io["k2_enabled"]),
@@ -1687,9 +1804,15 @@ def validate_characterization_causality(
         raise ParseError(f"{label}: Resident measurements are not classified as resident_steady")
 
     after_fill_snapshot = validate_slot_snapshot(
-        run_dir / "slots_after_fill.json", f"{label}.slots_after_fill")
+        run_dir / "slots_after_fill.json",
+        f"{label}.slots_after_fill",
+        require_resident=case["policy"] != "v2",
+    )
     after_measurement_snapshot = validate_slot_snapshot(
-        run_dir / "slots_after_measurement.json", f"{label}.slots_after_measurement")
+        run_dir / "slots_after_measurement.json",
+        f"{label}.slots_after_measurement",
+        require_resident=case["policy"] != "v2",
+    )
     if (
         record["after_fill"]["captured_mono_ns"] != after_fill_snapshot["captured_mono_ns"]
         or record["after_measurement"]["captured_mono_ns"]
@@ -1704,10 +1827,16 @@ def validate_characterization_causality(
         or after_measurement_snapshot["captured_mono_ns"] < first_measurement["finished_mono_ns"]
     ):
         raise ParseError(f"{label}: fill/measurement physical snapshots are out of order")
-    resident_after_fill = authoritative_slot_resident(
-        after_fill_snapshot, f"{label}.slots_after_fill")
-    resident_after_measurement = authoritative_slot_resident(
-        after_measurement_snapshot, f"{label}.slots_after_measurement")
+    if case["policy"] == "v2":
+        resident_after_fill = optional_authoritative_slot_resident(
+            after_fill_snapshot, f"{label}.slots_after_fill")
+        resident_after_measurement = optional_authoritative_slot_resident(
+            after_measurement_snapshot, f"{label}.slots_after_measurement")
+    else:
+        resident_after_fill = authoritative_slot_resident(
+            after_fill_snapshot, f"{label}.slots_after_fill")
+        resident_after_measurement = authoritative_slot_resident(
+            after_measurement_snapshot, f"{label}.slots_after_measurement")
 
     if case["policy"] == "resident":
         return {
@@ -1880,28 +2009,23 @@ def validate_characterization_causality(
         }
 
     settled_snapshot = validate_slot_snapshot(
-        run_dir / "slots_settled.json", f"{label}.slots_settled")
+        run_dir / "slots_settled.json",
+        f"{label}.slots_settled",
+        require_resident=False,
+    )
     if record["settled"]["captured_mono_ns"] != settled_snapshot["captured_mono_ns"]:
         raise ParseError(f"{label}: settled snapshot reference timestamp mismatch")
-    settled_resident = authoritative_slot_resident(settled_snapshot, f"{label}.slots_settled")
+    settled_resident = optional_authoritative_slot_resident(
+        settled_snapshot, f"{label}.slots_settled")
     release_snapshot = validate_slot_snapshot(
-        run_dir / "slots_release_settled.json", f"{label}.slots_release_settled")
+        run_dir / "slots_release_settled.json",
+        f"{label}.slots_release_settled",
+        require_resident=False,
+    )
     if record["release_settled"]["captured_mono_ns"] != release_snapshot["captured_mono_ns"]:
         raise ParseError(f"{label}: release settled snapshot reference timestamp mismatch")
-    release_resident = authoritative_slot_resident(
+    release_resident = optional_authoritative_slot_resident(
         release_snapshot, f"{label}.slots_release_settled")
-    identity_keys = ("object_id", "generation", "page_size", "total_bytes", "total_pages")
-    if any(
-        resident_after_fill[key] != release_resident[key]
-        or release_resident[key] != settled_resident[key]
-        or settled_resident[key] != resident_after_measurement[key]
-        for key in identity_keys
-    ):
-        raise ParseError(f"{label}: physical resident identity changed across characterization")
-    if release_resident["resident_bytes"] > resident_after_fill["resident_bytes"]:
-        raise ParseError(f"{label}: RELEASE settle exceeds after-fill B_full observation")
-    if settled_resident["resident_bytes"] > release_resident["resident_bytes"]:
-        raise ParseError(f"{label}: OFFLOAD settle exceeds RELEASE settle resident")
 
     idle = record["idle"]
     settle = record["settle"]
@@ -1966,12 +2090,67 @@ def validate_characterization_causality(
         or recorded_boundary["soft_offload_armed_after"] != (boundary_action["soft_offload_armed_after"] == "1")
     ):
         raise ParseError(f"{label}: recorded RELEASE phase boundary differs from production marker")
-    tolerance = int(spec["workload"]["characterization"]["target_tolerance_bytes"])
-    if abs(
-        release_resident["resident_bytes"] - recorded_boundary["budget_resident_bytes"]
-    ) > tolerance:
+
+    slot_resident_snapshots = (
+        resident_after_fill, release_resident, settled_resident, resident_after_measurement)
+    missing_slot_resident = any(resident is None for resident in slot_resident_snapshots)
+    all_slot_resident_missing = all(resident is None for resident in slot_resident_snapshots)
+    observed_slot_residents = [
+        resident for resident in slot_resident_snapshots if resident is not None
+    ]
+    if terminal["status"] != "unmet_floor" and missing_slot_resident:
         raise ParseError(
-            f"{label}: slots RELEASE snapshot disagrees with marker phase-boundary resident")
+            f"{label}: V2 physical resident snapshots are incomplete outside UNMET_FLOOR")
+    if terminal["status"] == "unmet_floor" and missing_slot_resident and not all_slot_resident_missing:
+        raise ParseError(f"{label}: V2 physical resident snapshots are partially missing")
+    if len(observed_slot_residents) > 1:
+        identity_keys = ("object_id", "generation", "page_size", "total_bytes", "total_pages")
+        first_resident = observed_slot_residents[0]
+        if any(
+            first_resident[key] != resident[key]
+            for resident in observed_slot_residents[1:]
+            for key in identity_keys
+        ):
+            raise ParseError(f"{label}: physical resident identity changed across characterization")
+    if not observations:
+        raise ParseError(f"{label}: V2 characterization has no budget resident observations")
+    budget_resident_views = {
+        "after_fill": {
+            "authority": "budget_view_marker",
+            "resident_bytes": observations[0]["budget_resident_bytes"],
+        },
+        "after_release_settle": {
+            "authority": "budget_view_marker",
+            "resident_bytes": recorded_boundary["budget_resident_bytes"],
+        },
+        "settled": {
+            "authority": "budget_view_marker",
+            "resident_bytes": terminal["budget_resident_bytes"],
+        },
+        "after_resume": None,
+    }
+    if (
+        budget_resident_views["after_release_settle"]["resident_bytes"]
+        > budget_resident_views["after_fill"]["resident_bytes"]
+        or budget_resident_views["settled"]["resident_bytes"]
+        > budget_resident_views["after_release_settle"]["resident_bytes"]
+    ):
+        raise ParseError(f"{label}: budget-view resident observations are not monotonic")
+    physical_resident_available = not missing_slot_resident
+    if physical_resident_available:
+        assert resident_after_fill is not None
+        assert release_resident is not None
+        assert settled_resident is not None
+        if release_resident["resident_bytes"] > resident_after_fill["resident_bytes"]:
+            raise ParseError(f"{label}: RELEASE settle exceeds after-fill B_full observation")
+        if settled_resident["resident_bytes"] > release_resident["resident_bytes"]:
+            raise ParseError(f"{label}: OFFLOAD settle exceeds RELEASE settle resident")
+        tolerance = int(spec["workload"]["characterization"]["target_tolerance_bytes"])
+        if abs(
+            release_resident["resident_bytes"] - recorded_boundary["budget_resident_bytes"]
+        ) > tolerance:
+            raise ParseError(
+                f"{label}: slots RELEASE snapshot disagrees with marker phase-boundary resident")
     positive_action_indices = [
         index for index, action in enumerate(settle_actions)
         if is_qualifying_offload_action(
@@ -1996,13 +2175,17 @@ def validate_characterization_causality(
     ):
         raise ParseError(f"{label}: runner settle record differs from production markers")
     terminal_resident = terminal["budget_resident_bytes"]
-    if settle["physical_resident_bytes"] != settled_resident["resident_bytes"]:
-        raise ParseError(f"{label}: runner settled resident differs from the physical snapshot")
-    if terminal["status"] != "debt_closed" and abs(
-            settled_resident["resident_bytes"] - terminal_resident) > tolerance:
-        raise ParseError(f"{label}: settled physical resident differs from terminal budget view")
+    if settle["physical_resident_bytes"] is not None:
+        if not physical_resident_available or settled_resident is None:
+            raise ParseError(f"{label}: runner claims physical resident without physical authority")
+        if settle["physical_resident_bytes"] != settled_resident["resident_bytes"]:
+            raise ParseError(f"{label}: runner settled resident differs from the physical snapshot")
+    if terminal["status"] != "debt_closed" and physical_resident_available:
+        assert settled_resident is not None
+        if abs(settled_resident["resident_bytes"] - terminal_resident) > tolerance:
+            raise ParseError(f"{label}: settled physical resident differs from terminal budget view")
     if terminal["status"] in {"debt_closed", "target_reached"}:
-        if (
+        if settled_resident is None or (
             settled_resident["resident_bytes"] > resident_target + tolerance
             or terminal["budget_debt_after_bytes"] != 0
             or terminal["unmet_budget_bytes_after"] != 0
@@ -2035,33 +2218,7 @@ def validate_characterization_causality(
     for timing in resume_timings:
         numeric_fields(timing, TIMING_REQUIRED, f"{label}.resume.timing")
     positive_timing: dict[str, str] | None = None
-    for event in resume_events:
-        if (
-            event["phase"] != "prefetch"
-            or event["action"] != "prefetch"
-            or event["outcome"] != "completed"
-            or event["graph_allowed"] != "1"
-        ):
-            continue
-        key = (event["decision_id"], event["transaction_id"], event["seq_id"])
-        graph_gate = next((
-            item for item in resume_events
-            if item["phase"] == "graph_gate"
-            and item["action"] == "prefetch"
-            and item["outcome"] == "completed"
-            and item["graph_allowed"] == "1"
-            and (item["decision_id"], item["transaction_id"], item["seq_id"]) == key
-        ), None)
-        timing = next((
-            item for item in resume_timings
-            if (item["decision_id"], item["transaction_id"], item["seq_id"]) == key
-            and int(item["restored_blocks"]) > 0
-            and int(item["restored_bytes"]) > 0
-            and int(item["total_us"]) > 0
-        ), None)
-        if graph_gate is not None and timing is not None:
-            positive_timing = timing
-            break
+    positive_resume_evidence: dict[str, dict[str, str]] | None = None
     positive_offloads = [item for item in observations if item["positive_offload"]]
     release_actions = [
         item["action"] for item in observations if item["action"]["release_attempted"] == "1"
@@ -2094,19 +2251,43 @@ def validate_characterization_causality(
     }
     if pair_keys != positive_keys:
         raise ParseError(f"{label}: transaction-local OFFLOAD pairs do not match settled actions")
-    if positive_offloads and positive_timing is None:
-        raise ParseError(f"{label}: OFFLOAD characterization has no positive resume restore timing")
+    if positive_offloads:
+        selected_offload_epochs: dict[int, set[int]] = {}
+        for item in positive_offloads:
+            action = item["action"]
+            selected_offload_epochs.setdefault(
+                int(action["selected_seq_id"]), set()).add(
+                    int(action["selected_claimant_epoch"]))
+        positive_resume_evidence = validate_resume_restore_evidence(
+            resume_events,
+            resume_timings,
+            selected_offload_epochs,
+            f"{label}.resume",
+        )
+        positive_timing = positive_resume_evidence["timing"]
+    if terminal["status"] == "unmet_floor" and not positive_offloads:
+        raise ParseError(f"{label}: UNMET_FLOOR requires positive OFFLOAD evidence")
+    if terminal["status"] == "unmet_floor" and positive_timing is None:
+        raise ParseError(f"{label}: UNMET_FLOOR requires positive resume restore evidence")
     if not release_actions and positive_offloads:
         raise ParseError(f"{label}: V2 OFFLOAD was not preceded by a Unified RELEASE decision")
-    release_physical_relief = (
-        resident_after_fill["resident_bytes"] - recorded_boundary["budget_resident_bytes"])
     offload_physical_relief = sum(item["resident_drop_bytes"] for item in offload_pairs)
-    total_physical_relief = release_physical_relief + offload_physical_relief
-    settled_physical_relief = (
-        resident_after_fill["resident_bytes"] - settled_resident["resident_bytes"])
-    if total_physical_relief != settled_physical_relief:
-        raise ParseError(
-            f"{label}: RELEASE plus OFFLOAD physical relief violates resident conservation")
+    if physical_resident_available:
+        assert resident_after_fill is not None
+        assert release_resident is not None
+        assert settled_resident is not None
+        release_physical_relief = (
+            resident_after_fill["resident_bytes"] - release_resident["resident_bytes"])
+        settled_physical_relief = (
+            resident_after_fill["resident_bytes"] - settled_resident["resident_bytes"])
+        total_physical_relief = release_physical_relief + offload_physical_relief
+        if total_physical_relief != settled_physical_relief:
+            raise ParseError(
+                f"{label}: RELEASE plus OFFLOAD physical relief violates resident conservation")
+    else:
+        release_physical_relief = None
+        settled_physical_relief = None
+        total_physical_relief = None
     resume_measurement = {
         "sequence": first_measurement["sequence"],
         "request_id": first_measurement["request_id"],
@@ -2131,25 +2312,66 @@ def validate_characterization_causality(
         "action_target_bytes": action_target,
         "resume_measurement": resume_measurement,
         "post_resume_steady_measurements": post_resume_steady_measurements,
-        "resident_after_fill": resident_after_fill["resident_bytes"],
-        "resident_after_release_settle": release_resident["resident_bytes"],
+        "resident_after_fill": (
+            resident_after_fill["resident_bytes"] if physical_resident_available else None),
+        "resident_after_fill_authority": (
+            "slots_physical" if physical_resident_available else "budget_view_marker"),
+        "resident_after_release_settle": (
+            release_resident["resident_bytes"] if physical_resident_available else None),
+        "resident_after_release_settle_authority": (
+            "slots_physical" if physical_resident_available else "budget_view_marker"),
         "resident_after_offload_settle": (
-            settled_resident["resident_bytes"] if positive_offloads else None),
-        "resident_settled": settled_resident["resident_bytes"],
-        "resident_after_resume": resident_after_measurement["resident_bytes"],
+            settled_resident["resident_bytes"]
+            if physical_resident_available and positive_offloads else None),
+        "resident_after_offload_settle_authority": (
+            "slots_physical" if physical_resident_available and positive_offloads
+            else "budget_view_marker" if positive_offloads else "unavailable"),
+        "resident_settled": (
+            settled_resident["resident_bytes"] if physical_resident_available else None),
+        "resident_settled_authority": (
+            "slots_physical" if physical_resident_available else "budget_view_marker"),
+        "resident_after_resume": (
+            resident_after_measurement["resident_bytes"]
+            if resident_after_measurement is not None else None),
+        "resident_after_resume_authority": (
+            "slots_physical" if resident_after_measurement is not None else "unavailable"),
+        "resident_views": {
+            "after_fill": (
+                {"authority": "slots_physical", "resident_bytes": resident_after_fill["resident_bytes"]}
+                if physical_resident_available else None),
+            "after_release_settle": (
+                {"authority": "slots_physical", "resident_bytes": release_resident["resident_bytes"]}
+                if physical_resident_available else None),
+            "settled": (
+                {"authority": "slots_physical", "resident_bytes": settled_resident["resident_bytes"]}
+                if physical_resident_available else None),
+            "after_resume": (
+                {"authority": "slots_physical", "resident_bytes": resident_after_measurement["resident_bytes"]}
+                if resident_after_measurement is not None else None),
+        },
+        "budget_resident_views": budget_resident_views,
+        "release_budget_view_relief_bytes": (
+            budget_resident_views["after_fill"]["resident_bytes"]
+            - budget_resident_views["after_release_settle"]["resident_bytes"]),
+        "settled_budget_view_relief_bytes": (
+            budget_resident_views["after_fill"]["resident_bytes"]
+            - budget_resident_views["settled"]["resident_bytes"]),
+        "budget_view_relief_authority": "budget_view_marker",
         "release_physical_relief_bytes": release_physical_relief,
-        "release_physical_relief_authority": "phase_boundary_budget_marker",
+        "release_physical_relief_authority": (
+            "phase_boundary_slots" if physical_resident_available
+            else "unavailable_no_independent_physical_authority"),
         "offload_physical_relief_bytes": offload_physical_relief,
         "offload_physical_relief_authority": "transaction_local_mincore",
         "total_physical_relief_bytes": total_physical_relief,
-        "total_physical_relief_authority": "sum_of_authorities",
+        "total_physical_relief_authority": (
+            "sum_of_independent_physical_authorities"
+            if physical_resident_available else "unavailable_no_independent_physical_authority"),
         "physical_relief_bytes": total_physical_relief,
-        "memory_saved_bytes": (
-            resident_after_fill["resident_bytes"] - settled_resident["resident_bytes"]),
+        "memory_saved_bytes": total_physical_relief,
         "memory_saved_ratio": (
-            (resident_after_fill["resident_bytes"] - settled_resident["resident_bytes"])
-            / resident_after_fill["resident_bytes"]
-            if resident_after_fill["resident_bytes"] else None),
+            total_physical_relief / resident_after_fill["resident_bytes"]
+            if physical_resident_available and resident_after_fill["resident_bytes"] else None),
         "budget_debt_after": terminal["budget_debt_after_bytes"],
         "settle_time_seconds": settle["duration_ns"] / 1_000_000_000,
         "unmet_budget_bytes": terminal["unmet_budget_bytes_after"],
@@ -2272,30 +2494,6 @@ def parse_run(artifact: pathlib.Path, plan: dict[str, Any], case: dict[str, Any]
             raise ParseError(f"{label}: finite cgroup pressure authority is unavailable")
     if sampler_argv[7] != str(server_cgroup.get("memory_current_file") or ""):
         raise ParseError(f"{label}: sampler cgroup path does not match server cgroup")
-    transaction_local_physical_authority = (
-        case["policy"] == "v2" and spec["run_mode"] == "qualification")
-    slots_before = validate_slot_snapshot(
-        run_dir / "slots_before.json",
-        f"{label}.slots_before",
-        require_resident=not transaction_local_physical_authority,
-    )
-    slots_after = validate_slot_snapshot(
-        run_dir / "slots_after.json",
-        f"{label}.slots_after",
-        require_resident=not transaction_local_physical_authority,
-    )
-    cleanup = exact(read_json(run_dir / "cleanup.json"), CLEANUP_KEYS, f"{label}.cleanup")
-    server_cleanup = validate_cleanup_record(cleanup["server"], f"{label}.cleanup.server")
-    sampler_cleanup = validate_cleanup_record(cleanup["sampler"], f"{label}.cleanup.sampler")
-    if not isinstance(cleanup["residual_process"], bool) or not isinstance(cleanup["cleanup_complete"], bool):
-        raise ParseError(f"{label}: cleanup booleans are invalid")
-    nested_residual = bool(server_cleanup["residual_process"] or sampler_cleanup["residual_process"])
-    if cleanup["residual_process"] != nested_residual:
-        raise ParseError(f"{label}: cleanup residual summary disagrees with PGID checks")
-    if nested_residual or not cleanup["cleanup_complete"]:
-        raise ParseError(f"{label}: cleanup is incomplete or has residual process")
-    if server_cleanup["exit_code"] != 0 or sampler_cleanup["exit_code"] != 0:
-        raise ParseError(f"{label}: process exit code is non-zero")
     qualification = validate_qualification_record(
         execution["qualification"],
         workload["qualification"] if spec["run_mode"] == "qualification" else None,
@@ -2309,6 +2507,41 @@ def parse_run(artifact: pathlib.Path, plan: dict[str, Any], case: dict[str, Any]
         spec["max_blocks"],
         f"{label}.characterization",
     )
+    allow_missing_v2_run_resident = (
+        spec["run_mode"] == "characterization"
+        and case["policy"] == "v2"
+        and characterization["settle"] is not None
+        and characterization["settle"]["status"] == "unmet_floor"
+    )
+    slots_before = validate_slot_snapshot(
+        run_dir / "slots_before.json",
+        f"{label}.slots_before",
+        require_resident=not allow_missing_v2_run_resident,
+    )
+    slots_after = validate_slot_snapshot(
+        run_dir / "slots_after.json",
+        f"{label}.slots_after",
+        require_resident=not allow_missing_v2_run_resident,
+    )
+    if allow_missing_v2_run_resident:
+        slots_before_resident = optional_authoritative_slot_resident(
+            slots_before, f"{label}.slots_before")
+        slots_after_resident = optional_authoritative_slot_resident(
+            slots_after, f"{label}.slots_after")
+        if (slots_before_resident is None) != (slots_after_resident is None):
+            raise ParseError(f"{label}: V2 run-level resident snapshots are partially missing")
+    cleanup = exact(read_json(run_dir / "cleanup.json"), CLEANUP_KEYS, f"{label}.cleanup")
+    server_cleanup = validate_cleanup_record(cleanup["server"], f"{label}.cleanup.server")
+    sampler_cleanup = validate_cleanup_record(cleanup["sampler"], f"{label}.cleanup.sampler")
+    if not isinstance(cleanup["residual_process"], bool) or not isinstance(cleanup["cleanup_complete"], bool):
+        raise ParseError(f"{label}: cleanup booleans are invalid")
+    nested_residual = bool(server_cleanup["residual_process"] or sampler_cleanup["residual_process"])
+    if cleanup["residual_process"] != nested_residual:
+        raise ParseError(f"{label}: cleanup residual summary disagrees with PGID checks")
+    if nested_residual or not cleanup["cleanup_complete"]:
+        raise ParseError(f"{label}: cleanup is incomplete or has residual process")
+    if server_cleanup["exit_code"] != 0 or sampler_cleanup["exit_code"] != 0:
+        raise ParseError(f"{label}: process exit code is non-zero")
     for filename in ("server.stdout", "server.stderr", "sampler.stdout", "sampler.stderr"):
         if not (run_dir / filename).is_file():
             raise ParseError(f"{label}: missing {filename}")
@@ -2410,7 +2643,10 @@ def parse_run(artifact: pathlib.Path, plan: dict[str, Any], case: dict[str, Any]
                 or int(io_last["bytes_written"]) <= 0
             ):
                 raise ParseError(f"{label}: V2 characterization IO has no swap-out/write")
-            if positive_offloads > 0 and (
+            if (
+                positive_offloads > 0
+                or characterization_metrics["status"] == "UNMET_FLOOR"
+            ) and (
                 int(io_last["block_swap_in_calls"]) <= 0
                 or int(io_last["backing_read_syscalls"]) <= 0
                 or int(io_last["bytes_read"]) <= 0
@@ -2429,10 +2665,19 @@ def parse_run(artifact: pathlib.Path, plan: dict[str, Any], case: dict[str, Any]
             "block_swap_out_calls", "block_swap_in_calls", "backing_read_syscalls",
             "backing_write_syscalls", "bytes_read", "bytes_written",
         )
-        if any(int(io_last[key]) != 0 for key in migration_fields):
+        if any(
+            int(io[key]) != 0
+            for io in io_records
+            for key in migration_fields
+        ):
             raise ParseError(f"{label}: RELEASE-only contains swap or backing IO evidence")
-        if resumes or timings:
-            raise ParseError(f"{label}: RELEASE-only contains PREFETCH/resume evidence")
+        if any(
+            int(io[key]) > 0
+            for io in io_records
+            for key in RESTORE_ACTIVITY_FIELDS
+        ):
+            raise ParseError(f"{label}: RELEASE-only contains positive restore activity")
+        validate_release_only_noop_restore(resumes, timings, f"{label}.resume")
     else:
         if any(action["offload_attempted"] != "0" or action["release_attempted"] != "0" for action in actions):
             raise ParseError(f"{label}: resident case contains state-changing action evidence")
@@ -2688,11 +2933,17 @@ def characterization_comparisons(
         if len(baselines) == 1:
             baseline = baselines[0]
             comparison["baseline_run_id"] = baseline["run_id"]
-            saved = baseline["resident_after_fill"] - item["resident_settled"]
-            comparison["memory_saved_bytes"] = saved
-            comparison["memory_saved_ratio"] = (
-                saved / baseline["resident_after_fill"]
-                if baseline["resident_after_fill"] else None)
+            physical_candidate = (
+                (policy == "release_only" or item.get("resident_settled_authority") == "slots_physical")
+                and baseline.get("resident_after_fill") is not None
+                and item.get("resident_settled") is not None
+            )
+            if physical_candidate:
+                saved = baseline["resident_after_fill"] - item["resident_settled"]
+                comparison["memory_saved_bytes"] = saved
+                comparison["memory_saved_ratio"] = (
+                    saved / baseline["resident_after_fill"]
+                    if baseline["resident_after_fill"] else None)
             candidate_performance = (
                 item.get("performance", {}) if policy == "release_only"
                 else item.get("post_resume_steady_performance", {}))
@@ -2839,8 +3090,18 @@ def summarize_characterization(
     if v2_runs:
         lowest_target = min(item["requested_target_bytes"] for item in v2_runs)
         lowest_runs = [item for item in v2_runs if item["requested_target_bytes"] == lowest_target]
-        if lowest_runs and all(item["status"] == "UNMET_FLOOR" for item in lowest_runs):
-            floor_values = [item["resident_settled"] for item in lowest_runs]
+        physical_floor_runs = [
+            item for item in lowest_runs
+            if item["status"] == "UNMET_FLOOR"
+            and item.get("resident_settled_authority") == "slots_physical"
+            and item.get("resident_settled") is not None
+        ]
+        if (
+            lowest_runs
+            and len(physical_floor_runs) == len(lowest_runs)
+            and all(item["status"] == "UNMET_FLOOR" for item in lowest_runs)
+        ):
+            floor_values = [item["resident_settled"] for item in physical_floor_runs]
             b_floor = {
                 "status": "AVAILABLE",
                 "definition": "actual settled resident from the lowest explicit target with terminal unmet budget",
@@ -2849,20 +3110,26 @@ def summarize_characterization(
                     {
                         "run_id": item["run_id"],
                         "resident_settled": item["resident_settled"],
+                        "resident_settled_authority": item["resident_settled_authority"],
                         "unmet_budget_bytes": item["unmet_budget_bytes"],
                     }
-                    for item in lowest_runs
+                    for item in physical_floor_runs
                 ],
                 "min_bytes": min(floor_values),
                 "max_bytes": max(floor_values),
                 "p50_bytes": percentile([float(value) for value in floor_values], 0.50),
             }
         else:
+            reason = "lowest explicit target did not terminate as UNMET_FLOOR in every run"
+            if lowest_runs and any(
+                    item.get("resident_settled_authority") != "slots_physical"
+                    for item in lowest_runs):
+                reason = "independent physical resident authority is unavailable"
             b_floor = {
                 "status": "UNAVAILABLE",
                 "definition": "actual settled resident from the lowest explicit target with terminal unmet budget",
                 "requested_target_bytes": lowest_target,
-                "reason": "lowest explicit target did not terminate as UNMET_FLOOR in every run",
+                "reason": reason,
                 "observations": [],
                 "min_bytes": None,
                 "max_bytes": None,
@@ -2944,6 +3211,10 @@ def parse_artifact(artifact: pathlib.Path) -> tuple[str, dict[str, Any]]:
                 "authority": (
                     "transaction_local_mincore"
                     if item["qualified_offload_pairs"]
+                    and item["characterization"] is not None
+                    and item["characterization"]["total_physical_relief_bytes"] is not None
+                    else "transaction_local_mincore_only"
+                    if item["qualified_offload_pairs"]
                     else "phase_boundary_release"
                     if item["characterization"] is not None
                     and item["policy"] in BUDGET_POLICIES
@@ -2961,6 +3232,12 @@ def parse_artifact(artifact: pathlib.Path) -> tuple[str, dict[str, Any]]:
                     item["characterization"]["offload_physical_relief_authority"]
                     if item["characterization"] is not None else (
                         "transaction_local_mincore" if item["qualified_offload_pairs"] else "not_applicable")),
+                "resident_views": (
+                    item["characterization"].get("resident_views")
+                    if item["characterization"] is not None else None),
+                "budget_resident_views": (
+                    item["characterization"].get("budget_resident_views")
+                    if item["characterization"] is not None else None),
                 "slots_before": slot_resident_values(item["slots_before"]),
                 "slots_after": slot_resident_values(item["slots_after"]),
                 "transaction_local_offload": item["qualified_offload_pairs"],
@@ -2983,13 +3260,28 @@ def parse_artifact(artifact: pathlib.Path) -> tuple[str, dict[str, Any]]:
             "release_bytes": sum(sum(int(action["bytes"]) for action in item["actions"] if action["release_attempted"] == "1") for item in run_results),
             "release_blocks": sum(item["release"]["blocks"] for item in characterization_runs),
             "offload_blocks": sum(item["offload"]["blocks"] for item in characterization_runs),
-            "release_physical_relief_bytes": sum(item["release_physical_relief_bytes"] for item in characterization_runs),
-            "offload_physical_relief_bytes": sum(item["offload_physical_relief_bytes"] for item in characterization_runs),
-            "total_physical_relief_bytes": sum(item["total_physical_relief_bytes"] for item in characterization_runs),
+            "release_physical_relief_bytes": (
+                sum(item["release_physical_relief_bytes"] for item in characterization_runs)
+                if all(item["release_physical_relief_bytes"] is not None
+                       for item in characterization_runs) else None),
+            "offload_physical_relief_bytes": sum(
+                item["offload_physical_relief_bytes"] for item in characterization_runs),
+            "total_physical_relief_bytes": (
+                sum(item["total_physical_relief_bytes"] for item in characterization_runs)
+                if all(item["total_physical_relief_bytes"] is not None
+                       for item in characterization_runs) else None),
             "physical_relief_authority": {
-                "release": "per_run_phase_boundary",
+                "release": (
+                    "per_run_phase_boundary"
+                    if all(item["release_physical_relief_bytes"] is not None
+                           for item in characterization_runs)
+                    else "UNAVAILABLE_NO_INDEPENDENT_PHYSICAL_AUTHORITY"),
                 "offload": "transaction_local_mincore",
-                "total": "release_plus_offload",
+                "total": (
+                    "release_plus_offload"
+                    if all(item["total_physical_relief_bytes"] is not None
+                           for item in characterization_runs)
+                    else "UNAVAILABLE_NO_INDEPENDENT_PHYSICAL_AUTHORITY"),
             },
             "backing_bytes_written": sum(item["offload"]["bytes_written"] for item in characterization_runs),
             "backing_bytes_read": sum(item["resume"]["bytes_read"] for item in characterization_runs),

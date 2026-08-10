@@ -830,7 +830,8 @@ def capture_slots(port: int, path: pathlib.Path, timeout: float) -> dict[str, An
     return snapshot
 
 
-def captured_resident_bytes(snapshot: dict[str, Any]) -> int:
+def captured_resident_bytes(
+        snapshot: dict[str, Any], *, allow_missing: bool = False) -> int | None:
     slots = snapshot.get("body_json")
     if not isinstance(slots, list):
         raise RunnerError("slot snapshot body is unavailable")
@@ -843,7 +844,11 @@ def captured_resident_bytes(snapshot: dict[str, Any]) -> int:
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise RunnerError("slot physical resident value is invalid")
         values.append(value)
-    if not values or any(value != values[0] for value in values[1:]):
+    if not values:
+        if allow_missing:
+            return None
+        raise RunnerError("slot physical resident observation is missing or inconsistent")
+    if any(value != values[0] for value in values[1:]):
         raise RunnerError("slot physical resident observation is missing or inconsistent")
     return values[0]
 
@@ -947,14 +952,15 @@ def qualifying_offload_action(
     decision_id = uint_marker_field(fields, "decision_id")
     transaction_id = uint_marker_field(fields, "transaction_id")
     seq_id = uint_marker_field(fields, "selected_seq_id")
+    claimant_epoch = uint_marker_field(fields, "selected_claimant_epoch")
     budget_excess = uint_marker_field(fields, "budget_observed_excess_bytes")
     blocks = uint_marker_field(fields, "blocks")
     migrated_bytes = uint_marker_field(fields, "bytes")
     relieved_bytes = uint_marker_field(fields, "relieved_bytes")
     shortfall_bytes = uint_marker_field(fields, "shortfall_bytes")
     if None in (
-            decision_id, transaction_id, seq_id, budget_excess, blocks, migrated_bytes,
-            relieved_bytes, shortfall_bytes):
+            decision_id, transaction_id, seq_id, claimant_epoch, budget_excess, blocks,
+            migrated_bytes, relieved_bytes, shortfall_bytes):
         return None
     if (
         fields.get("state") != "NORMAL"
@@ -963,6 +969,7 @@ def qualifying_offload_action(
         or fields.get("stale") != "0"
         or fields.get("pressure_basis_valid") != "1"
         or fields.get("budget_active") != "1"
+        or claimant_epoch <= 0
         or budget_excess <= 0
         or fields.get("offload_attempted") != "1"
         or fields.get("outcome") != "completed"
@@ -1020,10 +1027,15 @@ def find_offload_barrier_pair(text: str, expected_source: str) -> dict[str, int]
         if observation is None:
             continue
         decision_id, transaction_id, seq_id = key
+        selected_claimant_epoch = uint_marker_field(
+            actions[key], "selected_claimant_epoch")
+        if selected_claimant_epoch is None or selected_claimant_epoch <= 0:
+            continue
         return {
             "decision_id": decision_id,
             "transaction_id": transaction_id,
             "seq_id": seq_id,
+            "selected_claimant_epoch": selected_claimant_epoch,
             "before_object_id": observation["before_object_id"],
             "before_generation": observation["before_generation"],
             "before_resident_bytes": observation["before_resident_bytes"],
@@ -1713,8 +1725,14 @@ def run_one(
                             "characterization timed out waiting for target closure or budget_unmet_terminal")
                     settled = capture_slots(
                         port, run_dir / "slots_settled.json", spec["request_timeout_seconds"])
-                    settled_resident_bytes = captured_resident_bytes(settled)
-                    settle["physical_resident_bytes"] = settled_resident_bytes
+                    settled_resident_bytes = captured_resident_bytes(
+                        settled, allow_missing=settle["status"] == "unmet_floor")
+                    if settled_resident_bytes is None:
+                        settled_resident_bytes = int(
+                            settle["terminal_decision"]["budget_resident_bytes"])
+                        settle["physical_resident_bytes"] = None
+                    else:
+                        settle["physical_resident_bytes"] = settled_resident_bytes
                     target_bytes = int(case["kv_target_bytes"])
                     tolerance_bytes = characterization_config["target_tolerance_bytes"]
                     if settle["status"] in {"debt_closed", "target_reached"}:
