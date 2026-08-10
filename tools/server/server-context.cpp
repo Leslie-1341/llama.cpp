@@ -26,15 +26,20 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cinttypes>
 #include <cstdlib>
 #include <exception>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <queue>
 #include <filesystem>
 #include <sstream>
+#include <thread>
 #include <utility>
 
 // fix problem with std::min and std::max
@@ -690,6 +695,9 @@ public:
     }
 
     ~server_context_impl() {
+#if defined(__linux__)
+        memory_governor_async_stop_worker();
+#endif
         if (!sleeping) {
             // destroy() is already called when entering sleeping state
             // we don't call it again here to avoid double free
@@ -758,6 +766,7 @@ private:
     // Stage G0: read-only Dense/MoE/KV memory-governor observation marker.
     // This never submits actions; it only publishes the state future arbitration
     // would consume. Enabled with LLAMA_MEMORY_GOVERNOR_OBSERVE=1.
+    bool memory_governor_auto_backends_enabled = false;
     bool memory_governor_observe_enabled = false;
     server_kv_pressure_runtime::time_point memory_governor_observe_last {};
     uint32_t memory_governor_observe_interval_ms = 1000;
@@ -778,32 +787,84 @@ private:
     uint64_t memory_governor_kv_offload_next_sample = 0;
     bool memory_governor_kv_soft_budget_enabled = false;
     uint64_t memory_governor_kv_soft_target_bytes = 0;
-    uint64_t memory_governor_kv_soft_idle_bytes = 64ull * 1024ull * 1024ull;
+    uint64_t memory_governor_kv_soft_idle_bytes = 0;
     bool memory_governor_prefetch_budget_enabled = false;
     bool memory_governor_prefetch_budget_auto = false;
     bool memory_governor_prefetch_budget_runtime_auto = false;
     uint64_t memory_governor_prefetch_budget_bytes_per_tick = 0;
-    uint64_t memory_governor_prefetch_budget_min_bytes_per_tick = 4ull * 1024ull * 1024ull;
-    uint64_t memory_governor_prefetch_budget_max_bytes_per_tick = 64ull * 1024ull * 1024ull;
-    uint64_t memory_governor_prefetch_budget_headroom_bytes = 128ull * 1024ull * 1024ull;
-    uint32_t memory_governor_prefetch_budget_normal_divisor = 8;
-    uint32_t memory_governor_prefetch_budget_pressure_divisor = 16;
-    uint32_t memory_governor_prefetch_budget_critical_divisor = 32;
+    uint64_t memory_governor_prefetch_budget_min_bytes_per_tick = 0;
+    uint64_t memory_governor_prefetch_budget_max_bytes_per_tick = 0;
+    uint64_t memory_governor_prefetch_budget_headroom_bytes = 0;
+    uint32_t memory_governor_prefetch_budget_normal_divisor = 0;
+    uint32_t memory_governor_prefetch_budget_pressure_divisor = 0;
+    uint32_t memory_governor_prefetch_budget_critical_divisor = 0;
     uint64_t memory_governor_prefetch_budget_cgroup_max_bytes = 0;
     uint64_t memory_governor_prefetch_budget_cgroup_current_bytes = 0;
     uint64_t memory_governor_prefetch_budget_initial_headroom_bytes = 0;
     uint64_t memory_governor_prefetch_budget_available_bytes = 0;
     uint64_t memory_governor_prefetch_budget_kv_resume_used_bytes = 0;
     uint64_t memory_governor_prefetch_budget_kv_resume_overruns = 0;
+    bool memory_governor_async_actions_enabled = true;
+    uint32_t memory_governor_async_queue_max_depth = 0;
+    enum class memory_governor_async_action_kind {
+        dense_clean_reclaim,
+        moe_clean_reclaim,
+        kv_global_release,
+        kv_sequence_offload,
+        kv_sequence_slot_state_offload,
+    };
+    struct memory_governor_async_action {
+        memory_governor_async_action_kind kind = memory_governor_async_action_kind::dense_clean_reclaim;
+        int32_t seq_id = -1;
+        int64_t score = 0;
+        double roi = 0.0;
+        uint64_t target_bytes = 0;
+        uint64_t max_blocks = 0;
+        uint32_t max_objects = 0;
+        uint64_t sample_count = 0;
+        uint64_t decision_id = 0;
+        kv_pressure_state pressure_state = kv_pressure_state::NORMAL;
+    };
+    struct memory_governor_async_action_before {
+        bool operator()(
+                const memory_governor_async_action & lhs,
+                const memory_governor_async_action & rhs) const {
+            if (lhs.pressure_state != rhs.pressure_state) {
+                return (int) lhs.pressure_state < (int) rhs.pressure_state;
+            }
+            if (lhs.roi != rhs.roi) return lhs.roi < rhs.roi;
+            if (lhs.score != rhs.score) return lhs.score < rhs.score;
+            if (lhs.target_bytes != rhs.target_bytes) return lhs.target_bytes < rhs.target_bytes;
+            return lhs.decision_id > rhs.decision_id;
+        }
+    };
+    std::mutex memory_governor_async_mtx;
+    std::condition_variable memory_governor_async_cv;
+    std::priority_queue<
+        memory_governor_async_action,
+        std::vector<memory_governor_async_action>,
+        memory_governor_async_action_before> memory_governor_async_queue;
+    std::thread memory_governor_async_worker;
+    std::atomic<bool> memory_governor_async_stop { false };
+    std::atomic<uint64_t> memory_governor_async_submitted { 0 };
+    std::atomic<uint64_t> memory_governor_async_completed { 0 };
+    std::atomic<uint64_t> memory_governor_async_rejected { 0 };
+    std::atomic<uint64_t> memory_governor_async_dropped { 0 };
+    std::atomic<uint64_t> memory_governor_async_relieved_pending_bytes { 0 };
+    std::atomic<uint64_t> memory_governor_async_queue_depth { 0 };
+    std::atomic<bool> memory_governor_async_dense_clean_inflight { false };
+    std::atomic<bool> memory_governor_async_moe_clean_inflight { false };
+    std::atomic<bool> memory_governor_async_kv_release_inflight { false };
+    std::atomic<bool> memory_governor_async_kv_offload_inflight { false };
     bool memory_governor_global_optimizer_enabled = false;
     bool memory_governor_global_min_catchup_enabled = true;
-    uint64_t memory_governor_global_hard_headroom_bytes = 64ull * 1024ull * 1024ull;
-    double memory_governor_global_roi_threshold = 0.05;
-    double memory_governor_global_moe_eviction_weight = 2.0;
+    uint64_t memory_governor_global_hard_headroom_bytes = 0;
+    double memory_governor_global_roi_threshold = 0.0;
+    double memory_governor_global_moe_eviction_weight = 1.0;
     double memory_governor_global_moe_read_weight = 1.0;
-    double memory_governor_global_moe_prefetch_weight = 3.0;
-    double memory_governor_global_kv_reclaim_weight = 1.5;
-    double memory_governor_global_kv_resident_weight = 0.25;
+    double memory_governor_global_moe_prefetch_weight = 1.0;
+    double memory_governor_global_kv_reclaim_weight = 1.0;
+    double memory_governor_global_kv_resident_weight = 1.0;
     bool memory_governor_reallocation_enabled = false;
     bool memory_governor_reallocation_apply_moe = true;
     bool memory_governor_reallocation_confirm_enabled = true;
@@ -811,28 +872,33 @@ private:
     uint64_t memory_governor_reallocation_pending_bytes = 0;
     uint64_t memory_governor_reallocation_last_current_bytes = 0;
     bool memory_governor_reallocation_last_current_valid = false;
-    uint64_t memory_governor_reallocation_credit_cap_bytes = 256ull * 1024ull * 1024ull;
-    uint64_t memory_governor_reallocation_max_grant_bytes = 128ull * 1024ull * 1024ull;
-    uint64_t memory_governor_reallocation_min_grant_bytes = 8ull * 1024ull * 1024ull;
-    uint64_t memory_governor_reallocation_hard_guard_bytes = 64ull * 1024ull * 1024ull;
-    uint64_t memory_governor_reallocation_confirm_slack_bytes = 32ull * 1024ull * 1024ull;
+    uint64_t memory_governor_reallocation_credit_cap_bytes = 0;
+    uint64_t memory_governor_reallocation_max_grant_bytes = 0;
+    uint64_t memory_governor_reallocation_min_grant_bytes = 0;
+    uint64_t memory_governor_reallocation_hard_guard_bytes = 0;
+    uint64_t memory_governor_reallocation_confirm_slack_bytes = 0;
     double memory_governor_reallocation_decay = 0.5;
     double memory_governor_reallocation_normal_discount = 1.0;
     double memory_governor_reallocation_pressure_discount = 0.75;
     bool memory_governor_dense_repin_enabled = false;
-    uint64_t memory_governor_dense_repin_step_bytes = 32ull * 1024ull * 1024ull;
-    uint64_t memory_governor_dense_repin_max_bytes = 256ull * 1024ull * 1024ull;
-    uint64_t memory_governor_dense_repin_headroom_bytes = 96ull * 1024ull * 1024ull;
+    bool memory_governor_dense_repin_async_enabled = true;
+    bool memory_governor_dense_repin_idle_only = true;
+    uint32_t memory_governor_dense_repin_cooldown_samples = 2;
+    uint64_t memory_governor_dense_repin_next_sample = 0;
+    uint64_t memory_governor_dense_repin_step_bytes = 0;
+    uint64_t memory_governor_dense_repin_max_bytes = 0;
+    uint64_t memory_governor_dense_repin_headroom_bytes = 0;
     double memory_governor_dense_repin_min_roi = 0.5;
+    bool memory_governor_dense_runtime_ring_shrink_enabled = true;
     bool memory_governor_moe_budget_dynamic_enabled = false;
     bool memory_governor_moe_budget_fast_start_enabled = true;
-    uint64_t memory_governor_moe_budget_min_bytes = 64ull * 1024ull * 1024ull;
-    uint64_t memory_governor_moe_budget_warm_bytes = 768ull * 1024ull * 1024ull;
+    uint64_t memory_governor_moe_budget_min_bytes = 0;
+    uint64_t memory_governor_moe_budget_warm_bytes = 0;
     uint64_t memory_governor_moe_budget_max_bytes = 0;
-    uint64_t memory_governor_moe_budget_grow_bytes = 64ull * 1024ull * 1024ull;
-    uint64_t memory_governor_moe_budget_headroom_bytes = 256ull * 1024ull * 1024ull;
-    uint32_t memory_governor_moe_budget_pressure_shrink_pct = 25;
-    uint64_t memory_governor_moe_budget_pressure_shrink_max_bytes = 128ull * 1024ull * 1024ull;
+    uint64_t memory_governor_moe_budget_grow_bytes = 0;
+    uint64_t memory_governor_moe_budget_headroom_bytes = 0;
+    uint32_t memory_governor_moe_budget_pressure_shrink_pct = 0;
+    uint64_t memory_governor_moe_budget_pressure_shrink_max_bytes = 0;
     uint32_t memory_governor_moe_budget_grow_samples = 3;
     uint32_t memory_governor_moe_budget_cooldown_samples = 3;
     uint64_t memory_governor_moe_budget_next_sample = 0;
@@ -876,6 +942,9 @@ private:
     };
 
     void destroy() {
+#if defined(__linux__)
+        memory_governor_async_stop_worker();
+#endif
         spec.reset();
         ctx_dft.reset();
         model_dft.reset();
@@ -1001,6 +1070,7 @@ private:
         if (new_state) {
             SRV_INF("%s", "server is entering sleeping state\n");
 #if defined(__linux__)
+            memory_governor_async_stop_worker();
             kv_pressure_sampler_owner.reset();
             kv_pressure_runtime.disable();
             kv_pressure_runtime.dry_run_disable();
@@ -1035,6 +1105,7 @@ private:
             if (!init_kv_pressure_sampler()) {
                 GGML_ABORT("invalid KV pressure action configuration after sleeping");
             }
+            memory_governor_async_start();
 #endif
         }
         sleeping = new_state;
@@ -1409,17 +1480,8 @@ private:
     }
 
     static uint64_t memory_governor_round_prefetch_budget(uint64_t bytes) {
-        static constexpr uint64_t mib = 1024ull * 1024ull;
-        if (bytes <= 8ull * mib) {
-            return 8ull * mib;
-        }
-        if (bytes <= 16ull * mib) {
-            return 16ull * mib;
-        }
-        if (bytes <= 32ull * mib) {
-            return 32ull * mib;
-        }
-        return 64ull * mib;
+        const uint64_t page = 4096;
+        return bytes == 0 ? 0 : ((bytes + page - 1) / page) * page;
     }
 
     static uint64_t memory_governor_auto_prefetch_budget(
@@ -1455,32 +1517,41 @@ private:
         memory_governor_kv_offload_next_sample = 0;
         memory_governor_kv_soft_budget_enabled = false;
         memory_governor_kv_soft_target_bytes = 0;
-        memory_governor_kv_soft_idle_bytes = 64ull * 1024ull * 1024ull;
+        memory_governor_kv_soft_idle_bytes = 0;
         memory_governor_prefetch_budget_enabled = false;
         memory_governor_prefetch_budget_auto = false;
         memory_governor_prefetch_budget_runtime_auto = false;
         memory_governor_prefetch_budget_bytes_per_tick = 0;
-        memory_governor_prefetch_budget_min_bytes_per_tick = 4ull * 1024ull * 1024ull;
-        memory_governor_prefetch_budget_max_bytes_per_tick = 64ull * 1024ull * 1024ull;
-        memory_governor_prefetch_budget_headroom_bytes = 128ull * 1024ull * 1024ull;
-        memory_governor_prefetch_budget_normal_divisor = 8;
-        memory_governor_prefetch_budget_pressure_divisor = 16;
-        memory_governor_prefetch_budget_critical_divisor = 32;
+        memory_governor_prefetch_budget_min_bytes_per_tick = 0;
+        memory_governor_prefetch_budget_max_bytes_per_tick = 0;
+        memory_governor_prefetch_budget_headroom_bytes = 0;
+        memory_governor_prefetch_budget_normal_divisor = 0;
+        memory_governor_prefetch_budget_pressure_divisor = 0;
+        memory_governor_prefetch_budget_critical_divisor = 0;
         memory_governor_prefetch_budget_cgroup_max_bytes = 0;
         memory_governor_prefetch_budget_cgroup_current_bytes = 0;
         memory_governor_prefetch_budget_initial_headroom_bytes = 0;
         memory_governor_prefetch_budget_available_bytes = 0;
         memory_governor_prefetch_budget_kv_resume_used_bytes = 0;
         memory_governor_prefetch_budget_kv_resume_overruns = 0;
+        memory_governor_async_actions_enabled = true;
+        memory_governor_async_queue_max_depth = 0;
+        memory_governor_async_submitted.store(0, std::memory_order_relaxed);
+        memory_governor_async_completed.store(0, std::memory_order_relaxed);
+        memory_governor_async_rejected.store(0, std::memory_order_relaxed);
+        memory_governor_async_dropped.store(0, std::memory_order_relaxed);
+        memory_governor_async_relieved_pending_bytes.store(0, std::memory_order_relaxed);
+        memory_governor_async_queue_depth.store(0, std::memory_order_relaxed);
+        memory_governor_async_reset_inflight();
         memory_governor_global_optimizer_enabled = false;
         memory_governor_global_min_catchup_enabled = true;
-        memory_governor_global_hard_headroom_bytes = 64ull * 1024ull * 1024ull;
-        memory_governor_global_roi_threshold = 0.05;
-        memory_governor_global_moe_eviction_weight = 2.0;
+        memory_governor_global_hard_headroom_bytes = 0;
+        memory_governor_global_roi_threshold = 0.0;
+        memory_governor_global_moe_eviction_weight = 1.0;
         memory_governor_global_moe_read_weight = 1.0;
-        memory_governor_global_moe_prefetch_weight = 3.0;
-        memory_governor_global_kv_reclaim_weight = 1.5;
-        memory_governor_global_kv_resident_weight = 0.25;
+        memory_governor_global_moe_prefetch_weight = 1.0;
+        memory_governor_global_kv_reclaim_weight = 1.0;
+        memory_governor_global_kv_resident_weight = 1.0;
         memory_governor_reallocation_enabled = false;
         memory_governor_reallocation_apply_moe = true;
         memory_governor_reallocation_confirm_enabled = true;
@@ -1488,23 +1559,23 @@ private:
         memory_governor_reallocation_pending_bytes = 0;
         memory_governor_reallocation_last_current_bytes = 0;
         memory_governor_reallocation_last_current_valid = false;
-        memory_governor_reallocation_credit_cap_bytes = 256ull * 1024ull * 1024ull;
-        memory_governor_reallocation_max_grant_bytes = 128ull * 1024ull * 1024ull;
-        memory_governor_reallocation_min_grant_bytes = 8ull * 1024ull * 1024ull;
-        memory_governor_reallocation_hard_guard_bytes = 64ull * 1024ull * 1024ull;
-        memory_governor_reallocation_confirm_slack_bytes = 32ull * 1024ull * 1024ull;
+        memory_governor_reallocation_credit_cap_bytes = 0;
+        memory_governor_reallocation_max_grant_bytes = 0;
+        memory_governor_reallocation_min_grant_bytes = 0;
+        memory_governor_reallocation_hard_guard_bytes = 0;
+        memory_governor_reallocation_confirm_slack_bytes = 0;
         memory_governor_reallocation_decay = 0.5;
         memory_governor_reallocation_normal_discount = 1.0;
         memory_governor_reallocation_pressure_discount = 0.75;
         memory_governor_moe_budget_dynamic_enabled = false;
         memory_governor_moe_budget_fast_start_enabled = true;
-        memory_governor_moe_budget_min_bytes = 64ull * 1024ull * 1024ull;
-        memory_governor_moe_budget_warm_bytes = 768ull * 1024ull * 1024ull;
+        memory_governor_moe_budget_min_bytes = 0;
+        memory_governor_moe_budget_warm_bytes = 0;
         memory_governor_moe_budget_max_bytes = 0;
-        memory_governor_moe_budget_grow_bytes = 64ull * 1024ull * 1024ull;
-        memory_governor_moe_budget_headroom_bytes = 256ull * 1024ull * 1024ull;
-        memory_governor_moe_budget_pressure_shrink_pct = 25;
-        memory_governor_moe_budget_pressure_shrink_max_bytes = 128ull * 1024ull * 1024ull;
+        memory_governor_moe_budget_grow_bytes = 0;
+        memory_governor_moe_budget_headroom_bytes = 0;
+        memory_governor_moe_budget_pressure_shrink_pct = 0;
+        memory_governor_moe_budget_pressure_shrink_max_bytes = 0;
         memory_governor_moe_budget_grow_samples = 3;
         memory_governor_moe_budget_cooldown_samples = 3;
         memory_governor_moe_budget_next_sample = 0;
@@ -1515,9 +1586,13 @@ private:
         memory_governor_moe_budget_last_prefetch_late = 0;
         memory_governor_moe_budget_last_prefetch_dropped = 0;
 
-        const bool governor_requested = server_env_flag("LLAMA_MEMORY_GOVERNOR");
+        const auto init_cgroup = memory_governor_read_cgroup_memory();
+        const bool governor_auto_by_cgroup = init_cgroup.valid && init_cgroup.max_bytes > 0;
+        const bool governor_requested =
+            server_env_flag("LLAMA_MEMORY_GOVERNOR") || governor_auto_by_cgroup;
         const bool governor_auto_backends =
                 server_env_flag("LLAMA_MEMORY_GOVERNOR_AUTO_BACKENDS", governor_requested);
+        memory_governor_auto_backends_enabled = governor_auto_backends;
         const char * observe = std::getenv("LLAMA_MEMORY_GOVERNOR_OBSERVE");
         const char * clean_reclaim = std::getenv("LLAMA_MEMORY_GOVERNOR_CLEAN_RECLAIM");
         const char * clean_reclaim_ranked =
@@ -1536,7 +1611,7 @@ private:
         memory_governor_kv_offload_enabled =
             kv_offload != nullptr ? std::atoi(kv_offload) > 0 : governor_auto_backends;
         memory_governor_kv_soft_budget_enabled =
-            kv_soft_budget != nullptr ? std::atoi(kv_soft_budget) > 0 : false;
+            kv_soft_budget != nullptr ? std::atoi(kv_soft_budget) > 0 : governor_auto_backends;
         if (prefetch_budget != nullptr) {
             const double mb = std::max(0.0, std::atof(prefetch_budget));
             memory_governor_prefetch_budget_bytes_per_tick =
@@ -1546,7 +1621,7 @@ private:
             memory_governor_prefetch_budget_available_bytes =
                 memory_governor_prefetch_budget_bytes_per_tick;
         } else if (governor_auto_backends) {
-            const auto cgroup = memory_governor_read_cgroup_memory();
+            const auto cgroup = init_cgroup;
             memory_governor_prefetch_budget_auto = true;
             memory_governor_prefetch_budget_cgroup_max_bytes = cgroup.max_bytes;
             memory_governor_prefetch_budget_cgroup_current_bytes = cgroup.current_bytes;
@@ -1567,6 +1642,9 @@ private:
             memory_governor_prefetch_budget_enabled =
                 memory_governor_prefetch_budget_enabled ||
                 memory_governor_prefetch_budget_runtime_auto;
+        } else if (governor_auto_backends) {
+            memory_governor_prefetch_budget_runtime_auto = true;
+            memory_governor_prefetch_budget_enabled = true;
         }
         if (memory_governor_clean_reclaim_enabled ||
                 memory_governor_kv_release_enabled ||
@@ -1649,6 +1727,12 @@ private:
             memory_governor_prefetch_budget_max_bytes_per_tick =
                 (uint64_t) (mb * 1024.0 * 1024.0);
         }
+        memory_governor_async_actions_enabled =
+            server_env_flag("LLAMA_MEMORY_GOVERNOR_ASYNC_ACTIONS", true);
+        if (const char * depth = std::getenv("LLAMA_MEMORY_GOVERNOR_ASYNC_QUEUE_DEPTH")) {
+            memory_governor_async_queue_max_depth =
+                (uint32_t) std::max(1, std::atoi(depth));
+        }
         if (const char * headroom_mb = std::getenv("LLAMA_MEMORY_GOVERNOR_PREFETCH_BUDGET_HEADROOM_MB")) {
             const double mb = std::max(0.0, std::atof(headroom_mb));
             memory_governor_prefetch_budget_headroom_bytes =
@@ -1673,7 +1757,7 @@ private:
                 memory_governor_prefetch_budget_bytes_per_tick;
         }
         memory_governor_global_optimizer_enabled =
-            server_env_flag("LLAMA_MEMORY_GOVERNOR_GLOBAL_OPTIMIZER");
+            server_env_flag("LLAMA_MEMORY_GOVERNOR_GLOBAL_OPTIMIZER", governor_auto_backends);
         memory_governor_global_min_catchup_enabled =
             server_env_flag("LLAMA_MEMORY_GOVERNOR_GLOBAL_MIN_CATCHUP", true);
         if (const char * hard_mb = std::getenv("LLAMA_MEMORY_GOVERNOR_HARD_HEADROOM_MB")) {
@@ -1699,7 +1783,7 @@ private:
             memory_governor_global_kv_resident_weight = std::max(0.0, std::atof(weight));
         }
         memory_governor_reallocation_enabled =
-            server_env_flag("LLAMA_MEMORY_GOVERNOR_REALLOCATION");
+            server_env_flag("LLAMA_MEMORY_GOVERNOR_REALLOCATION", governor_auto_backends);
         memory_governor_reallocation_apply_moe =
             server_env_flag("LLAMA_MEMORY_GOVERNOR_REALLOCATION_APPLY_MOE", true);
         memory_governor_reallocation_confirm_enabled =
@@ -1742,7 +1826,15 @@ private:
                 std::max(0.0, std::min(1.0, std::atof(discount)));
         }
         memory_governor_dense_repin_enabled =
-            server_env_flag("LLAMA_MEMORY_GOVERNOR_DENSE_REPIN");
+            server_env_flag("LLAMA_MEMORY_GOVERNOR_DENSE_REPIN", governor_auto_backends);
+        memory_governor_dense_repin_async_enabled =
+            server_env_flag("LLAMA_MEMORY_GOVERNOR_DENSE_REPIN_ASYNC", true);
+        memory_governor_dense_repin_idle_only =
+            server_env_flag("LLAMA_MEMORY_GOVERNOR_DENSE_REPIN_IDLE_ONLY", true);
+        if (const char * cooldown = std::getenv("LLAMA_MEMORY_GOVERNOR_DENSE_REPIN_COOLDOWN_SAMPLES")) {
+            memory_governor_dense_repin_cooldown_samples =
+                (uint32_t) std::max(0, std::atoi(cooldown));
+        }
         if (const char * step_mb = std::getenv("LLAMA_MEMORY_GOVERNOR_DENSE_REPIN_STEP_MB")) {
             const double mb = std::max(0.0, std::atof(step_mb));
             memory_governor_dense_repin_step_bytes = (uint64_t) (mb * 1024.0 * 1024.0);
@@ -1758,8 +1850,10 @@ private:
         if (const char * roi = std::getenv("LLAMA_MEMORY_GOVERNOR_DENSE_REPIN_MIN_ROI")) {
             memory_governor_dense_repin_min_roi = std::max(0.0, std::atof(roi));
         }
+        memory_governor_dense_runtime_ring_shrink_enabled =
+            server_env_flag("LLAMA_MEMORY_GOVERNOR_DENSE_RING_SHRINK", true);
         memory_governor_moe_budget_dynamic_enabled =
-            server_env_flag("LLAMA_MEMORY_GOVERNOR_MOE_BUDGET_DYNAMIC");
+            server_env_flag("LLAMA_MEMORY_GOVERNOR_MOE_BUDGET_DYNAMIC", governor_auto_backends);
         memory_governor_moe_budget_fast_start_enabled =
             server_env_flag("LLAMA_MEMORY_GOVERNOR_MOE_FAST_START", true);
         if (const char * min_mb = std::getenv("LLAMA_MEMORY_GOVERNOR_MOE_MIN_MB")) {
@@ -1784,7 +1878,7 @@ private:
         }
         if (const char * pct = std::getenv("LLAMA_MEMORY_GOVERNOR_MOE_PRESSURE_SHRINK_PCT")) {
             memory_governor_moe_budget_pressure_shrink_pct =
-                (uint32_t) std::max(1, std::min(100, std::atoi(pct)));
+                (uint32_t) std::max(0, std::min(100, std::atoi(pct)));
         }
         if (const char * max_mb = std::getenv("LLAMA_MEMORY_GOVERNOR_MOE_PRESSURE_SHRINK_MAX_MB")) {
             const double mb = std::max(0.0, std::atof(max_mb));
@@ -1823,6 +1917,8 @@ private:
                 " prefetch_budget_cgroup_max_bytes=%" PRIu64
                 " prefetch_budget_cgroup_current_bytes=%" PRIu64
                 " prefetch_budget_headroom_bytes=%" PRIu64
+                " async_actions=%d"
+                " async_queue_depth=%" PRIu32
                 " global_optimizer=%d"
                 " global_min_catchup=%d"
                 " global_hard_headroom_bytes=%" PRIu64
@@ -1883,6 +1979,8 @@ private:
                 memory_governor_prefetch_budget_cgroup_max_bytes,
                 memory_governor_prefetch_budget_cgroup_current_bytes,
                 memory_governor_prefetch_budget_initial_headroom_bytes,
+                memory_governor_async_actions_enabled ? 1 : 0,
+                memory_governor_async_queue_max_depth,
                 memory_governor_global_optimizer_enabled ? 1 : 0,
                 memory_governor_global_min_catchup_enabled ? 1 : 0,
                 memory_governor_global_hard_headroom_bytes,
@@ -2287,6 +2385,384 @@ private:
         const char * action_reason = "none";
     };
 
+    static const char * memory_governor_async_action_kind_name(
+            memory_governor_async_action_kind kind) {
+        switch (kind) {
+        case memory_governor_async_action_kind::dense_clean_reclaim:          return "dense_clean_reclaim";
+        case memory_governor_async_action_kind::moe_clean_reclaim:            return "moe_clean_reclaim";
+        case memory_governor_async_action_kind::kv_global_release:            return "kv_global_release";
+        case memory_governor_async_action_kind::kv_sequence_offload:          return "kv_sequence_offload";
+        case memory_governor_async_action_kind::kv_sequence_slot_state_offload:return "kv_sequence_slot_state_offload";
+        }
+        return "unknown";
+    }
+
+    static bool memory_governor_candidate_has_positive_roi(
+            const memory_governor_would_candidate & candidate) {
+        return candidate.score > 0 && candidate.roi > 0.0;
+    }
+
+    std::atomic<bool> & memory_governor_async_inflight_flag(
+            memory_governor_async_action_kind kind) {
+        switch (kind) {
+        case memory_governor_async_action_kind::dense_clean_reclaim:
+            return memory_governor_async_dense_clean_inflight;
+        case memory_governor_async_action_kind::moe_clean_reclaim:
+            return memory_governor_async_moe_clean_inflight;
+        case memory_governor_async_action_kind::kv_global_release:
+            return memory_governor_async_kv_release_inflight;
+        case memory_governor_async_action_kind::kv_sequence_offload:
+        case memory_governor_async_action_kind::kv_sequence_slot_state_offload:
+            return memory_governor_async_kv_offload_inflight;
+        }
+        return memory_governor_async_moe_clean_inflight;
+    }
+
+    void memory_governor_async_reset_inflight() {
+        memory_governor_async_dense_clean_inflight.store(false, std::memory_order_relaxed);
+        memory_governor_async_moe_clean_inflight.store(false, std::memory_order_relaxed);
+        memory_governor_async_kv_release_inflight.store(false, std::memory_order_relaxed);
+        memory_governor_async_kv_offload_inflight.store(false, std::memory_order_relaxed);
+    }
+
+    bool memory_governor_async_submit(memory_governor_async_action action) {
+        if (!memory_governor_async_actions_enabled || action.target_bytes == 0) {
+            return false;
+        }
+        auto & inflight = memory_governor_async_inflight_flag(action.kind);
+        bool expected = false;
+        if (!inflight.compare_exchange_strong(
+                    expected, true, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+            memory_governor_async_rejected.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        action.decision_id = next_kv_decision_id();
+        {
+            std::lock_guard<std::mutex> lock(memory_governor_async_mtx);
+            if (memory_governor_async_stop.load(std::memory_order_relaxed)) {
+                inflight.store(false, std::memory_order_release);
+                memory_governor_async_rejected.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            const uint32_t effective_queue_max_depth =
+                memory_governor_async_queue_max_depth > 0
+                    ? memory_governor_async_queue_max_depth
+                    : (uint32_t) std::max<size_t>(1, slots.size() + 1);
+            if (memory_governor_async_queue.size() >= effective_queue_max_depth) {
+                inflight.store(false, std::memory_order_release);
+                memory_governor_async_dropped.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            memory_governor_async_queue.push(action);
+            memory_governor_async_queue_depth.store(
+                    memory_governor_async_queue.size(), std::memory_order_relaxed);
+        }
+        memory_governor_async_submitted.fetch_add(1, std::memory_order_relaxed);
+        memory_governor_async_cv.notify_one();
+        return true;
+    }
+
+    bool memory_governor_async_pop(memory_governor_async_action & action) {
+        std::unique_lock<std::mutex> lock(memory_governor_async_mtx);
+        memory_governor_async_cv.wait(lock, [&]() {
+            return memory_governor_async_stop.load(std::memory_order_relaxed) ||
+                !memory_governor_async_queue.empty();
+        });
+        if (memory_governor_async_stop.load(std::memory_order_relaxed) &&
+                memory_governor_async_queue.empty()) {
+            memory_governor_async_queue_depth.store(0, std::memory_order_relaxed);
+            return false;
+        }
+        action = memory_governor_async_queue.top();
+        memory_governor_async_queue.pop();
+        memory_governor_async_queue_depth.store(
+                memory_governor_async_queue.size(), std::memory_order_relaxed);
+        return true;
+    }
+
+    bool memory_governor_async_slot_still_reclaimable(int32_t seq_id) const {
+        for (const server_slot & slot : slots) {
+            if (slot.id != seq_id) {
+                continue;
+            }
+            const bool active = slot.is_processing() || slot.task != nullptr;
+            const bool shared = slot.task && (slot.task->is_parent() || slot.task->is_child());
+            return !active && !shared && !slot.kv_resume_protected && slot.prompt.n_tokens() > 0;
+        }
+        return false;
+    }
+
+    void memory_governor_async_execute(const memory_governor_async_action & action) {
+        uint64_t relieved_bytes = 0;
+        uint64_t bytes = 0;
+        uint64_t blocks = 0;
+        bool completed = false;
+        bool state_changed = false;
+        const char * reason = "not_executed";
+        const char * outcome = "none";
+        const char * action_reason = "none";
+        const char * backend = "none";
+        int io_errno = 0;
+
+        if (memory_governor_async_stop.load(std::memory_order_relaxed)) {
+            reason = "stopping";
+        } else if (!ctx_tgt || !model_tgt) {
+            reason = "context_unavailable";
+        } else {
+            switch (action.kind) {
+            case memory_governor_async_action_kind::dense_clean_reclaim:
+                backend = "flex";
+                if (model_tgt->get_flex_context()) {
+                    const auto result = llama_flex_reclaim_released(
+                            *model_tgt->get_flex_context(),
+                            action.target_bytes,
+                            (uint32_t) std::max<uint32_t>(1, action.max_objects));
+                    relieved_bytes = result.released_bytes;
+                    completed = result.target_satisfied || result.released_bytes > 0;
+                    state_changed = result.released_bytes > 0;
+                    reason = "completed";
+                    outcome = completed ? "completed" : "no_op";
+                } else {
+                    reason = "no_flex";
+                }
+                break;
+            case memory_governor_async_action_kind::moe_clean_reclaim:
+                backend = "moe";
+                if (model_tgt->get_moe_buffer_context()) {
+                    const auto result = llama_moe_buffer_reclaim_clean(
+                            *model_tgt->get_moe_buffer_context(),
+                            action.target_bytes,
+                            (uint32_t) std::max<uint32_t>(1, action.max_objects));
+                    relieved_bytes = result.released_bytes;
+                    completed = result.target_satisfied || result.released_bytes > 0;
+                    state_changed = result.released_bytes > 0;
+                    reason = "completed";
+                    outcome = completed ? "completed" : "no_op";
+                } else {
+                    reason = "no_moe";
+                }
+                break;
+            case memory_governor_async_action_kind::kv_global_release:
+                backend = "memory_backend";
+                if (llama_get_memory(ctx_tgt)) {
+                    auto * mem = llama_get_memory(ctx_tgt);
+                    const auto evaluation = mem->execute_action({
+                            llama_kv_action::evaluate,
+                            action.decision_id,
+                            -1,
+                            0,
+                            0,
+                            false,
+                            false,
+                            llama_kv_memory_claimant::kv,
+                            llama_kv_io_class::background_write,
+                            0,
+                            0,
+                    });
+                    if (evaluation.decision_id != action.decision_id) {
+                        reason = "decision_mismatch";
+                    } else if (!evaluation.capability.can_release) {
+                        reason = "release_unsupported";
+                    } else if (evaluation.outcome != llama_kv_action_outcome::completed ||
+                            evaluation.reason != llama_kv_action_reason::none) {
+                        reason = "evaluate_rejected";
+                        outcome = memory_governor_action_outcome_name(evaluation.outcome);
+                        action_reason = memory_governor_action_reason_name(evaluation.reason);
+                    } else {
+                        const auto release = mem->execute_action({
+                                llama_kv_action::release,
+                                action.decision_id,
+                                -1,
+                                action.target_bytes,
+                                (uint32_t) action.max_blocks,
+                                false,
+                                false,
+                                llama_kv_memory_claimant::kv,
+                                llama_kv_io_class::background_write,
+                                0,
+                                action.target_bytes,
+                        });
+                        bytes = release.bytes;
+                        blocks = release.blocks;
+                        relieved_bytes = release.relieved_bytes;
+                        state_changed = release.state_changed;
+                        completed = release.outcome == llama_kv_action_outcome::completed;
+                        io_errno = release.io_errno;
+                        outcome = memory_governor_action_outcome_name(release.outcome);
+                        action_reason = memory_governor_action_reason_name(release.reason);
+                        reason = "completed";
+                    }
+                } else {
+                    reason = "no_memory";
+                }
+                break;
+            case memory_governor_async_action_kind::kv_sequence_offload:
+                backend = "memory_backend";
+                if (!memory_governor_async_slot_still_reclaimable(action.seq_id)) {
+                    reason = "slot_not_reclaimable";
+                } else if (llama_get_memory(ctx_tgt)) {
+                    auto * mem = llama_get_memory(ctx_tgt);
+                    const auto evaluation = mem->execute_action({
+                            llama_kv_action::evaluate,
+                            action.decision_id,
+                            -1,
+                            0,
+                            0,
+                            false,
+                            false,
+                            llama_kv_memory_claimant::kv,
+                            llama_kv_io_class::capacity_write,
+                            0,
+                            0,
+                    });
+                    if (evaluation.decision_id != action.decision_id) {
+                        reason = "decision_mismatch";
+                    } else if (!evaluation.capability.can_offload) {
+                        reason = "offload_unsupported";
+                    } else if (evaluation.outcome != llama_kv_action_outcome::completed ||
+                            evaluation.reason != llama_kv_action_reason::none) {
+                        reason = "evaluate_rejected";
+                        outcome = memory_governor_action_outcome_name(evaluation.outcome);
+                        action_reason = memory_governor_action_reason_name(evaluation.reason);
+                    } else {
+                        const int64_t bounded_priority = std::max<int64_t>(
+                                std::numeric_limits<int32_t>::min(),
+                                std::min<int64_t>(
+                                        std::numeric_limits<int32_t>::max(),
+                                        action.score));
+                        const auto offload = mem->execute_action({
+                                llama_kv_action::offload,
+                                action.decision_id,
+                                action.seq_id,
+                                action.target_bytes,
+                                (uint32_t) action.max_blocks,
+                                false,
+                                false,
+                                llama_kv_memory_claimant::kv,
+                                llama_kv_io_class::capacity_write,
+                                (int32_t) bounded_priority,
+                                action.target_bytes,
+                        });
+                        bytes = offload.bytes;
+                        blocks = offload.blocks;
+                        relieved_bytes = offload.relieved_bytes;
+                        state_changed = offload.state_changed;
+                        completed = offload.outcome == llama_kv_action_outcome::completed;
+                        io_errno = offload.io_errno;
+                        outcome = memory_governor_action_outcome_name(offload.outcome);
+                        action_reason = memory_governor_action_reason_name(offload.reason);
+                        reason = "completed";
+                    }
+                } else {
+                    reason = "no_memory";
+                }
+                break;
+            case memory_governor_async_action_kind::kv_sequence_slot_state_offload:
+                backend = "slot_state";
+                if (!memory_governor_async_slot_still_reclaimable(action.seq_id)) {
+                    reason = "slot_not_reclaimable";
+                } else {
+                    const auto offload =
+                        memory_governor_slot_state_offload(action.seq_id, action.target_bytes);
+                    bytes = offload.bytes_before;
+                    relieved_bytes = offload.relieved_bytes;
+                    state_changed = offload.state_changed;
+                    completed = offload.state_changed;
+                    reason = offload.reason;
+                    outcome = completed ? "completed" : "deferred";
+                    action_reason = completed ? "none" : offload.reason;
+                }
+                break;
+            }
+        }
+
+        if (completed || state_changed || relieved_bytes > 0) {
+            memory_governor_async_completed.fetch_add(1, std::memory_order_relaxed);
+            if (relieved_bytes > 0) {
+                memory_governor_async_relieved_pending_bytes.fetch_add(
+                        relieved_bytes, std::memory_order_relaxed);
+            }
+        } else {
+            memory_governor_async_rejected.fetch_add(1, std::memory_order_relaxed);
+        }
+        memory_governor_async_inflight_flag(action.kind).store(false, std::memory_order_release);
+
+        SRV_INF("memory_governor_async_action"
+                " kind=%s"
+                " seq_id=%d"
+                " decision_id=%" PRIu64
+                " sample_count=%" PRIu64
+                " score=%" PRId64
+                " roi=%.6f"
+                " target_bytes=%" PRIu64
+                " max_blocks=%" PRIu64
+                " backend=%s"
+                " completed=%d"
+                " state_changed=%d"
+                " bytes=%" PRIu64
+                " blocks=%" PRIu64
+                " relieved_bytes=%" PRIu64
+                " outcome=%s"
+                " action_reason=%s"
+                " reason=%s"
+                " io_errno=%d\n",
+                memory_governor_async_action_kind_name(action.kind),
+                action.seq_id,
+                action.decision_id,
+                action.sample_count,
+                action.score,
+                action.roi,
+                action.target_bytes,
+                action.max_blocks,
+                backend,
+                completed ? 1 : 0,
+                state_changed ? 1 : 0,
+                bytes,
+                blocks,
+                relieved_bytes,
+                outcome,
+                action_reason,
+                reason,
+                io_errno);
+    }
+
+    void memory_governor_async_worker_loop() {
+        while (true) {
+            memory_governor_async_action action;
+            if (!memory_governor_async_pop(action)) {
+                break;
+            }
+            memory_governor_async_execute(action);
+        }
+    }
+
+    void memory_governor_async_start() {
+        if (!memory_governor_async_actions_enabled ||
+                memory_governor_async_worker.joinable()) {
+            return;
+        }
+        memory_governor_async_stop.store(false, std::memory_order_relaxed);
+        memory_governor_async_worker =
+            std::thread([this]() { memory_governor_async_worker_loop(); });
+    }
+
+    void memory_governor_async_stop_worker() {
+        memory_governor_async_stop.store(true, std::memory_order_relaxed);
+        memory_governor_async_cv.notify_all();
+        if (memory_governor_async_worker.joinable()) {
+            memory_governor_async_worker.join();
+        }
+        {
+            std::lock_guard<std::mutex> lock(memory_governor_async_mtx);
+            while (!memory_governor_async_queue.empty()) {
+                memory_governor_async_queue.pop();
+                memory_governor_async_dropped.fetch_add(1, std::memory_order_relaxed);
+            }
+            memory_governor_async_queue_depth.store(0, std::memory_order_relaxed);
+        }
+        memory_governor_async_reset_inflight();
+    }
+
     bool publish_memory_governor_observation(
             bool idle,
             uint64_t sample_count,
@@ -2294,6 +2770,7 @@ private:
         if (!memory_governor_observe_enabled) {
             return false;
         }
+        const auto memory_governor_observe_t0 = std::chrono::steady_clock::now();
 
         llama_kv_release_budget_snapshot kv_budget;
         bool kv_memory_present = false;
@@ -2349,6 +2826,34 @@ private:
                 flex_stats = llama_flex_get_stats(*flex);
             }
         }
+        const uint64_t derived_hard_headroom_bytes =
+            flex_enabled && flex_stats.slot_bytes > 0
+                ? (uint64_t) flex_stats.slot_bytes
+                : (kv_slot_reclaimable_sequences > 0
+                    ? kv_slot_reclaimable_resident_bytes / kv_slot_reclaimable_sequences
+                    : (kv_slot_sequences > 0 ? kv_slot_resident_bytes / kv_slot_sequences : 0));
+        const uint64_t effective_hard_headroom_bytes =
+            memory_governor_global_hard_headroom_bytes > 0
+                ? memory_governor_global_hard_headroom_bytes
+                : derived_hard_headroom_bytes;
+        const uint64_t effective_prefetch_headroom_bytes =
+            memory_governor_prefetch_budget_headroom_bytes > 0
+                ? memory_governor_prefetch_budget_headroom_bytes
+                : effective_hard_headroom_bytes;
+        const uint64_t effective_dense_repin_headroom_bytes =
+            memory_governor_dense_repin_headroom_bytes > 0
+                ? memory_governor_dense_repin_headroom_bytes
+                : effective_hard_headroom_bytes;
+        const uint64_t effective_dense_repin_step_bytes =
+            memory_governor_dense_repin_step_bytes > 0
+                ? memory_governor_dense_repin_step_bytes
+                : (uint64_t) flex_stats.slot_bytes;
+        const uint64_t effective_dense_repin_max_bytes =
+            memory_governor_dense_repin_max_bytes > 0
+                ? memory_governor_dense_repin_max_bytes
+                : (flex_stats.stream_per_token > flex_stats.delta_locked_bytes
+                    ? flex_stats.stream_per_token - flex_stats.delta_locked_bytes
+                    : 0);
 
         const auto pressure_state = telemetry ? telemetry->state : kv_pressure_state::NORMAL;
         const auto pressure_source = telemetry ? telemetry->source : kv_pressure_source::NONE;
@@ -2356,22 +2861,24 @@ private:
         const bool pressure_stale = telemetry ? telemetry->stale : true;
         const uint64_t pressure_current_bytes = telemetry ? telemetry->pressure_current_bytes : 0;
         const uint64_t pressure_low_water_bytes = telemetry ? telemetry->pressure_low_water_bytes : 0;
-        const uint64_t pressure_excess_bytes =
+        const uint64_t async_relieved_drained_bytes =
+            memory_governor_async_relieved_pending_bytes.exchange(
+                    0, std::memory_order_relaxed);
+        const uint64_t pressure_raw_excess_bytes =
             pressure_current_bytes > pressure_low_water_bytes
                 ? pressure_current_bytes - pressure_low_water_bytes
                 : 0;
+        const uint64_t pressure_excess_bytes = memory_governor_saturating_sub(
+                pressure_raw_excess_bytes, async_relieved_drained_bytes);
         kv_pressure_state effective_pressure_state = pressure_state;
         const char * effective_pressure_reason = "telemetry";
         uint64_t effective_pressure_critical_excess_bytes =
-            std::max<uint64_t>(32ull * 1024ull * 1024ull, pressure_low_water_bytes / 32);
+            slots.empty() ? pressure_low_water_bytes : pressure_low_water_bytes / slots.size();
         if (pressure_valid && !pressure_stale && flex_enabled) {
             const auto cgroup = memory_governor_read_cgroup_memory();
             if (cgroup.valid && cgroup.max_bytes > 0) {
-                static constexpr uint64_t mib = 1024ull * 1024ull;
-                const uint64_t pressure_headroom_bytes =
-                    std::max<uint64_t>(64ull * mib, memory_governor_global_hard_headroom_bytes);
-                const uint64_t critical_headroom_bytes =
-                    std::max<uint64_t>(32ull * mib, pressure_headroom_bytes / 2);
+                const uint64_t pressure_headroom_bytes = effective_hard_headroom_bytes;
+                const uint64_t critical_headroom_bytes = pressure_headroom_bytes / 2;
                 const uint64_t headroom_bytes = cgroup.max_bytes > pressure_current_bytes
                     ? cgroup.max_bytes - pressure_current_bytes
                     : 0;
@@ -2449,6 +2956,28 @@ private:
                 moe_stats = llama_moe_buffer_get_stats(*moe_context);
             }
         }
+        const uint64_t effective_moe_budget_min_bytes =
+            memory_governor_moe_budget_min_bytes > 0
+                ? memory_governor_moe_budget_min_bytes
+                : moe_stats.expert_bytes;
+        const uint64_t effective_moe_budget_grow_bytes =
+            memory_governor_moe_budget_grow_bytes > 0
+                ? memory_governor_moe_budget_grow_bytes
+                : moe_stats.expert_bytes;
+        const uint64_t effective_moe_budget_headroom_bytes =
+            memory_governor_moe_budget_headroom_bytes > 0
+                ? memory_governor_moe_budget_headroom_bytes
+                : effective_hard_headroom_bytes;
+        const uint64_t effective_moe_budget_warm_bytes =
+            memory_governor_moe_budget_warm_bytes > 0
+                ? memory_governor_moe_budget_warm_bytes
+                : (moe_stats.warm_working_set_bytes > 0
+                    ? (uint64_t) moe_stats.warm_working_set_bytes
+                    : moe_stats.resident_bytes);
+        const uint64_t effective_moe_budget_pressure_shrink_max_bytes =
+            memory_governor_moe_budget_pressure_shrink_max_bytes > 0
+                ? memory_governor_moe_budget_pressure_shrink_max_bytes
+                : moe_stats.expert_bytes;
 
         const char * moe_budget_action = memory_governor_moe_budget_dynamic_enabled ? "keep" : "disabled";
         const char * moe_budget_reason = memory_governor_moe_budget_dynamic_enabled ? "no_moe" : "disabled";
@@ -2491,7 +3020,7 @@ private:
             const bool dense_pressure_gate =
                 effective_pressure_state != kv_pressure_state::NORMAL;
             const auto cgroup = memory_governor_read_cgroup_memory();
-            const uint64_t hard_headroom = memory_governor_global_hard_headroom_bytes;
+            const uint64_t hard_headroom = effective_hard_headroom_bytes;
             const uint64_t available =
                 cgroup.valid && cgroup.max_bytes > pressure_current_bytes + hard_headroom
                     ? cgroup.max_bytes - pressure_current_bytes - hard_headroom
@@ -2503,8 +3032,6 @@ private:
             const uint64_t dense_slot_bytes = flex_stats.slot_bytes > 0
                 ? (uint64_t) flex_stats.slot_bytes
                 : (uint64_t) flex_stats.stream_per_token;
-            const uint64_t dense_ahead =
-                (uint64_t) std::max(1, flex_stats.effective_ahead);
             const uint64_t dense_current_slots =
                 flex_stats.slot_bytes > 0
                     ? (uint64_t) (flex_stats.ring_bytes / flex_stats.slot_bytes)
@@ -2512,15 +3039,21 @@ private:
             const bool dense_io_bound =
                 flex_stats.ewma_io_us > 0.0 &&
                 flex_stats.ewma_compute_us > 0.0 &&
-                flex_stats.ewma_io_us > flex_stats.ewma_compute_us * 3.0;
+                flex_stats.ewma_io_us > flex_stats.ewma_compute_us;
             global_dense_io_bound_ratio =
                 flex_stats.ewma_compute_us > 0.0
                     ? flex_stats.ewma_io_us / flex_stats.ewma_compute_us
                     : 0.0;
-            global_dense_target_ring_slots =
-                dense_io_bound && dense_current_slots > 0
-                    ? std::min<uint64_t>(dense_current_slots, 5)
-                    : 0;
+            if (dense_io_bound && dense_current_slots > 0) {
+                const double useful_slots_f =
+                    (double) dense_current_slots *
+                    flex_stats.ewma_compute_us /
+                    std::max(1.0, flex_stats.ewma_io_us);
+                global_dense_target_ring_slots =
+                    std::max<uint64_t>(1, (uint64_t) std::ceil(useful_slots_f));
+                global_dense_target_ring_slots =
+                    std::min<uint64_t>(global_dense_target_ring_slots, dense_current_slots);
+            }
             if (dense_io_bound && dense_current_slots > global_dense_target_ring_slots &&
                     flex_stats.slot_bytes > 0) {
                 global_dense_ring_flowback_bytes =
@@ -2529,9 +3062,11 @@ private:
                             dense_current_slots - global_dense_target_ring_slots);
                 global_dense_recommended_lock_bytes =
                     (uint64_t) flex_stats.locked_bytes + global_dense_ring_flowback_bytes;
+                const double dense_scale_mib =
+                    std::max(1.0, (double) effective_hard_headroom_bytes / mib);
                 global_dense_utility =
-                    std::log1p((double) flex_stats.stream_per_token / (64.0 * mib)) * 8.0 +
-                    std::log1p(global_dense_io_bound_ratio) * 16.0;
+                    std::log1p((double) flex_stats.stream_per_token / (dense_scale_mib * mib)) +
+                    std::log1p(global_dense_io_bound_ratio);
                 global_dense_roi =
                     global_dense_utility /
                     std::max(1.0, (double) global_dense_ring_flowback_bytes / mib);
@@ -2539,22 +3074,27 @@ private:
                 global_optimizer_decision = "dense_lock_rebalance";
             } else if (dense_io_bound) {
                 global_dense_recommended_lock_bytes = (uint64_t) flex_stats.locked_bytes;
+                const double dense_scale_mib =
+                    std::max(1.0, (double) effective_hard_headroom_bytes / mib);
                 global_dense_utility =
-                    std::log1p((double) flex_stats.stream_per_token / (64.0 * mib)) * 8.0 +
-                    std::log1p(global_dense_io_bound_ratio) * 16.0;
+                    std::log1p((double) flex_stats.stream_per_token / (dense_scale_mib * mib)) +
+                    std::log1p(global_dense_io_bound_ratio);
                 global_dense_roi = global_dense_utility;
                 global_prefetch_utility = std::max(global_prefetch_utility, global_dense_utility);
                 global_optimizer_decision = "dense_lock_first";
             }
             if (!dense_io_bound) {
-                const uint64_t dense_target_slots =
-                    std::min<uint64_t>(
-                            dense_current_slots + 1,
-                            dense_ahead + 3);
-                const uint64_t dense_growth_slots =
-                    dense_target_slots > dense_current_slots
-                        ? dense_target_slots - dense_current_slots
-                        : 0;
+                uint64_t dense_growth_slots = 0;
+                if (dense_slot_bytes > 0 &&
+                        flex_stats.ewma_wait_us > 0.0 &&
+                        flex_stats.ewma_compute_us > 0.0) {
+                    const uint64_t slots_by_headroom = available / dense_slot_bytes;
+                    const uint64_t slots_by_stall =
+                        (uint64_t) std::ceil(
+                                flex_stats.ewma_wait_us /
+                                std::max(1.0, flex_stats.ewma_compute_us));
+                    dense_growth_slots = std::min<uint64_t>(slots_by_headroom, slots_by_stall);
+                }
                 const uint64_t dense_growth_bytes =
                     memory_governor_saturating_mul(dense_slot_bytes, dense_growth_slots);
                 const double dense_growth_mib =
@@ -2564,12 +3104,14 @@ private:
                 global_headroom_barrier = std::max(
                         global_headroom_barrier,
                         std::log1p(1.0 / std::max(eps, pressure_margin_mib)));
+                const double dense_scale_mib =
+                    std::max(1.0, (double) effective_hard_headroom_bytes / mib);
                 const double stall_avoidance =
-                    std::log1p((double) flex_stats.total_wait_us / 1000.0) * 2.0 +
+                    std::log1p((double) flex_stats.total_wait_us / 1000.0) +
                     std::log1p((double) flex_stats.demand_loads) +
-                    std::log1p((double) flex_stats.prefetch_budget_dropped) * 3.0 +
-                    std::log1p((double) flex_stats.stream_per_token / (64.0 * mib));
-                global_dense_utility = stall_avoidance * 4.0;
+                    std::log1p((double) flex_stats.prefetch_budget_dropped) +
+                    std::log1p((double) flex_stats.stream_per_token / (dense_scale_mib * mib));
+                global_dense_utility = stall_avoidance;
                 global_prefetch_utility = std::max(
                         global_prefetch_utility,
                         global_dense_utility);
@@ -2634,20 +3176,21 @@ private:
                 if (max_budget == 0 || max_budget > moe_stats.expert_bytes) {
                     max_budget = moe_stats.expert_bytes;
                 }
-                if (max_budget < memory_governor_moe_budget_min_bytes) {
-                    max_budget = memory_governor_moe_budget_min_bytes;
+                if (moe_stats.planner_floor_bytes > 0) {
+                    max_budget = std::min<uint64_t>(
+                            max_budget,
+                            (uint64_t) moe_stats.planner_safe_budget_bytes);
+                }
+                if (moe_stats.planner_floor_bytes == 0 &&
+                        max_budget < effective_moe_budget_min_bytes) {
+                    max_budget = effective_moe_budget_min_bytes;
                 }
 
                 const uint64_t current_budget =
-                    moe_stats.budget_bytes == 0 ? max_budget : (uint64_t) moe_stats.budget_bytes;
-                const bool unlimited = moe_stats.budget_bytes == 0;
+                    moe_stats.budget_unbounded ? max_budget : (uint64_t) moe_stats.budget_bytes;
+                const bool unlimited = moe_stats.budget_unbounded;
                 const bool cooldown =
                     sample_count != 0 && sample_count < memory_governor_moe_budget_next_sample;
-                const bool thrash =
-                    moe_budget_delta_evictions > 0 ||
-                    moe_budget_delta_prefetch_late > 0 ||
-                    moe_budget_delta_prefetch_dropped > 0 ||
-                    moe_budget_delta_bytes_read >= 16ull * 1024ull * 1024ull;
 
                 if (memory_governor_global_optimizer_enabled) {
                     static constexpr double mib = 1024.0 * 1024.0;
@@ -2659,27 +3202,37 @@ private:
                     const double kv_resident_mib =
                         (double) kv_effective_resident_bytes / mib;
                     const double pressure_margin_mib =
-                        moe_budget_headroom_bytes > memory_governor_global_hard_headroom_bytes
+                        moe_budget_headroom_bytes > effective_hard_headroom_bytes
                             ? (double) (moe_budget_headroom_bytes -
-                                    memory_governor_global_hard_headroom_bytes) / mib
+                                    effective_hard_headroom_bytes) / mib
                             : 0.0;
                     global_available_growth_bytes =
-                        moe_budget_headroom_bytes > memory_governor_global_hard_headroom_bytes
-                            ? moe_budget_headroom_bytes - memory_governor_global_hard_headroom_bytes
+                        moe_budget_headroom_bytes > effective_hard_headroom_bytes
+                            ? moe_budget_headroom_bytes - effective_hard_headroom_bytes
                             : 0;
-                    uint64_t adaptive_grow_bytes = memory_governor_moe_budget_grow_bytes;
-                    const uint64_t adaptive_grow_max_bytes = 256ull * 1024ull * 1024ull;
+                    const uint64_t working_set_deficit =
+                        effective_moe_budget_warm_bytes > current_budget
+                            ? effective_moe_budget_warm_bytes - current_budget
+                            : 0;
+                    uint64_t adaptive_grow_bytes = working_set_deficit > 0
+                        ? working_set_deficit
+                        : effective_moe_budget_grow_bytes;
+                    adaptive_grow_bytes = std::min<uint64_t>(
+                            adaptive_grow_bytes,
+                            max_budget > current_budget ? max_budget - current_budget : 0);
                     const double grant_mib = std::max(
                             1.0,
-                            (double) memory_governor_moe_budget_grow_bytes / mib);
+                            (double) std::max<uint64_t>(adaptive_grow_bytes, effective_moe_budget_grow_bytes) / mib);
                     global_headroom_barrier = std::log1p(
                             1.0 / std::max(eps, pressure_margin_mib));
+                    const double moe_scale_mib =
+                        std::max(1.0, (double) effective_hard_headroom_bytes / mib);
                     global_moe_utility =
                         memory_governor_global_moe_eviction_weight *
                             std::log1p((double) moe_budget_delta_evictions) +
                         memory_governor_global_moe_read_weight *
                             std::log1p((double) moe_budget_delta_bytes_read /
-                                    (64.0 * mib)) +
+                                    (moe_scale_mib * mib)) +
                         memory_governor_global_moe_prefetch_weight *
                             std::log1p((double) moe_budget_delta_prefetch_late +
                                     (double) moe_budget_delta_prefetch_dropped);
@@ -2692,29 +3245,18 @@ private:
                         std::log1p((double) moe_budget_delta_prefetch_late +
                                 (double) moe_budget_delta_prefetch_dropped);
                     const double diminishing_return =
-                        1.0 + current_mib / std::max(64.0, resident_mib);
+                        1.0 + current_mib / std::max(
+                                std::max(1.0, (double) effective_hard_headroom_bytes / mib),
+                                resident_mib);
                     const double pressure_excess_mib =
                         (double) pressure_excess_bytes / mib;
                     const double allocation_risk_tax =
-                        std::log1p(pressure_excess_mib) * 4.0 +
+                        std::log1p(pressure_excess_mib) +
                         grant_mib / std::max(1.0, pressure_margin_mib);
                     global_moe_roi =
                         global_moe_utility / (grant_mib * diminishing_return) -
                         global_headroom_barrier / std::max(1.0, pressure_margin_mib) -
                         allocation_risk_tax;
-                    if (memory_governor_moe_budget_grow_bytes > 0 &&
-                            global_moe_roi >= memory_governor_global_roi_threshold * 4.0 &&
-                            moe_budget_delta_evictions + moe_budget_delta_prefetch_dropped > 1024) {
-                        adaptive_grow_bytes = std::min<uint64_t>(
-                                adaptive_grow_max_bytes,
-                                memory_governor_moe_budget_grow_bytes * 4);
-                    } else if (memory_governor_moe_budget_grow_bytes > 0 &&
-                            global_moe_roi >= memory_governor_global_roi_threshold * 2.0 &&
-                            moe_budget_delta_evictions + moe_budget_delta_prefetch_dropped > 256) {
-                        adaptive_grow_bytes = std::min<uint64_t>(
-                                adaptive_grow_max_bytes,
-                                memory_governor_moe_budget_grow_bytes * 2);
-                    }
                     if (effective_pressure_state == kv_pressure_state::NORMAL &&
                             pressure_excess_bytes == 0 &&
                             global_available_growth_bytes > 0 &&
@@ -2725,10 +3267,10 @@ private:
                             memory_governor_global_roi_threshold;
                         uint64_t target = max_budget;
                         if (memory_governor_global_min_catchup_enabled &&
-                                current_budget < memory_governor_moe_budget_min_bytes &&
+                                current_budget < effective_moe_budget_min_bytes &&
                                 global_moe_utility > 0.0) {
                             should_grant = true;
-                            target = memory_governor_moe_budget_min_bytes;
+                            target = effective_moe_budget_min_bytes;
                             global_optimizer_decision = "moe_min_catchup";
                         } else if (should_grant) {
                             global_optimizer_decision =
@@ -2786,7 +3328,7 @@ private:
                     moe_budget_reason = "cooldown";
                 } else if (effective_pressure_state == kv_pressure_state::CRITICAL ||
                            effective_pressure_state == kv_pressure_state::PRESSURE) {
-                    if (current_budget <= memory_governor_moe_budget_min_bytes) {
+                    if (current_budget <= effective_moe_budget_min_bytes) {
                         moe_budget_reason = "min";
                     } else {
                         uint64_t next_budget = current_budget;
@@ -2795,24 +3337,26 @@ private:
                             moe_budget_reason = "critical";
                         } else {
                             const uint64_t proportional_shrink =
-                                std::max<uint64_t>(
-                                        1,
-                                        current_budget *
-                                            memory_governor_moe_budget_pressure_shrink_pct / 100);
+                                memory_governor_moe_budget_pressure_shrink_pct > 0
+                                    ? std::max<uint64_t>(
+                                            1,
+                                            current_budget *
+                                                memory_governor_moe_budget_pressure_shrink_pct / 100)
+                                    : current_budget;
                             uint64_t shrink = pressure_excess_bytes == 0
-                                ? memory_governor_moe_budget_grow_bytes
+                                ? effective_moe_budget_grow_bytes
                                 : pressure_excess_bytes;
                             shrink = std::min<uint64_t>(shrink, proportional_shrink);
-                            if (memory_governor_moe_budget_pressure_shrink_max_bytes != 0) {
+                            if (effective_moe_budget_pressure_shrink_max_bytes != 0) {
                                 shrink = std::min<uint64_t>(
                                         shrink,
-                                        memory_governor_moe_budget_pressure_shrink_max_bytes);
+                                        effective_moe_budget_pressure_shrink_max_bytes);
                             }
                             next_budget = current_budget > shrink ? current_budget - shrink : 0;
                             moe_budget_reason = "pressure_smooth";
                         }
                         next_budget = std::max<uint64_t>(
-                                memory_governor_moe_budget_min_bytes,
+                                effective_moe_budget_min_bytes,
                                 next_budget);
                         if (next_budget < current_budget) {
                             llama_moe_buffer_set_budget(moe_context, (size_t) next_budget);
@@ -2833,16 +3377,16 @@ private:
                 } else if (unlimited) {
                     moe_budget_reason = "unbounded";
                 } else if (memory_governor_moe_budget_fast_start_enabled &&
-                           moe_budget_headroom_bytes > memory_governor_moe_budget_headroom_bytes &&
+                           moe_budget_headroom_bytes > effective_moe_budget_headroom_bytes &&
                            current_budget < max_budget &&
-                           current_budget < memory_governor_moe_budget_warm_bytes) {
+                           current_budget < effective_moe_budget_warm_bytes) {
                     const uint64_t safe_headroom =
-                        moe_budget_headroom_bytes - memory_governor_moe_budget_headroom_bytes;
+                        moe_budget_headroom_bytes - effective_moe_budget_headroom_bytes;
                     const uint64_t warm_target = std::min<uint64_t>(
                             std::min<uint64_t>(
-                                memory_governor_moe_budget_warm_bytes,
+                                effective_moe_budget_warm_bytes,
                                 max_budget),
-                            current_budget + safe_headroom / 2);
+                            current_budget + safe_headroom);
                     if (warm_target > current_budget) {
                         llama_moe_buffer_set_budget(moe_context, (size_t) warm_target);
                         moe_budget_action = "grow";
@@ -2877,16 +3421,16 @@ private:
                     }
                 } else if (memory_governor_global_optimizer_enabled) {
                     moe_budget_reason = global_optimizer_decision;
-                } else if (moe_budget_headroom_bytes <= memory_governor_moe_budget_headroom_bytes) {
+                } else if (moe_budget_headroom_bytes <= effective_moe_budget_headroom_bytes) {
                     moe_budget_reason = "headroom";
                 } else if (current_budget >= max_budget) {
                     moe_budget_reason = "max";
-                } else {
+                } else if (current_budget < effective_moe_budget_warm_bytes) {
                     const uint64_t safe_headroom =
-                        moe_budget_headroom_bytes - memory_governor_moe_budget_headroom_bytes;
+                        moe_budget_headroom_bytes - effective_moe_budget_headroom_bytes;
                     uint64_t grow = std::min<uint64_t>(
-                            memory_governor_moe_budget_grow_bytes,
-                            safe_headroom / 2);
+                            effective_moe_budget_warm_bytes - current_budget,
+                            safe_headroom);
                     grow = std::min<uint64_t>(grow, max_budget - current_budget);
                     if (grow == 0) {
                         moe_budget_reason = "headroom";
@@ -2894,11 +3438,13 @@ private:
                         const uint64_t next_budget = current_budget + grow;
                         llama_moe_buffer_set_budget(moe_context, (size_t) next_budget);
                         moe_budget_action = "grow";
-                        moe_budget_reason = thrash ? "thrash_headroom" : "headroom_probe";
+                        moe_budget_reason = "working_set_warm";
                         moe_budget_new_bytes = next_budget;
                         memory_governor_moe_budget_next_sample =
                             sample_count + memory_governor_moe_budget_cooldown_samples;
                     }
+                } else {
+                    moe_budget_reason = "working_set_ready";
                 }
             }
 
@@ -2916,7 +3462,56 @@ private:
 
         llama_flex_resize_result dense_resize_result;
         dense_resize_result.reason = flex_enabled ? "no_grant" : "disabled";
-        if (memory_governor_global_optimizer_enabled &&
+        uint64_t dense_ring_shrink_required_bytes = 0;
+        uint64_t dense_ring_shrink_releasable_bytes = 0;
+        int dense_ring_shrink_target_slots = 0;
+        if (memory_governor_dense_runtime_ring_shrink_enabled &&
+                flex_enabled &&
+                model_tgt &&
+                model_tgt->get_flex_context() &&
+                flex_stats.slot_bytes > 0 &&
+                effective_pressure_state != kv_pressure_state::NORMAL) {
+            const int current_slots = (int) (flex_stats.ring_bytes / flex_stats.slot_bytes);
+            const auto cgroup = memory_governor_read_cgroup_memory();
+            const uint64_t observed_current_bytes =
+                pressure_current_bytes > 0 ? pressure_current_bytes : cgroup.current_bytes;
+            uint64_t headroom_bytes = 0;
+            if (cgroup.valid && cgroup.max_bytes > observed_current_bytes) {
+                headroom_bytes = cgroup.max_bytes - observed_current_bytes;
+            }
+            uint64_t required_headroom = effective_hard_headroom_bytes;
+            if (effective_pressure_state == kv_pressure_state::CRITICAL) {
+                required_headroom += flex_stats.slot_bytes;
+            }
+            if (required_headroom > headroom_bytes) {
+                dense_ring_shrink_required_bytes = required_headroom - headroom_bytes;
+            }
+            dense_ring_shrink_required_bytes =
+                std::max<uint64_t>(dense_ring_shrink_required_bytes, pressure_excess_bytes);
+            if (current_slots > 1) {
+                dense_ring_shrink_releasable_bytes =
+                    (uint64_t) (current_slots - 1) * (uint64_t) flex_stats.slot_bytes;
+            }
+            if (!cgroup.valid && pressure_excess_bytes == 0) {
+                dense_resize_result.reason = "no_headroom_signal";
+            } else if (dense_ring_shrink_required_bytes == 0) {
+                dense_resize_result.reason = "no_shrink_required";
+            } else if (dense_ring_shrink_releasable_bytes == 0) {
+                dense_resize_result.reason = "ring_minimum";
+            } else {
+                const uint64_t release_bytes =
+                    std::min<uint64_t>(dense_ring_shrink_required_bytes,
+                            dense_ring_shrink_releasable_bytes);
+                const int release_slots =
+                    (int) ((release_bytes + flex_stats.slot_bytes - 1) / flex_stats.slot_bytes);
+                const int target_slots = std::max(1, current_slots - release_slots);
+                dense_ring_shrink_target_slots = target_slots;
+                dense_resize_result = llama_flex_resize_ring(
+                        *model_tgt->get_flex_context(),
+                        target_slots);
+                flex_stats = llama_flex_get_stats(*model_tgt->get_flex_context());
+            }
+        } else if (memory_governor_global_optimizer_enabled &&
                 global_dense_ring_flowback_bytes > 0 &&
                 global_dense_target_ring_slots > 0 &&
                 flex_enabled &&
@@ -2952,7 +3547,7 @@ private:
             pressure_excess_bytes +
             (effective_pressure_state == kv_pressure_state::NORMAL
                 ? 0
-                : memory_governor_global_hard_headroom_bytes);
+                : effective_hard_headroom_bytes);
 
         std::vector<memory_governor_would_candidate> reclaim_candidates;
         std::vector<memory_governor_would_candidate> prefetch_candidates;
@@ -2977,7 +3572,7 @@ private:
 
         if (moe_enabled && moe_stats.resident_bytes > 0) {
             const bool over_budget =
-                moe_stats.budget_bytes > 0 && moe_stats.resident_bytes > moe_stats.budget_bytes;
+                !moe_stats.budget_unbounded && moe_stats.resident_bytes > moe_stats.budget_bytes;
             int64_t score = 0;
             score = memory_governor_add_score(
                     score, memory_governor_bounded_term(moe_stats.resident_bytes, 4096, 512));
@@ -3137,13 +3732,12 @@ private:
                 ? pressure_low_water_bytes - pressure_current_bytes
                 : 0;
         if (memory_governor_prefetch_budget_enabled) {
-            static constexpr uint64_t mib = 1024ull * 1024ull;
             if (memory_governor_prefetch_budget_runtime_auto) {
                 uint64_t usable_headroom = 0;
                 if (prefetch_budget_runtime_headroom_bytes >
-                        memory_governor_prefetch_budget_headroom_bytes) {
+                        effective_prefetch_headroom_bytes) {
                     usable_headroom = prefetch_budget_runtime_headroom_bytes -
-                        memory_governor_prefetch_budget_headroom_bytes;
+                        effective_prefetch_headroom_bytes;
                 }
                 uint32_t divisor = memory_governor_prefetch_budget_normal_divisor;
                 if (effective_pressure_state == kv_pressure_state::CRITICAL) {
@@ -3153,7 +3747,8 @@ private:
                     divisor = memory_governor_prefetch_budget_pressure_divisor;
                     prefetch_budget_clamp_reason = "pressure";
                 }
-                prefetch_budget_effective_bytes = usable_headroom / std::max<uint32_t>(1, divisor);
+                prefetch_budget_effective_bytes =
+                    divisor > 0 ? usable_headroom / divisor : usable_headroom;
                 if (prefetch_budget_effective_bytes > 0) {
                     prefetch_budget_effective_bytes =
                         memory_governor_round_prefetch_budget(prefetch_budget_effective_bytes);
@@ -3169,23 +3764,16 @@ private:
                             prefetch_budget_effective_bytes,
                             memory_governor_prefetch_budget_max_bytes_per_tick);
                 }
-                if (effective_pressure_state == kv_pressure_state::CRITICAL) {
-                    prefetch_budget_effective_bytes =
-                        std::min<uint64_t>(prefetch_budget_effective_bytes, 4ull * mib);
-                } else if (effective_pressure_state == kv_pressure_state::PRESSURE) {
-                    prefetch_budget_effective_bytes =
-                        std::min<uint64_t>(prefetch_budget_effective_bytes, 16ull * mib);
-                }
                 if (usable_headroom == 0) {
                     prefetch_budget_auto_reason = "headroom";
                 }
             } else if (effective_pressure_state == kv_pressure_state::CRITICAL) {
                 prefetch_budget_effective_bytes =
-                    std::min<uint64_t>(prefetch_budget_effective_bytes, 4ull * mib);
+                    std::min<uint64_t>(prefetch_budget_effective_bytes, effective_hard_headroom_bytes);
                 prefetch_budget_clamp_reason = "critical";
             } else if (effective_pressure_state == kv_pressure_state::PRESSURE) {
                 prefetch_budget_effective_bytes =
-                    std::min<uint64_t>(prefetch_budget_effective_bytes, 16ull * mib);
+                    std::min<uint64_t>(prefetch_budget_effective_bytes, effective_hard_headroom_bytes);
                 prefetch_budget_clamp_reason = "pressure";
             }
             if (flex_enabled && flex_stats.slot_bytes > 0) {
@@ -3310,13 +3898,14 @@ private:
                     std::vector<memory_governor_would_candidate> sorted_clean;
                     for (const auto & candidate : reclaim_candidates) {
                         if (memory_governor_is_clean_reclaim_candidate(candidate) &&
+                                memory_governor_candidate_has_positive_roi(candidate) &&
                                 memory_governor_candidate_allowed_in_state(candidate, effective_pressure_state)) {
                             sorted_clean.push_back(candidate);
                         }
                     }
                     std::sort(sorted_clean.begin(), sorted_clean.end(), memory_governor_candidate_before);
                     if (sorted_clean.empty()) {
-                        clean_result.reason = "no_candidate";
+                        clean_result.reason = "no_positive_candidate";
                     } else {
                         uint64_t remaining = target;
                         clean_result.reason = "ranked_submitted";
@@ -3337,7 +3926,30 @@ private:
                             clean_result.attempted = true;
                             clean_result.target_bytes += pass_target;
                             clean_result.passes++;
-                            if (std::string(selected.kind) == "dense_layer" &&
+                            if (memory_governor_async_actions_enabled) {
+                                memory_governor_async_action action;
+                                if (std::string(selected.kind) == "dense_layer") {
+                                    action.kind = memory_governor_async_action_kind::dense_clean_reclaim;
+                                } else if (std::string(selected.kind) == "moe_expert") {
+                                    action.kind = memory_governor_async_action_kind::moe_clean_reclaim;
+                                } else {
+                                    clean_result.reason = "context_unavailable";
+                                    continue;
+                                }
+                                action.score = selected.score;
+                                action.roi = selected.roi;
+                                action.target_bytes = pass_target;
+                                action.max_objects = memory_governor_clean_reclaim_max_objects;
+                                action.sample_count = sample_count;
+                                action.pressure_state = effective_pressure_state;
+                                const bool enqueued = memory_governor_async_submit(action);
+                                clean_result.reason =
+                                    enqueued ? "async_enqueued" : "async_queue_full";
+                                if (enqueued) {
+                                    remaining = memory_governor_saturating_sub(
+                                            remaining, pass_target);
+                                }
+                            } else if (std::string(selected.kind) == "dense_layer" &&
                                     flex_enabled && model_tgt && model_tgt->get_flex_context()) {
                                 const auto result = llama_flex_reclaim_released(
                                         *model_tgt->get_flex_context(),
@@ -3374,6 +3986,7 @@ private:
                         for (const auto & candidate : reclaim_candidates) {
                             if (std::string(candidate.kind) != "dense_layer" ||
                                     !memory_governor_is_clean_reclaim_candidate(candidate) ||
+                                    !memory_governor_candidate_has_positive_roi(candidate) ||
                                     !memory_governor_candidate_allowed_in_state(
                                         candidate, effective_pressure_state)) {
                                 continue;
@@ -3392,7 +4005,10 @@ private:
                         selected = memory_governor_auction_select(
                                 reclaim_candidates,
                                 effective_pressure_state,
-                                memory_governor_is_clean_reclaim_candidate,
+                                [](const memory_governor_would_candidate & candidate) {
+                                    return memory_governor_is_clean_reclaim_candidate(candidate) &&
+                                        memory_governor_candidate_has_positive_roi(candidate);
+                                },
                                 &clean_auction_reason);
                     }
                     if (memory_governor_is_clean_reclaim_candidate(selected)) {
@@ -3404,7 +4020,30 @@ private:
                         clean_result.passes = 1;
                         clean_result.candidates_tried = 1;
                         clean_result.reason = clean_auction_reason;
-                        if (std::string(selected.kind) == "dense_layer" &&
+                        if (memory_governor_async_actions_enabled) {
+                            memory_governor_async_action action;
+                            bool async_clean_kind_valid = true;
+                            if (std::string(selected.kind) == "dense_layer") {
+                                action.kind = memory_governor_async_action_kind::dense_clean_reclaim;
+                            } else if (std::string(selected.kind) == "moe_expert") {
+                                action.kind = memory_governor_async_action_kind::moe_clean_reclaim;
+                            } else {
+                                async_clean_kind_valid = false;
+                                clean_result.reason = "context_unavailable";
+                            }
+                            if (async_clean_kind_valid) {
+                                action.score = selected.score;
+                                action.roi = selected.roi;
+                                action.target_bytes = target;
+                                action.max_objects = memory_governor_clean_reclaim_max_objects;
+                                action.sample_count = sample_count;
+                                action.pressure_state = effective_pressure_state;
+                                clean_result.reason =
+                                    memory_governor_async_submit(action)
+                                        ? "async_enqueued"
+                                        : "async_queue_full";
+                            }
+                        } else if (std::string(selected.kind) == "dense_layer" &&
                                 flex_enabled && model_tgt && model_tgt->get_flex_context()) {
                             const auto result = llama_flex_reclaim_released(
                                     *model_tgt->get_flex_context(),
@@ -3475,69 +4114,92 @@ private:
                     kv_release_result.reason = "zero_target";
                 } else {
                     target = std::min<uint64_t>(target, selected.bytes);
-                    auto * mem = llama_get_memory(ctx_tgt);
-                    const uint64_t decision_id = next_kv_decision_id();
-                    kv_release_result.evaluate_attempted = true;
-                    const auto evaluation = mem->execute_action({
-                            llama_kv_action::evaluate,
-                            decision_id,
-                            -1,
-                            0,
-                            0,
-                            false,
-                            false,
-                            llama_kv_memory_claimant::kv,
-                            llama_kv_io_class::background_write,
-                            0,
-                            0,
-                    });
-                    if (evaluation.decision_id != decision_id) {
-                        kv_release_result.reason = "decision_mismatch";
-                    } else if (evaluation.capability.context_invalid) {
-                        kv_release_result.reason = "context_invalid";
-                    } else if (evaluation.capability.write_transaction_open) {
-                        kv_release_result.reason = "write_transaction_open";
-                    } else if (evaluation.fail_stop) {
-                        kv_release_result.reason = "fail_stop";
-                        kv_release_result.fail_stop = true;
-                    } else if (!evaluation.capability.can_release) {
-                        kv_release_result.reason = "release_unsupported";
-                    } else if (evaluation.outcome != llama_kv_action_outcome::completed ||
-                            evaluation.reason != llama_kv_action_reason::none) {
-                        kv_release_result.reason = "evaluate_rejected";
-                    } else {
+                    if (memory_governor_async_actions_enabled) {
+                        memory_governor_async_action action;
+                        action.kind = memory_governor_async_action_kind::kv_global_release;
+                        action.score = selected.score;
+                        action.roi = selected.roi;
+                        action.target_bytes = target;
+                        action.max_blocks = memory_governor_kv_release_max_blocks;
+                        action.sample_count = sample_count;
+                        action.pressure_state = effective_pressure_state;
                         kv_release_result.attempted = true;
                         kv_release_result.score = selected.score;
                         kv_release_result.target_bytes = target;
-                        const auto release = mem->execute_action({
-                                llama_kv_action::release,
+                        kv_release_result.reason =
+                            memory_governor_async_submit(action)
+                                ? "async_enqueued"
+                                : "async_queue_full";
+                        if (std::string(kv_release_result.reason) == "async_enqueued") {
+                            memory_governor_kv_release_next_sample =
+                                sample_count + std::max<uint32_t>(
+                                        memory_governor_kv_release_cooldown_samples, 1);
+                        }
+                    } else {
+                        auto * mem = llama_get_memory(ctx_tgt);
+                        const uint64_t decision_id = next_kv_decision_id();
+                        kv_release_result.evaluate_attempted = true;
+                        const auto evaluation = mem->execute_action({
+                                llama_kv_action::evaluate,
                                 decision_id,
                                 -1,
-                                target,
-                                memory_governor_kv_release_max_blocks,
+                                0,
+                                0,
                                 false,
                                 false,
                                 llama_kv_memory_claimant::kv,
                                 llama_kv_io_class::background_write,
                                 0,
-                                target,
+                                0,
                         });
-                        kv_release_result.bytes = release.bytes;
-                        kv_release_result.blocks = release.blocks;
-                        kv_release_result.relieved_bytes = release.relieved_bytes;
-                        kv_release_result.shortfall_bytes = release.shortfall_bytes;
-                        kv_release_result.state_changed = release.state_changed;
-                        kv_release_result.io_failure = release.io_failure;
-                        kv_release_result.fail_stop = release.fail_stop;
-                        kv_release_result.io_errno = release.io_errno;
-                        kv_release_result.outcome =
-                            memory_governor_action_outcome_name(release.outcome);
-                        kv_release_result.action_reason =
-                            memory_governor_action_reason_name(release.reason);
-                        kv_release_result.reason = "release_submitted";
-                        memory_governor_kv_release_next_sample =
-                            sample_count + std::max<uint32_t>(
-                                    memory_governor_kv_release_cooldown_samples, 1);
+                        if (evaluation.decision_id != decision_id) {
+                            kv_release_result.reason = "decision_mismatch";
+                        } else if (evaluation.capability.context_invalid) {
+                            kv_release_result.reason = "context_invalid";
+                        } else if (evaluation.capability.write_transaction_open) {
+                            kv_release_result.reason = "write_transaction_open";
+                        } else if (evaluation.fail_stop) {
+                            kv_release_result.reason = "fail_stop";
+                            kv_release_result.fail_stop = true;
+                        } else if (!evaluation.capability.can_release) {
+                            kv_release_result.reason = "release_unsupported";
+                        } else if (evaluation.outcome != llama_kv_action_outcome::completed ||
+                                evaluation.reason != llama_kv_action_reason::none) {
+                            kv_release_result.reason = "evaluate_rejected";
+                        } else {
+                            kv_release_result.attempted = true;
+                            kv_release_result.score = selected.score;
+                            kv_release_result.target_bytes = target;
+                            const auto release = mem->execute_action({
+                                    llama_kv_action::release,
+                                    decision_id,
+                                    -1,
+                                    target,
+                                    memory_governor_kv_release_max_blocks,
+                                    false,
+                                    false,
+                                    llama_kv_memory_claimant::kv,
+                                    llama_kv_io_class::background_write,
+                                    0,
+                                    target,
+                            });
+                            kv_release_result.bytes = release.bytes;
+                            kv_release_result.blocks = release.blocks;
+                            kv_release_result.relieved_bytes = release.relieved_bytes;
+                            kv_release_result.shortfall_bytes = release.shortfall_bytes;
+                            kv_release_result.state_changed = release.state_changed;
+                            kv_release_result.io_failure = release.io_failure;
+                            kv_release_result.fail_stop = release.fail_stop;
+                            kv_release_result.io_errno = release.io_errno;
+                            kv_release_result.outcome =
+                                memory_governor_action_outcome_name(release.outcome);
+                            kv_release_result.action_reason =
+                                memory_governor_action_reason_name(release.reason);
+                            kv_release_result.reason = "release_submitted";
+                            memory_governor_kv_release_next_sample =
+                                sample_count + std::max<uint32_t>(
+                                        memory_governor_kv_release_cooldown_samples, 1);
+                        }
                     }
                 }
             }
@@ -3624,6 +4286,33 @@ private:
                     kv_offload_result.action_reason =
                         offload.state_changed ? "none" : offload.reason;
                     if (offload.attempted) {
+                        memory_governor_kv_offload_next_sample =
+                            sample_count + std::max<uint32_t>(
+                                    memory_governor_kv_offload_cooldown_samples, 1);
+                    }
+                } else if (memory_governor_async_actions_enabled) {
+                    target = std::min<uint64_t>(target, selected.bytes);
+                    memory_governor_async_action action;
+                    action.kind = memory_governor_async_action_kind::kv_sequence_offload;
+                    action.seq_id = selected.id;
+                    action.score = selected.score;
+                    action.roi = selected.roi;
+                    action.target_bytes = target;
+                    action.max_blocks = memory_governor_kv_offload_max_blocks;
+                    action.sample_count = sample_count;
+                    action.pressure_state = effective_pressure_state;
+                    kv_offload_result.attempted = true;
+                    kv_offload_result.seq_id = selected.id;
+                    kv_offload_result.score = selected.score;
+                    kv_offload_result.target_bytes = target;
+                    kv_offload_result.bytes = selected.bytes;
+                    kv_offload_result.backend = "memory_backend";
+                    kv_offload_result.reason =
+                        memory_governor_async_submit(action)
+                            ? "async_enqueued"
+                            : "async_queue_full";
+                    kv_offload_result.outcome = "enqueued";
+                    if (std::string(kv_offload_result.reason) == "async_enqueued") {
                         memory_governor_kv_offload_next_sample =
                             sample_count + std::max<uint32_t>(
                                     memory_governor_kv_offload_cooldown_samples, 1);
@@ -3718,6 +4407,32 @@ private:
         uint64_t reallocation_moe_grant_bytes = 0;
         uint64_t reallocation_moe_old_budget_bytes = moe_stats.budget_bytes;
         uint64_t reallocation_moe_new_budget_bytes = moe_stats.budget_bytes;
+        const uint64_t effective_reallocation_unit_bytes =
+            flex_stats.slot_bytes > 0
+                ? (uint64_t) flex_stats.slot_bytes
+                : (effective_moe_budget_grow_bytes > 0
+                    ? effective_moe_budget_grow_bytes
+                    : effective_hard_headroom_bytes);
+        const uint64_t effective_reallocation_credit_cap_bytes =
+            memory_governor_reallocation_credit_cap_bytes > 0
+                ? memory_governor_reallocation_credit_cap_bytes
+                : effective_reallocation_unit_bytes;
+        const uint64_t effective_reallocation_max_grant_bytes =
+            memory_governor_reallocation_max_grant_bytes > 0
+                ? memory_governor_reallocation_max_grant_bytes
+                : effective_reallocation_credit_cap_bytes;
+        const uint64_t effective_reallocation_min_grant_bytes =
+            memory_governor_reallocation_min_grant_bytes > 0
+                ? memory_governor_reallocation_min_grant_bytes
+                : effective_reallocation_unit_bytes;
+        const uint64_t effective_reallocation_hard_guard_bytes =
+            memory_governor_reallocation_hard_guard_bytes > 0
+                ? memory_governor_reallocation_hard_guard_bytes
+                : effective_hard_headroom_bytes;
+        const uint64_t effective_reallocation_confirm_slack_bytes =
+            memory_governor_reallocation_confirm_slack_bytes > 0
+                ? memory_governor_reallocation_confirm_slack_bytes
+                : effective_hard_headroom_bytes;
         const char * reallocation_best_kind =
             memory_governor_reallocation_enabled ? "none" : "disabled";
         const char * reallocation_reason =
@@ -3727,7 +4442,8 @@ private:
                 clean_result.released_bytes +
                 kv_release_result.relieved_bytes +
                 kv_offload_result.relieved_bytes +
-                moe_budget_reclaim_released_bytes;
+                moe_budget_reclaim_released_bytes +
+                async_relieved_drained_bytes;
             double discount = memory_governor_reallocation_normal_discount;
             if (effective_pressure_state == kv_pressure_state::CRITICAL) {
                 discount = 0.0;
@@ -3737,7 +4453,7 @@ private:
             reallocation_pending_added_bytes = (uint64_t) ((double) raw_relieved * discount);
             if (reallocation_pending_added_bytes > 0) {
                 memory_governor_reallocation_pending_bytes = std::min<uint64_t>(
-                        memory_governor_reallocation_credit_cap_bytes,
+                        effective_reallocation_credit_cap_bytes,
                         memory_governor_reallocation_pending_bytes +
                             reallocation_pending_added_bytes);
             }
@@ -3751,7 +4467,7 @@ private:
             if (memory_governor_reallocation_confirm_enabled) {
                 reallocation_confirm_limit_bytes =
                     reallocation_observed_drop_bytes +
-                    memory_governor_reallocation_confirm_slack_bytes;
+                    effective_reallocation_confirm_slack_bytes;
                 reallocation_credit_earned_bytes = std::min<uint64_t>(
                         memory_governor_reallocation_pending_bytes,
                         reallocation_confirm_limit_bytes);
@@ -3771,7 +4487,7 @@ private:
                 (uint64_t) ((double) memory_governor_reallocation_credit_bytes *
                         memory_governor_reallocation_decay);
             memory_governor_reallocation_credit_bytes = std::min<uint64_t>(
-                    memory_governor_reallocation_credit_cap_bytes,
+                    effective_reallocation_credit_cap_bytes,
                     reallocation_credit_decayed_bytes + reallocation_credit_earned_bytes);
             reallocation_credit_available_bytes = memory_governor_reallocation_credit_bytes;
 
@@ -3789,9 +4505,9 @@ private:
                     const uint64_t grant = std::min<uint64_t>(
                             std::min<uint64_t>(
                                 memory_governor_reallocation_credit_bytes,
-                                memory_governor_reallocation_max_grant_bytes),
+                                effective_reallocation_max_grant_bytes),
                             dense_window_bytes);
-                    if (grant >= memory_governor_reallocation_min_grant_bytes) {
+                    if (grant >= effective_reallocation_min_grant_bytes) {
                         reallocation_dense_grant_bytes = grant;
                         memory_governor_reallocation_credit_bytes -= grant;
                         reallocation_credit_spent_bytes = grant;
@@ -3805,33 +4521,77 @@ private:
                 }
             } else if (effective_pressure_state == kv_pressure_state::CRITICAL) {
                 reallocation_reason = "critical";
+            } else if ((moe_budget_delta_evictions > 0 ||
+                        moe_budget_delta_bytes_read > 0 ||
+                        moe_budget_delta_prefetch_late > 0) &&
+                    (moe_stats.budget_unbounded ||
+                     moe_stats.warm_working_set_bytes > moe_stats.budget_bytes) &&
+                    moe_budget_headroom_bytes > effective_reallocation_hard_guard_bytes) {
+                uint64_t max_budget = memory_governor_moe_budget_max_bytes;
+                if (max_budget == 0 || max_budget > moe_stats.expert_bytes) {
+                    max_budget = moe_stats.expert_bytes;
+                }
+                if (moe_stats.planner_floor_bytes > 0) {
+                    max_budget = std::min<uint64_t>(
+                            max_budget,
+                            (uint64_t) moe_stats.planner_safe_budget_bytes);
+                }
+                const uint64_t current_budget =
+                    moe_stats.budget_unbounded ? max_budget : (uint64_t) moe_stats.budget_bytes;
+                reallocation_moe_old_budget_bytes = current_budget;
+                const uint64_t guard_headroom =
+                    effective_reallocation_hard_guard_bytes == 0
+                        ? moe_budget_headroom_bytes
+                        : moe_budget_headroom_bytes - effective_reallocation_hard_guard_bytes;
+                const uint64_t warm_deficit =
+                    (uint64_t) moe_stats.warm_working_set_bytes > current_budget
+                        ? (uint64_t) moe_stats.warm_working_set_bytes - current_budget
+                        : 0;
+                uint64_t grant = std::min<uint64_t>(warm_deficit, guard_headroom);
+                grant = std::min<uint64_t>(grant, max_budget > current_budget ? max_budget - current_budget : 0);
+                if (grant == 0) {
+                    reallocation_reason = "emergency_no_headroom";
+                } else {
+                    const uint64_t next_budget = current_budget + grant;
+                    llama_moe_buffer_set_budget(moe_context, (size_t) next_budget);
+                    reallocation_moe_grant_bytes = grant;
+                    reallocation_moe_new_budget_bytes = next_budget;
+                    reallocation_best_kind = "moe_resident";
+                    reallocation_reason = "moe_emergency_working_set";
+                    moe_stats = llama_moe_buffer_get_stats(*moe_context);
+                }
             } else if (memory_governor_reallocation_credit_bytes <
-                    memory_governor_reallocation_min_grant_bytes) {
+                    effective_reallocation_min_grant_bytes) {
                 reallocation_reason = "below_min_grant";
             } else {
                 uint64_t max_budget = memory_governor_moe_budget_max_bytes;
                 if (max_budget == 0 || max_budget > moe_stats.expert_bytes) {
                     max_budget = moe_stats.expert_bytes;
                 }
+                if (moe_stats.planner_floor_bytes > 0) {
+                    max_budget = std::min<uint64_t>(
+                            max_budget,
+                            (uint64_t) moe_stats.planner_safe_budget_bytes);
+                }
                 const uint64_t current_budget =
-                    moe_stats.budget_bytes == 0 ? max_budget : (uint64_t) moe_stats.budget_bytes;
+                    moe_stats.budget_unbounded ? max_budget : (uint64_t) moe_stats.budget_bytes;
                 reallocation_moe_old_budget_bytes = current_budget;
                 if (current_budget >= max_budget) {
                     reallocation_reason = "moe_max";
-                } else if (memory_governor_reallocation_hard_guard_bytes > 0 &&
-                        moe_budget_headroom_bytes <= memory_governor_reallocation_hard_guard_bytes) {
+                } else if (effective_reallocation_hard_guard_bytes > 0 &&
+                        moe_budget_headroom_bytes <= effective_reallocation_hard_guard_bytes) {
                     reallocation_reason = "hard_guard";
                 } else {
                     const uint64_t guard_headroom =
-                        memory_governor_reallocation_hard_guard_bytes == 0
+                        effective_reallocation_hard_guard_bytes == 0
                             ? memory_governor_reallocation_credit_bytes
-                            : moe_budget_headroom_bytes - memory_governor_reallocation_hard_guard_bytes;
+                            : moe_budget_headroom_bytes - effective_reallocation_hard_guard_bytes;
                     uint64_t grant = std::min<uint64_t>(
                             memory_governor_reallocation_credit_bytes,
-                            memory_governor_reallocation_max_grant_bytes);
+                            effective_reallocation_max_grant_bytes);
                     grant = std::min<uint64_t>(grant, guard_headroom);
                     grant = std::min<uint64_t>(grant, max_budget - current_budget);
-                    if (grant < memory_governor_reallocation_min_grant_bytes) {
+                    if (grant < effective_reallocation_min_grant_bytes) {
                         reallocation_reason = "grant_below_min";
                     } else {
                         const uint64_t next_budget = current_budget + grant;
@@ -3864,32 +4624,48 @@ private:
                     ? cgroup.max_bytes - pressure_current_bytes
                     : 0;
             const uint64_t safe_headroom_grant =
-                dense_repin_headroom_bytes > memory_governor_dense_repin_headroom_bytes
-                    ? dense_repin_headroom_bytes - memory_governor_dense_repin_headroom_bytes
+                dense_repin_headroom_bytes > effective_dense_repin_headroom_bytes
+                    ? dense_repin_headroom_bytes - effective_dense_repin_headroom_bytes
                     : 0;
             const uint64_t cap_remaining =
-                memory_governor_dense_repin_max_bytes > flex_stats.delta_locked_bytes
-                    ? memory_governor_dense_repin_max_bytes - flex_stats.delta_locked_bytes
+                effective_dense_repin_max_bytes > flex_stats.delta_locked_bytes
+                    ? effective_dense_repin_max_bytes - flex_stats.delta_locked_bytes
                     : 0;
             dense_repin_grant_bytes = std::min<uint64_t>(
-                    memory_governor_dense_repin_step_bytes,
+                    effective_dense_repin_step_bytes,
                     std::min<uint64_t>(cap_remaining,
                         std::max<uint64_t>(safe_headroom_grant, reallocation_dense_grant_bytes)));
             if (effective_pressure_state != kv_pressure_state::NORMAL) {
                 dense_repin_result.reason = "not_normal";
                 dense_repin_grant_bytes = 0;
+            } else if (memory_governor_dense_repin_idle_only && !idle) {
+                dense_repin_result.reason = "busy";
+                dense_repin_grant_bytes = 0;
+            } else if (sample_count < memory_governor_dense_repin_next_sample) {
+                dense_repin_result.reason = "cooldown";
+                dense_repin_grant_bytes = 0;
             } else if (cap_remaining == 0) {
                 dense_repin_result.reason = "cap_reached";
-            } else if (dense_repin_headroom_bytes <= memory_governor_dense_repin_headroom_bytes) {
+            } else if (dense_repin_headroom_bytes <= effective_dense_repin_headroom_bytes) {
                 dense_repin_result.reason = "headroom_guard";
-            } else if (dense_repin_grant_bytes < memory_governor_reallocation_min_grant_bytes) {
+            } else if (dense_repin_grant_bytes < effective_reallocation_min_grant_bytes) {
                 dense_repin_result.reason = "grant_below_min";
             } else {
-                dense_repin_result = llama_flex_delta_pin(
-                        *model_tgt->get_flex_context(),
-                        dense_repin_grant_bytes,
-                        memory_governor_dense_repin_min_roi);
+                dense_repin_result = memory_governor_dense_repin_async_enabled
+                    ? llama_flex_delta_pin_async(
+                            *model_tgt->get_flex_context(),
+                            dense_repin_grant_bytes,
+                            memory_governor_dense_repin_min_roi)
+                    : llama_flex_delta_pin(
+                            *model_tgt->get_flex_context(),
+                            dense_repin_grant_bytes,
+                            memory_governor_dense_repin_min_roi);
                 flex_stats = llama_flex_get_stats(*model_tgt->get_flex_context());
+                if (std::string(dense_repin_result.reason) == "async_enqueued" ||
+                        dense_repin_result.changed) {
+                    memory_governor_dense_repin_next_sample =
+                        sample_count + memory_governor_dense_repin_cooldown_samples;
+                }
             }
         }
 
@@ -3924,10 +4700,31 @@ private:
             memory_governor_format_candidate(auction_selected_allocation);
         const std::string auction_selected_reclaim_log =
             memory_governor_format_candidate(auction_selected_reclaim);
+        const uint64_t memory_governor_observe_elapsed_us =
+            (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - memory_governor_observe_t0).count();
+        const char * planner_model_kind =
+            moe_enabled ? "moe" : (flex_enabled ? "dense" : "none");
+        const uint64_t planner_floor_bytes =
+            moe_enabled ? (uint64_t) moe_stats.planner_floor_bytes :
+            (flex_enabled ? (uint64_t) flex_stats.sched_fixed_bytes : 0);
+        const uint64_t planner_dynamic_budget_bytes =
+            moe_enabled
+                ? (moe_stats.budget_unbounded
+                    ? (uint64_t) moe_stats.expert_bytes
+                    : (uint64_t) moe_stats.budget_bytes)
+                : (flex_enabled
+                    ? (uint64_t) (flex_stats.locked_bytes + flex_stats.ring_bytes)
+                    : 0);
 
         std::ostringstream out;
         out << "memory_governor_observe"
             << " sample_count=" << sample_count
+            << " planner_auto_enabled=" << (memory_governor_auto_backends_enabled ? 1 : 0)
+            << " planner_model_kind=" << planner_model_kind
+            << " planner_floor_bytes=" << planner_floor_bytes
+            << " planner_dynamic_budget_bytes=" << planner_dynamic_budget_bytes
+            << " governor_observe_elapsed_us=" << memory_governor_observe_elapsed_us
             << " idle=" << (idle ? 1 : 0)
             << " pressure_valid=" << (pressure_valid ? 1 : 0)
             << " pressure_state=" << kv_pressure_state_name(pressure_state)
@@ -3937,6 +4734,7 @@ private:
             << " pressure_stale=" << (pressure_stale ? 1 : 0)
             << " pressure_current_bytes=" << pressure_current_bytes
             << " pressure_low_water_bytes=" << pressure_low_water_bytes
+            << " pressure_raw_excess_bytes=" << pressure_raw_excess_bytes
             << " pressure_excess_bytes=" << pressure_excess_bytes
             << " effective_pressure_critical_excess_bytes=" << effective_pressure_critical_excess_bytes
             << " rss_observed_bytes=" << window_observed_rss
@@ -3953,6 +4751,12 @@ private:
             << " dense_delta_pin_saved_per_token_bytes=" << flex_stats.delta_pin_saved_per_token
             << " dense_delta_pin_attempts=" << flex_stats.delta_pin_attempts
             << " dense_delta_pin_failures=" << flex_stats.delta_pin_failures
+            << " dense_delta_pin_async_submitted=" << flex_stats.delta_pin_async_submitted
+            << " dense_delta_pin_async_completed=" << flex_stats.delta_pin_async_completed
+            << " dense_delta_pin_async_rejected=" << flex_stats.delta_pin_async_rejected
+            << " dense_delta_pin_async_pending=" << flex_stats.delta_pin_async_pending
+            << " dense_delta_pin_async_last_io_us=" << flex_stats.delta_pin_async_last_io_us
+            << " dense_delta_pin_async_last_elapsed_us=" << flex_stats.delta_pin_async_last_elapsed_us
             << " dense_lock_unused_bytes=" << flex_stats.lock_budget_unused
             << " dense_stream_per_token_bytes=" << flex_stats.stream_per_token
             << " dense_effective_ahead=" << flex_stats.effective_ahead
@@ -3970,6 +4774,9 @@ private:
             << " moe_enabled=" << (moe_enabled ? 1 : 0)
             << " moe_resident_bytes=" << moe_stats.resident_bytes
             << " moe_budget_bytes=" << moe_stats.budget_bytes
+            << " moe_budget_unbounded=" << (moe_stats.budget_unbounded ? 1 : 0)
+            << " moe_planner_safe_budget_bytes=" << moe_stats.planner_safe_budget_bytes
+            << " moe_planner_floor_bytes=" << moe_stats.planner_floor_bytes
             << " moe_expert_bytes=" << moe_stats.expert_bytes
             << " moe_streams=" << moe_stats.streams
             << " moe_hits=" << moe_stats.hits
@@ -3986,11 +4793,14 @@ private:
             << " moe_budget_reason=" << moe_budget_reason
             << " moe_budget_old_bytes=" << moe_budget_old_bytes
             << " moe_budget_new_bytes=" << moe_budget_new_bytes
-            << " moe_budget_warm_bytes=" << memory_governor_moe_budget_warm_bytes
+            << " moe_budget_warm_bytes=" << effective_moe_budget_warm_bytes
+            << " moe_warm_working_set_bytes=" << moe_stats.warm_working_set_bytes
+            << " moe_warm_working_set_groups=" << moe_stats.warm_working_set_groups
+            << " moe_warm_working_set_coverage=" << moe_stats.warm_working_set_coverage
             << " moe_budget_headroom_bytes=" << moe_budget_headroom_bytes
             << " moe_budget_pressure_shrink_pct=" << memory_governor_moe_budget_pressure_shrink_pct
             << " moe_budget_pressure_shrink_max_bytes=" <<
-                memory_governor_moe_budget_pressure_shrink_max_bytes
+                effective_moe_budget_pressure_shrink_max_bytes
             << " moe_budget_delta_evictions=" << moe_budget_delta_evictions
             << " moe_budget_delta_bytes_read=" << moe_budget_delta_bytes_read
             << " moe_budget_delta_prefetch_late=" << moe_budget_delta_prefetch_late
@@ -4002,6 +4812,8 @@ private:
             << " global_optimizer_enabled=" << (memory_governor_global_optimizer_enabled ? 1 : 0)
             << " global_optimizer_decision=" << global_optimizer_decision
             << " global_hard_headroom_bytes=" << memory_governor_global_hard_headroom_bytes
+            << " global_effective_hard_headroom_bytes=" << effective_hard_headroom_bytes
+            << " global_derived_hard_headroom_bytes=" << derived_hard_headroom_bytes
             << " global_available_growth_bytes=" << global_available_growth_bytes
             << " global_dense_grant_bytes=" << global_dense_grant_bytes
             << " global_dense_utility=" << global_dense_utility
@@ -4013,6 +4825,10 @@ private:
             << " global_dense_recommended_lock_bytes=" << global_dense_recommended_lock_bytes
             << " global_dense_target_ring_slots=" << global_dense_target_ring_slots
             << " dense_repin_enabled=" << (memory_governor_dense_repin_enabled ? 1 : 0)
+            << " dense_repin_async_enabled=" << (memory_governor_dense_repin_async_enabled ? 1 : 0)
+            << " dense_repin_idle_only=" << (memory_governor_dense_repin_idle_only ? 1 : 0)
+            << " dense_repin_cooldown_samples=" << memory_governor_dense_repin_cooldown_samples
+            << " dense_repin_next_sample=" << memory_governor_dense_repin_next_sample
             << " dense_repin_grant_bytes=" << dense_repin_grant_bytes
             << " dense_repin_headroom_bytes=" << dense_repin_headroom_bytes
             << " dense_repin_attempted=" << (dense_repin_result.attempted ? 1 : 0)
@@ -4022,6 +4838,8 @@ private:
             << " dense_repin_saved_per_token_bytes=" << dense_repin_result.saved_per_token_bytes
             << " dense_repin_candidates=" << dense_repin_result.candidates
             << " dense_repin_pinned_tensors=" << dense_repin_result.pinned_tensors
+            << " dense_repin_io_us=" << dense_repin_result.io_us
+            << " dense_repin_elapsed_us=" << dense_repin_result.elapsed_us
             << " dense_repin_roi=" << dense_repin_result.roi
             << " dense_repin_reason=" << dense_repin_result.reason
             << " dense_resize_attempted=" << (dense_resize_result.attempted ? 1 : 0)
@@ -4031,6 +4849,10 @@ private:
             << " dense_resize_old_bytes=" << dense_resize_result.old_bytes
             << " dense_resize_new_bytes=" << dense_resize_result.new_bytes
             << " dense_resize_reason=" << dense_resize_result.reason
+            << " dense_ring_shrink_enabled=" << (memory_governor_dense_runtime_ring_shrink_enabled ? 1 : 0)
+            << " dense_ring_shrink_required_bytes=" << dense_ring_shrink_required_bytes
+            << " dense_ring_shrink_releasable_bytes=" << dense_ring_shrink_releasable_bytes
+            << " dense_ring_shrink_target_slots=" << dense_ring_shrink_target_slots
             << " global_moe_grant_bytes=" << global_moe_grant_bytes
             << " global_moe_utility=" << global_moe_utility
             << " global_kv_utility=" << global_kv_utility
@@ -4104,6 +4926,13 @@ private:
             << " prefetch_budget_kv_resume_overruns=" << prefetch_budget_kv_overruns
             << " dense_prefetch_budget_dropped=" << flex_stats.prefetch_budget_dropped
             << " moe_prefetch_budget_dropped=" << moe_stats.prefetch_budget_dropped
+            << " governor_async_actions_enabled=" << (memory_governor_async_actions_enabled ? 1 : 0)
+            << " governor_async_queue_depth=" << memory_governor_async_queue_depth.load(std::memory_order_relaxed)
+            << " governor_async_submitted=" << memory_governor_async_submitted.load(std::memory_order_relaxed)
+            << " governor_async_completed=" << memory_governor_async_completed.load(std::memory_order_relaxed)
+            << " governor_async_rejected=" << memory_governor_async_rejected.load(std::memory_order_relaxed)
+            << " governor_async_dropped=" << memory_governor_async_dropped.load(std::memory_order_relaxed)
+            << " governor_async_relieved_drained_bytes=" << async_relieved_drained_bytes
             << " clean_reclaim_enabled=" << (memory_governor_clean_reclaim_enabled ? 1 : 0)
             << " clean_reclaim_ranked_enabled=" << (memory_governor_clean_reclaim_ranked_enabled ? 1 : 0)
             << " clean_reclaim_attempted=" << (clean_result.attempted ? 1 : 0)
@@ -4761,6 +5590,7 @@ private:
         if (!init_kv_pressure_sampler()) {
             return false;
         }
+        memory_governor_async_start();
 #endif
 
         // wiring up server queues

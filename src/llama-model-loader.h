@@ -85,6 +85,7 @@ struct llama_model_loader {
     llama_files files;
     llama_ftype ftype;
     llama_fver  fver;
+    std::string fname_model;
 
     llama_mmaps mappings;
 

@@ -38,6 +38,7 @@ struct llama_flex_params {
     bool   direct_io      = true; // use O_DIRECT for streaming reads when possible
     bool   debug_log      = false;
     bool   sched_auto     = false; // cap-aware scheduler: tune ring after pinning
+    bool   planner_applied = false; // load-time global planner selected ring/ahead/lock
     bool   adaptive_ahead = true;  // runtime prefetch-depth controller
     int    ring_layers    = 4;    // k: number of layer slots kept resident
     int    prefetch_ahead = 2;    // initial/fixed layers ahead to stream
@@ -77,6 +78,12 @@ struct llama_flex_stats {
     uint64_t delta_locked_tensors = 0;
     uint64_t delta_pin_attempts = 0;
     uint64_t delta_pin_failures = 0;
+    uint64_t delta_pin_async_submitted = 0;
+    uint64_t delta_pin_async_completed = 0;
+    uint64_t delta_pin_async_rejected = 0;
+    uint64_t delta_pin_async_pending = 0;
+    uint64_t delta_pin_async_last_io_us = 0;
+    uint64_t delta_pin_async_last_elapsed_us = 0;
     size_t   ring_bytes      = 0;  // total bytes held by the ring
     size_t   slot_bytes      = 0;  // bytes charged for one streamed layer slot
     size_t   locked_bytes    = 0;  // bytes pinned by balanced locking
@@ -121,6 +128,8 @@ struct llama_flex_delta_pin_result {
     uint64_t saved_per_token_bytes = 0;
     uint64_t candidates = 0;
     uint64_t pinned_tensors = 0;
+    uint64_t io_us = 0;
+    uint64_t elapsed_us = 0;
     double roi = 0.0;
     const char * reason = "none";
 };
@@ -186,6 +195,11 @@ llama_flex_resize_result llama_flex_resize_ring(
         int                 target_slots);
 
 llama_flex_delta_pin_result llama_flex_delta_pin(
+        llama_flex_context & ctx,
+        uint64_t             budget_bytes,
+        double               min_roi);
+
+llama_flex_delta_pin_result llama_flex_delta_pin_async(
         llama_flex_context & ctx,
         uint64_t             budget_bytes,
         double               min_roi);

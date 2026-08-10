@@ -46,7 +46,10 @@ struct llama_moe_buffer_params {
     bool   vnni_q2_swiglu = true;    // allow the VNNI q2 path for fused gate/up SWIGLU
     int    vnni_block = 64;          // activation int8 quantization block; q2 VNNI currently uses 64-column chunks
     int    avx512_prefetch = 0;      // q2-hier kernel prefetch distance in MWQ blocks; 0 disables explicit prefetch
-    size_t budget_bytes = 1024ull * 1024ull * 1024ull; // resident-expert byte budget; 0 = unbounded
+    size_t budget_bytes = 1024ull * 1024ull * 1024ull; // resident-expert byte budget when bounded
+    bool   budget_unbounded = false; // explicit unbounded mode; separates unlimited from a zero-byte bounded budget
+    size_t planner_safe_budget_bytes = 0; // load-time safe budget derived from memory.max
+    size_t planner_floor_bytes = 0;       // non-reclaimable load-time floor
     int    n_workers    = 2;         // parallel prefetch workers (raise to lift effective
                                      // read bandwidth on NVMe: single-thread O_DIRECT
                                      // random reads under-utilise the device)
@@ -77,12 +80,16 @@ struct llama_moe_buffer_params {
     int    active_window = 4;        // future-use distance protected by Belady-style eviction
     int    group_cooldown_tokens = 0; // protect recently used (layer, expert) groups for N decode-token epochs
     int    pin_refresh_interval = 128; // group touches between top-score pin refreshes
+    double warm_coverage = 0.95;    // target per-layer expert probability mass for warm-start sizing
     std::string sidecar_path;        // optional exact low-bit/MWQ sidecar data source
 };
 
 struct llama_moe_buffer_stats {
     size_t   resident_bytes = 0;
     size_t   budget_bytes = 0;
+    bool     budget_unbounded = false;
+    size_t   planner_safe_budget_bytes = 0;
+    size_t   planner_floor_bytes = 0;
     size_t   expert_bytes = 0;
     uint64_t streams = 0;
     uint64_t hits = 0;
@@ -96,6 +103,9 @@ struct llama_moe_buffer_stats {
     uint64_t prefetch_budget_dropped = 0;
     size_t   prefetch_budget_bytes = 0;
     size_t   prefetch_budget_available_bytes = 0;
+    size_t   warm_working_set_bytes = 0;
+    uint64_t warm_working_set_groups = 0;
+    double   warm_working_set_coverage = 0.0;
 };
 
 struct llama_moe_buffer_reclaim_result {
@@ -114,8 +124,24 @@ size_t llama_moe_buffer_expert_bytes(const llama_moe_buffer_context * ctx);
 
 // Override the resident-expert byte budget after registration (for adaptive
 // budgeting computed once the expert total and available memory are known).
-// 0 = unbounded.
 void llama_moe_buffer_set_budget(llama_moe_buffer_context * ctx, size_t budget_bytes);
+
+// Install the load-time memory.max plan. This makes the bounded/unbounded
+// state explicit so a bounded zero-byte budget is not confused with unlimited.
+void llama_moe_buffer_set_budget_plan(
+        llama_moe_buffer_context * ctx,
+        size_t                    budget_bytes,
+        bool                      budget_unbounded,
+        size_t                    planner_safe_budget_bytes,
+        size_t                    planner_floor_bytes);
+
+// Estimate the warm-start resident working set from the registered
+// (layer, expert) groups. Uses observed per-request/historical group scores when
+// present, and the structural top-k/uniform prior before any routing history
+// exists.
+size_t llama_moe_buffer_warm_working_set_bytes(
+        llama_moe_buffer_context * ctx,
+        double                    coverage);
 
 // Register one `*_exps` weight tensor: allocate a full-size anonymous buffer,
 // repoint exps->data to it, and record per-expert file metadata. `fd` is the

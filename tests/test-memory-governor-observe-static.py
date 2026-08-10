@@ -82,8 +82,34 @@ class MemoryGovernorObserveStaticTest(unittest.TestCase):
             "prefetch_budget_dense_bytes",
             "prefetch_budget_moe_bytes",
             "prefetch_budget_kv_resume_used_bytes",
+            "governor_async_actions_enabled",
+            "governor_async_queue_depth",
+            "governor_async_submitted",
+            "governor_async_completed",
+            "governor_async_rejected",
+            "governor_async_dropped",
+            "governor_async_relieved_drained_bytes",
         ]:
             self.assertIn(field, SERVER_CONTEXT)
+
+    def test_async_governor_action_executor_is_present(self):
+        self.assertIn("LLAMA_MEMORY_GOVERNOR_ASYNC_ACTIONS", SERVER_CONTEXT)
+        self.assertIn("LLAMA_MEMORY_GOVERNOR_ASYNC_QUEUE_DEPTH", SERVER_CONTEXT)
+        self.assertIn("memory_governor_async_action", SERVER_CONTEXT)
+        self.assertIn("memory_governor_async_submit", SERVER_CONTEXT)
+        self.assertIn("memory_governor_async_worker_loop", SERVER_CONTEXT)
+        self.assertIn("memory_governor_async_stop_worker", SERVER_CONTEXT)
+        self.assertIn("memory_governor_async_relieved_pending_bytes", SERVER_CONTEXT)
+        self.assertIn('"memory_governor_async_action"', SERVER_CONTEXT)
+        for token in [
+            "dense_clean_reclaim",
+            "moe_clean_reclaim",
+            "kv_global_release",
+            "kv_sequence_offload",
+            "kv_sequence_slot_state_offload",
+            "async_enqueued",
+        ]:
+            self.assertIn(token, SERVER_CONTEXT)
 
     def test_observe_path_scores_would_candidates(self):
         observe = self.observe_function()
@@ -192,11 +218,14 @@ class MemoryGovernorObserveStaticTest(unittest.TestCase):
         self.assertIn("LLAMA_MEMORY_GOVERNOR_REALLOCATION_MIN_GRANT_MB", SERVER_CONTEXT)
         self.assertIn("LLAMA_MEMORY_GOVERNOR_REALLOCATION_HARD_GUARD_MB", SERVER_CONTEXT)
         self.assertIn("reallocation_reason = \"moe_credit_grant\"", observe)
+        self.assertIn("reallocation_reason = \"moe_emergency_working_set\"", observe)
         self.assertIn("reallocation_credit_earned_bytes", observe)
         self.assertIn("reallocation_moe_grant_bytes", observe)
         self.assertIn("moe_budget_reason = \"fast_start\"", observe)
         self.assertIn("moe_budget_reason = \"pressure_smooth\"", observe)
-        self.assertIn("moe_budget_reason = thrash ? \"thrash_headroom\" : \"headroom_probe\"", observe)
+        self.assertIn("moe_warm_working_set_bytes", observe)
+        self.assertIn("moe_warm_working_set_groups", observe)
+        self.assertIn("moe_warm_working_set_coverage", observe)
         self.assertIn("memory_governor_prefetch_budget_enabled", observe)
         self.assertIn("llama_flex_set_prefetch_budget", observe)
         self.assertIn("llama_moe_buffer_set_prefetch_budget", observe)
@@ -217,6 +246,8 @@ class MemoryGovernorObserveStaticTest(unittest.TestCase):
         self.assertIn("ctx.resident_bytes", impl)
         self.assertIn("ctx.params.budget_bytes", impl)
         self.assertIn("ctx.expert_total", impl)
+        self.assertIn("llama_moe_buffer_warm_working_set_bytes", MOE_H)
+        self.assertIn("warm_working_set_bytes", MOE_H)
 
 
 if __name__ == "__main__":
