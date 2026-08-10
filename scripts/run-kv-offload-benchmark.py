@@ -45,6 +45,23 @@ DEFAULT_SAMPLE_INTERVAL = 0.10
 DEFAULT_MAX_BLOCKS = 64
 DEFAULT_HEALTH_TIMEOUT = 30.0
 DEFAULT_REQUEST_TIMEOUT = 180.0
+CANONICAL_BUDGET_RELEASE_TARGETS = (
+    2_684_354_560,
+    2_147_483_648,
+    1_610_612_736,
+)
+CANONICAL_BUDGET_OFFLOAD_TARGETS = (
+    1_073_741_824,
+    805_306_368,
+    536_870_912,
+    268_435_456,
+)
+CANONICAL_BUDGET_ACTION_TARGET_BYTES = 268_435_456
+CANONICAL_BUDGET_MAX_BLOCKS = 64
+# Reference-only anchors retained for manifest metadata; they never drive a run.
+REFERENCE_B_FULL_BYTES = 3_221_028_864
+REFERENCE_B_RELEASE_FLOOR_BYTES = 1_386_479_616
+BUDGET_SWEEP_ORDER_MODE = "interleaved_reverse"
 CANONICAL_SERVER_OPTIONS = {"-m", "--model", "--host", "--port"}
 IDENTITY_BIND_TIMEOUT_SEC = 0.5
 PRESSURE_BASIS_AUTHORITIES = {"cgroup_finite", "rss_absolute"}
@@ -592,19 +609,122 @@ def normalize_plan(value: Any, cases: dict[str, dict[str, Any]]) -> list[dict[st
     return plan
 
 
+def budget_case_signature(item: dict[str, Any]) -> tuple[str, int | None]:
+    return item["policy"], item["kv_target_bytes"]
+
+
+def normalize_budget_sweep(
+        value: Any,
+        cases: dict[str, dict[str, Any]],
+        plan: list[dict[str, Any]],
+        max_blocks: int,
+        run_kind: str,
+) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    sweep = validate_mapping(
+        value,
+        {
+            "release_targets_bytes", "offload_targets_bytes", "action_target_bytes",
+            "max_blocks", "rounds", "order_mode",
+        },
+        "budget_sweep",
+    )
+
+    def target_list(raw: Any, label: str) -> tuple[int, ...]:
+        if not isinstance(raw, list) or any(
+                isinstance(item, bool) or not isinstance(item, int) or item <= 0
+                for item in raw):
+            raise RunnerError(f"{label} must be a list of positive absolute byte values")
+        if len(raw) != len(set(raw)) or raw != sorted(raw, reverse=True):
+            raise RunnerError(f"{label} must be unique and in descending explicit-byte order")
+        return tuple(raw)
+
+    release_targets = target_list(
+        sweep["release_targets_bytes"], "budget_sweep.release_targets_bytes")
+    offload_targets = target_list(
+        sweep["offload_targets_bytes"], "budget_sweep.offload_targets_bytes")
+    if release_targets != CANONICAL_BUDGET_RELEASE_TARGETS:
+        raise RunnerError(
+            "budget_sweep.release_targets_bytes must use the canonical 2.50/2.00/1.50 GiB bytes")
+    if offload_targets != CANONICAL_BUDGET_OFFLOAD_TARGETS:
+        raise RunnerError(
+            "budget_sweep.offload_targets_bytes must use the canonical 1.00/0.75/0.50/0.25 GiB bytes")
+    action_target = sweep["action_target_bytes"]
+    if isinstance(action_target, bool) or not isinstance(action_target, int) or action_target <= 0:
+        raise RunnerError("budget_sweep.action_target_bytes must be a positive absolute byte value")
+    if action_target != CANONICAL_BUDGET_ACTION_TARGET_BYTES:
+        raise RunnerError("budget_sweep.action_target_bytes must be exactly 256 MiB")
+    if any(
+            item["policy"] in BUDGET_POLICIES
+            and item["action_target_bytes"] != action_target
+            for item in cases.values()):
+        raise RunnerError("budget_sweep.action_target_bytes differs from a budget case")
+    sweep_max_blocks = sweep["max_blocks"]
+    if isinstance(sweep_max_blocks, bool) or not isinstance(sweep_max_blocks, int) or sweep_max_blocks <= 0:
+        raise RunnerError("budget_sweep.max_blocks must be a positive integer")
+    if sweep_max_blocks != CANONICAL_BUDGET_MAX_BLOCKS or max_blocks != sweep_max_blocks:
+        raise RunnerError("budget_sweep and spec.max_blocks must both be exactly 64")
+    rounds = sweep["rounds"]
+    if isinstance(rounds, bool) or not isinstance(rounds, int) or rounds <= 0:
+        raise RunnerError("budget_sweep.rounds must be a positive integer")
+    if run_kind == "formal" and rounds != 2:
+        raise RunnerError("formal budget_sweep requires exactly two independent rounds")
+    if sweep["order_mode"] != BUDGET_SWEEP_ORDER_MODE:
+        raise RunnerError("budget_sweep.order_mode must be interleaved_reverse")
+
+    expected_signatures = [("resident", None)]
+    expected_signatures.extend(("release_only", target) for target in release_targets)
+    expected_signatures.extend(("v2", target) for target in offload_targets)
+    expected_set = set(expected_signatures)
+    planned_rounds: dict[int, list[dict[str, Any]]] = {}
+    for item in plan:
+        planned_rounds.setdefault(item["round"], []).append(item)
+    if sorted(planned_rounds) != list(range(1, rounds + 1)):
+        raise RunnerError("budget_sweep rounds must be numbered consecutively from one")
+    for round_id, entries in planned_rounds.items():
+        if [item["run_order"] for item in entries] != list(range(1, len(entries) + 1)):
+            raise RunnerError(f"budget_sweep round {round_id} run_order must be consecutive")
+        signatures = [budget_case_signature(item) for item in entries]
+        if len(entries) != len(expected_signatures) or set(signatures) != expected_set:
+            raise RunnerError(
+                f"budget_sweep round {round_id} must contain one Resident, all RELEASE targets, and all V2 targets")
+        if len(signatures) != len(set(signatures)):
+            raise RunnerError(f"budget_sweep round {round_id} contains duplicate target cases")
+        budget_signatures = [signature for signature in signatures if signature[0] != "resident"]
+        if any(
+                budget_signatures[index][0] == budget_signatures[index + 1][0]
+                for index in range(len(budget_signatures) - 1)):
+            raise RunnerError(
+                f"budget_sweep round {round_id} must interleave RELEASE and V2 cases")
+    if rounds == 2:
+        first = [budget_case_signature(item) for item in planned_rounds[1]]
+        second = [budget_case_signature(item) for item in planned_rounds[2]]
+        if second != list(reversed(first)):
+            raise RunnerError("budget_sweep rounds must use reverse order without randomization")
+
+    return {
+        "release_targets_bytes": list(release_targets),
+        "offload_targets_bytes": list(offload_targets),
+        "action_target_bytes": action_target,
+        "max_blocks": sweep_max_blocks,
+        "rounds": rounds,
+        "order_mode": sweep["order_mode"],
+    }
+
+
 def validate_spec(raw: Any) -> tuple[dict[str, Any], dict[str, dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     if isinstance(raw, dict):
         raw = dict(raw)
         raw.setdefault("pressure_basis", dict(DEFAULT_PRESSURE_BASIS))
-    spec = validate_mapping(
-        raw,
-        {
-            "schema_version", "protocol", "phase", "run_kind", "run_mode", "binary", "model", "model_quantization",
-            "server_args", "environment", "pressure_basis", "workload", "cases", "run_order", "sampler",
-            "cgroup", "max_blocks", "health_timeout_seconds", "request_timeout_seconds",
-        },
-        "spec",
-    )
+    spec_keys = {
+        "schema_version", "protocol", "phase", "run_kind", "run_mode", "binary", "model", "model_quantization",
+        "server_args", "environment", "pressure_basis", "workload", "cases", "run_order", "sampler",
+        "cgroup", "max_blocks", "health_timeout_seconds", "request_timeout_seconds",
+    }
+    if isinstance(raw, dict) and "budget_sweep" in raw:
+        spec_keys.add("budget_sweep")
+    spec = validate_mapping(raw, spec_keys, "spec")
     if spec["schema_version"] != SCHEMA_VERSION or spec["protocol"] != PROTOCOL:
         raise RunnerError("spec protocol/schema version is unsupported")
     if spec["phase"] not in {"resident_baseline", "coarse_target", "local_target", "representative"}:
@@ -638,6 +758,15 @@ def validate_spec(raw: Any) -> tuple[dict[str, Any], dict[str, dict[str, Any]], 
     workload = normalize_workload(spec["workload"])
     cases = normalize_cases(spec["cases"])
     plan = normalize_plan(spec["run_order"], cases)
+    budget_sweep = normalize_budget_sweep(
+        spec.get("budget_sweep"), cases, plan, max_blocks, spec["run_kind"])
+    if (
+        budget_sweep is not None
+        and spec["run_kind"] == "formal"
+        and spec["run_mode"] == "characterization"
+        and workload["repeat"] < 2
+    ):
+        raise RunnerError("formal budget_sweep requires repeat >= 2 for post-resume steady measurements")
     if any(item["policy"] == "release_only" for item in plan) and spec["run_mode"] != "characterization":
         raise RunnerError("release_only policy is available only in characterization mode")
     if spec["run_mode"] == "qualification":
@@ -660,6 +789,8 @@ def validate_spec(raw: Any) -> tuple[dict[str, Any], dict[str, dict[str, Any]], 
     normalized["max_blocks"] = max_blocks
     normalized["health_timeout_seconds"] = health_timeout
     normalized["request_timeout_seconds"] = request_timeout
+    if budget_sweep is not None:
+        normalized["budget_sweep"] = budget_sweep
     return normalized, cases, plan, workload
 
 
@@ -723,7 +854,8 @@ def runtime_environment(
         "LLAMA_KV_PAGED_PREFETCH_PHASE_TRACE": "0",
         "LLAMA_KV_RESUME_STAGE_TIMING": "1",
         "LLAMA_KV_G0_S1_RESIDENT_OBSERVATION": (
-            "1" if case["policy"] == "v2" else "preflight"),
+            "both" if case["policy"] == "v2" and spec["run_mode"] == "characterization"
+            else "1" if case["policy"] == "v2" else "preflight"),
         "LLAMA_KV_PRESSURE_SAMPLE_INTERVAL_MS": "100",
         "LLAMA_KV_PRESSURE_LOG_INTERVAL_MS": "1000",
         "LLAMA_KV_PRESSURE_SAMPLER": "1",

@@ -73,6 +73,13 @@ class UnifiedPressureActionStaticTest(unittest.TestCase):
         self.assertIn("LLAMA_KV_G0_S1_RESIDENT_OBSERVATION", CONTEXT)
         self.assertIn('std::strcmp(resident_observation, "1")', CONTEXT)
         self.assertIn('std::strcmp(resident_observation, "preflight")', CONTEXT)
+        self.assertIn('std::strcmp(resident_observation, "both")', CONTEXT)
+        init_start = CONTEXT.index("const char * resident_observation =")
+        init_end = CONTEXT.index("const char * resume_stage_timing =", init_start)
+        init = CONTEXT[init_start:init_end]
+        self.assertIn("resident_observation_both", init)
+        self.assertIn("kv_g0_s1_resident_observation = resident_observation_both", init)
+        self.assertIn("kv_g0_s1_resident_preflight = resident_observation_both", init)
 
         callback_start = CONTEXT.index("[mem, observe_resident = kv_g0_s1_resident_observation]")
         callback_end = CONTEXT.index("} : server_kv_pressure_action_ops {}", callback_start)

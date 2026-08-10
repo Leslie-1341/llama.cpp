@@ -1823,8 +1823,12 @@ private:
         GGML_ASSERT(!sleeping);
 
         const char * resident_observation = std::getenv("LLAMA_KV_G0_S1_RESIDENT_OBSERVATION");
-        kv_g0_s1_resident_observation = resident_observation && std::strcmp(resident_observation, "1") == 0;
-        kv_g0_s1_resident_preflight = resident_observation && std::strcmp(resident_observation, "preflight") == 0;
+        const bool resident_observation_both = resident_observation &&
+            std::strcmp(resident_observation, "both") == 0;
+        kv_g0_s1_resident_observation = resident_observation_both ||
+            (resident_observation && std::strcmp(resident_observation, "1") == 0);
+        kv_g0_s1_resident_preflight = resident_observation_both ||
+            (resident_observation && std::strcmp(resident_observation, "preflight") == 0);
         const char * resume_stage_timing = std::getenv("LLAMA_KV_RESUME_STAGE_TIMING");
         kv_resume_stage_timing = resume_stage_timing && std::strcmp(resume_stage_timing, "1") == 0;
 

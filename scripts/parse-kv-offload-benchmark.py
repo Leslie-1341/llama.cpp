@@ -26,6 +26,24 @@ SUPPORTED_RUN_MODES = {"qualification", "characterization"}
 CASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 UINT = re.compile(r"^[0-9]+$")
 SIGNED_INT = re.compile(r"^-?[0-9]+$")
+CANONICAL_BUDGET_RELEASE_TARGETS = (
+    2_684_354_560,
+    2_147_483_648,
+    1_610_612_736,
+)
+CANONICAL_BUDGET_OFFLOAD_TARGETS = (
+    1_073_741_824,
+    805_306_368,
+    536_870_912,
+    268_435_456,
+)
+CANONICAL_BUDGET_ACTION_TARGET_BYTES = 268_435_456
+CANONICAL_BUDGET_MAX_BLOCKS = 64
+# Reference-only anchors from prior physical observations. They never supply
+# actual resident values or participate in budget-curve eligibility gates.
+REFERENCE_B_FULL_BYTES = 3_221_028_864
+REFERENCE_B_RELEASE_FLOOR_BYTES = 1_386_479_616
+BUDGET_SWEEP_ORDER_MODE = "interleaved_reverse"
 CANONICAL_SERVER_OPTIONS = {"-m", "--model", "--host", "--port"}
 PRESSURE_BASIS_AUTHORITIES = {"cgroup_finite", "rss_absolute"}
 SAMPLE_HEADER = [
@@ -413,8 +431,116 @@ def expanded_request_plan(
     return result
 
 
+def budget_case_signature(item: dict[str, Any]) -> tuple[str, int | None]:
+    return item["policy"], item["kv_target_bytes"]
+
+
+def validate_budget_sweep(
+        value: Any,
+        cases: dict[str, dict[str, Any]],
+        plan: list[dict[str, Any]],
+        max_blocks: int,
+        run_kind: str,
+) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    sweep = exact(
+        value,
+        {
+            "release_targets_bytes", "offload_targets_bytes", "action_target_bytes",
+            "max_blocks", "rounds", "order_mode",
+        },
+        "spec.budget_sweep",
+    )
+
+    def target_list(raw: Any, label: str) -> tuple[int, ...]:
+        if not isinstance(raw, list) or any(
+                isinstance(item, bool) or not isinstance(item, int) or item <= 0
+                for item in raw):
+            raise ParseError(f"{label} must be a list of positive absolute byte values")
+        if len(raw) != len(set(raw)) or raw != sorted(raw, reverse=True):
+            raise ParseError(f"{label} must be unique and in descending explicit-byte order")
+        return tuple(raw)
+
+    release_targets = target_list(
+        sweep["release_targets_bytes"], "spec.budget_sweep.release_targets_bytes")
+    offload_targets = target_list(
+        sweep["offload_targets_bytes"], "spec.budget_sweep.offload_targets_bytes")
+    if release_targets != CANONICAL_BUDGET_RELEASE_TARGETS:
+        raise ParseError(
+            "spec.budget_sweep.release_targets_bytes must use the canonical 2.50/2.00/1.50 GiB bytes")
+    if offload_targets != CANONICAL_BUDGET_OFFLOAD_TARGETS:
+        raise ParseError(
+            "spec.budget_sweep.offload_targets_bytes must use the canonical 1.00/0.75/0.50/0.25 GiB bytes")
+    action_target = sweep["action_target_bytes"]
+    if isinstance(action_target, bool) or not isinstance(action_target, int) or action_target <= 0:
+        raise ParseError("spec.budget_sweep.action_target_bytes must be a positive absolute byte value")
+    if action_target != CANONICAL_BUDGET_ACTION_TARGET_BYTES:
+        raise ParseError("spec.budget_sweep.action_target_bytes must be exactly 256 MiB")
+    if any(
+            item["policy"] in BUDGET_POLICIES
+            and item["action_target_bytes"] != action_target
+            for item in cases.values()):
+        raise ParseError("spec.budget_sweep.action_target_bytes differs from a budget case")
+    sweep_max_blocks = sweep["max_blocks"]
+    if isinstance(sweep_max_blocks, bool) or not isinstance(sweep_max_blocks, int) or sweep_max_blocks <= 0:
+        raise ParseError("spec.budget_sweep.max_blocks must be a positive integer")
+    if sweep_max_blocks != CANONICAL_BUDGET_MAX_BLOCKS or max_blocks != sweep_max_blocks:
+        raise ParseError("spec.budget_sweep and spec.max_blocks must both be exactly 64")
+    rounds = sweep["rounds"]
+    if isinstance(rounds, bool) or not isinstance(rounds, int) or rounds <= 0:
+        raise ParseError("spec.budget_sweep.rounds must be a positive integer")
+    if run_kind == "formal" and rounds != 2:
+        raise ParseError("formal budget_sweep requires exactly two independent rounds")
+    if sweep["order_mode"] != BUDGET_SWEEP_ORDER_MODE:
+        raise ParseError("spec.budget_sweep.order_mode must be interleaved_reverse")
+
+    expected_signatures = [("resident", None)]
+    expected_signatures.extend(("release_only", target) for target in release_targets)
+    expected_signatures.extend(("v2", target) for target in offload_targets)
+    expected_set = set(expected_signatures)
+    planned_rounds: dict[int, list[dict[str, Any]]] = {}
+    for item in plan:
+        planned_rounds.setdefault(item["round"], []).append(item)
+    if sorted(planned_rounds) != list(range(1, rounds + 1)):
+        raise ParseError("spec.budget_sweep rounds must be numbered consecutively from one")
+    for round_id, entries in planned_rounds.items():
+        if [item["run_order"] for item in entries] != list(range(1, len(entries) + 1)):
+            raise ParseError(f"spec.budget_sweep round {round_id} run_order must be consecutive")
+        signatures = [budget_case_signature(item) for item in entries]
+        if len(entries) != len(expected_signatures) or set(signatures) != expected_set:
+            raise ParseError(
+                f"spec.budget_sweep round {round_id} must contain one Resident, all RELEASE targets, and all V2 targets")
+        if len(signatures) != len(set(signatures)):
+            raise ParseError(f"spec.budget_sweep round {round_id} contains duplicate target cases")
+        budget_signatures = [signature for signature in signatures if signature[0] != "resident"]
+        if any(
+                budget_signatures[index][0] == budget_signatures[index + 1][0]
+                for index in range(len(budget_signatures) - 1)):
+            raise ParseError(
+                f"spec.budget_sweep round {round_id} must interleave RELEASE and V2 cases")
+    if rounds == 2:
+        first = [budget_case_signature(item) for item in planned_rounds[1]]
+        second = [budget_case_signature(item) for item in planned_rounds[2]]
+        if second != list(reversed(first)):
+            raise ParseError("spec.budget_sweep rounds must use reverse order without randomization")
+
+    return {
+        "release_targets_bytes": list(release_targets),
+        "offload_targets_bytes": list(offload_targets),
+        "action_target_bytes": action_target,
+        "max_blocks": sweep_max_blocks,
+        "rounds": rounds,
+        "order_mode": sweep["order_mode"],
+        "reference_anchors": {
+            "b_full_bytes": REFERENCE_B_FULL_BYTES,
+            "b_release_floor_bytes": REFERENCE_B_RELEASE_FLOOR_BYTES,
+        },
+    }
+
+
 def validate_spec(spec: Any) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
-    value = exact(spec, SPEC_KEYS, "spec")
+    value = exact(spec, SPEC_KEYS, "spec", {"budget_sweep"})
     if value["schema_version"] != SCHEMA_VERSION or value["protocol"] != PROTOCOL:
         raise ParseError("spec protocol/schema mismatch")
     if value["phase"] not in {"resident_baseline", "coarse_target", "local_target", "representative"}:
@@ -509,6 +635,15 @@ def validate_spec(spec: Any) -> tuple[dict[str, dict[str, Any]], list[dict[str, 
             "kv_target_bytes": case["kv_target_bytes"],
             "action_target_bytes": case["action_target_bytes"],
         })
+    validate_budget_sweep(
+        value.get("budget_sweep"), cases, plan, max_blocks, value["run_kind"])
+    if (
+        value.get("budget_sweep") is not None
+        and value["run_kind"] == "formal"
+        and value["run_mode"] == "characterization"
+        and workload["repeat"] < 2
+    ):
+        raise ParseError("formal budget_sweep requires repeat >= 2 for post-resume steady measurements")
     if any(item["policy"] == "release_only" for item in plan) and value["run_mode"] != "characterization":
         raise ParseError("release_only policy is available only in characterization mode")
     if value["run_kind"] == "formal":
@@ -793,7 +928,9 @@ def validate_execution_environment(execution: dict[str, Any], case: dict[str, An
         raise ParseError(f"{label}: canonical pressure interval environment mismatch")
     if env.get("LLAMA_KV_PRESSURE_SAMPLER") != "1" or env.get("LLAMA_KV_RESUME_STAGE_TIMING") != "1":
         raise ParseError(f"{label}: canonical telemetry environment is incomplete")
-    expected_resident_observation = "1" if case["policy"] == "v2" else "preflight"
+    expected_resident_observation = (
+        "both" if case["policy"] == "v2" and spec["run_mode"] == "characterization"
+        else "1" if case["policy"] == "v2" else "preflight")
     if env.get("LLAMA_KV_G0_S1_RESIDENT_OBSERVATION") != expected_resident_observation:
         raise ParseError(f"{label}: physical resident observation mode mismatch")
     basis = spec["pressure_basis"]
@@ -1969,10 +2106,15 @@ def validate_characterization_causality(
             "resume_measurement": None,
             "post_resume_steady_measurements": [],
             "resident_after_fill": resident_after_fill["resident_bytes"],
+            "resident_after_fill_authority": "slots_physical",
             "resident_after_release_settle": settled_resident["resident_bytes"],
+            "resident_after_release_settle_authority": "slots_physical",
             "resident_after_offload_settle": None,
+            "resident_after_offload_settle_authority": "unavailable",
             "resident_settled": settled_resident["resident_bytes"],
+            "resident_settled_authority": "slots_physical",
             "resident_after_resume": settled_resident["resident_bytes"],
+            "resident_after_resume_authority": "slots_physical",
             "release_physical_relief_bytes": release_physical_relief,
             "release_physical_relief_authority": "phase_boundary_slots",
             "offload_physical_relief_bytes": 0,
@@ -2508,10 +2650,14 @@ def parse_run(artifact: pathlib.Path, plan: dict[str, Any], case: dict[str, Any]
         f"{label}.characterization",
     )
     allow_missing_v2_run_resident = (
-        spec["run_mode"] == "characterization"
-        and case["policy"] == "v2"
-        and characterization["settle"] is not None
-        and characterization["settle"]["status"] == "unmet_floor"
+        case["policy"] == "v2"
+        and (
+            spec["run_mode"] == "qualification"
+            or (
+                characterization["settle"] is not None
+                and characterization["settle"]["status"] == "unmet_floor"
+            )
+        )
     )
     slots_before = validate_slot_snapshot(
         run_dir / "slots_before.json",
@@ -2990,8 +3136,318 @@ def characterization_comparisons(
     return comparisons, aggregates
 
 
+def curve_numeric_summary(values: list[float | int]) -> dict[str, Any]:
+    if not values:
+        return {
+            "status": "UNAVAILABLE", "n": 0, "min": None, "max": None, "p50": None,
+        }
+    numeric = [float(value) for value in values]
+    return {
+        "status": "AVAILABLE", "n": len(numeric), "min": min(numeric),
+        "max": max(numeric), "p50": percentile(numeric, 0.50),
+    }
+
+
+def unavailable_curve_metric(unit: str) -> dict[str, Any]:
+    return {
+        "status": "UNAVAILABLE", "unit": unit, "n": 0,
+        "p50": None, "p95": None, "p99": None,
+    }
+
+
+def curve_point(
+        item: dict[str, Any], segment: str, baseline: dict[str, Any] | None,
+) -> dict[str, Any]:
+    policy = item["policy"]
+    if segment == "release_segment":
+        actual = item.get("resident_after_release_settle")
+        actual_authority = item.get("resident_after_release_settle_authority")
+        steady = item.get("performance") or {}
+        eligible = (
+            policy == "release_only"
+            and item.get("status") == "RELEASE_SETTLED"
+            and item.get("performance_eligible") is True
+            and isinstance(actual, int)
+            and actual_authority == "slots_physical"
+        )
+        exclusion_reason = None if eligible else (
+            "release_no_candidate_floor_probe"
+            if item.get("release_terminal") == "release_no_candidate"
+            else "RELEASE target is not physically settled")
+    else:
+        actual = item.get("resident_settled")
+        actual_authority = item.get("resident_settled_authority")
+        steady = item.get("post_resume_steady_performance") or {}
+        eligible = (
+            policy == "v2"
+            and item.get("status") == "TARGET_REACHED"
+            and isinstance(actual, int)
+            and actual_authority == "slots_physical"
+            and item.get("total_physical_relief_bytes") is not None
+        )
+        exclusion_reason = None if eligible else (
+            "UNMET_FLOOR_without_independent_physical_authority"
+            if item.get("status") == "UNMET_FLOOR"
+            and actual_authority != "slots_physical"
+            else "V2 point requires TARGET_REACHED and independent physical authority")
+    requested = item.get("requested_target_bytes")
+    io = item.get("io") or {}
+    resume = item.get("resume") or {}
+    k2 = item.get("k2") or {}
+    if not isinstance(requested, int) or requested <= 0:
+        raise ParseError(f"{item.get('run_id', 'budget run')}: requested target is invalid")
+    baseline_bytes = baseline.get("resident_after_fill") if baseline else None
+    if eligible and isinstance(baseline_bytes, int):
+        memory_saved_bytes = baseline_bytes - actual
+        memory_saved_ratio = memory_saved_bytes / baseline_bytes if baseline_bytes else None
+    else:
+        memory_saved_bytes = item.get("memory_saved_bytes") if eligible else None
+        memory_saved_ratio = item.get("memory_saved_ratio") if eligible else None
+    metrics = {
+        name: steady.get(name, unavailable_curve_metric(unit))
+        for name, unit in (
+            ("e2e_ms", "ms"),
+            ("tpot_ms_per_token", "ms/token"),
+            ("throughput_tokens_per_second", "tokens/s"),
+            ("ttft_ms", "ms"),
+        )
+    }
+    point = {
+        "run_id": item["run_id"],
+        "case_id": item["case_id"],
+        "round": item["round"],
+        "policy": policy,
+        "requested_target_bytes": requested,
+        "action_target_bytes": item.get("action_target_bytes"),
+        "actual_settled_resident_bytes": actual if eligible else None,
+        "actual_resident_bytes": actual if eligible else None,
+        "actual_resident_authority": actual_authority if eligible else "UNAVAILABLE",
+        "target_error_bytes": actual - requested if eligible else None,
+        "baseline_resident_bytes": baseline_bytes,
+        "release_physical_relief_bytes": item.get("release_physical_relief_bytes"),
+        "release_physical_relief_authority": item.get("release_physical_relief_authority"),
+        "offload_physical_relief_bytes": item.get("offload_physical_relief_bytes"),
+        "offload_physical_relief_authority": item.get("offload_physical_relief_authority"),
+        "total_physical_relief_bytes": item.get("total_physical_relief_bytes"),
+        "total_physical_relief_authority": item.get("total_physical_relief_authority"),
+        "physical_relief": {
+            "release_bytes": item.get("release_physical_relief_bytes"),
+            "release_authority": item.get("release_physical_relief_authority"),
+            "offload_bytes": item.get("offload_physical_relief_bytes"),
+            "offload_authority": item.get("offload_physical_relief_authority"),
+            "total_bytes": item.get("total_physical_relief_bytes"),
+            "total_authority": item.get("total_physical_relief_authority"),
+        },
+        "memory_saved_bytes": memory_saved_bytes,
+        "memory_saved_ratio": memory_saved_ratio,
+        "release": item.get("release"),
+        "offload": item.get("offload"),
+        "actions": {
+            "release": (item.get("release") or {}).get("actions"),
+            "offload": (item.get("offload") or {}).get("actions"),
+        },
+        "blocks": {
+            "release": (item.get("release") or {}).get("blocks"),
+            "offload": (item.get("offload") or {}).get("blocks"),
+        },
+        "backing_io": {
+            key: int(io[key]) if key in io else None
+            for key in (
+                "block_swap_out_calls", "block_swap_in_calls", "backing_read_syscalls",
+                "backing_write_syscalls", "bytes_read", "bytes_written",
+            )
+        },
+        "resume": resume,
+        "resume_restored_bytes": resume.get("restored_bytes"),
+        "resume_gate_us": resume.get("gate_us"),
+        "resume_total_us": resume.get("total_us"),
+        "k2": k2,
+        "k2_read_us": k2.get("read_us"),
+        "k2_unpack_us": k2.get("unpack_us"),
+        "k2_prefault": k2.get("prefault"),
+        "k2_scatter": k2.get("scatter"),
+        "staging_peak_bytes": item.get("transient_staging_peak_bytes"),
+        "staging_bound_bytes": item.get("transient_staging_bound_bytes"),
+        "performance": metrics,
+        "steady_performance": steady,
+        "curve_eligible": eligible,
+        "curve_exclusion_reason": exclusion_reason,
+    }
+    return point
+
+
+def curve_target_aggregate(points: list[dict[str, Any]], target: int) -> dict[str, Any]:
+    selected = [point for point in points if point["requested_target_bytes"] == target]
+    def values(key: str) -> list[float | int]:
+        return [point[key] for point in selected if point.get(key) is not None]
+    performance = {
+        name: curve_numeric_summary([
+            metric["p50"] for point in selected
+            for metric in [point["performance"].get(name, {})]
+            if metric.get("status") == "AVAILABLE" and metric.get("p50") is not None
+        ])
+        for name in ("e2e_ms", "tpot_ms_per_token", "throughput_tokens_per_second", "ttft_ms")
+    }
+    return {
+        "requested_target_bytes": target,
+        "rounds": [
+            {"round": point["round"], "run_id": point["run_id"],
+             "actual_settled_resident_bytes": point["actual_settled_resident_bytes"]}
+            for point in sorted(selected, key=lambda value: (value["round"], value["run_id"]))
+        ],
+        "actual_settled_resident_bytes": curve_numeric_summary(values("actual_settled_resident_bytes")),
+        "target_error_bytes": curve_numeric_summary(values("target_error_bytes")),
+        "memory_saved_bytes": curve_numeric_summary(values("memory_saved_bytes")),
+        "memory_saved_ratio": curve_numeric_summary(values("memory_saved_ratio")),
+        "release_physical_relief_bytes": curve_numeric_summary(values("release_physical_relief_bytes")),
+        "offload_physical_relief_bytes": curve_numeric_summary(values("offload_physical_relief_bytes")),
+        "total_physical_relief_bytes": curve_numeric_summary(values("total_physical_relief_bytes")),
+        "performance": performance,
+    }
+
+
+def build_budget_curve(
+        runs: list[dict[str, Any]], budget_sweep: dict[str, Any] | None,
+        run_kind: str | None,
+) -> dict[str, Any] | None:
+    if budget_sweep is None:
+        return None
+    baseline_by_round: dict[int, dict[str, Any]] = {}
+    diagnostics: list[dict[str, Any]] = []
+    for item in runs:
+        if item.get("status") == "RESIDENT_BASELINE":
+            if item["round"] in baseline_by_round:
+                diagnostics.append({
+                    "run_id": item["run_id"], "round": item["round"],
+                    "reason": "duplicate Resident baseline",
+                })
+            else:
+                baseline_by_round[item["round"]] = item
+
+    def segment(name: str, policy: str, targets: list[int]) -> dict[str, Any]:
+        candidates = [item for item in runs if item.get("policy") == policy]
+        points: list[dict[str, Any]] = []
+        segment_diagnostics: list[dict[str, Any]] = []
+        for item in candidates:
+            baseline = baseline_by_round.get(item["round"])
+            point = curve_point(item, name, baseline)
+            if point["curve_eligible"]:
+                if baseline is None or not isinstance(point["baseline_resident_bytes"], int):
+                    point["curve_eligible"] = False
+                    point["curve_exclusion_reason"] = "missing Resident baseline in the same round"
+                elif point["baseline_resident_bytes"] < point["actual_settled_resident_bytes"]:
+                    point["curve_eligible"] = False
+                    point["curve_exclusion_reason"] = "actual resident exceeds same-round Resident baseline"
+            if point["curve_eligible"]:
+                points.append(point)
+            else:
+                segment_diagnostics.append({
+                    "run_id": point["run_id"], "case_id": point["case_id"],
+                    "round": point["round"],
+                    "requested_target_bytes": point["requested_target_bytes"],
+                    "actual_settled_resident_bytes": None,
+                    "actual_resident_authority": "UNAVAILABLE",
+                    "status": item.get("status"),
+                    "reason": point["curve_exclusion_reason"],
+                })
+        points.sort(key=lambda point: (
+            point["actual_settled_resident_bytes"], point["round"], point["requested_target_bytes"],
+        ))
+        expected_count = len(targets) * int(budget_sweep["rounds"])
+        missing = [
+            {"round": round_id, "requested_target_bytes": target}
+            for round_id in range(1, int(budget_sweep["rounds"]) + 1)
+            for target in targets
+            if not any(
+                point["round"] == round_id and point["requested_target_bytes"] == target
+                for point in points)
+        ]
+        target_aggregates = [curve_target_aggregate(points, target) for target in targets]
+        per_round = [
+            {
+                "round": round_id,
+                "points": [
+                    point for point in points if point["round"] == round_id
+                ],
+            }
+            for round_id in range(1, int(budget_sweep["rounds"]) + 1)
+        ]
+        performance = {
+            name: curve_numeric_summary([
+                metric["p50"] for point in points
+                for metric in [point["performance"].get(name, {})]
+                if metric.get("status") == "AVAILABLE" and metric.get("p50") is not None
+            ])
+            for name in ("e2e_ms", "tpot_ms_per_token", "throughput_tokens_per_second", "ttft_ms")
+        }
+        gate_pass = len(points) == expected_count and not missing
+        return {
+            "policy": policy,
+            "requested_targets_bytes": list(targets),
+            "action_target_bytes": budget_sweep["action_target_bytes"],
+            "max_blocks": budget_sweep["max_blocks"],
+            "axis": "actual_settled_resident_bytes",
+            "axis_authority": "independent_physical_slots",
+            "ordered_by": "actual_settled_resident_bytes_ascending",
+            "points": points,
+            "per_round": per_round,
+            "target_aggregates": target_aggregates,
+            "aggregate": {
+                "n": len(points),
+                "actual_settled_resident_bytes": curve_numeric_summary([
+                    point["actual_settled_resident_bytes"] for point in points]),
+                "target_error_bytes": curve_numeric_summary([
+                    point["target_error_bytes"] for point in points]),
+                "memory_saved_bytes": curve_numeric_summary([
+                    point["memory_saved_bytes"] for point in points]),
+                "memory_saved_ratio": curve_numeric_summary([
+                    point["memory_saved_ratio"] for point in points]),
+                "release_physical_relief_bytes": curve_numeric_summary([
+                    point["release_physical_relief_bytes"] for point in points
+                    if point.get("release_physical_relief_bytes") is not None]),
+                "offload_physical_relief_bytes": curve_numeric_summary([
+                    point["offload_physical_relief_bytes"] for point in points
+                    if point.get("offload_physical_relief_bytes") is not None]),
+                "total_physical_relief_bytes": curve_numeric_summary([
+                    point["total_physical_relief_bytes"] for point in points
+                    if point.get("total_physical_relief_bytes") is not None]),
+                "performance": performance,
+            },
+            "gate": {
+                "status": "PASS" if gate_pass else "UNAVAILABLE",
+                "required_points": expected_count,
+                "eligible_points": len(points),
+                "missing_points": missing,
+                "physical_authority_required": True,
+                "reason": None if gate_pass else "not every target/round has TARGET_REACHED with independent physical resident authority",
+            },
+            "diagnostics": segment_diagnostics,
+        }
+
+    release_segment = segment(
+        "release_segment", "release_only", list(budget_sweep["release_targets_bytes"]))
+    offload_segment = segment(
+        "offload_segment", "v2", list(budget_sweep["offload_targets_bytes"]))
+    curve = {
+        "status": "READY" if release_segment["gate"]["status"] == "PASS"
+        and offload_segment["gate"]["status"] == "PASS" else "INCOMPLETE",
+        "reference_anchors": {
+            "b_full_bytes": REFERENCE_B_FULL_BYTES,
+            "b_release_floor_bytes": REFERENCE_B_RELEASE_FLOOR_BYTES,
+        },
+        "release_segment": release_segment,
+        "offload_segment": offload_segment,
+        "knee": None,
+        "diagnostics": diagnostics,
+    }
+    if run_kind == "formal" and curve["status"] != "READY":
+        raise ParseError("formal budget_sweep physical curve gate is incomplete")
+    return curve
+
+
 def summarize_characterization(
         run_results: list[dict[str, Any]], run_kind: str | None = None,
+        budget_sweep: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     runs = [
         {
@@ -2999,6 +3455,8 @@ def summarize_characterization(
             "case_id": item["case_id"],
             "round": item.get("round"),
             "policy": item.get("policy"),
+            "io": item.get("io"),
+            "statistics": item.get("statistics"),
             **item["characterization"],
         }
         for item in run_results if item["characterization"] is not None
@@ -3154,6 +3612,20 @@ def summarize_characterization(
         else "TARGET_REACHED"
     )
     comparisons, comparison_aggregate = characterization_comparisons(runs)
+    budget_curve = build_budget_curve(runs, budget_sweep, run_kind)
+    if budget_curve is not None:
+        observed_anchor_status = (
+            "AVAILABLE"
+            if b_full["status"] == "AVAILABLE" and b_release_floor["status"] == "AVAILABLE"
+            else "PARTIAL"
+            if b_full["status"] == "AVAILABLE" or b_release_floor["status"] == "AVAILABLE"
+            else "UNAVAILABLE"
+        )
+        budget_curve["observed_anchors"] = {
+            "b_full_bytes": b_full["p50_bytes"],
+            "b_release_floor_bytes": b_release_floor["p50_bytes"],
+            "status": observed_anchor_status,
+        }
     return {
         "status": status,
         "runs": runs,
@@ -3168,6 +3640,7 @@ def summarize_characterization(
         },
         "comparisons": comparisons,
         "comparison_aggregate": comparison_aggregate,
+        "budget_curve": budget_curve,
     }
 
 
@@ -3303,7 +3776,10 @@ def parse_artifact(artifact: pathlib.Path) -> tuple[str, dict[str, Any]]:
             if service_failures:
                 raise ParseError("characterization contains a service failure")
             characterization_summary = summarize_characterization(
-                run_results, manifest["spec"]["run_kind"])
+                run_results,
+                manifest["spec"]["run_kind"],
+                manifest["spec"].get("budget_sweep"),
+            )
         success_verdict = "FORMAL_PASS" if manifest["spec"]["run_kind"] == "formal" else "QUALIFICATION_PASS"
         result_verdict = (
             characterization_summary["status"]
@@ -3337,6 +3813,9 @@ def parse_artifact(artifact: pathlib.Path) -> tuple[str, dict[str, Any]]:
             ],
             "action_summary": action_summary,
             "characterization": characterization_summary,
+            "budget_curve": (
+                characterization_summary.get("budget_curve")
+                if characterization_summary is not None else None),
             "telemetry_gaps": TELEMETRY_GAPS,
         }
         return result["verdict"], result

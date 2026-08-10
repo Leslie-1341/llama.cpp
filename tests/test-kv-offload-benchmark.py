@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import importlib.util
 import json
 import os
@@ -12,6 +13,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import textwrap
 import unittest
 from unittest import mock
@@ -101,7 +103,9 @@ class CanonicalBenchmarkTest(unittest.TestCase):
             unified_enabled = os.environ.get('LLAMA_KV_PRESSURE_UNIFIED_ACTION') == '1'
             release_only_enabled = unified_enabled and not offload_enabled
             mode = os.environ.get('KV_SYNTHETIC_MODE', 'complete')
-            expose_v2_resident = os.environ.get('KV_SYNTHETIC_V2_SLOTS_RESIDENT') == '1'
+            observation_mode = os.environ.get('LLAMA_KV_G0_S1_RESIDENT_OBSERVATION', '')
+            transaction_local_observation = observation_mode in ('1', 'both')
+            slots_physical_observation = observation_mode in ('preflight', 'both')
             omit_v2_resident = os.environ.get('KV_SYNTHETIC_OMIT_V2_SLOTS_RESIDENT') == '1'
             resident_target = int(os.environ.get('LLAMA_KV_RESIDENT_TARGET_BYTES', '4096') or '4096')
             action_target = int(os.environ.get('LLAMA_KV_PRESSURE_UNIFIED_ACTION_TARGET_BYTES', '8192') or '8192')
@@ -126,6 +130,10 @@ class CanonicalBenchmarkTest(unittest.TestCase):
             def emit_marker(token, fields):
                 with output_lock:
                     print(token + " " + " ".join(f"{{key}}={{value}}" for key, value in fields.items()), file=sys.stderr, flush=True)
+
+            def emit_transaction_observation(fields):
+                if transaction_local_observation:
+                    emit_marker('kv_g0_s1_resident_observation', fields)
 
             def resident_drop(decision_id, transaction_id, before_bytes, after_bytes):
                 total_bytes = 12288 if characterization_mode else 8192
@@ -285,7 +293,7 @@ class CanonicalBenchmarkTest(unittest.TestCase):
                     observation['after_resident_bytes'] = observation['before_resident_bytes']
                     observation['after_resident_pages'] = observation['before_resident_pages']
                 if mode != 'action_only':
-                    emit_marker('kv_g0_s1_resident_observation', observation)
+                    emit_transaction_observation(observation)
                 emit_marker('kv_pressure_unified_action', action_fields)
                 state['offload_emitted'] = True
                 state['offload_count'] = 1
@@ -339,7 +347,7 @@ class CanonicalBenchmarkTest(unittest.TestCase):
                     time.sleep(0.02)
                     before = state['resident_bytes']
                     after = before - 4096
-                    emit_marker('kv_g0_s1_resident_observation', resident_drop(3, 9, before, after))
+                    emit_transaction_observation(resident_drop(3, 9, before, after))
                     emit_marker('kv_pressure_unified_action', characterization_action(3, before, 0))
                     state['resident_bytes'] = after
                     state['offload_emitted'] = True
@@ -349,7 +357,7 @@ class CanonicalBenchmarkTest(unittest.TestCase):
                 time.sleep(0.02)
                 before = state['resident_bytes']
                 after = before - 4096
-                emit_marker('kv_g0_s1_resident_observation', resident_drop(2, 8, before, after))
+                emit_transaction_observation(resident_drop(2, 8, before, after))
                 emit_marker('kv_pressure_unified_action', characterization_action(2, before, after - 4096))
                 state['resident_bytes'] = after
                 state['offload_emitted'] = True
@@ -361,7 +369,7 @@ class CanonicalBenchmarkTest(unittest.TestCase):
                 if mode == 'characterization_target':
                     before = state['resident_bytes']
                     after = before - 4096
-                    emit_marker('kv_g0_s1_resident_observation', resident_drop(3, 9, before, after))
+                    emit_transaction_observation(resident_drop(3, 9, before, after))
                     emit_marker('kv_pressure_unified_action', characterization_action(3, before, 0))
                     state['resident_bytes'] = after
                     state['offload_count'] += 1
@@ -448,8 +456,7 @@ class CanonicalBenchmarkTest(unittest.TestCase):
                         self.send_response(200); self.end_headers(); self.wfile.write(b'{{"status":"ok"}}'); return
                     if self.path == '/slots':
                         slot = {{'id': 0, 'is_processing': False}}
-                        if (not offload_enabled or expose_v2_resident or characterization_mode) and not (
-                                offload_enabled and omit_v2_resident):
+                        if slots_physical_observation and not omit_v2_resident:
                             total_bytes = 12288 if characterization_mode else 8192
                             slot['kv_resident'] = {{
                                 'status': 'available', 'source': 'synthetic', 'object_id': 1, 'generation': 1,
@@ -513,7 +520,6 @@ class CanonicalBenchmarkTest(unittest.TestCase):
             "server_args": [],
             "environment": {
                 "KV_SYNTHETIC_MODE": "complete",
-                "KV_SYNTHETIC_V2_SLOTS_RESIDENT": "1",
             },
             "pressure_basis": {
                 "authority": "rss_absolute",
@@ -594,14 +600,9 @@ class CanonicalBenchmarkTest(unittest.TestCase):
             *,
             policy: str = "v2",
             mode: str = "complete",
-            expose_v2_resident: bool = True,
     ) -> pathlib.Path:
         value = self.spec(policy=policy)
         value["environment"]["KV_SYNTHETIC_MODE"] = mode
-        if expose_v2_resident:
-            value["environment"]["KV_SYNTHETIC_V2_SLOTS_RESIDENT"] = "1"
-        else:
-            value["environment"].pop("KV_SYNTHETIC_V2_SLOTS_RESIDENT", None)
         spec = self.write_spec(value)
         artifact = self.root / f"real-{policy}-{mode}-{len(list(self.root.glob('real-*')))}"
         runner = self.run_runner(spec, artifact)
@@ -621,6 +622,65 @@ class CanonicalBenchmarkTest(unittest.TestCase):
         runner = self.run_runner(spec, artifact)
         self.assertEqual(runner.returncode, 0, runner.stderr)
         return artifact
+
+    def probe_synthetic_observation_mode(self, mode: str) -> tuple[list[dict[str, object]], str]:
+        runner = load_runner_module()
+        port = runner.free_port()
+        environment = {
+            **os.environ,
+            "LLAMA_KV_PAGED_SWAP": "1",
+            "LLAMA_KV_PRESSURE_UNIFIED_ACTION": "1",
+            "LLAMA_KV_G0_S1_RESIDENT_OBSERVATION": mode,
+            "KV_SYNTHETIC_MODE": "complete",
+        }
+        process = subprocess.Popen(
+            [sys.executable, str(self.fake_server), "--host", "127.0.0.1", "--port", str(port)],
+            cwd=self.root,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        slots: list[dict[str, object]] | None = None
+        try:
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    self.fail(f"synthetic server exited before observation probe: {process.returncode}")
+                try:
+                    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=0.2)
+                    connection.request("GET", "/health")
+                    response = connection.getresponse()
+                    response.read()
+                    connection.close()
+                    if response.status == 200:
+                        break
+                except (OSError, http.client.HTTPException):
+                    time.sleep(0.01)
+            else:
+                self.fail("synthetic server observation probe health timeout")
+
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=1.0)
+            connection.request("GET", "/slots")
+            response = connection.getresponse()
+            slots = json.loads(response.read().decode("utf-8"))
+            connection.close()
+            for _ in range(2):
+                connection = http.client.HTTPConnection("127.0.0.1", port, timeout=1.0)
+                connection.request("POST", "/completion", body=b"{}")
+                response = connection.getresponse()
+                response.read()
+                connection.close()
+            time.sleep(0.15)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            try:
+                _, stderr = process.communicate(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                _, stderr = process.communicate(timeout=2.0)
+        self.assertIsNotNone(slots)
+        return slots, stderr.decode("utf-8", errors="replace")
 
     def remove_slot_resident(self, artifact: pathlib.Path, filename: str) -> None:
         snapshot_path = next(artifact.glob(f"runs/*/{filename}"))
@@ -884,6 +944,18 @@ class CanonicalBenchmarkTest(unittest.TestCase):
         self.assertGreater(resume["started_mono_ns"], barrier["completed_mono_ns"])
         self.assertEqual(resume["request_id"], "request")
 
+    def test_synthetic_observation_modes_match_server_semantics(self) -> None:
+        for mode, slots_expected, marker_expected in (
+            ("1", False, True),
+            ("preflight", True, False),
+            ("both", True, True),
+        ):
+            with self.subTest(mode=mode):
+                slots, stderr = self.probe_synthetic_observation_mode(mode)
+                has_slots_resident = "kv_resident" in slots[0]
+                self.assertEqual(has_slots_resident, slots_expected)
+                self.assertEqual("kv_g0_s1_resident_observation" in stderr, marker_expected)
+
     def test_v2_swap_out_without_swap_in_is_invalid(self) -> None:
         artifact = self.run_real_artifact(mode="swap_in_zero")
         parsed = self.run_parser(artifact)
@@ -900,15 +972,42 @@ class CanonicalBenchmarkTest(unittest.TestCase):
         self.assertEqual(result["verdict"], "INVALID_ARTIFACT")
         self.assertIn("completed graph-allowed PREFETCH", result["errors"][0])
 
-    def test_v2_qualification_missing_slot_resident_is_invalid(self) -> None:
-        artifact = self.run_real_artifact(expose_v2_resident=False)
+    def test_v2_qualification_uses_transaction_only_without_slots_authority(self) -> None:
+        artifact = self.run_real_artifact()
+        execution = json.loads(next(artifact.glob("runs/*/execution.json")).read_text(encoding="utf-8"))
+        self.assertEqual(
+            execution["environment"]["LLAMA_KV_G0_S1_RESIDENT_OBSERVATION"], "1")
         slots_before = json.loads(next(artifact.glob("runs/*/slots_before.json")).read_text(encoding="utf-8"))
         self.assertNotIn("kv_resident", slots_before["body_json"][0])
+        stderr = next(artifact.glob("runs/*/server.stderr")).read_text(encoding="utf-8")
+        self.assertIn("kv_g0_s1_resident_observation", stderr)
         parsed = self.run_parser(artifact)
-        self.assertNotEqual(parsed.returncode, 0)
+        self.assertEqual(parsed.returncode, 0, parsed.stderr)
         result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
-        self.assertEqual(result["verdict"], "INVALID_ARTIFACT")
-        self.assertIn("no valid physical resident observation", result["errors"][0])
+        self.assertEqual(result["verdict"], "QUALIFICATION_PASS")
+        self.assertEqual(
+            result["physical_observations"][0]["authority"],
+            "transaction_local_mincore_only",
+        )
+
+    def test_characterization_requires_combined_observation_mode(self) -> None:
+        runner = load_runner_module()
+        parser = load_parser_module()
+        value = self.characterization_spec()
+        spec, cases, _, _ = runner.validate_spec(value)
+        environment = runner.runtime_environment(
+            spec, cases["case"], self.root / "combined-observation")
+        execution = {"environment": environment}
+        parser.validate_execution_environment(execution, cases["case"], "combined", spec)
+        self.assertEqual(
+            parser.qualified_offload_pairs([ACTION_FIELDS], [], "RSS_ABSOLUTE"), [])
+        for mode in ("1", "preflight"):
+            invalid = {"environment": dict(environment)}
+            invalid["environment"]["LLAMA_KV_G0_S1_RESIDENT_OBSERVATION"] = mode
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(parser.ParseError, "physical resident observation mode"):
+                    parser.validate_execution_environment(
+                        invalid, cases["case"], mode, spec)
 
     def test_resident_no_swap_in_does_not_require_resume(self) -> None:
         artifact = self.run_real_artifact(policy="resident")
@@ -1333,7 +1432,14 @@ class CanonicalBenchmarkTest(unittest.TestCase):
         settle = execution["characterization"]["settle"]
         resume = execution["characterization"]["resume"]
         self.assertEqual(
-            execution["environment"]["LLAMA_KV_G0_S1_RESIDENT_OBSERVATION"], "1")
+            execution["environment"]["LLAMA_KV_G0_S1_RESIDENT_OBSERVATION"], "both")
+        slots_after_fill = json.loads(
+            next(artifact.glob("runs/*/slots_after_fill.json")).read_text(encoding="utf-8"))
+        self.assertIn("kv_resident", slots_after_fill["body_json"][0])
+        self.assertIn(
+            "kv_g0_s1_resident_observation",
+            next(artifact.glob("runs/*/server.stderr")).read_text(encoding="utf-8"),
+        )
         self.assertEqual(settle["status"], "target_reached")
         self.assertEqual(settle["decision_ids"], [1, 2, 3])
         self.assertEqual(settle["offload_decision_ids"], [2, 3])
@@ -1517,6 +1623,22 @@ class CanonicalBenchmarkTest(unittest.TestCase):
         self.assertEqual(result["verdict"], "INVALID_ARTIFACT")
         self.assertIn("partially missing", result["errors"][0])
 
+    def test_v2_target_reached_without_transaction_observation_is_invalid(self) -> None:
+        artifact = self.run_characterization_artifact(mode="characterization_target")
+        stderr_path = next(artifact.glob("runs/*/server.stderr"))
+        stderr_path.write_text(
+            "\n".join(
+                line for line in stderr_path.read_text(encoding="utf-8").splitlines()
+                if "kv_g0_s1_resident_observation" not in line
+            ) + "\n",
+            encoding="utf-8",
+        )
+        parsed = self.run_parser(artifact)
+        self.assertNotEqual(parsed.returncode, 0)
+        result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["verdict"], "INVALID_ARTIFACT")
+        self.assertIn("transaction-local", result["errors"][0])
+
     def test_v2_target_reached_resident_missing_is_invalid(self) -> None:
         artifact = self.run_characterization_artifact(mode="characterization_target")
         self.remove_slot_resident(artifact, "slots_before.json")
@@ -1675,6 +1797,233 @@ class CanonicalBenchmarkTest(unittest.TestCase):
             parser.validate_formal_pressure_authority(
                 spec, plan, "run_complete")
         parser.validate_formal_pressure_authority(spec, plan, "UNSUPPORTED")
+
+    def test_budget_sweep_plan_requires_canonical_targets_and_reverse_rounds(self) -> None:
+        runner = load_runner_module()
+        parser = load_parser_module()
+        value = self.characterization_spec(
+            policy="resident", mode="characterization_resident", restore="k1_sync")
+        release_targets = list(runner.CANONICAL_BUDGET_RELEASE_TARGETS)
+        offload_targets = list(runner.CANONICAL_BUDGET_OFFLOAD_TARGETS)
+        cases = [{
+            "case_id": "resident",
+            "policy": "resident",
+            "kv_representation": "paged",
+            "loading_mode": "exact",
+            "restore": "k1_sync",
+            "prefault": "off",
+            "kv_target_bytes": None,
+            "action_target_bytes": None,
+        }]
+        case_by_signature = {("resident", None): "resident"}
+        for index, target in enumerate(release_targets):
+            case_id = f"release-{index}"
+            cases.append({
+                "case_id": case_id, "policy": "release_only", "kv_representation": "paged",
+                "loading_mode": "exact", "restore": "k1_sync", "prefault": "off",
+                "kv_target_bytes": target,
+                "action_target_bytes": runner.CANONICAL_BUDGET_ACTION_TARGET_BYTES,
+            })
+            case_by_signature[("release_only", target)] = case_id
+        for index, target in enumerate(offload_targets):
+            case_id = f"offload-{index}"
+            cases.append({
+                "case_id": case_id, "policy": "v2", "kv_representation": "paged",
+                "loading_mode": "exact", "restore": "k2_pipeline", "prefault": "off",
+                "kv_target_bytes": target,
+                "action_target_bytes": runner.CANONICAL_BUDGET_ACTION_TARGET_BYTES,
+            })
+            case_by_signature[("v2", target)] = case_id
+        first_order = [
+            ("resident", None),
+            ("v2", offload_targets[0]),
+            ("release_only", release_targets[0]),
+            ("v2", offload_targets[1]),
+            ("release_only", release_targets[1]),
+            ("v2", offload_targets[2]),
+            ("release_only", release_targets[2]),
+            ("v2", offload_targets[3]),
+        ]
+        second_order = list(reversed(first_order))
+        value.update({
+            "run_kind": "formal",
+            "workload": dict(value["workload"], repeat=2),
+            "cases": cases,
+            "run_order": [
+                {"round": round_id, "run_order": order, "case_id": case_by_signature[signature]}
+                for round_id, order_list in ((1, first_order), (2, second_order))
+                for order, signature in enumerate(order_list, start=1)
+            ],
+            "budget_sweep": {
+                "release_targets_bytes": release_targets,
+                "offload_targets_bytes": offload_targets,
+                "action_target_bytes": runner.CANONICAL_BUDGET_ACTION_TARGET_BYTES,
+                "max_blocks": runner.CANONICAL_BUDGET_MAX_BLOCKS,
+                "rounds": 2,
+                "order_mode": runner.BUDGET_SWEEP_ORDER_MODE,
+            },
+        })
+        normalized, _, plan, _ = runner.validate_spec(value)
+        self.assertEqual(normalized["budget_sweep"]["rounds"], 2)
+        parser.validate_spec(value)
+        self.assertEqual(len(plan), 16)
+
+        invalid = json.loads(json.dumps(value))
+        invalid["budget_sweep"]["offload_targets_bytes"][0] = 1.0
+        with self.assertRaisesRegex(runner.RunnerError, "positive absolute byte"):
+            runner.validate_spec(invalid)
+        with self.assertRaisesRegex(parser.ParseError, "positive absolute byte"):
+            parser.validate_spec(invalid)
+
+    def test_budget_curve_uses_actual_resident_and_keeps_round_aggregates(self) -> None:
+        parser = load_parser_module()
+        sweep = {
+            "release_targets_bytes": list(parser.CANONICAL_BUDGET_RELEASE_TARGETS),
+            "offload_targets_bytes": list(parser.CANONICAL_BUDGET_OFFLOAD_TARGETS),
+            "action_target_bytes": parser.CANONICAL_BUDGET_ACTION_TARGET_BYTES,
+            "max_blocks": parser.CANONICAL_BUDGET_MAX_BLOCKS,
+            "rounds": 2,
+            "order_mode": parser.BUDGET_SWEEP_ORDER_MODE,
+        }
+        metric = lambda unit, value: {
+            "status": "AVAILABLE", "unit": unit, "n": 1,
+            "p50": value, "p95": value, "p99": value,
+        }
+        runs = []
+        baseline_bytes = parser.REFERENCE_B_FULL_BYTES
+        for round_id in (1, 2):
+            runs.append({
+                "run_id": f"resident-{round_id}", "case_id": "resident", "round": round_id,
+                "policy": "resident", "status": "RESIDENT_BASELINE",
+                "resident_after_fill": baseline_bytes,
+            })
+            for segment, policy, targets in (
+                ("release_segment", "release_only", sweep["release_targets_bytes"]),
+                ("offload_segment", "v2", sweep["offload_targets_bytes"]),
+            ):
+                for target in targets:
+                    release_relief = 4096 if policy == "v2" else baseline_bytes - target
+                    offload_relief = 4096 if policy == "v2" else 0
+                    total_relief = release_relief + offload_relief
+                    performance = {
+                        "e2e_ms": metric("ms", float(target) / 1024),
+                        "tpot_ms_per_token": metric("ms/token", 2.0),
+                        "throughput_tokens_per_second": metric("tokens/s", 500.0),
+                        "ttft_ms": {
+                            "status": "UNAVAILABLE", "unit": "ms", "n": 0,
+                            "p50": None, "p95": None, "p99": None,
+                        },
+                    }
+                    runs.append({
+                        "run_id": f"{policy}-{round_id}-{target}",
+                        "case_id": f"{policy}-{target}", "round": round_id,
+                        "policy": policy,
+                        "status": "RELEASE_SETTLED" if policy == "release_only" else "TARGET_REACHED",
+                        "performance_eligible": True,
+                        "release_terminal": "release_settled",
+                        "requested_target_bytes": target,
+                        "resident_after_fill": baseline_bytes,
+                        "resident_after_release_settle": target if policy == "release_only" else baseline_bytes - 4096,
+                        "resident_after_release_settle_authority": "slots_physical",
+                        "resident_settled": target,
+                        "resident_settled_authority": "slots_physical",
+                        "release_physical_relief_bytes": release_relief,
+                        "release_physical_relief_authority": "phase_boundary_slots",
+                        "offload_physical_relief_bytes": offload_relief,
+                        "offload_physical_relief_authority": "transaction_local_mincore",
+                        "total_physical_relief_bytes": total_relief,
+                        "total_physical_relief_authority": "sum_of_independent_physical_authorities",
+                        "memory_saved_bytes": total_relief,
+                        "memory_saved_ratio": total_relief / baseline_bytes,
+                        "release": {"actions": 1, "blocks": 1, "bytes": release_relief},
+                        "offload": {"actions": 1 if policy == "v2" else 0, "blocks": 1 if policy == "v2" else 0},
+                        "io": {}, "resume": {"restored_bytes": 4096, "gate_us": 2, "total_us": 6},
+                        "k2": {"read_us": 2, "unpack_us": 3, "prefault": {}, "scatter": {}},
+                        "transient_staging_peak_bytes": 2048,
+                        "transient_staging_bound_bytes": 2048,
+                        "performance": performance,
+                        "post_resume_steady_performance": performance,
+                    })
+        curve = parser.build_budget_curve(runs, sweep, "formal")
+        self.assertEqual(curve["status"], "READY")
+        self.assertEqual(curve["reference_anchors"]["b_full_bytes"], baseline_bytes)
+        self.assertEqual(len(curve["release_segment"]["points"]), 6)
+        self.assertEqual(len(curve["offload_segment"]["points"]), 8)
+        self.assertEqual(
+            [point["actual_settled_resident_bytes"] for point in curve["release_segment"]["points"]],
+            sorted(parser.CANONICAL_BUDGET_RELEASE_TARGETS * 2),
+        )
+        self.assertEqual(len(curve["offload_segment"]["per_round"]), 2)
+        self.assertEqual(
+            curve["offload_segment"]["target_aggregates"][0]["actual_settled_resident_bytes"]["p50"],
+            float(parser.CANONICAL_BUDGET_OFFLOAD_TARGETS[0]),
+        )
+        point = curve["offload_segment"]["points"][0]
+        self.assertIn("resume_restored_bytes", point)
+        self.assertIn("k2_prefault", point)
+        self.assertEqual(
+            point["total_physical_relief_bytes"],
+            point["release_physical_relief_bytes"] + point["offload_physical_relief_bytes"],
+        )
+        self.assertIsNone(curve["knee"])
+
+    def test_budget_curve_excludes_no_candidate_and_unmet_without_physical_authority(self) -> None:
+        parser = load_parser_module()
+        sweep = {
+            "release_targets_bytes": [4096], "offload_targets_bytes": [2048],
+            "action_target_bytes": 256, "max_blocks": 64, "rounds": 1,
+            "order_mode": parser.BUDGET_SWEEP_ORDER_MODE,
+        }
+        baseline = {
+            "run_id": "resident", "case_id": "resident", "round": 1,
+            "policy": "resident", "status": "RESIDENT_BASELINE",
+            "resident_after_fill": 12288,
+        }
+        release = {
+            "run_id": "release-floor", "case_id": "release-floor", "round": 1,
+            "policy": "release_only", "status": "RELEASE_FLOOR_PROBE",
+            "release_terminal": "release_no_candidate", "performance_eligible": False,
+            "requested_target_bytes": 4096, "resident_after_release_settle": 12288,
+            "resident_after_release_settle_authority": "slots_physical",
+            "release_physical_relief_bytes": 0,
+            "release_physical_relief_authority": "phase_boundary_slots",
+            "offload_physical_relief_bytes": 0,
+            "offload_physical_relief_authority": "not_applicable",
+            "total_physical_relief_bytes": 0,
+            "total_physical_relief_authority": "sum_of_independent_physical_authorities",
+            "memory_saved_bytes": 0, "memory_saved_ratio": 0.0,
+            "release": {"actions": 1, "blocks": 0}, "offload": {"actions": 0, "blocks": 0},
+            "io": {}, "resume": {}, "k2": {}, "transient_staging_peak_bytes": 0,
+            "transient_staging_bound_bytes": 0, "performance": {},
+        }
+        unmet = {
+            "run_id": "offload-unmet", "case_id": "offload-unmet", "round": 1,
+            "policy": "v2", "status": "UNMET_FLOOR", "performance_eligible": True,
+            "requested_target_bytes": 2048, "resident_settled": None,
+            "resident_settled_authority": "budget_view_marker",
+            "release_physical_relief_bytes": None,
+            "release_physical_relief_authority": "unavailable_no_independent_physical_authority",
+            "offload_physical_relief_bytes": 4096,
+            "offload_physical_relief_authority": "transaction_local_mincore",
+            "total_physical_relief_bytes": None,
+            "total_physical_relief_authority": "unavailable_no_independent_physical_authority",
+            "memory_saved_bytes": None, "memory_saved_ratio": None,
+            "release": {"actions": 1, "blocks": 0}, "offload": {"actions": 1, "blocks": 1},
+            "io": {}, "resume": {"restored_bytes": 4096}, "k2": {},
+            "transient_staging_peak_bytes": 0, "transient_staging_bound_bytes": 0,
+            "performance": {}, "post_resume_steady_performance": {},
+        }
+        curve = parser.build_budget_curve([baseline, release, unmet], sweep, None)
+        self.assertEqual(curve["status"], "INCOMPLETE")
+        self.assertEqual(curve["release_segment"]["points"], [])
+        self.assertEqual(curve["offload_segment"]["points"], [])
+        self.assertIsNone(curve["offload_segment"]["aggregate"]["actual_settled_resident_bytes"]["p50"])
+        diagnostic = curve["offload_segment"]["diagnostics"][0]
+        self.assertIsNone(diagnostic["actual_settled_resident_bytes"])
+        self.assertEqual(diagnostic["actual_resident_authority"], "UNAVAILABLE")
+        self.assertIn("UNMET_FLOOR", diagnostic["reason"])
+        with self.assertRaisesRegex(parser.ParseError, "formal budget_sweep physical curve gate"):
+            parser.build_budget_curve([baseline, release, unmet], sweep, "formal")
 
     def test_process_identity_startup_transient_retries_and_timeout_fails_closed(self) -> None:
         runner = load_runner_module()
