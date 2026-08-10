@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import http.client
+import io
 import importlib.util
 import json
 import os
@@ -2223,6 +2224,12 @@ class CanonicalBenchmarkTest(unittest.TestCase):
         self.assertIn("cmdline hash", result["errors"][0])
 
     def test_formal_requires_clean_worktree_and_measurements(self) -> None:
+        # The dirty-worktree and missing-measurement guards must each fail
+        # closed with runner error 2.  Injecting dirty provenance keeps the
+        # dirty-guard assertion hermetic: without it the spec's rss_absolute
+        # authority falls through to the formal cgroup_finite gate and returns
+        # UNSUPPORTED=3, and the result depended on the host repo being dirty.
+        runner = load_runner_module()
         value = self.spec()
         value["run_kind"] = "formal"
         value["workload"]["repeat"] = 2
@@ -2230,8 +2237,30 @@ class CanonicalBenchmarkTest(unittest.TestCase):
             {"round": 1, "run_order": 1, "case_id": "case"},
             {"round": 2, "run_order": 1, "case_id": "case"},
         ]
-        result = self.run_runner(self.write_spec(value), self.root / "formal-dirty", dry_run=True)
-        self.assertEqual(result.returncode, 2, result.stderr)
+        spec_path = self.write_spec(value)
+        artifact = self.root / "formal-dirty"
+        dirty_provenance = {
+            "head": "deadbeef", "branch": "test", "diff_sha256": "0" * 64,
+            "dirty_status": [" M tracked/file"], "capture_mode": "diagnostic_dirty",
+        }
+        saved_argv = sys.argv
+        saved_stdout, saved_stderr = sys.stdout, sys.stderr
+        stdout_buf = io.StringIO()
+        stderr_buf = io.StringIO()
+        try:
+            sys.argv = [str(RUNNER), "--spec", str(spec_path), "--output", str(artifact), "--dry-run"]
+            sys.stdout, sys.stderr = stdout_buf, stderr_buf
+            with mock.patch.object(runner, "git_provenance", return_value=dirty_provenance):
+                returncode = runner.main()
+        finally:
+            sys.argv = saved_argv
+            sys.stdout, sys.stderr = saved_stdout, saved_stderr
+        self.assertEqual(returncode, 2, stderr_buf.getvalue())
+        self.assertFalse(artifact.exists(), stderr_buf.getvalue())
+
+        # The "no measurement request" guard is independent of git state: an
+        # empty workload.requests fails closed at spec validation before any
+        # formal git-provenance gate runs, so it stays here unchanged.
         value["workload"]["requests"] = []
         value["run_kind"] = "qualification"
         value["run_order"] = [{"round": 1, "run_order": 1, "case_id": "case"}]
