@@ -939,6 +939,16 @@ def qualified_offload_pairs(
     return result
 
 
+def offload_physical_relief_from_pairs(
+        offload_pairs: list[dict[str, Any]]) -> int:
+    # Sum the resident drops of already-validated transaction-local mincore
+    # pairs. Qualification V2 contributes a single barrier pair; characterization
+    # V2 contributes the same pairs this function sums. Empty (resident /
+    # release_only / unmatched) yields 0. Only real physical authority is used;
+    # action.bytes / relieved_bytes / logical KV bytes never substitute here.
+    return sum(item["resident_drop_bytes"] for item in offload_pairs)
+
+
 def stderr_window(data: bytes, start_offset: int, end_offset: int, label: str) -> str:
     if (
         isinstance(start_offset, bool)
@@ -3031,6 +3041,7 @@ def parse_run(artifact: pathlib.Path, plan: dict[str, Any], case: dict[str, Any]
         "actions": actions,
         "resident_observations": resident_observations,
         "qualified_offload_pairs": qualified_pairs,
+        "offload_physical_relief_bytes": offload_physical_relief_from_pairs(qualified_pairs),
         "qualification_round_trip": qualification_round_trip,
         "characterization": characterization_metrics,
         "resume_events": resumes,
@@ -3861,9 +3872,7 @@ def parse_artifact(artifact: pathlib.Path) -> tuple[str, dict[str, Any]]:
                 "release_physical_relief_bytes": (
                     item["characterization"]["release_physical_relief_bytes"]
                     if item["characterization"] is not None else 0),
-                "offload_physical_relief_bytes": (
-                    item["characterization"]["offload_physical_relief_bytes"]
-                    if item["characterization"] is not None else 0),
+                "offload_physical_relief_bytes": item["offload_physical_relief_bytes"],
                 "release_authority": (
                     item["characterization"]["release_physical_relief_authority"]
                     if item["characterization"] is not None else "not_applicable"),
@@ -3904,10 +3913,11 @@ def parse_artifact(artifact: pathlib.Path) -> tuple[str, dict[str, Any]]:
                 if all(item["release_physical_relief_bytes"] is not None
                        for item in characterization_runs) else None),
             "offload_physical_relief_bytes": sum(
-                item["offload_physical_relief_bytes"] for item in characterization_runs),
+                item["offload_physical_relief_bytes"] for item in run_results),
             "total_physical_relief_bytes": (
-                sum(item["total_physical_relief_bytes"] for item in characterization_runs)
-                if all(item["total_physical_relief_bytes"] is not None
+                sum(item["release_physical_relief_bytes"] for item in characterization_runs)
+                + sum(item["offload_physical_relief_bytes"] for item in run_results)
+                if all(item["release_physical_relief_bytes"] is not None
                        for item in characterization_runs) else None),
             "physical_relief_authority": {
                 "release": (
@@ -3918,7 +3928,7 @@ def parse_artifact(artifact: pathlib.Path) -> tuple[str, dict[str, Any]]:
                 "offload": "transaction_local_mincore",
                 "total": (
                     "release_plus_offload"
-                    if all(item["total_physical_relief_bytes"] is not None
+                    if all(item["release_physical_relief_bytes"] is not None
                            for item in characterization_runs)
                     else "UNAVAILABLE_NO_INDEPENDENT_PHYSICAL_AUTHORITY"),
             },

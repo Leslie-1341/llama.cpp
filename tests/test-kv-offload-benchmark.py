@@ -1117,10 +1117,117 @@ class CanonicalBenchmarkTest(unittest.TestCase):
         self.assertEqual(parsed.returncode, 0, parsed.stderr)
         result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
         self.assertEqual(result["verdict"], "QUALIFICATION_PASS")
+        observation = result["physical_observations"][0]
+        self.assertEqual(observation["authority"], "transaction_local_mincore_only")
+        # V2 qualification has a single OFFLOAD barrier with one transaction-local
+        # resident drop (8192 -> 4096 = 4096 B). There is no RELEASE phase, so the
+        # OFFLOAD relief must be attributed to transaction_local_mincore and the
+        # total must be release(0) + offload(4096), never 0 (the F16 regression).
+        self.assertEqual(observation["offload_authority"], "transaction_local_mincore")
+        self.assertEqual(observation["offload_physical_relief_bytes"], 4096)
+        self.assertEqual(observation["release_authority"], "not_applicable")
+        self.assertEqual(observation["release_physical_relief_bytes"], 0)
+        self.assertEqual(len(observation["transaction_local_offload"]), 1)
         self.assertEqual(
-            result["physical_observations"][0]["authority"],
-            "transaction_local_mincore_only",
-        )
+            observation["transaction_local_offload"][0]["resident_drop_bytes"], 4096)
+        summary = result["action_summary"]
+        self.assertEqual(summary["offload_physical_relief_bytes"], 4096)
+        self.assertEqual(summary["release_physical_relief_bytes"], 0)
+        self.assertEqual(summary["total_physical_relief_bytes"],
+                         summary["release_physical_relief_bytes"]
+                         + summary["offload_physical_relief_bytes"])
+        self.assertEqual(summary["total_physical_relief_bytes"], 4096)
+        self.assertEqual(summary["physical_relief_authority"]["offload"],
+                         "transaction_local_mincore")
+
+    def test_v2_characterization_offload_relief_sums_two_transaction_local_drops(self) -> None:
+        # Regression for the F16 OFFLOAD physical-relief attribution defect. The V2
+        # characterization target fixture emits two positive OFFLOAD actions (decision
+        # ids 2 and 3), each backed by a transaction_local_mincore resident drop of
+        # 4096 B. Their resident drops must sum to 8192, and the action_summary total
+        # must equal release + offload (conservation). The per-run offload relief must
+        # carry the transaction_local_mincore authority, never substitute action.bytes
+        # or relieved_bytes for the mincore drop.
+        artifact = self.run_characterization_artifact()
+        parsed = self.run_parser(artifact)
+        self.assertEqual(parsed.returncode, 0, parsed.stderr)
+        result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
+        observation = result["physical_observations"][0]
+        pairs = observation["transaction_local_offload"]
+        self.assertEqual(len(pairs), 2)
+        self.assertEqual(
+            [pair["resident_drop_bytes"] for pair in pairs], [4096, 4096])
+        self.assertEqual(
+            sum(pair["resident_drop_bytes"] for pair in pairs), 8192)
+        self.assertEqual(observation["offload_authority"],
+                         "transaction_local_mincore")
+        self.assertEqual(
+            sum(int(pair["resident_observation"]["before_resident_bytes"])
+                for pair in pairs)
+            - sum(int(pair["resident_observation"]["after_resident_bytes"])
+                  for pair in pairs), 8192)
+        summary = result["action_summary"]
+        self.assertEqual(summary["offload_physical_relief_bytes"], 8192)
+        self.assertEqual(summary["total_physical_relief_bytes"],
+                         summary["release_physical_relief_bytes"]
+                         + summary["offload_physical_relief_bytes"])
+        # The single physical barrier above checks that logical action.bytes or
+        # relieved_bytes never substituted for the mincore drop: action.bytes is
+        # also 4096-per-action here, but relief must equal the resident drop, not
+        # some other field; if the parser had substituted action["relieved_bytes"]
+        # the value would still be 8192 by coincidence — so fail-closed the
+        # substitution by also asserting the per-pair resident drop matches the
+        # mincore before-after delta exactly, proving the source is mincore.
+        for pair in pairs:
+            observation_record = pair["resident_observation"]
+            self.assertEqual(
+                pair["resident_drop_bytes"],
+                int(observation_record["before_resident_bytes"])
+                - int(observation_record["after_resident_bytes"]))
+            self.assertEqual(
+                observation_record["source"], "paged_sample_mincore")
+
+    def test_v2_qualification_relief_fail_closed_on_tampered_resident_drop(self) -> None:
+        # Boundary: with the barrier transaction-local mincore pair removed (no
+        # matching resident drop), the qualifier rejects the artifact; the parser
+        # MUST never backfill offload_physical_relief_bytes from action.relieved_bytes
+        # or action.bytes. The existing barrier contract already rejects this run,
+        # but here we additionally assert that an INVALID ARTIFACT verdict leaves no
+        # plausible relief attribution at all.
+        artifact = self.run_real_artifact()
+        stderr_path = next(artifact.glob("runs/*/server.stderr"))
+        stderr_path.write_text(
+            "\n".join(
+                line for line in stderr_path.read_text(encoding="utf-8").splitlines()
+                if "kv_g0_s1_resident_observation" not in line) + "\n",
+            encoding="utf-8")
+        parsed = self.run_parser(artifact)
+        self.assertNotEqual(parsed.returncode, 0)
+        result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["verdict"], "INVALID_ARTIFACT")
+        # No successful parse -> no physical relief is reported; the artifact is
+        # rejected, and action_summary/physical_observations are not emitted.
+        self.assertNotIn("physical_observations", result)
+        self.assertNotIn("action_summary", result)
+
+    def test_v2_qualification_zero_relief_stays_zero_for_resident_policy(self) -> None:
+        # Boundary: resident policy issues no offload, so qualified_offload_pairs is
+        # empty and offload_physical_relief_bytes must remain exactly 0 (never
+        # synthesized from action.bytes/io), with release relief also 0.
+        artifact = self.run_real_artifact(policy="resident")
+        parsed = self.run_parser(artifact)
+        self.assertEqual(parsed.returncode, 0, parsed.stderr)
+        result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
+        observation = result["physical_observations"][0]
+        self.assertEqual(observation["authority"], "slots_pre_post")
+        self.assertEqual(observation["offload_physical_relief_bytes"], 0)
+        self.assertEqual(observation["release_physical_relief_bytes"], 0)
+        self.assertEqual(observation["offload_authority"], "not_applicable")
+        self.assertEqual(observation["transaction_local_offload"], [])
+        summary = result["action_summary"]
+        self.assertEqual(summary["offload_physical_relief_bytes"], 0)
+        self.assertEqual(summary["release_physical_relief_bytes"], 0)
+        self.assertEqual(summary["total_physical_relief_bytes"], 0)
 
     def test_characterization_requires_combined_observation_mode(self) -> None:
         runner = load_runner_module()
