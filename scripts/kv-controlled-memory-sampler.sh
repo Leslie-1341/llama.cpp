@@ -280,11 +280,19 @@ kv_controlled_sample_bound_process() {
     trap 'KV_CONTROLLED_STOP_REQUESTED=1' TERM INT
 
     if ! start_realtime_ns="$(date +%s%N)" || ! [[ "$start_realtime_ns" =~ ^[0-9]+$ ]]; then
-        printf 'sampler: cannot read realtime sampling clock\n' >&2
-        rc=12
+        if (( KV_CONTROLLED_STOP_REQUESTED != 0 )); then
+            rc=0
+        else
+            printf 'sampler: cannot read realtime sampling clock\n' >&2
+            rc=12
+        fi
     elif ! start_mono_ns="$(kv_controlled_read_monotonic_ns)" || ! [[ "$start_mono_ns" =~ ^[0-9]+$ ]]; then
-        printf 'sampler: cannot read monotonic sampling clock\n' >&2
-        rc=12
+        if (( KV_CONTROLLED_STOP_REQUESTED != 0 )); then
+            rc=0
+        else
+            printf 'sampler: cannot read monotonic sampling clock\n' >&2
+            rc=12
+        fi
     elif ! header="$(kv_controlled_sample_header)"; then
         printf 'sampler: cannot select sample header\n' >&2
         rc=2
@@ -310,13 +318,21 @@ kv_controlled_sample_bound_process() {
                 break
             fi
             if ! now_realtime_ns="$(date +%s%N)" || ! [[ "$now_realtime_ns" =~ ^[0-9]+$ ]]; then
-                printf 'sampler: cannot read realtime sampling clock\n' >&2
-                rc=12
+                if (( KV_CONTROLLED_STOP_REQUESTED != 0 )); then
+                    rc=0
+                else
+                    printf 'sampler: cannot read realtime sampling clock\n' >&2
+                    rc=12
+                fi
                 break
             fi
             if ! now_mono_ns="$(kv_controlled_read_monotonic_ns)" || ! [[ "$now_mono_ns" =~ ^[0-9]+$ ]]; then
-                printf 'sampler: cannot read monotonic sampling clock\n' >&2
-                rc=12
+                if (( KV_CONTROLLED_STOP_REQUESTED != 0 )); then
+                    rc=0
+                else
+                    printf 'sampler: cannot read monotonic sampling clock\n' >&2
+                    rc=12
+                fi
                 break
             fi
 

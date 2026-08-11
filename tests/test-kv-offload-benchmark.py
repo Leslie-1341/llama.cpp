@@ -2476,6 +2476,63 @@ class CanonicalBenchmarkTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), ["7010000000", "7450000000", "7123456000"])
 
+    def test_sampler_active_stop_with_interrupted_clock_reads_exit_zero(self) -> None:
+        # SIGTERM arrives while the trap is installed and interrupts the
+        # monotonic sampling-clock read inside the initial $() subshell.
+        # The trap runs in the parent context and sets KV_CONTROLLED_STOP_REQUESTED=1;
+        # the interrupted subshell read returns failure with empty output. The sampler
+        # must treat this as a normal stop (rc=0) and must NOT print the clock-failure
+        # diagnostic. We drive the read through a long-running child so the real
+        # SIGTERM has a stable window to interrupt it.
+        import shlex
+        script = ROOT / "scripts/kv-controlled-memory-sampler.sh"
+        out = self.root / "active-stop-clock.tsv"
+        err = self.root / "active-stop-clock.err"
+        log = self.root / "active-stop-script.log"
+        shell = "\n".join([
+            f"source {str(script)!r}",
+            "KV_CONTROLLED_SAMPLE_SCHEMA=legacy_v1",
+            "date() { printf '%s' '1000000000'; return 0; }",
+            "kv_controlled_read_monotonic_ns() { sleep 3; return 1; }",
+            f"kv_controlled_sample_bound_process 123 1 {str(out)!r} '' 1 '' "
+            f">/dev/null 2>{str(err)!r} &",
+            "sp=$!",
+            "sleep 0.5",
+            "kill -TERM $sp 2>/dev/null || true",
+            "wait $sp; echo $?",
+        ])
+        result = subprocess.run(
+            ["bash", "-c", shell], text=True, capture_output=True, check=False)
+        log.write_text(result.stdout, encoding="utf-8")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "0",
+                         f"expected rc=0 for active-stop interrupt, got: {result.stdout!r}; "
+                         f"stderr={result.stderr!r}; errfile={err.read_text(encoding='utf-8') if err.exists() else '<empty>'}")
+        stderr_text = err.read_text(encoding="utf-8") if err.exists() else ""
+        self.assertNotIn("cannot read monotonic sampling clock", stderr_text)
+        self.assertNotIn("cannot read realtime sampling clock", stderr_text)
+
+    def test_sampler_real_clock_failure_without_stop_request_exits_twelve(self) -> None:
+        # A genuine monotonic clock failure with no stop requested must stay
+        # fail-closed at rc=12 and must surface the diagnostic on stderr.
+        script = ROOT / "scripts/kv-controlled-memory-sampler.sh"
+        out = (self.root / "real-clock-fail.tsv").as_posix()
+        err = (self.root / "real-clock-fail.err").as_posix()
+        shell = f"""
+            source {str(script)!r}
+            KV_CONTROLLED_SAMPLE_SCHEMA=legacy_v1
+            date() {{ printf '%s' '1000000000'; return 0; }}
+            kv_controlled_read_monotonic_ns() {{ return 1; }}
+            kv_controlled_sample_bound_process 123 1 {out!r} '' 0.1 '' >/dev/null 2>{err!r}
+            rc=$?
+            printf '%s' "$rc"
+        """
+        result = subprocess.run(["bash", "-c", shell], text=True, capture_output=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "12")
+        stderr_text = (self.root / "real-clock-fail.err").read_text(encoding="utf-8")
+        self.assertIn("cannot read monotonic sampling clock", stderr_text)
+
     def test_real_short_synthetic_http_and_sampler_path(self) -> None:
         spec = self.write_spec(self.spec(), "real.json")
         artifact = self.root / "real"
