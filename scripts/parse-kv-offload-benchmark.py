@@ -11,6 +11,9 @@ import re
 import sys
 from typing import Any
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from multi_session_replay import ReplayError, check_fidelity, expand_schedule, load_replay
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT = pathlib.Path(__file__).resolve()
 PROTOCOL = "kv_offload_benchmark"
@@ -327,14 +330,47 @@ def pressure_basis_source(basis: dict[str, Any]) -> str:
     return "CGROUP_RATIO" if basis["authority"] == "cgroup_finite" else "RSS_ABSOLUTE"
 
 
-def normalize_workload(workload: Any) -> dict[str, Any]:
-    value = exact(
-        workload,
-        {"warmup", "requests", "repeat", "qualification", "characterization"},
-        "spec.workload",
+def normalize_replay(value: Any) -> dict[str, Any]:
+    replay = exact(
+        value,
+        {"source", "path", "time_dilation", "n_parallel", "session_ids", "admission_timeout_seconds"},
+        "spec.workload.replay",
     )
+    if replay["source"] not in {"transcript", "fixture"}:
+        raise ParseError("spec.workload.replay.source is invalid")
+    if not isinstance(replay["path"], str) or not replay["path"]:
+        raise ParseError("spec.workload.replay.path is invalid")
+    if isinstance(replay["time_dilation"], bool) or not isinstance(replay["time_dilation"], (int, float)) or not math.isfinite(float(replay["time_dilation"])) or replay["time_dilation"] < 0:
+        raise ParseError("spec.workload.replay.time_dilation is invalid")
+    if isinstance(replay["n_parallel"], bool) or not isinstance(replay["n_parallel"], int) or replay["n_parallel"] <= 0:
+        raise ParseError("spec.workload.replay.n_parallel is invalid")
+    if replay["session_ids"] is not None and (
+        not isinstance(replay["session_ids"], list)
+        or any(not isinstance(item, str) or not item for item in replay["session_ids"])
+        or len(replay["session_ids"]) != len(set(replay["session_ids"]))
+    ):
+        raise ParseError("spec.workload.replay.session_ids is invalid")
+    admission_timeout = require_finite_positive(
+        replay["admission_timeout_seconds"], "spec.workload.replay.admission_timeout_seconds")
+    return {**replay, "time_dilation": float(replay["time_dilation"]),
+            "admission_timeout_seconds": admission_timeout}
+
+
+def normalize_workload(workload: Any) -> dict[str, Any]:
+    if not isinstance(workload, dict):
+        raise ParseError("spec.workload must be an object")
+    replay = normalize_replay(workload["replay"]) if "replay" in workload else None
+    expected_keys = {"warmup", "requests", "repeat", "qualification", "characterization"}
+    if replay is not None:
+        expected_keys.add("replay")
+    value = exact(workload, expected_keys, "spec.workload")
     if not isinstance(value["warmup"], list) or not isinstance(value["requests"], list):
         raise ParseError("spec.workload warmup/requests must be arrays")
+    if replay is not None:
+        if value["warmup"] or value["requests"] or value["qualification"] is not None or value["characterization"] is not None:
+            raise ParseError("spec.workload.replay cannot be combined with legacy workload")
+        return {"warmup": [], "requests": [], "repeat": 1,
+                "qualification": None, "characterization": None, "replay": replay}
     all_requests = value["warmup"] + value["requests"]
     ids: list[str] = []
     for index, item in enumerate(all_requests):
@@ -591,7 +627,10 @@ def validate_spec(spec: Any) -> tuple[dict[str, dict[str, Any]], list[dict[str, 
     reject_canonical_kv_environment(value["environment"], "spec.environment")
     pressure_basis = normalize_pressure_basis(value["pressure_basis"])
     workload = normalize_workload(value["workload"])
-    if value["run_mode"] == "qualification":
+    if "replay" in workload:
+        if value["run_mode"] != "qualification" or value["run_kind"] != "qualification":
+            raise ParseError("replay workload is restricted to qualification mode")
+    elif value["run_mode"] == "qualification":
         if workload["qualification"] is None or workload["characterization"] is not None:
             raise ParseError(
                 "qualification mode requires only workload.qualification configuration")
@@ -1032,6 +1071,26 @@ def validate_resident_observation(value: Any, label: str) -> dict[str, Any]:
     return value
 
 
+def validate_optional_resident_observation(value: Any, label: str) -> dict[str, Any] | None:
+    """Validate the /slots kv_resident union without inventing physical authority.
+
+    The server's preflight observation is legitimately {"status":"unavailable"}
+    before a resident sample can be established.  That state is acceptable only
+    when the caller explicitly treats resident authority as optional.  Available
+    observations still use the strict full physical schema.
+    """
+    if not isinstance(value, dict):
+        raise ParseError(f"{label}: resident observation is not an object")
+    status = value.get("status")
+    if status == "unavailable":
+        if set(value) != {"status"}:
+            raise ParseError(f"{label}: unavailable resident observation schema mismatch")
+        return None
+    if status == "available":
+        return validate_resident_observation(value, label)
+    raise ParseError(f"{label}: resident observation status is invalid")
+
+
 def validate_slot_snapshot(
         path: pathlib.Path, label: str, require_resident: bool = True) -> dict[str, Any]:
     snapshot = exact(read_json(path), SLOT_SNAPSHOT_KEYS, label)
@@ -1055,12 +1114,21 @@ def validate_slot_snapshot(
         raise ParseError(f"{label}: raw /slots body is not JSON") from exc
     if decoded != snapshot["body_json"] or not isinstance(decoded, list):
         raise ParseError(f"{label}: /slots body_json does not match raw body")
-    residents = []
+    residents: list[dict[str, Any]] = []
+    saw_unavailable_resident = False
     for index, slot in enumerate(decoded):
         if not isinstance(slot, dict):
             raise ParseError(f"{label}: slot {index} is not an object")
-        if "kv_resident" in slot:
-            residents.append(validate_resident_observation(slot["kv_resident"], f"{label}.slot[{index}].kv_resident"))
+        if "kv_resident" not in slot:
+            continue
+        resident = validate_optional_resident_observation(
+            slot["kv_resident"], f"{label}.slot[{index}].kv_resident")
+        if resident is None:
+            saw_unavailable_resident = True
+        else:
+            residents.append(resident)
+    if residents and saw_unavailable_resident:
+        raise ParseError(f"{label}: slots disagree on physical resident availability")
     if require_resident and not residents:
         raise ParseError(f"{label}: no valid physical resident observation")
     return snapshot
@@ -1773,14 +1841,21 @@ def optional_authoritative_slot_resident(
     value = snapshot.get("body_json")
     if not isinstance(value, list):
         raise ParseError(f"{label}: slot snapshot body is unavailable")
-    observations = [
-        slot["kv_resident"] for slot in value
-        if isinstance(slot, dict) and isinstance(slot.get("kv_resident"), dict)
-    ]
+    observations: list[dict[str, Any] | None] = []
+    for index, slot in enumerate(value):
+        if not isinstance(slot, dict) or "kv_resident" not in slot:
+            continue
+        observations.append(validate_optional_resident_observation(
+            slot["kv_resident"], f"{label}.slot[{index}].kv_resident"))
     if not observations:
         return None
-    first = observations[0]
-    if any(item != first for item in observations[1:]):
+    available = [item for item in observations if item is not None]
+    if not available:
+        return None
+    if len(available) != len(observations):
+        raise ParseError(f"{label}: slots disagree on physical resident availability")
+    first = available[0]
+    if any(item != first for item in available[1:]):
         raise ParseError(f"{label}: slots disagree on the global physical resident observation")
     return first
 
@@ -2725,12 +2800,195 @@ def validate_characterization_causality(
     }
 
 
+def parse_replay_run(
+        artifact: pathlib.Path,
+        plan: dict[str, Any],
+        case: dict[str, Any],
+        workload: dict[str, Any],
+        expected_execution_index: int,
+        spec: dict[str, Any]) -> dict[str, Any]:
+    label = plan["run_id"]
+    run_dir = artifact / "runs" / label
+    run = exact(read_json(run_dir / "run.json"), RUN_KEYS, f"{label}.run", {"replay"})
+    for key in ("run_id", "round", "run_order", "case_id"):
+        if run[key] != plan[key]:
+            raise ParseError(f"{label}: replay run identity mismatch at {key}")
+    if run["execution_index"] != expected_execution_index or run["case"] != plan:
+        raise ParseError(f"{label}: replay run execution/case identity mismatch")
+    replay_cfg = workload["replay"]
+    try:
+        replay_plan = load_replay(replay_cfg["source"], replay_cfg["path"],
+                                  n_parallel=replay_cfg["n_parallel"],
+                                  time_dilation=replay_cfg["time_dilation"],
+                                  selected_session_ids=replay_cfg["session_ids"])
+    except (OSError, ReplayError) as exc:
+        raise ParseError(f"{label}: replay source cannot be reloaded: {exc}") from exc
+    expected_schedule = expand_schedule(replay_plan)
+    if run.get("request_plan") != expected_schedule:
+        raise ParseError(f"{label}: replay request schedule drift")
+    execution = exact(read_json(run_dir / "execution.json"), EXECUTION_KEYS, f"{label}.execution", {"replay"})
+    if any(execution[key] != plan[key] for key in ("run_id", "round", "run_order", "case_id")):
+        raise ParseError(f"{label}: replay execution identity mismatch")
+    if execution["execution_index"] != expected_execution_index or execution["run_mode"] != "qualification":
+        raise ParseError(f"{label}: replay execution mode/order mismatch")
+    expected_argv = [spec["binary"], "--host", "127.0.0.1", "--port", execution["argv"][execution["argv"].index("--port") + 1],
+                     "--model", spec["model"], *spec["server_args"], "--parallel", str(replay_cfg["n_parallel"]),
+                     "--no-cache-idle-slots", "--no-context-shift"]
+    if execution["argv"] != expected_argv:
+        raise ParseError(f"{label}: replay server argv does not match canonical multi-session options")
+    validate_process_identity(execution["server_identity"], execution["argv"], f"{label}.server_identity")
+    sampler_argv = execution["sampler_argv"]
+    validate_process_identity(execution["sampler_identity"], sampler_argv, f"{label}.sampler_identity")
+    if execution["request_loop_started"] is not True or execution["request_count"] != len(expected_schedule):
+        raise ParseError(f"{label}: replay request lifecycle/count mismatch")
+    cleanup = exact(read_json(run_dir / "cleanup.json"), CLEANUP_KEYS, f"{label}.cleanup")
+    server_cleanup = validate_cleanup_record(cleanup["server"], f"{label}.cleanup.server")
+    sampler_cleanup = validate_cleanup_record(cleanup["sampler"], f"{label}.cleanup.sampler")
+    if cleanup["residual_process"] or not cleanup["cleanup_complete"] or server_cleanup["exit_code"] != 0 or sampler_cleanup["exit_code"] != 0:
+        raise ParseError(f"{label}: replay cleanup is incomplete")
+    if not (run_dir / "memory_samples.tsv").is_file():
+        raise ParseError(f"{label}: replay memory samples missing")
+    validate_sampler(run_dir / "memory_samples.tsv", execution["server_identity"], label)
+    slots_before = validate_slot_snapshot(
+        run_dir / "slots_before.json", f"{label}.slots_before", require_resident=False)
+    slots = slots_before["body_json"]
+    if not isinstance(slots, list):
+        raise ParseError(f"{label}: replay /slots preflight body is unavailable")
+    slot_map = {
+        slot.get("id"): slot
+        for slot in slots
+        if isinstance(slot, dict)
+        and isinstance(slot.get("id"), int)
+        and not isinstance(slot.get("id"), bool)
+    }
+    required_ids = set(range(replay_cfg["n_parallel"]))
+    if not required_ids.issubset(slot_map):
+        raise ParseError(f"{label}: replay /slots does not expose all requested slots")
+    max_required = max(
+        len(event.prompt_tokens) + event.n_predict for event in replay_plan.events)
+    for slot_id in sorted(required_ids):
+        n_ctx = slot_map[slot_id].get("n_ctx")
+        if isinstance(n_ctx, bool) or not isinstance(n_ctx, int) or n_ctx < max_required:
+            raise ParseError(
+                f"{label}: replay slot {slot_id} context capacity is insufficient")
+    responses_path = run_dir / "responses.jsonl"
+    if not responses_path.is_file():
+        raise ParseError(f"{label}: replay responses missing")
+    actual: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for line_number, line in enumerate(responses_path.read_text(encoding="utf-8").splitlines(), 1):
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ParseError(f"{label}: invalid replay response line {line_number}: {exc}") from exc
+        if not isinstance(row, dict):
+            raise ParseError(f"{label}: replay response line {line_number} is not an object")
+        required = {"event_seq", "logical_session_id", "lineage_id", "turn", "planned_ts_us", "planned_arrival_us",
+                    "prompt_tokens", "prompt_sha256", "prompt_token_count", "n_predict", "request_id", "slot_id", "seq_id",
+                    "runner_generation", "cache_prompt", "claimant_epoch", "physical_object_id", "physical_generation",
+                    "dispatch_order", "admitted_us", "dispatched_us", "completed_us", "arrival_lag_us",
+                    "admission_wait_us", "service_us", "started_mono_ns", "started_us", "finished_mono_ns",
+                    "http_status", "headers", "request_sha256", "body_path", "body_bytes", "body_sha256",
+                    "response_json", "response_slot_id", "tokens_evaluated", "tokens_predicted",
+                    "response_token_sha256", "error"}
+        if set(row) != required:
+            raise ParseError(f"{label}: replay response schema mismatch at line {line_number}")
+        if row["request_id"] in seen:
+            raise ParseError(f"{label}: duplicate replay request_id {row['request_id']}")
+        seen.add(row["request_id"])
+        slot = row["slot_id"]
+        if isinstance(slot, bool) or not isinstance(slot, int) or not 0 <= slot < replay_cfg["n_parallel"] or row["seq_id"] != slot:
+            raise ParseError(f"{label}: replay slot/seq binding is invalid")
+        if row["http_status"] != 200 or row["response_slot_id"] != slot:
+            raise ParseError(f"{label}: replay completion slot/status mismatch")
+        if row["prompt_token_count"] != len(row["prompt_tokens"]):
+            raise ParseError(f"{label}: replay prompt token count mismatch")
+        if row["cache_prompt"] is not (row["turn"] > 1):
+            raise ParseError(f"{label}: replay cache_prompt lifecycle mismatch")
+        if isinstance(row["runner_generation"], bool) or not isinstance(row["runner_generation"], int) or row["runner_generation"] <= 0:
+            raise ParseError(f"{label}: replay runner generation is invalid")
+        for key in ("claimant_epoch", "physical_object_id", "physical_generation"):
+            value = row[key]
+            if value != "UNAVAILABLE" and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+                raise ParseError(f"{label}: replay {key} is neither a valid telemetry value nor UNAVAILABLE")
+        if isinstance(row["dispatch_order"], bool) or not isinstance(row["dispatch_order"], int) or row["dispatch_order"] < 0:
+            raise ParseError(f"{label}: replay dispatch order is invalid")
+        expected_request = {
+            "prompt": row["prompt_tokens"], "n_predict": row["n_predict"], "seed": 0,
+            "temperature": 0.0, "top_k": 1, "top_p": 1.0,
+            "cache_prompt": row["cache_prompt"], "return_tokens": True,
+            "ignore_eos": True, "stream": False, "id_slot": slot,
+        }
+        expected_request_sha = sha256_bytes(json.dumps(expected_request, ensure_ascii=False,
+                                                       separators=(",", ":"), sort_keys=True).encode("utf-8"))
+        if row["request_sha256"] != expected_request_sha:
+            raise ParseError(f"{label}: replay request identity mismatch")
+        if row["prompt_sha256"] != sha256_bytes(json.dumps(row["prompt_tokens"], separators=(",", ":")).encode("utf-8")):
+            raise ParseError(f"{label}: replay prompt SHA mismatch")
+        payload = row["response_json"]
+        if not isinstance(payload, dict) or payload.get("id_slot") != slot:
+            raise ParseError(f"{label}: replay response id_slot mismatch")
+        tokens = payload.get("tokens")
+        if not isinstance(tokens, list) or len(tokens) != row["n_predict"] or row["tokens_predicted"] != row["n_predict"] or row["tokens_evaluated"] != len(row["prompt_tokens"]):
+            raise ParseError(f"{label}: replay token conservation mismatch")
+        token_sha = sha256_bytes(json.dumps(tokens, separators=(",", ":")).encode("utf-8"))
+        if row["response_token_sha256"] != token_sha:
+            raise ParseError(f"{label}: replay response token SHA mismatch")
+        body_path = pathlib.Path(row["body_path"])
+        if body_path.is_absolute() or ".." in body_path.parts:
+            raise ParseError(f"{label}: replay response body escapes artifact")
+        body = run_dir / body_path
+        if not body.is_file() or body.stat().st_size != row["body_bytes"] or sha256_file(body) != row["body_sha256"]:
+            raise ParseError(f"{label}: replay response body identity mismatch")
+        for key in ("admitted_us", "dispatched_us", "completed_us", "arrival_lag_us",
+                    "admission_wait_us", "service_us", "started_us"):
+            value = row[key]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ParseError(f"{label}: replay {key} is invalid")
+        if row["completed_us"] < row["dispatched_us"] or row["dispatched_us"] < row["admitted_us"]:
+            raise ParseError(f"{label}: replay timestamps are not monotonic")
+        if row["dispatched_us"] != row["started_us"]:
+            raise ParseError(f"{label}: replay dispatched/start timestamp mismatch")
+        if row["arrival_lag_us"] != max(0, row["dispatched_us"] - row["planned_arrival_us"]):
+            raise ParseError(f"{label}: replay arrival_lag_us is inconsistent")
+        if row["admission_wait_us"] != max(0, row["admitted_us"] - row["planned_arrival_us"]):
+            raise ParseError(f"{label}: replay admission_wait_us is inconsistent")
+        if row["service_us"] != row["completed_us"] - row["dispatched_us"]:
+            raise ParseError(f"{label}: replay service_us is inconsistent")
+        actual.append(row)
+    if len(actual) != len(expected_schedule):
+        raise ParseError(f"{label}: replay response count mismatch")
+    fidelity = check_fidelity(replay_plan, actual, n_parallel=replay_cfg["n_parallel"])
+    if fidelity["status"] != "PASS":
+        raise ParseError(f"{label}: workload_fidelity failed: {fidelity['errors']}")
+    replay_artifact = exact(read_json(run_dir / "replay.json"), {"plan", "schedule", "admission", "events", "workload_fidelity"}, f"{label}.replay")
+    admitted_sessions = {item.get("logical_session_id") for item in replay_artifact["admission"] if item.get("status") in {"admitted", "already_live", "finished"}}
+    planned_sessions = {item["logical_session_id"] for item in expected_schedule}
+    if admitted_sessions != planned_sessions:
+        raise ParseError(f"{label}: planned sessions differ from admitted sessions")
+    if replay_artifact["plan"] != replay_plan.to_dict():
+        raise ParseError(f"{label}: replay plan identity drift")
+    if replay_artifact["schedule"] != expected_schedule or replay_artifact["workload_fidelity"]["status"] != "PASS":
+        raise ParseError(f"{label}: replay artifact schedule/fidelity record drift")
+    if replay_artifact["events"] != actual:
+        raise ParseError(f"{label}: replay artifact event journal differs from responses authority")
+    if execution.get("replay") != replay_artifact:
+        raise ParseError(f"{label}: execution replay journal differs from replay.json")
+    return {"run_id": label, "case_id": plan["case_id"], "round": plan["round"], "policy": plan["policy"],
+            "server_exit_code": server_cleanup["exit_code"], "sampler_exit_code": sampler_cleanup["exit_code"],
+            "samples": [], "memory": {}, "slots_before": None, "slots_after": None, "responses": actual,
+            "service_failures": [], "actions": [], "resident_observations": [], "qualified_offload_pairs": [],
+            "offload_physical_relief_bytes": 0, "qualification_round_trip": None, "characterization": None,
+            "resume_events": [], "resume_timings": [], "io": {}, "statistics": {},
+            "workload_fidelity": fidelity, "replay": replay_artifact}
+
+
 def parse_run(artifact: pathlib.Path, plan: dict[str, Any], case: dict[str, Any], workload: dict[str, Any], expected_execution_index: int, spec: dict[str, Any]) -> dict[str, Any]:
     run_dir = artifact / "runs" / plan["run_id"]
     label = f"{plan['run_id']}"
     if not run_dir.is_dir():
         raise ParseError(f"{label}: run directory missing")
-    run = exact(read_json(run_dir / "run.json"), RUN_KEYS, f"{label}.run")
+    run = exact(read_json(run_dir / "run.json"), RUN_KEYS, f"{label}.run", {"replay"})
     for key in ("run_id", "round", "run_order", "case_id"):
         if run[key] != plan[key]:
             raise ParseError(f"{label}: run identity mismatch at {key}")
@@ -2738,6 +2996,8 @@ def parse_run(artifact: pathlib.Path, plan: dict[str, Any], case: dict[str, Any]
         raise ParseError(f"{label}: declared execution index mismatch")
     if run["case"] != plan:
         raise ParseError(f"{label}: embedded case differs from planned factor")
+    if "replay" in workload:
+        return parse_replay_run(artifact, plan, case, workload, expected_execution_index, spec)
     request_plan = run["request_plan"]
     expected_plan = expanded_request_plan(workload, case, spec["run_mode"])
     if request_plan != expected_plan:
@@ -3066,6 +3326,20 @@ def validate_formal_pressure_authority(
         raise ParseError("formal budget run requires real finite cgroup pressure authority")
 
 
+def validate_replay_model_binding(model_binding: Any, artifact_model_sha: Any) -> None:
+    """Bind replay to the transcript model while retaining binary provenance validation."""
+    if not isinstance(model_binding, dict):
+        raise ParseError("replay transcript model identity is missing")
+    transcript_model_sha = model_binding.get("model_sha256")
+    transcript_binary_sha = model_binding.get("binary_sha256")
+    if not isinstance(transcript_model_sha, str) or re.fullmatch(r"[0-9a-f]{64}", transcript_model_sha) is None:
+        raise ParseError("replay transcript model SHA is invalid")
+    if not isinstance(transcript_binary_sha, str) or re.fullmatch(r"[0-9a-f]{64}", transcript_binary_sha) is None:
+        raise ParseError("replay transcript binary SHA is invalid")
+    if transcript_model_sha != artifact_model_sha:
+        raise ParseError("replay transcript model SHA differs from artifact model identity")
+
+
 def validate_manifest(artifact: pathlib.Path) -> tuple[dict[str, Any], dict[str, dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     manifest = exact(read_json(artifact / "manifest.json"), MANIFEST_REQUIRED, "manifest", MANIFEST_OPTIONAL)
     reject_runner_verdict(manifest)
@@ -3092,6 +3366,11 @@ def validate_manifest(artifact: pathlib.Path) -> tuple[dict[str, Any], dict[str,
     if git["capture_mode"] not in {"archival_clean", "diagnostic_dirty"}:
         raise ParseError("manifest.provenance.git capture_mode is invalid")
     cases, plan, workload = validate_spec(manifest["spec"])
+    if "replay" in workload and workload["replay"]["source"] == "transcript":
+        transcript_path = pathlib.Path(workload["replay"]["path"])
+        transcript = read_json(transcript_path)
+        model_binding = transcript.get("model") if isinstance(transcript, dict) else None
+        validate_replay_model_binding(model_binding, provenance["model"]["sha256"])
     if manifest["spec"]["run_kind"] == "formal" and (git["capture_mode"] != "archival_clean" or git["dirty_status"]):
         raise ParseError("formal artifact is not from a clean worktree")
     for item in plan:
@@ -3839,6 +4118,33 @@ def parse_artifact(artifact: pathlib.Path) -> tuple[str, dict[str, Any]]:
                 "telemetry_gaps": TELEMETRY_GAPS,
             }
             return "DRY_RUN", result
+        if "replay" in workload:
+            replay_results = [
+                parse_run(artifact, item, cases[item["case_id"]], workload, index, manifest["spec"])
+                for index, item in enumerate(plan)
+            ]
+            fidelity = {
+                "status": "PASS" if all(item["workload_fidelity"]["status"] == "PASS" for item in replay_results) else "FAIL",
+                "runs": [item["workload_fidelity"] for item in replay_results],
+                "planned_sessions": sum(item["workload_fidelity"]["planned_sessions"] for item in replay_results),
+                "executed_sessions": sum(item["workload_fidelity"]["executed_sessions"] for item in replay_results),
+                "planned_turns": sum(item["workload_fidelity"]["planned_turns"] for item in replay_results),
+                "completed_turns": sum(item["workload_fidelity"]["completed_turns"] for item in replay_results),
+            }
+            result = {
+                "schema_version": SCHEMA_VERSION,
+                "protocol": PROTOCOL,
+                "artifact_id": manifest["artifact_id"],
+                "run_kind": manifest["spec"]["run_kind"],
+                "run_mode": manifest["spec"]["run_mode"],
+                "verdict": "QUALIFICATION_PASS" if fidelity["status"] == "PASS" else "INVALID_ARTIFACT",
+                "errors": [],
+                "planned_runs": plan,
+                "workload_fidelity": fidelity,
+                "replay_runs": replay_results,
+                "telemetry_gaps": TELEMETRY_GAPS,
+            }
+            return result["verdict"], result
         run_results: list[dict[str, Any]] = []
         service_failures: list[dict[str, Any]] = []
         for item in plan:

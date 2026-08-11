@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import http.client
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import math
 import json
 import os
@@ -24,6 +25,9 @@ import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from multi_session_replay import ReplayError, check_fidelity, expand_schedule, load_replay
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 RUNNER = pathlib.Path(__file__).resolve()
@@ -435,16 +439,72 @@ def normalize_pressure_basis(value: Any) -> dict[str, Any]:
     }
 
 
-def normalize_workload(value: Any) -> dict[str, Any]:
-    workload = validate_mapping(
+def normalize_replay(value: Any) -> dict[str, Any]:
+    replay = validate_mapping(
         value,
-        {"warmup", "requests", "repeat", "qualification", "characterization"},
-        "workload",
+        {"source", "path", "time_dilation", "n_parallel", "session_ids", "admission_timeout_seconds"},
+        "workload.replay",
     )
+    if replay["source"] not in {"transcript", "fixture"}:
+        raise RunnerError("workload.replay.source must be transcript or fixture")
+    if not isinstance(replay["path"], str) or not replay["path"]:
+        raise RunnerError("workload.replay.path must be a non-empty string")
+    time_dilation = replay["time_dilation"]
+    if isinstance(time_dilation, bool) or not isinstance(time_dilation, (int, float)) or not math.isfinite(float(time_dilation)) or time_dilation < 0:
+        raise RunnerError("workload.replay.time_dilation must be finite and non-negative")
+    n_parallel = replay["n_parallel"]
+    if isinstance(n_parallel, bool) or not isinstance(n_parallel, int) or n_parallel <= 0:
+        raise RunnerError("workload.replay.n_parallel must be positive")
+    session_ids = replay["session_ids"]
+    if session_ids is not None and (
+        not isinstance(session_ids, list)
+        or any(not isinstance(item, str) or not item for item in session_ids)
+        or len(session_ids) != len(set(session_ids))
+    ):
+        raise RunnerError("workload.replay.session_ids must be null or a unique string array")
+    admission_timeout = require_finite_positive(
+        replay["admission_timeout_seconds"], "workload.replay.admission_timeout_seconds")
+    return {
+        "source": replay["source"],
+        "path": replay["path"],
+        "time_dilation": float(time_dilation),
+        "n_parallel": n_parallel,
+        "session_ids": session_ids,
+        "admission_timeout_seconds": admission_timeout,
+    }
+
+
+def load_replay_plan(replay: dict[str, Any]) -> Any:
+    try:
+        return load_replay(
+            replay["source"], replay["path"],
+            n_parallel=replay["n_parallel"],
+            time_dilation=replay["time_dilation"],
+            selected_session_ids=replay["session_ids"],
+        )
+    except (OSError, ReplayError) as exc:
+        raise RunnerError(f"replay input is invalid: {exc}") from exc
+
+
+def normalize_workload(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise RunnerError("workload must be an object")
+    replay = normalize_replay(value["replay"]) if "replay" in value else None
+    expected_keys = {"warmup", "requests", "repeat", "qualification", "characterization"}
+    if replay is not None:
+        expected_keys.add("replay")
+    workload = validate_mapping(value, expected_keys, "workload")
     if not isinstance(workload["warmup"], list) or not isinstance(workload["requests"], list):
         raise RunnerError("workload warmup/requests must be arrays")
     warmup = [normalize_request(item, f"workload.warmup[{i}]") for i, item in enumerate(workload["warmup"])]
     requests = [normalize_request(item, f"workload.requests[{i}]") for i, item in enumerate(workload["requests"])]
+    if replay is not None:
+        if warmup or requests or workload["qualification"] is not None or workload["characterization"] is not None:
+            raise RunnerError("workload.replay cannot be combined with legacy requests or qualification/characterization")
+        return {
+            "warmup": [], "requests": [], "repeat": 1,
+            "qualification": None, "characterization": None, "replay": replay,
+        }
     ids = [item["request_id"] for item in warmup + requests]
     if len(ids) != len(set(ids)):
         raise RunnerError("workload request_id values must be unique")
@@ -740,6 +800,10 @@ def validate_spec(raw: Any) -> tuple[dict[str, Any], dict[str, dict[str, Any]], 
     if not isinstance(spec["server_args"], list) or any(not isinstance(item, str) for item in spec["server_args"]):
         raise RunnerError("spec.server_args must be a string array")
     reject_canonical_server_args(spec["server_args"])
+    if isinstance(spec.get("workload"), dict) and "replay" in spec["workload"]:
+        replay_args = set(spec["server_args"])
+        if replay_args.intersection({"--parallel", "-np", "--cache-idle-slots", "--no-cache-idle-slots", "--context-shift", "--no-context-shift"}):
+            raise RunnerError("replay workload owns --parallel/cache-idle/context-shift server options")
     if not isinstance(spec["environment"], dict) or any(
         not isinstance(key, str) or not isinstance(value, str) for key, value in spec["environment"].items()
     ):
@@ -770,7 +834,10 @@ def validate_spec(raw: Any) -> tuple[dict[str, Any], dict[str, dict[str, Any]], 
         raise RunnerError("formal budget_sweep requires repeat >= 2 for post-resume steady measurements")
     if any(item["policy"] == "release_only" for item in plan) and spec["run_mode"] != "characterization":
         raise RunnerError("release_only policy is available only in characterization mode")
-    if spec["run_mode"] == "qualification":
+    if "replay" in workload:
+        if spec["run_mode"] != "qualification" or spec["run_kind"] != "qualification":
+            raise RunnerError("replay workload is restricted to qualification mode")
+    elif spec["run_mode"] == "qualification":
         if workload["qualification"] is None or workload["characterization"] is not None:
             raise RunnerError(
                 "qualification mode requires only workload.qualification configuration")
@@ -902,13 +969,17 @@ def runtime_environment(
 
 
 def server_argv(spec: dict[str, Any], port: int) -> list[str]:
-    return [
+    args = [
         spec["binary"],
         "--host", "127.0.0.1",
         "--port", str(port),
         "--model", spec["model"],
         *spec["server_args"],
     ]
+    replay = spec.get("workload", {}).get("replay") if isinstance(spec.get("workload"), dict) else None
+    if replay is not None:
+        args.extend(["--parallel", str(replay["n_parallel"]), "--no-cache-idle-slots", "--no-context-shift"])
+    return args
 
 
 def wait_health(port: int, process: subprocess.Popen[bytes], timeout: float) -> None:
@@ -1611,6 +1682,458 @@ def terminate_process(
     }
 
 
+def request_completion_replay(
+        port: int,
+        event: dict[str, Any],
+        slot_id: int,
+        raw_dir: pathlib.Path,
+        timeout: float,
+        started_at_ns: int,
+) -> dict[str, Any]:
+    if isinstance(slot_id, bool) or not isinstance(slot_id, int) or slot_id < 0:
+        raise RunnerError("replay id_slot must be a non-negative integer")
+    cache_prompt = event["turn"] > 1
+    body = {
+        "prompt": event["prompt_tokens"],
+        "n_predict": event["n_predict"],
+        "seed": 0,
+        "temperature": 0.0,
+        "top_k": 1,
+        "top_p": 1.0,
+        "cache_prompt": cache_prompt,
+        "return_tokens": True,
+        "ignore_eos": True,
+        "stream": False,
+        "id_slot": slot_id,
+    }
+    encoded = json.dumps(body, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    request_sha = sha256_bytes(encoded)
+    started_mono = time.monotonic_ns()
+    status = 0
+    response_body = b""
+    headers: list[list[str]] = []
+    error: str | None = None
+    try:
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+        connection.request("POST", "/completion", encoded, {"Content-Type": "application/json"})
+        response = connection.getresponse()
+        status = int(response.status)
+        headers = [[key, value] for key, value in response.getheaders()]
+        chunks: list[bytes] = []
+        while True:
+            chunk = response.read(64 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        response_body = b"".join(chunks)
+        connection.close()
+    except (OSError, http.client.HTTPException) as exc:
+        error = str(exc)
+    finished_mono = time.monotonic_ns()
+    body_path = raw_dir / f"replay_response_{event['event_seq']:06d}.body"
+    body_path.write_bytes(response_body)
+    parsed: Any = None
+    try:
+        parsed = json.loads(response_body.decode("utf-8")) if response_body else None
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        parsed = None
+    token_sha: str | None = None
+    tokens_evaluated: int | None = None
+    tokens_predicted: int | None = None
+    response_slot: int | None = None
+    if isinstance(parsed, dict):
+        response_slot = parsed.get("id_slot")
+        tokens_evaluated = parsed.get("tokens_evaluated")
+        tokens_predicted = parsed.get("tokens_predicted")
+        tokens = parsed.get("tokens")
+        if isinstance(tokens, list) and all(isinstance(t, int) and not isinstance(t, bool) and t >= 0 for t in tokens):
+            token_sha = sha256_bytes(json.dumps(tokens, separators=(",", ":")).encode("utf-8"))
+    return {
+        **event,
+        "slot_id": slot_id,
+        "seq_id": slot_id,
+        "cache_prompt": cache_prompt,
+        "prompt_token_count": len(event["prompt_tokens"]),
+        "claimant_epoch": "UNAVAILABLE",
+        "physical_object_id": "UNAVAILABLE",
+        "physical_generation": "UNAVAILABLE",
+        "request_sha256": request_sha,
+        "started_mono_ns": started_mono,
+        "started_us": (started_mono - started_at_ns) // 1000,
+        "finished_mono_ns": finished_mono,
+        "completed_us": (finished_mono - started_at_ns) // 1000,
+        "http_status": status,
+        "headers": headers,
+        "body_path": str(body_path.relative_to(raw_dir.parent)),
+        "body_bytes": len(response_body),
+        "body_sha256": sha256_bytes(response_body),
+        "response_json": parsed,
+        "response_slot_id": response_slot,
+        "tokens_evaluated": tokens_evaluated,
+        "tokens_predicted": tokens_predicted,
+        "response_token_sha256": token_sha,
+        "error": error,
+    }
+
+
+def validate_replay_model_binding(replay_plan: Any, spec: dict[str, Any]) -> None:
+    """Bind a model-bound transcript to the replay model, not its materializer binary."""
+    if replay_plan.schema != "gt-trace-1b-a/v1":
+        return
+    try:
+        document = json.loads(pathlib.Path(replay_plan.source_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RunnerError(f"cannot reload model-bound replay transcript: {exc}") from exc
+    model = document.get("model")
+    if not isinstance(model, dict):
+        raise RunnerError("model-bound replay transcript has no model identity")
+    expected_model_sha = model.get("model_sha256")
+    transcript_binary_sha = model.get("binary_sha256")
+    if not isinstance(expected_model_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_model_sha):
+        raise RunnerError("model-bound replay transcript model SHA is invalid")
+    if not isinstance(transcript_binary_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", transcript_binary_sha):
+        raise RunnerError("model-bound replay transcript binary SHA is invalid")
+    if sha256_file(pathlib.Path(spec["model"])) != expected_model_sha:
+        raise RunnerError("replay model bytes differ from the model-bound transcript")
+
+
+def validate_replay_slot_capacity(
+        snapshot: dict[str, Any], replay_plan: Any, n_parallel: int) -> None:
+    """Require every replay slot to fit the largest selected request."""
+    slots = snapshot.get("body_json")
+    if not isinstance(slots, list):
+        raise RunnerError("replay /slots preflight body is unavailable")
+    by_id: dict[int, dict[str, Any]] = {}
+    for slot in slots:
+        if not isinstance(slot, dict):
+            continue
+        slot_id = slot.get("id")
+        if isinstance(slot_id, bool) or not isinstance(slot_id, int):
+            continue
+        by_id[slot_id] = slot
+    required_ids = set(range(n_parallel))
+    if not required_ids.issubset(by_id):
+        raise RunnerError(
+            f"replay /slots does not expose all requested slots: expected={sorted(required_ids)} "
+            f"actual={sorted(by_id)}")
+    max_required = max(
+        len(event.prompt_tokens) + event.n_predict
+        for event in replay_plan.events
+    )
+    for slot_id in sorted(required_ids):
+        n_ctx = by_id[slot_id].get("n_ctx")
+        if isinstance(n_ctx, bool) or not isinstance(n_ctx, int) or n_ctx <= 0:
+            raise RunnerError(f"replay slot {slot_id} n_ctx is invalid")
+        if n_ctx < max_required:
+            raise RunnerError(
+                f"replay slot {slot_id} context too small: n_ctx={n_ctx} "
+                f"required={max_required}")
+
+
+def run_one_replay(
+        artifact: pathlib.Path,
+        run: dict[str, Any],
+        case: dict[str, Any],
+        spec: dict[str, Any],
+        workload: dict[str, Any],
+        execution_index: int,
+) -> dict[str, Any]:
+    run_dir = artifact / "runs" / run["run_id"]
+    raw_dir = run_dir / "raw"
+    backing_dir = run_dir / "backing"
+    raw_dir.mkdir(parents=True)
+    backing_dir.mkdir()
+    replay_cfg = workload["replay"]
+    replay_plan = load_replay_plan(replay_cfg)
+    validate_replay_model_binding(replay_plan, spec)
+    schedule = expand_schedule(replay_plan)
+    dump(run_dir / "run.json", {
+        "run_id": run["run_id"], "round": run["round"], "run_order": run["run_order"],
+        "case_id": run["case_id"], "execution_index": execution_index, "case": run,
+        "request_plan": schedule, "replay": replay_plan.to_dict(),
+    })
+    port = free_port()
+    env = runtime_environment(spec, case, backing_dir)
+    argv = server_argv(spec, port)
+    stdout_path, stderr_path = run_dir / "server.stdout", run_dir / "server.stderr"
+    sampler_stdout_path, sampler_stderr_path = run_dir / "sampler.stdout", run_dir / "sampler.stderr"
+    samples_path, responses_path = run_dir / "memory_samples.tsv", run_dir / "responses.jsonl"
+    server: subprocess.Popen[bytes] | None = None
+    sampler: subprocess.Popen[bytes] | None = None
+    server_identity_record: dict[str, Any] | None = None
+    sampler_identity_record: dict[str, Any] | None = None
+    server_cgroup: dict[str, Any] | None = None
+    runner_cgroup = cgroup_identity(os.getpid())
+    request_records: list[dict[str, Any]] = []
+    admission_records: list[dict[str, Any]] = []
+    lifecycle_error: str | None = None
+    server_cleanup = {"pid": None, "pgid": None, "exit_code": None, "stop_requested": False,
+                       "stop_signal": None, "term_timed_out": False, "kill_timed_out": False,
+                       "pgid_check_complete": False, "residual_process": False}
+    sampler_cleanup = dict(server_cleanup)
+    handles: list[Any] = []
+    started_at_ns = time.monotonic_ns()
+    request_loop_started = False
+    try:
+        server_handle = stdout_path.open("wb"); handles.append(server_handle)
+        server_err_handle = stderr_path.open("wb"); handles.append(server_err_handle)
+        server = subprocess.Popen(argv, cwd=run_dir, env=env, stdout=server_handle,
+                                  stderr=server_err_handle, start_new_session=True)
+        server_identity_record = process_identity(server.pid, argv)
+        server_cgroup = cgroup_scope(cgroup_identity(server.pid), runner_cgroup)
+        expected_memory_max = spec["cgroup"]["expected_memory_max"]
+        if expected_memory_max is not None and server_cgroup.get("memory_max") != expected_memory_max:
+            raise RunnerError("server cgroup memory.max mismatch")
+        if spec["pressure_basis"]["authority"] == "cgroup_finite" and not finite_memory_limit(server_cgroup.get("memory_max")):
+            raise RunnerError("server cgroup does not provide a finite pressure authority")
+        current_file = server_cgroup.get("memory_current_file") or ""
+        sampler_env = dict(os.environ)
+        sampler_env["KV_CONTROLLED_SAMPLE_SCHEMA"] = SAMPLE_SCHEMA
+        sampler_env["KV_CONTROLLED_CGROUP_DIR"] = server_cgroup.get("path") or ""
+        sampler_command = ["bash", str(MEMORY_SAMPLER), "--sample-process", str(server.pid),
+                           str(samples_path), str(backing_dir), str(spec["sampler"]["interval_seconds"]), current_file]
+        sampler_stdout_handle = sampler_stdout_path.open("wb"); handles.append(sampler_stdout_handle)
+        sampler_stderr_handle = sampler_stderr_path.open("wb"); handles.append(sampler_stderr_handle)
+        sampler = subprocess.Popen(sampler_command, cwd=run_dir, env=sampler_env,
+                                   stdout=sampler_stdout_handle, stderr=sampler_stderr_handle,
+                                   start_new_session=True)
+        sampler_identity_record = process_identity(sampler.pid, sampler_command)
+        wait_health(port, server, spec["health_timeout_seconds"])
+        slots_before = capture_slots(
+            port, run_dir / "slots_before.json", spec["request_timeout_seconds"])
+        validate_replay_slot_capacity(
+            slots_before, replay_plan, replay_cfg["n_parallel"])
+        request_loop_started = True
+        admission = __import__("multi_session_replay", fromlist=["SlotAdmission"]).SlotAdmission(
+            replay_cfg["n_parallel"])
+        session_last_turn = {
+            session.logical_session_id: session.turns[-1].turn
+            for session in replay_plan.sessions
+        }
+        session_next_turn: dict[str, int] = {
+            session.logical_session_id: 1 for session in replay_plan.sessions
+        }
+        session_available_us: dict[str, int] = {
+            session.logical_session_id: 0 for session in replay_plan.sessions
+        }
+        pending = list(schedule)
+        inflight: dict[Any, dict[str, Any]] = {}
+        inflight_sessions: set[str] = set()
+        queued_recorded: set[str] = set()
+        dispatch_count = 0
+        blocked_since: float | None = None
+
+        with ThreadPoolExecutor(max_workers=replay_cfg["n_parallel"]) as executor:
+            while pending or inflight:
+                progressed = False
+
+                # Retire completed HTTP requests first.  Results are kept in
+                # dispatch order when persisted, but their own timestamps retain
+                # the true completion order.
+                done = [future for future in inflight if future.done()]
+                for future in sorted(done, key=lambda item: inflight[item]["dispatch_order"]):
+                    meta = inflight.pop(future)
+                    first = meta["event"]
+                    sid = first["logical_session_id"]
+                    try:
+                        actual = future.result()
+                    except Exception as exc:
+                        raise RunnerError(
+                            f"replay request failed for {first['request_id']}: {exc}") from exc
+                    actual.update({
+                        "dispatch_order": meta["dispatch_order"],
+                        "admitted_us": meta["admitted_us"],
+                        "dispatched_us": actual["started_us"],
+                        "planned_arrival_us": first["planned_arrival_us"],
+                        "arrival_lag_us": max(
+                            0, actual["started_us"] - first["planned_arrival_us"]),
+                        "admission_wait_us": max(
+                            0, meta["admitted_us"] - first["planned_arrival_us"]),
+                        "service_us": actual["completed_us"] - actual["started_us"],
+                        "runner_generation": meta["binding"]["runner_generation"],
+                    })
+                    request_records.append(actual)
+                    inflight_sessions.remove(sid)
+                    session_available_us[sid] = actual["completed_us"]
+                    session_next_turn[sid] += 1
+                    if first["turn"] == session_last_turn[sid]:
+                        finish = admission.finish(sid, actual["completed_us"])
+                        admission_records.append({**first, **finish})
+                    progressed = True
+
+                now_us = (time.monotonic_ns() - started_at_ns) // 1000
+                ready = [
+                    item for item in pending
+                    if item["planned_arrival_us"] <= now_us
+                ]
+
+                # Dispatch independent sessions concurrently, up to n_parallel.
+                for first in ready:
+                    if len(inflight) >= replay_cfg["n_parallel"]:
+                        break
+                    sid = first["logical_session_id"]
+                    if sid in inflight_sessions:
+                        continue
+                    if first["turn"] != session_next_turn[sid]:
+                        # A later turn may have arrived while the previous turn is
+                        # still running; defer it, but never reinterpret it as a
+                        # new session/admission event.
+                        if first["turn"] > session_next_turn[sid]:
+                            continue
+                        raise ReplayError(
+                            f"session {sid} turn order is not contiguous")
+
+                    if sid in admission.bindings:
+                        binding = admission.binding(sid)
+                        admitted_us = max(
+                            first["planned_arrival_us"], session_available_us[sid])
+                    else:
+                        was_waiting = sid in admission.waiting
+                        decision = admission.admit(sid, now_us)
+                        if decision["status"] == "queued":
+                            if not was_waiting and sid not in queued_recorded:
+                                admission_records.append({
+                                    **first, **decision, "observed_us": now_us})
+                                queued_recorded.add(sid)
+                            continue
+                        if decision["status"] != "admitted":
+                            raise RunnerError(
+                                f"unexpected replay admission state {decision['status']!r}")
+                        admission_records.append({
+                            **first, **decision, "observed_us": now_us})
+                        queued_recorded.discard(sid)
+                        binding = {
+                            "slot_id": decision["slot_id"],
+                            "seq_id": decision["seq_id"],
+                            "runner_generation": decision["runner_generation"],
+                        }
+                        admitted_us = max(first["planned_arrival_us"], now_us)
+
+                    if not 0 <= binding["slot_id"] < replay_cfg["n_parallel"]:
+                        raise RunnerError("replay slot binding is out of range")
+
+                    pending.remove(first)
+                    inflight_sessions.add(sid)
+                    current_dispatch_order = dispatch_count
+                    dispatch_count += 1
+                    future = executor.submit(
+                        request_completion_replay,
+                        port,
+                        first,
+                        binding["slot_id"],
+                        raw_dir,
+                        spec["request_timeout_seconds"],
+                        started_at_ns,
+                    )
+                    inflight[future] = {
+                        "event": first,
+                        "binding": binding,
+                        "dispatch_order": current_dispatch_order,
+                        "admitted_us": admitted_us,
+                    }
+                    progressed = True
+
+                if progressed:
+                    blocked_since = None
+                    continue
+
+                if inflight:
+                    next_arrival_us = min(
+                        (item["planned_arrival_us"] for item in pending),
+                        default=None,
+                    )
+                    timeout = None
+                    if next_arrival_us is not None and next_arrival_us > now_us:
+                        timeout = max(
+                            0.0, (next_arrival_us - now_us) / 1_000_000.0)
+                    wait(
+                        list(inflight),
+                        timeout=timeout,
+                        return_when=FIRST_COMPLETED,
+                    )
+                    continue
+
+                if not pending:
+                    break
+
+                # No request is in flight.  If all current slots are held by
+                # idle sessions, a queued session must wait for one of those
+                # sessions' future turns to complete; this qualification gate
+                # deliberately does not invent eviction/TTL semantics.
+                future_live = [
+                    item for item in pending
+                    if item["logical_session_id"] in admission.bindings
+                ]
+                next_wakeup_us = min(
+                    (item["planned_arrival_us"] for item in future_live),
+                    default=min(item["planned_arrival_us"] for item in pending),
+                )
+                if next_wakeup_us > now_us:
+                    blocked_since = None
+                    time.sleep((next_wakeup_us - now_us) / 1_000_000.0)
+                    continue
+
+                if blocked_since is None:
+                    blocked_since = time.monotonic()
+                if time.monotonic() - blocked_since >= replay_cfg["admission_timeout_seconds"]:
+                    raise RunnerError(
+                        "replay admission queue cannot drain without lifecycle release")
+                time.sleep(0.01)
+
+        request_records.sort(key=lambda item: item["dispatch_order"])
+        with responses_path.open("w", encoding="utf-8") as responses:
+            for actual in request_records:
+                responses.write(
+                    json.dumps(actual, ensure_ascii=False, sort_keys=True) + "\n")
+        capture_slots(port, run_dir / "slots_after.json", spec["request_timeout_seconds"])
+    except (OSError, RunnerError, ReplayError, subprocess.SubprocessError) as exc:
+        lifecycle_error = str(exc)
+    finally:
+        if sampler is not None:
+            sampler_cleanup = terminate_process(sampler, "sampler", 5.0)
+        if server is not None:
+            server_cleanup = terminate_process(server, "server", 10.0)
+        for handle in handles:
+            handle.close()
+    cleanup = {"server": server_cleanup, "sampler": sampler_cleanup,
+               "residual_process": bool(server_cleanup["residual_process"] or sampler_cleanup["residual_process"]),
+               "cleanup_complete": lifecycle_error is None and server_cleanup["exit_code"] == 0
+               and sampler_cleanup["exit_code"] == 0 and not (server_cleanup["residual_process"] or sampler_cleanup["residual_process"])}
+    dump(run_dir / "cleanup.json", cleanup)
+    fidelity = check_fidelity(replay_plan, request_records, n_parallel=replay_cfg["n_parallel"])
+    replay_record = {"plan": replay_plan.to_dict(), "schedule": schedule,
+                     "admission": admission_records, "events": request_records,
+                     "workload_fidelity": fidelity}
+    dump(run_dir / "replay.json", replay_record)
+    execution = {
+        "run_id": run["run_id"], "round": run["round"], "run_order": run["run_order"],
+        "case_id": run["case_id"], "execution_index": execution_index, "run_mode": spec["run_mode"],
+        "argv": argv, "environment": env, "server_identity": server_identity_record,
+        "server_cgroup": server_cgroup, "pressure_basis": dict(spec["pressure_basis"]),
+        "sampler_identity": sampler_identity_record, "sampler_schema": SAMPLE_SCHEMA,
+        "sampler_argv": ["bash", str(MEMORY_SAMPLER), "--sample-process",
+                         str(server_identity_record["pid"]) if server_identity_record else "NOT_STARTED",
+                         str(samples_path), str(backing_dir), str(spec["sampler"]["interval_seconds"]),
+                         str(server_cgroup.get("memory_current_file", "")) if server_cgroup else ""],
+        "request_loop_started": request_loop_started, "request_count": len(request_records),
+        "qualification": {"idle_seconds": None, "offload_timeout_seconds": None, "resume_request_id": None,
+                          "idle": None, "offload_barrier": None, "resume": None},
+        "characterization": {"idle_seconds": None, "settle_timeout_seconds": None, "target_tolerance_bytes": None,
+                             "resume_request_id": None, "requested_target_bytes": None, "action_target_bytes": None,
+                             "after_fill": None, "idle": None, "settle": None, "release_settled": None,
+                             "settled": None, "resume": None, "after_measurement": None},
+        "replay": replay_record,
+    }
+    dump(run_dir / "execution.json", execution)
+    if not responses_path.exists():
+        responses_path.write_text("", encoding="utf-8")
+    complete = cleanup["cleanup_complete"] and lifecycle_error is None and fidelity["status"] == "PASS"
+    return {"run_id": run["run_id"], "case_id": run["case_id"], "round": run["round"],
+            "run_order": run["run_order"], "execution_index": execution_index,
+            "directory": str(run_dir.relative_to(artifact)), "status": "complete" if complete else "incomplete",
+            "error": lifecycle_error or (None if fidelity["status"] == "PASS" else "workload fidelity failed")}
+
+
 def run_one(
         artifact: pathlib.Path,
         run: dict[str, Any],
@@ -1619,6 +2142,8 @@ def run_one(
         workload: dict[str, Any],
         execution_index: int,
 ) -> dict[str, Any]:
+    if "replay" in workload:
+        return run_one_replay(artifact, run, case, spec, workload, execution_index)
     run_dir = artifact / "runs" / run["run_id"]
     raw_dir = run_dir / "raw"
     backing_dir = run_dir / "backing"
