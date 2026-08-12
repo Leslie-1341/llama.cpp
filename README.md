@@ -15,7 +15,7 @@
 | **小组成员** | 苏安炫、李思甜 |
 | **项目导师** | 夏文、李诗逸 |
 | **仓库地址** | https://gitlab.eduxiji.net/T2026181239911430/project3136859-389161 |
-| **参赛文档** | `docs/阶段性提交参赛文档.pdf` |
+| **参赛文档** | `docs/参赛文档.pdf` |
 
 ### 1.2 项目摘要
 
@@ -44,15 +44,13 @@
   利用混合专家（MoE）模型“全局稀疏、局部密集”的专家访问特征，以专家组（ExpertGroup）为管理粒度，通过热工作集估算器（Warm Working Set Estimator）与缓存局部组/专家活跃度监控（CLG/EAM）实时感知访问热度，结合成本感知通信传输（CCT）预测跨节点传输代价，并引入组级驱逐（Group-level Eviction）与压力感知保护（Pressure-Aware Protection）动态淘汰冷专家、避免热专家误换，配合清理回收（Clean Reclaim）与动态预算（Dynamic Budget）协同调节缓存资源水位，最终将完整的专家集合收敛为有限的高效动态工作集，有效降低跨节点通信开销与缓存抖动，使MoE模型在专家稀疏访问场景下仍保持稳定低延迟与高吞吐。
 
 - **实现 KV Cache 运行时生命周期与物理驻留管理**  
-  将 KV 的逻辑 Session 历史与物理驻留状态解耦，以 block/cell 为执行粒度维护 ownership、mapping generation、physical object/generation 和状态机。对 dead/unowned KV 采用 RELEASE 直接释放物理页；对 idle live KV 采用 OFFLOAD 写入 fixed-slot backing 后释放 DRAM，并在 Session 重访前通过 correctness-required PREFETCH 完成 Exact Restore。Physical Budget View 以真实 resident/reclaimable bytes 驱动 RELEASE-first 的 resident controller；Cost-aware Hot/Cold Ranking 综合 exclusive physical relief、OFFLOAD 写成本、reuse/restore 代价与 churn 选择 victim；恢复路径使用 contiguous Transfer Group、grouped read、`READ(N+1)||RESTORE(N)` 有界流水和 Destination Prefault，同时以 active/protected/shared、transaction/generation 与 graph gate 保证正确性。
+  将KV的逻辑会话历史与物理驻留状态解耦，以块/单元（block/cell）为执行粒度维护所有权（ownership）、映射代数（mapping generation）、物理对象/代数（physical object/generation）和状态机。对已失效或无主的KV采用RELEASE直接释放物理页；对空闲但仍存活的KV采用OFFLOAD写入固定槽位后备存储（fixed-slot backing）后释放DRAM，并在会话重访前通过正确性必需的PREFETCH完成精确恢复（Exact Restore）。物理预算视图（Physical Budget View）以真实的常驻/可回收字节数驱动优先释放型（RELEASE-first）常驻控制器；代价感知冷热排序（Cost-aware Hot/Cold Ranking）综合专有物理释放量、OFFLOAD写入成本、复用/恢复代价与颠簸惩罚来选择驱逐对象；恢复路径采用连续传输组（contiguous Transfer Group）、组读取（grouped read）、READ(N+1)||RESTORE(N)有界流水线和目标预缺页（Destination Prefault），同时通过活跃/受保护/共享（active/protected/shared）、事务/代数（transaction/generation）与计算图门控（graph gate）共同保障正确性。
 
 - **实现 Server Memory Governor 全局资源协调**  
   通过统一接收cgroup内存状态、常驻内存集（RSS）、Dense/MoE/KV各类资源状态、动作历史（Action History）与重分配额度（Reallocation Credit）等多维全局信息，结合压力门控（Pressure Gate）感知系统负载、分配选择（Auction Select）按需仲裁资源归属、异步动作执行器（Async Action Executor）非阻塞下发调整指令，并配合统一预取预算（Unified Prefetch Budget）平衡预取与存储开销，将分散的资源状态与历史行为转化为动态协同的分配策略，最终形成一套面向异构混合负载的资源调度闭环。
 
 - **建立可验证的测试与观测体系**  
-  使用 `llama-bench`、`llama-perplexity`、KV canonical benchmark、`mincore` physical resident 归因、cgroup v2 内存限制与 model-bound multi-session replay，对 RSS、KV physical resident、RELEASE/OFFLOAD relief、Exact Restore、TPOT/TPS、Session lifecycle 和推理正确性进行统一观测。
-
----
+  使用 `llama-bench`、`llama-perplexity`、KV canonical benchmark、`mincore` physical resident 归因、cgroup v2 内存限制与模型绑定的多会话回放，对于 RSS（常驻内存集）、KV 物理驻留、RELEASE/OFFLOAD 释放量、精确恢复、TPOT/TPS（每输出令牌时间/每秒令牌数）、会话生命周期和推理正确性进行统一观测。
 
 ## 二、项目概述
 
@@ -135,47 +133,7 @@ FlexKV-OS 采用四层运行时内存治理架构：
 
 由 Linux Virtual Memory、DRAM、SSD、`mmap`、`madvise`、`pread`、`O_DIRECT`、page cache 等机制提供底层能力。FlexKV-OS 不替代操作系统内存管理，而是在其之上增加模型结构感知的用户态控制层。
 
-### 2.5 系统整体运行流程
-
-系统形成如下闭环：
-
-```text
-Model Load
-   |
-   v
-Memory Planner
-   |-- detect cgroup / model type / weight size / KV reserve
-   |-- select Dense Flex or MoE Buffer
-   |-- plan Ring / Ahead / Lock / Expert Budget
-   v
-Inference Execution
-   |
-   v
-Observe Runtime State
-   |-- current Layer / Expert / Session
-   |-- RSS / cgroup pressure
-   |-- Dense / MoE / KV residency
-   v
-Server Memory Governor
-   |-- Pressure Gate
-   |-- Candidate / Auction Select
-   |-- Unified Prefetch Budget
-   |-- Reclaim / Resize / RELEASE / OFFLOAD / Exact PREFETCH / Reinvest
-   v
-Backend Action
-   |-- Dense Flex
-   |-- MoE Buffer
-   |-- KV Cache Backend
-   v
-Storage / DRAM / Virtual Memory
-   |
-   v
-Feedback & Observation Marker
-```
-
-运行过程中，系统遵循 **Compute -> Observe -> Decide -> Execute -> Feedback** 的闭环路径，使内存资源分配从静态配置转化为持续动态治理。
-
-### 2.6 核心技术与模块架构
+### 2.5 核心技术与模块架构
 
 FlexKV-OS 的核心不是单独增加一个缓存，而是将 **Dense Layer、MoE Expert、KV Cache 与 Prefetch I/O** 转化为可观测、可预算、可回收、可恢复的运行时资源对象。系统在加载期通过 Memory Planner 生成初始配置，在推理期通过各专用 Backend 执行显式驻留管理，再由 Server Memory Governor 统一协调资源竞争。
 
@@ -187,7 +145,7 @@ FlexKV-OS 的核心不是单独增加一个缓存，而是将 **Dense Layer、Mo
 | **KV Cache Manager** | KV block/cell、Session claimant、physical resident | 通过 RELEASE/OFFLOAD/PREFETCH、Physical Budget、Exact Restore 与 Hot/Cold ranking 管理 KV 生命周期和物理驻留 |
 | **Server Memory Governor** | Dense、MoE、KV、Prefetch | 根据全局内存压力统一决定回收、扩缩容、预取和资源再分配 |
 
-#### 2.6.1 Memory Planner：加载期自动后端选择与初始预算规划
+#### 2.5.1 Memory Planner：加载期自动后端选择与初始预算规划
 
 Memory Planner 位于模型加载路径，其目标是解决“**模型刚加载时应该采用哪一种显式驻留后端、各模块初始能拿多少内存**”的问题。Planner 不把全部可用内存直接交给权重，而是同时考虑模型固定开销、KV Cache 预留、最大 Tensor、安全余量以及存储/计算能力，先建立一个可运行的资源基线。
 
@@ -225,22 +183,12 @@ Memory Planner 位于模型加载路径，其目标是解决“**模型刚加载
 
 - **Safe Budget Clamping**：最终 Expert Budget 由 `warm_working_set` 与 `safe_budget` 共同限制；在内存充足时优先覆盖活跃专家集合，在内存受限时自动收缩到安全范围。
 
-#### 2.6.2 Dense Flex：Layer 级显式权重驻留
+#### 2.5.2 Dense Flex：Layer 级显式权重驻留
 
-![Dense Flex](./figures/flow/weight.png)
+![Dense Flex](./figures/flow/dense.png)
 
 Dense 模型每个 Token 都会按固定顺序遍历全部 Transformer Layer，因此其权重访问高度可预测。Dense Flex 利用这一特征，把原本由 `mmap/page cache` 被动决定的物理驻留集合，转化为应用层可显式控制的 **Layer Working Set**。
 
-整体数据流为：
-
-```text
-GGUF File
-   -> Background I/O
-   -> Layer Ring
-   -> Tensor Pointer Repoint
-   -> Compute
-   -> Release / Reclaim
-```
 
 核心机制如下：
 
@@ -270,7 +218,7 @@ GGUF File
 
 Dense Flex 的设计目标并不是让极端低内存 Dense 推理完全摆脱 I/O，而是建立明确的权重驻留边界：在内存低于完整模型工作集时首先保证**不因全量驻留而 OOM**，随后再通过 Lock、Pin、Ring 和 Prefetch 尽量降低 `stream_per_token`。
 
-#### 2.6.3 MoE Buffer：Expert 级显式驻留
+#### 2.5.3 MoE Buffer：Expert 级显式驻留
 
 ![MoE Buffer](./figures/flow/moe.png)
 
@@ -300,9 +248,7 @@ MoE 模型虽然总参数规模更大，但单 Token 仅由 Router 激活 Top-K 
 
 MoE Buffer 的核心目标是把“完整专家集合”转化为“有限动态工作集”。当 Budget 覆盖当前 workload 的活跃 Expert 后，eviction 和 read/token 会快速下降；当 Budget 低于工作集边界时，则会出现频繁驱逐和重复加载，这一点也与后续实验中的明显拐点相对应。
 
-#### 2.6.4 MoE Predictor：CLG、EAM 与 CCT
-
-![CLG](./figures/flow/pre.png)
+#### 2.5.4 MoE Predictor：CLG、EAM 与 CCT
 
 MoE 访问虽然由 Router 动态决定，但相邻层和相邻 Token 的 Expert 选择仍具有一定局部性。FlexKV-OS 将预测机制用于“**提前准备可能需要的 Expert**”，而不是替代真实 Router 决策。
 
@@ -314,41 +260,42 @@ MoE 访问虽然由 Router 动态决定，但相邻层和相邻 Token 的 Expert
 
 - **Prediction Safety Fallback**：CLG / EAM / CCT 只影响“提前加载”和“保留多久”。如果预测错误，真实 Router 结果仍通过 Demand 路径触发加载，并在 GEMM 前完成同步兜底，因此预测失误最多造成性能损失，不会改变模型选择的真实 Expert 或数值结果。
 
-#### 2.6.5 KV Cache 运行时内存管理
+#### 2.5.5 KV Cache 运行时内存管理
 
-![Paged KV](./figures/flow/swap.png)
+![Paged KV](./figures/flow/kv.png)
 
 KV Cache 与只读模型权重不同，它是推理过程中动态生成的 Session 状态。FlexKV-OS 将其拆分为 **Exact 物理生命周期执行、Physical Resident Budget 控制、Cost-aware Hot/Cold 选择、Exact Restore 数据路径和多会话 lifecycle** 五个相互配合的层次。KV core 维护物理事实与 correctness authority，Server/Governor 维护 Session 生命周期、预算与 victim policy，从而把“逻辑历史是否存在”和“物理页是否当前驻留”彻底分离。
 
-- **Block / Cell 物理生命周期**：系统以固定 block size 管理连续 KV tensor 上的 cell，并记录 sequence ownership、mapping generation、physical object/generation 与 block state。对 dead/unowned、无需再次恢复的 KV，Unified RELEASE 在重新检查 ownership/state 后执行 page-aligned `madvise(MADV_DONTNEED)`；对 idle 但仍属于 live Session 的 recoverable KV，OFFLOAD 先将完整数据写入 fixed-slot backing，只有完整 I/O 成功后才发布 `SWAPPED`，随后释放 live tensor 页。
+- **Block / Cell 物理生命周期**：系统以固定 block size 管理连续 KV tensor 上的单元，并为每个单元记录其所属序列、映射代数、物理对象/代数以及块状态。对于已失效且无需再恢复的 KV，统一释放流程，Unified RELEASE 在重新检查其所属状态后执行 page-aligned `madvise(MADV_DONTNEED)`；而对于处于空闲状态但仍属于活跃会话且可恢复的 KV，OFFLOAD 先将完整数据写入 fixed-slot backing，只有完整 I/O 成功后才发布 `SWAPPED`，随后释放 live tensor 页。
 
-- **Fixed-slot Backing 与事务安全**：每个 physical cell 映射到有界 backing 区间，反复 OFFLOAD 复用固定位置，避免交换文件随运行时间无界增长。短读、短写、EOF、ENOSPC/EIO 等异常通过结构化 result 和 fail-stop 传播；active/protected/shared、写事务中或 identity/generation 不一致的对象不会进入破坏性回收。
+- **Fixed-slot Backing 与事务安全**：每个物理单元都映射到后备存储中一个大小固定的有界区间，反复执行换出（OFFLOAD）时始终复用同一槽位，从而避免交换文件随系统运行时间无限膨胀。对于短读、短写、文件结束、磁盘空间不足、I/O 错误等异常情况，均通过结构化的返回值和故障停止机制向上层明确传递；任何处于活跃（active）、受保护（protected）、共享（shared）状态，或正处于写事务中，又或身份标识与代数不一致的对象，都不会被纳入可能破坏数据一致性的回收流程。
 
-- **Physical Budget View 与 RELEASE-first Controller**：系统通过 `mincore` 和 KV object resident view 获取真实 `resident_bytes`、dead reclaimable、ownership 与 generation，以 steady physical resident target 计算 excess。回收顺序遵循 `target -> RELEASE dead/unowned -> resample -> OFFLOAD idle-live -> resample`，避免把 logical KV size 或 I/O bytes 当作真实 DRAM relief。
+- **Physical Budget View 与 RELEASE-first Controller**：系统通过 `mincore` 和 KV 对象的常驻视图获取真实的常驻内存字节数`resident_bytes`、可回收的失效数据量`dead reclaimable`、所有权`ownership`以及映射代数 `generation`，并以稳定的物理常驻目标为基准计算出需要释放的超额部分。回收流程严格遵循既定顺序：先尝试达到目标，接着释放失效的 KV，然后重新采样，再换出空闲但仍属活跃会话的 KV，最后再次采样。这一设计确保系统不会将逻辑上的 KV 数据规模或 I/O 传输字节数，误当作实际可缓解的 DRAM 压力。
 
-- **Cost-aware Hot/Cold Claimant Ranking**：多个 idle live Session 同时竞争 resident budget 时，系统先执行 active/protected/shared/stale-generation 等 safety gate，再依据单位物理字节的预期驱逐代价排序：
+
+
+- **Cost-aware Hot/Cold Claimant Ranking**：多个空闲但仍存活的会话同时竞争常驻内存预算时，系统首先执行一系列安全门控检查，仅通过检查的候选者才进入排序环节。排序依据是单位物理字节的预期驱逐代价，计算公式如下：
 
   ```text
   Score(s) =
       (T_offload(s) + P_reuse(s) * T_restore(s) + T_churn(s))
       / estimated_exclusive_physical_bytes(s)
   ```
+   其中 `estimated_exclusive_physical_bytes` 表示当前决策时刻，基于 mincore 与所有权统计得到的专有常驻内存估算值；换出代价`T_offload`和恢复代价`T_restore`均来自真实的历史动作记录；往返抖动`round-trip`则通过颠簸惩罚项`T_churn`加以抑制。每次恢复后，系统会为该会话设置一段常驻时长，避免刚换入的 KV 被立即再次驱逐。当同一决策中各个候选项的代价权威信息不完整时，系统统一采用空闲时长权威进行排序，以防止不同量纲的分数混杂导致排名失真。
 
-  其中 `estimated_exclusive_physical_bytes` 为当前 decision 基于 `mincore` 与 ownership 统计得到的 exclusive resident estimate，OFFLOAD/restore cost 来自真实 action history，round-trip 通过 churn penalty 抑制往返抖动。restore 后设置 resident lease，避免刚恢复的 KV 被立即再次驱逐；当同一 decision 的 cost authority 不完整时，整个 decision 统一采用 idle-age authority，避免不同量纲 score 混排。
+- **Exact PREFETCH 与 Graph Gate**：对话被重新访问时，其恢复操作独立于软驱逐策略。服务器在构建计算图之前，先对目标序列进行保护，并提交正确性必需且全部必需的预取请求；只有当读取正确性、身份验证、状态提交以及短缺检查全部通过之后，才允许执行 `llama_decode()`。任何预测或策略决策只会影响性能，而不会影响模型的正确性
 
-- **Exact PREFETCH 与 Graph Gate**：Session 重访时，恢复动作独立于 soft victim policy。Server 在 graph 构建前保护目标 sequence，并提交 correctness-required、all-required PREFETCH；只有 read、identity revalidate、状态提交和 shortfall 检查全部通过后才允许 `llama_decode()`。预测或策略只影响性能，不影响模型正确性。
+- **Transfer Group + Read/Restore Pipeline**：将相邻的已换出（SWAPPED）物理块按字节上限合并为连续的传输组，通过组后备读取`grouped backing read`减少小粒度 I/O 次数。恢复过程采用有界读取工作线程和双暂存区，并固定预取窗口大小为 1，形成 READ(G[i+1]) || RESTORE(G[i]) 的流水线。
+- **Destination Prefault**：在 scatter 前对目标 KV tensor 的页对齐写范围执行 `MADV_POPULATE_WRITE`，主动建立目的物理页，将首次写入产生的缺页异常前移，降低恢复阶段的同步缺页抖动。
 
-- **Transfer Group + Read/Restore Pipeline**：相邻 SWAPPED physical blocks 按 byte cap 合并为 contiguous transfer group，使用 grouped backing read 减少小粒度 I/O。恢复采用 bounded read worker 与双 staging、固定 lookahead=1，形成 `READ(G[i+1]) || RESTORE(G[i])`；read worker 只写 task-owned staging，scheduler owner 负责 identity revalidate、prefault、tensor scatter、RESIDENT commit 与 graph gate。
+- **扩展协同层**：KV claimant 的物理内存释放量`physical relief`、复用/恢复代价`reuse/restore cost`、I/O 任务及其截止时间`I/O task and deadline` 均可接入统一的内存管理器与 I/O 仲裁机制；精确前缀缓存、冷 KV 表示以及查询感知的选择性加载可作为与主生命周期正交的数据复用与传输层设计，默认情况下，以正确性为优先的精确恢复与计算图门控为最终正确性边界。
 
-- **Destination Prefault**：在 scatter 前对目标 KV tensor 的 page-aligned 写范围执行 `MADV_POPULATE_WRITE`，主动建立目的物理页，将首次写入产生的 minor page fault 从 scatter 区间前移，降低恢复阶段的同步缺页抖动。
-
-- **Multi-session Lifecycle**：Alibaba usage trace 通过 frozen workload、model-bound tokenizer/direct-token transcript、stable session-slot binding 与 completion-driven lifecycle 映射到真实 `llama-server`。Session 在 `ACTIVE / IDLE / REVISIT / TTL / DEAD / COLD_RESTART` 状态间转换，为 idle age、reuse history、resident lease 和 churn 提供统一运行时语义。
-
-- **扩展协同层**：KV claimant 的 physical relief、reuse/restore cost、I/O task 与 deadline 可进入统一 Memory Governor / I/O arbitration；Exact Prefix Cache、cold-KV representation 和 query-aware selective loading 可作为与主生命周期正交的数据复用与传输层设计，默认 correctness-required Exact Restore 与 graph gate 保持为最终正确性边界。
 
 KV Cache 管理不以截断历史上下文作为节省内存手段。系统始终区分 logical KV bytes、backing I/O bytes 与 physical resident/relief：前者描述 Session 数据规模，中间项描述迁移开销，后者才表示 DRAM 中真实驻留或释放的物理内存。
 
-#### 2.6.6 Server Memory Governor：全局运行时治理
+#### 2.5.6 Server Memory Governor：全局运行时治理
+
+![Governor](./figures/flow/governor.png)
 
 Server Memory Governor 位于 `tools/server/server-context.cpp`，负责把 Dense、MoE、KV 和 Prefetch 从多个独立局部策略提升为统一的资源治理闭环。其输入包括 cgroup 内存状态、各模块常驻内存集、可回收字节数、缓存命中/未命中信息、历史调度动作与可分配内存大小；输出则是缓冲区大小调整、数据回收/释放/卸载、预算分配和预取等决策，从而在全局层面实现内存资源的动态调度与高效利用。
 
@@ -372,20 +319,7 @@ Server Memory Governor 位于 `tools/server/server-context.cpp`，负责把 Dens
 
 - **Observation Marker**：统一输出 Planner、Pressure、Dense、MoE、KV 和 Global 指标，包括 Pressure EMA、Resident Coverage、KV Offload Ratio、Global Slack 等，为实验复现、消融分析和运行时调试提供统一证据。
 
-通过上述机制，FlexKV-OS 的运行时资源路径由传统的“缺了再加载、满了再回收”转变为：
-
-```text
-Compute
-   -> Observe
-   -> Pressure Gate
-   -> Candidate / Auction Select
-   -> Async Execute
-   -> Measure Real Relief
-   -> Reallocate Credit
-   -> Feedback
-```
-
-即以 **Compute -> Observe -> Decide -> Execute -> Feedback** 为基本闭环，实现 Weight-KV-Prefetch 的全局协同治理。
+通过上述机制，FlexKV-OS 的运行时资源路径由传统的“缺了再加载、满了再回收”转变为以 **Compute -> Observe -> Decide -> Execute -> Feedback** 为基本闭环，实现 Weight-KV-Prefetch 的全局协同治理。
 
 ### 2.7 关键源码落点
 
@@ -399,7 +333,6 @@ Compute
 | KV 多会话执行 | `scripts/multi_session_replay.py`、`scripts/run-kv-offload-benchmark.py`、`scripts/parse-kv-offload-benchmark.py` | model-bound replay、Session lifecycle、physical/action evidence 与 fail-closed parsing |
 | 全局治理 | `tools/server/server-context.cpp` | Pressure Gate、Auction、Async Action、Unified Prefetch、Credit |
 
----
 
 ## 三、项目目标与完成情况
 
@@ -447,114 +380,176 @@ Compute
 | **李思甜** | 负责 KV Cache 与运行时内存管理，包括 block/cell 生命周期、Physical Budget、RELEASE/OFFLOAD/PREFETCH、Exact Restore、Hot/Cold 策略、压力调度与多会话测试；负责 Memory Governor 中 KV 资源状态接口 |
 | **共同负责** | 系统总体架构、Server Memory Governor 集成、Weight-KV-Prefetch 全局协调、Benchmark、结果分析、参赛文档与答辩材料 |
 
----
 
 ## 四、系统测试结果
 
 ### 4.1 测试环境
 
+本项目所有实验均在统一物理环境下完成，以保证不同优化模块之间的可比性。测试过程中分别启用或关闭权重管理、MoE Buffer、KV Cache 管理以及全局调度优化模块，并通过 cgroup v2 的 `memory.max` / `memory.high` 构造不同内存压力环境。
+
 | 项目 | 配置 |
 | --- | --- |
-| 操作系统 | Ubuntu 22.04 |
+| Linux 发行版 | Ubuntu 22.04 |
 | Linux 内核 | 5.15.0+ |
-| 机器类型 | 物理机 |
-| 内存 | 23 GB |
-| CPU | x86-64，8 核 |
-| 存储 | SSD，顺序读速约 279 MB/s |
+| 机器模式 | 物理机 |
+| 内存大小 | 23 GB |
+| 处理器 | x86-64，8 核 |
+| 存储设备 | SSD，顺序读速约 279 MB/s |
 | Dense 测试模型 | Llama-3-8B-Instruct-Q4_K_M.gguf |
 | Dense 模型大小 | 约 4.58 GB |
 | MoE 测试模型 | Qwen1.5-MoE-A2.7B-20-experts-SFT-trained.Q4_K_M.gguf |
 | MoE 模型结构 | 24 个 MoE Layer，每层 20 个 Expert，Top-4 激活 |
-| 内存限制 | cgroup v2 `memory.max` |
-| 测试工具 | `llama-bench`、`llama-perplexity`、KV canonical benchmark、`mincore` physical resident 诊断、multi-session replay |
+| 内存限制方式 | cgroup v2（`memory.max` / `memory.high`） |
+| 测试工具 | `llama-bench`、`llama-perplexity`、trace replay、`mincore` physical resident 观测 |
 
-测试重点关注：
+测试主要围绕以下三个目标展开：
 
-1. 是否显著降低物理内存占用；
-2. RSS 下降时是否保持可接受推理吞吐；
-3. 是否保持与原生路径一致的模型计算语义。
+1. 验证系统是否能够降低大模型推理过程中的真实物理内存占用；
+2. 验证权重流式加载、缓存驻留以及运行时调度机制是否能够降低 I/O 等待并维持可接受吞吐；
+3. 验证优化路径是否保持与原始 `mmap` 推理路径一致的计算语义与 Session 连续性。
 
-### 4.2 权重管理模块测试
+### 4.2 Dense 模型权重管理测试
 
-#### 4.2.1 关闭 repack 的内存收益
+#### 4.2.1 Repack 优化与基础内存降低
 
 | 配置 | RSS | 吞吐 | 说明 |
 | --- | ---: | ---: | --- |
-| Dense native（含 repack） | 7.77 GB | 8.15 tok/s | `mmap + repack` 副本 |
-| Dense（关闭 repack） | 4.56 GB | 8.60 tok/s | 消除匿名权重副本 |
-| MoE native（含 repack） | 5.73 GB | 19.26 tok/s | Expert 全量驻留 |
-| MoE（关闭 repack） | 3.60 GB | 19.58 tok/s | Buffer 直连权重文件 |
+| Dense native（含 Repack） | 7.77 GB | 8.15 tok/s | `mmap + repack` 匿名副本 |
+| Dense（关闭 Repack） | 4.56 GB | 8.60 tok/s | 消除额外权重复制 |
+| MoE native（含 Repack） | 5.73 GB | 19.26 tok/s | Expert 全量驻留趋势 |
+| MoE（关闭 Repack） | 3.60 GB | 19.58 tok/s | Buffer 直接管理 Expert 权重 |
 
-关闭 repack 后，Dense RSS 约降低 3.21 GB，MoE RSS 约降低 2.13 GB，同时吞吐没有下降。结果说明，在显式权重驻留后端已经接管权重管理的情况下，传统 repack 形成的中间匿名副本属于可消除的重复驻留。
+![](./figures/test/fig02_dense_residency.png)
 
-#### 4.2.2 Dense Flex / Window 路径
+关闭 Repack 后，Dense 模型 RSS 从 7.77 GB 降至 4.56 GB，减少约 3.21 GB；MoE 模型 RSS 从 5.73 GB 降至 3.60 GB，减少约 2.13 GB。两类模型吞吐均未下降，说明 Repack 形成的额外匿名权重副本是可消除的重复物理驻留，为后续显式 Residency 与 Expert Buffer 提供了更多内存空间。
 
-在无极端内存约束时，Dense Window / Flex 将 RSS 从约 7.77 GB 降至约 4.56 GB，吞吐由 8.15 tok/s 提升至 8.60 tok/s。说明当工作集可以覆盖有效窗口时，系统能够在减少权重驻留的同时，通过顺序预取保持接近原生路径的性能。
+#### 4.2.2 Dense 显式 Residency 机制
 
-当 memory cap 进一步低于模型有效工作集时，Dense 模型由于每个 Token 都必须遍历全部 Layer，系统会退化到强 I/O-bound 状态。此时显式权重管理的主要价值是**将原生路径的 OOM 转化为可运行状态**，但吞吐下界仍受 SSD 带宽约束。
+| 配置 | Stream / token | Flex Wait | TPS |
+| --- | ---: | ---: | ---: |
+| 无显式 Residency | 2684 MiB/token | 25694 ms | 1.77 tok/s |
+| 当前 Residency 配置 | 612 MiB/token | 6630 ms | 5.18 tok/s |
 
-### 4.3 MoE Buffer 测试
+![](./figures/test/fig01_repack_optimization.png)
+
+引入显式权重 Residency 后，每 Token 权重流式读取量由 2684 MiB 降至 612 MiB，下降约 **77.2%**；Flex Wait 由 25694 ms 降至 6630 ms，吞吐由 1.77 tok/s 提升至 5.18 tok/s。结果表明，Dense Flex 通过维护有效 Layer/Tensor 驻留集合，能够显著减少重复 Weight Streaming 与同步 I/O 等待。
+
+#### 4.2.3 Risk-Aware Lock 内存风险控制
+
+实验条件：`memory.max=2000MB`、`ctx=2048`、`tokens=128`、`repeats=3`。
+
+| 策略 | Stream / token | Flex Wait | TPS | 状态 |
+| --- | ---: | ---: | ---: | --- |
+| Legacy Auto | 1682 MiB | 37539 ms | 2.31 | 安全运行 |
+| Greedy Max | -- | -- | -- | 3/3 OOM |
+| Risk-Aware Auto v2 | 1382 MiB | 34193 ms | 2.53 | 安全运行 |
+
+![](./figures/test/fig03_dense_risk_aware_lock.png)
+
+Greedy Max 因单纯扩大锁定权重规模，在三次实验中均触发 OOM；Risk-Aware Auto v2 则在保持可运行性的同时，将 Stream/token 从 1682 MiB 降至 1382 MiB，并将吞吐提升至 2.53 tok/s。该结果说明，在严格内存约束下，权重驻留必须同时考虑 I/O 收益和内存风险，而不能简单追求最大化 Lock Budget。
+
+#### 4.2.4 Dense Pin Policy 对比
+
+实验条件：`memory.max=3000MB`、`ctx=1024`、`tokens=64`、`repeats=3`。
+
+| 策略 | Flex Wait | TPS | 结果 |
+| --- | ---: | ---: | --- |
+| none | 26448 ms | 1.80 tok/s | 无主动驻留，大量重复 I/O 等待 |
+| small-first | 13386 ms | 2.88 tok/s | 当前测试中最佳 |
+| attn-first | 14141 ms | 2.85 tok/s | 接近 small-first |
+| large-first | 15969 ms | 2.62 tok/s | 大张量优先，但关键路径覆盖不足 |
+| cost-aware-balanced | 17685 ms | 2.61 tok/s | 平衡频率与大小，但额外开销较高 |
+| ffn-first | 16851 ms | 2.57 tok/s | 收益低于 Attention 优先 |
+| cost-aware | 18403 ms | 2.54 tok/s | 当前代价模型下未达最优 |
+
+![](./figures/test/fig04_dense_pin_policy.png)
+
+在相同内存预算下，驻留对象选择会显著影响 I/O 等待与吞吐。其中 small-first 将 Flex Wait 从 26448 ms 降至 13386 ms，吞吐提升至 2.88 tok/s；attn-first 结果接近。该实验表明，Dense 权重优化不仅是“驻留多少”的容量问题，也包括“优先驻留哪些 Tensor”的策略问题。
+
+#### 4.2.5 Adaptive Ahead 权重预取调度
+
+实验条件：`memory.max=2400MB`、`ctx=2048`、`tokens=128`、`repeats=3`。
+
+| 策略 | Stream / token | Flex Wait | TPS | 说明 |
+| --- | ---: | ---: | ---: | --- |
+| ahead0 | 1682 MiB/token | 36511 ms | 2.36 | 无有效前瞻预取，I/O Stall 明显 |
+| ahead1 fixed | 1682 MiB/token | 36404 ms | 2.38 | 预取距离不足 |
+| ahead2 fixed | 1682 MiB/token | 38501 ms | 2.33 | 固定小窗口未缓解 I/O 等待 |
+| Adaptive Ahead | 1036 MiB/token | 23129 ms | 3.32 | 动态调整窗口，降低 Streaming 压力 |
+| ahead4 fixed | 1682 MiB/token | 377 ms | 4.94 | 大固定窗口几乎完全隐藏 I/O 延迟 |
+
+![](./figures/test/fig05_dense_adaptive_ahead.png)
+
+Adaptive Ahead 相比低 Ahead 配置将 Stream/token 降至 1036 MiB，Flex Wait 降低约 36%，TPS 提升至 3.32 tok/s。固定 ahead4 在该 workload 下取得最高 TPS，但其 Stream/token 仍为 1682 MiB/token，说明二者优化路径不同：Adaptive Ahead 更强调在内存安全范围内动态调节，ahead4 则通过更大的固定预取窗口换取更强 I/O 隐藏。当前自适应策略尚未在所有 workload 下超过固定最优参数，但能够稳定改善低 Ahead 场景下的 I/O Stall。
+
+### 4.3 MoE 模型权重管理测试
 
 #### 4.3.1 MoE Buffer 工作集边界
 
-| Budget | Evictions | Read / token | 吞吐 | 状态 |
+| Budget | Evictions | Read / token | TPS | 状态 |
 | ---: | ---: | ---: | ---: | --- |
 | 768 MB | 7392 | 598 | 1.97 tok/s | 严重抖动 |
 | 1536 MB | 2710 | 272 | 2.23 tok/s | 过渡状态 |
-| 2048 MB | 618 | 132 | 6.22 tok/s | 开始收敛 |
-| 2432 MB | 0 | ~0 | 11.57 tok/s | 工作集拐点 |
-| 2560 MB | 0 | ~0 | 9.43 tok/s | 稳态 |
+| 2048 MB | 618 | 132 | 6.22 tok/s | 接近收敛 |
+| 2432 MB | 0 | ~0 | 11.57 tok/s | 工作集边界 |
+| 2560 MB | 0 | ~0 | 9.43 tok/s | 过载状态 |
 
-MoE Buffer 存在明显的有效工作集边界。低于边界时，大量 Expert 在 Cold / Inflight / Resident 状态之间频繁切换，产生驱逐与重复加载；达到约 2432 MB 后，主要活跃 Expert 被缓存覆盖，evictions 降为 0，read/token 接近 0。
+MoE Buffer 存在明显的 Working-Set Boundary。低于活跃 Expert 工作集规模时，Expert 在 `COLD -> INFLIGHT -> RESIDENT` 状态间频繁切换，产生大量 eviction/reload；当 Budget 增至约 2432 MB 后，eviction 降为 0、read/token 接近 0，说明主要活跃 Expert 集合已被覆盖。该结果说明 MoE 的关键并非无限扩大缓存，而是准确覆盖高概率 Expert 工作集。
 
-#### 4.3.2 CLG 预测与预取效果
+![](./figures/test/fig06_moe_working_set_boundary.png)
 
-| Delta | RSS | 命中率 | 吞吐 |
-| ---: | ---: | ---: | ---: |
-| 0 | 2411 MB | 94% | 12.52 tok/s |
-| 4 | 2579 MB | 93% | 16.48 tok/s |
-| 8 | 2634 MB | 93% | 17.27 tok/s |
+#### 4.3.2 MoE Budget Planner v2 自动预算选择
 
-适度扩大预测集合虽然带来少量额外 RSS，但可以增加 Expert 加载与计算之间的提前量，提高 I/O-Compute overlap，从而显著提升吞吐。
+在 `memory.max=1500MB` 的严格内存限制下：
 
-#### 4.3.3 多 Worker I/O 扩展性
+| 策略 | Expert Budget | OOM 次数 | 结果 |
+| --- | ---: | ---: | --- |
+| Fixed 128 MB | 128 MB | 3/3 | 无法运行 |
+| Fixed 512 MB | 512 MB | 3/3 | 无法运行 |
+| Fixed 768 MB | 768 MB | 3/3 | 无法运行 |
+| Fixed 1024 MB | 1024 MB | 3/3 | 无法运行 |
+| Auto Planner v2 | 836 MB | 0/3 | 稳定运行 |
 
-| Budget | 1 Worker | 4 Worker | 加速比 |
-| ---: | ---: | ---: | ---: |
-| 512 MB | 1.58 | 2.87 | 1.8x |
-| 768 MB | 1.97 | 3.75 | 1.9x |
-| 1536 MB | 2.23 | 5.42 | 2.4x |
+所有固定预算策略均无法在 1500 MB hard cap 下稳定运行，而 Auto Planner v2 根据当前工作集和安全边界自动选择 836 MB Expert Buffer，实现 3/3 成功。该结果直接验证了 Working-Set-Aware Budget Planner 对低内存可运行性的价值。
 
-在 I/O 主导区间，多 Worker 可以并行执行多个 Expert `pread` 任务，降低计算线程等待 Inflight Expert 的时间。
+![](./figures/test/fig01_repack_optimization.png)
 
-#### 4.3.4 MoE 数值正确性
+#### 4.3.3 Pressure-Aware Full Adaptive 跨内存预算测试
 
-在 WikiText-2 上使用 `llama-perplexity` 对比 mmap 基线与 MoE Buffer + CLG 路径：
+| Memory cap | 相对 Adaptive-off TPS 变化 | 状态 |
+| ---: | ---: | --- |
+| 1500 MB | +1.51% | 提升 |
+| 1800 MB | +1.64% | 提升 |
+| 2000 MB | +0.99% | 提升 |
+| 2400 MB | +0.51% | 提升 |
 
-| Chunk | mmap 基线 PPL | MoE Buffer + CLG PPL | 是否一致 |
-| ---: | ---: | ---: | :---: |
-| 1 | 47948.2078 | 47948.2078 | 一致 |
-| 2 | 80646.3078 | 80646.3078 | 一致 |
-| 3 | 95059.6850 | 95059.6850 | 一致 |
-| 4 | 104976.4199 | 104976.4199 | 一致 |
+![](./figures/test/fig08_moe_pressure_aware_full_adaptive.png)
 
-结果表明，Expert Slice 注册、异步加载、状态切换和 Tensor Pointer Repoint 仅改变物理驻留位置，不改变权重内容和模型数值语义。
+Pressure-Aware Full Adaptive 在四档内存限制下均保持正向收益。其优势并非在单个压力点追求最高吞吐，而是根据当前 Resident/Buffer 压力动态调整保护范围，在不同 memory cap 下保持较稳定的性能表现。
 
-#### 4.3.5 极端内存约束鲁棒性
+#### 4.3.4 MoE 事件级调度诊断
 
-- Dense native 在低于完整工作集的内存限制下可能触发 OOM；
-- Dense Window / Flex 可以继续运行，但在极端约束下性能会明显受存储 I/O 限制；
-- MoE Buffer 在 2 GB cgroup 限制下可将 RSS 控制在约 1.90 GB，并保持约 2.57 tok/s，体现了 Expert 稀疏性在内存受限场景下的优势。
+实验条件：`memory.max=2400MB`、`ctx=2048`、`tokens=256`、`repeats=1`。
+
+| 指标 | Current Policy | Active Window Off | 现象 |
+| --- | ---: | ---: | --- |
+| Peak RSS | 2399.9 MiB | 1721 MiB | 当前策略接近内存上限 |
+| Evictions | 16290 | 1962 | 驱逐显著放大 |
+| Read Bytes | 18.44 GB | 3.14 GB | I/O 放大明显 |
+| Cache Hit | 0.9539 | 0.9927 | 命中率下降 |
+| TPS | 7.07 | 8.60 | 性能下降 |
+
+![](./figures/test/fig11_moe_event_trace.png)
+
+当前策略相比 Active Window Off，eviction 增加约 8.3 倍，读取量增加约 5.9 倍，表现出清晰的 `Resident Pressure -> Eviction -> Reload -> Read Amplification` 退化链。该结果说明，在部分低内存 workload 下，过强的 Resident 保护反而可能造成缓存抖动，也为后续 Pressure-Aware 保护缩放和动态预算调节提供了事件级依据。
 
 ### 4.4 KV Cache 管理模块测试
 
-KV Cache 部分围绕 **物理驻留控制、恢复关键路径、KV 表示宽度和多会话生命周期** 四个方面进行测试。容量侧使用 `mincore` 与 KV object resident view 观测 KV tensor 的真实物理驻留页，并将 RELEASE 与 OFFLOAD 的 physical relief 分开统计；恢复侧记录 grouped backing read、pipeline、prefault、scatter、page fault 与 graph gate；多会话侧通过 model-bound trace replay 驱动真实 Session lifecycle。
-
-受控容量实验使用 Qwen1.5-MoE-A2.7B Q4_K_M、CPU 推理和单 slot 长上下文 workload。容量控制曲线采用 F32 K/V；F16 对照使用近似等相对 resident 压力，以避免把“表示字节数变化”和“OFFLOAD 集合变化”混为一个因素。
+KV Cache 测试围绕 **Physical Resident Budget、RELEASE/OFFLOAD 物理收益、Exact Restore、F16 KV 与真实多会话生命周期** 展开。容量侧通过 `mincore` 与 KV object resident view 观测真实物理页，恢复侧记录 grouped backing read、prefault、scatter、restore wall time 与 graph gate，多会话侧通过 trace-driven replay 验证 Session 生命周期。
 
 #### 4.4.1 Physical Resident Budget 控制曲线
 
-以全驻留 Resident 为基线，逐步收紧 steady KV tensor resident target。实验覆盖 8 个 case、每个 case 2 轮，共 16 次运行，各预算点均达到目标 resident budget。
+固定模型、workload 与 binary 下，以全驻留 Resident 为基线，逐步收紧 steady KV tensor resident target。实验共覆盖 8 个 case、每个 case 2 轮，共 16 次运行，各预算点均达到设定目标。
 
 | 策略 / target | 实际 KV resident | 相比 Resident 节省 | steady TPOT 变化 | resume gate |
 | --- | ---: | ---: | ---: | ---: |
@@ -567,37 +562,35 @@ KV Cache 部分围绕 **物理驻留控制、恢复关键路径、KV 表示宽�
 | V2 0.50 GiB | 0.497 GiB | 83.4% | +5.1% | 约 370 ms |
 | V2 0.25 GiB | 0.247 GiB | 91.8% | +4.2% | 约 478 ms |
 
-Physical Resident Budget Controller 能够将 steady KV physical resident 从约 3.00 GiB 连续控制到 0.247 GiB，对应最大约 91.8% 的 KV 物理驻留压缩。随着 resident target 收紧，live KV 的 OFFLOAD 比例增加，Session 重访时的一次性 resume gate 从约 190 ms 增至约 478 ms；恢复完成后的 steady TPOT 保持在 Resident 基线约 +3% 至 +8% 的范围内，并未随 target 呈单调恶化。该结果展示了明确的 **resident-memory / resume-latency trade-off**。
+![](./figures/test/kv_fig1_target_vs_actual_resident.png)
+
+Physical Resident Budget Controller 能够将 steady KV physical resident 从约 3.00 GiB 连续压缩至 0.247 GiB，最大降低约 **91.8%**。随着 target 收紧，Session 重访时的一次性 resume gate 由约 190 ms 增至约 478 ms；恢复完成后的 steady TPOT 仍保持在 Resident 基线约 +3% 至 +8% 范围内。实验体现了明确的 **resident-memory / resume-latency trade-off**。
 
 #### 4.4.2 RELEASE 与 OFFLOAD 的物理收益归因
 
-FlexKV-OS 将“无需保留内容的 dead/unowned KV”和“仍需保留 Session 语义的 idle live KV”分开处理：
-
-| 阶段 | KV physical resident / relief | 相比前一阶段 | 观测口径 |
+| 阶段 | KV physical resident / relief | 相比前一阶段 | 证据口径 |
 | --- | ---: | ---: | --- |
 | Resident `B_full` | 3,221,028,864 B（约 3.00 GiB） | -- | KV physical resident |
 | RELEASE floor `B_release` | 1,386,479,616 B（约 1.291 GiB） | 释放 1.709 GiB（56.96%） | KV physical resident |
 | OFFLOAD 额外 relief | 1,286,012,928 B（约 1.198 GiB） | 额外真实物理下降 | transaction-local `mincore` |
 
-RELEASE-only 可将 KV physical resident 从约 3.00 GiB 降至 1.291 GiB，释放约 1.709 GiB（56.96%），且过程不产生 swap-out、swap-in、backing write、backing read 或 positive restore，因此作为第一层低开销容量回收手段。OFFLOAD 对 idle live KV 进一步产生约 1.198 GiB 的 transaction-local physical relief，使系统在保留 Session 语义的同时继续压缩 DRAM 驻留。
+![](./figures/test/kv_fig2_release_offload_physical_relief.png)
 
-系统分别记录 logical KV bytes、backing I/O bytes 与 physical relief：三者分别描述逻辑数据规模、迁移成本和真实 DRAM 收益。
+RELEASE-only 可将 KV physical resident 从约 3.00 GiB 降至 1.291 GiB，释放约 1.709 GiB（56.96%），且不产生 backing read/write 与 restore 开销，适合作为第一层低成本容量回收。对仍需保留 Session 语义的 idle live KV，OFFLOAD 可进一步产生约 1.198 GiB 的真实物理下降。系统始终区分 logical KV bytes、backing I/O bytes 与 physical relief，避免把逻辑数据量或迁移量误当成真实 DRAM 收益。
 
 #### 4.4.3 Exact Restore 执行器消融
 
-OFFLOAD 后的 KV 在 Session 重访前通过 Exact Restore 回到 live tensor。恢复路径由 Transfer Group、Read/Restore Pipeline 和 Destination Prefault 组成。
+在 1024-token workload 中，16 个 SWAPPED block 被组织为 8 个 Transfer Group，384 MiB Exact payload 收敛为每 Group 一次连续 range read；同一实验通过 `mincore` 观测到 399,507,456 B（381 MiB）的真实 KV resident drop。
 
-在 1024-token workload 中，16 个 SWAPPED block 被组织为 8 个连续 transfer group，384 MiB Exact payload 由逐 block 读取收敛为每 group 一次 range read；同一实验中的真实 KV resident drop 为 399,507,456 B（381 MiB）。
-
-两级流水采用固定 lookahead=1：
+Read/Restore Pipeline 使用固定 lookahead=1：
 
 ```text
 READ(G[i+1]) || RESTORE(G[i])
 ```
 
-后续 7 个 group 的 read 均能够与前一个 group restore 重叠，`exposed_read_wait_us=0`、`pipeline_stall_us=0`；额外 staging 工作集最多为 2 个 task-owned group，峰值 100,663,296 B（约 96 MiB）。
+首个 Group 完成读取后，后续 7 个 Group 的 backing read 均能与前一个 Group restore 重叠，`exposed_read_wait_us=0`、`pipeline_stall_us=0`；双 staging 峰值约 96 MiB，额外工作集保持有界。
 
-Destination Prefault 在 scatter 前使用 `MADV_POPULATE_WRITE` 建立目标页。三轮交错 OFF/ON A/B 的中位结果如下：
+Destination Prefault 三轮交错 OFF/ON A/B 的中位结果如下：
 
 | 指标 | Prefault OFF | Prefault ON | 变化 |
 | --- | ---: | ---: | ---: |
@@ -609,11 +602,11 @@ Destination Prefault 在 scatter 前使用 `MADV_POPULATE_WRITE` 建立目标页
 | prefault minor faults | 0 | 97,536 | 全部前移 |
 | major faults | 0 | 0 | 不变 |
 
-381 MiB 被释放的 KV 对应 97,536 个 4 KiB 页面。Prefault 将这些 minor page fault 从 scatter 阶段整体前移；计入 prefault 本身后，`physical_restore_us` 三轮中位数由 179.736 ms 降至 142.672 ms，降低 20.62%。这说明 Exact Restore 的成本同时包含 backing read、page population 和 tensor copy，三者需要作为同一恢复关键路径协同优化。
+381 MiB 物理页对应 97,536 个 4 KiB 页面。Prefault 将这些 minor page fault 从 scatter 阶段整体前移；计入 Prefault 本身成本后，`physical_restore_us` 由 179.736 ms 降至 142.672 ms，降低 **20.62%**。说明 Exact Restore 的关键路径不仅受 backing read 影响，还包括目标页建立和 Tensor 数据写回。
+
+![](./figures/test/kv_fig5_restore_path_k1_k2_r2_ablation.png)
 
 #### 4.4.4 F16 KV 精度与恢复数据量
-
-KV 元素精度直接决定 resident footprint 和 OFFLOAD/restore 搬运量。FlexKV-OS 支持 native F16 paged KV，并在近似等相对 resident 压力下与 F32 进行对照。
 
 | 指标 | F32 | F16 | 变化 |
 | --- | ---: | ---: | ---: |
@@ -621,46 +614,118 @@ KV 元素精度直接决定 resident footprint 和 OFFLOAD/restore 搬运量。F
 | 恢复数据量 | 840 MiB | 465 MiB | -44.64% |
 | resume gate | 471.318 ms | 259.381 ms | -44.97% |
 
-在相近的相对 resident 压力下，F16 将 full-KV physical resident 约减半，恢复数据量由 840 MiB 降至 465 MiB，resume gate 由 471.318 ms 降至 259.381 ms。恢复数据量和 gate latency 的变化幅度接近，体现出 Exact Restore 与需要搬运、重新驻留的 KV 字节量之间的直接关联。
+在近似相同的相对 resident 压力下，F16 将 full-KV physical resident 约减半；恢复数据量与 resume gate 均下降约 45%。两者变化幅度接近，说明 Exact Restore 端到端成本与需要搬运并重新驻留的 KV 字节量具有较强相关性。
 
-F16 gather 使用 type-aware `ggml_get_rows` 路径并包含 F16->F32 计算转换，因此该路径同时兼顾存储密度与现有计算图的数据类型要求。
+![](./figures/test/kv_fig6_f32_vs_f16_equal_relative_pressure.png)
 
 #### 4.4.5 真实多会话 Workload 执行
 
-系统将 Alibaba usage trace 映射为真实 `llama-server` 的多会话执行链：
+系统建立 Alibaba usage trace 到真实 `llama-server` 的执行链：
 
 ```text
 Frozen Trace
    -> Model-bound Tokenization / direct_token_ids
-   -> Stable Multi-session Slot Binding
+   -> Multi-session Slot Binding
    -> Completion-driven Lifecycle
-   -> ACTIVE / IDLE / REVISIT / TTL / DEAD / COLD_RESTART
 ```
 
 | 验证层 | 真实运行结果 | 系统作用 |
 | --- | --- | --- |
-| Model-bound transcript | real tokenizer、`direct_token_ids`、effective `n_ctx=8192` | 将 trace 请求与实际模型 token 和上下文配置绑定 |
-| Multi-session replay | 2 个 logical Session 稳定绑定不同 slot；HTTP 200；zero loss/duplicate；event order PASS | 保持独立 Session 生命周期与 arrival/revisit 顺序 |
+| Model-bound transcript | real tokenizer、`direct_token_ids`、effective `n_ctx=8192` | 将 trace 请求与真实模型 Token 和上下文配置绑定 |
+| Multi-session replay | 2 个 logical Session 稳定绑定不同 slot；HTTP 200；zero loss/duplicate；event order PASS | 保持 Session 独立生命周期与 arrival/revisit 顺序 |
 | Completion lifecycle | 3 个完成 turn；`revisit_count=1`、`ttl_expiry_count=2`、`dead_count=2` | 驱动 ACTIVE/IDLE/REVISIT/TTL/DEAD/COLD_RESTART 状态转换 |
 
-该执行链把真实请求到达、空闲、重访和生命周期结束统一转换为 Governor 的 claimant 状态，为 idle age、reuse history、resident lease、churn 以及 Cost-aware Hot/Cold 策略提供一致的多 Session 时间语义。
+多会话 replay 为 idle age、reuse history、resident lease、churn 以及 Cost-aware Hot/Cold Ranking 提供了真实 Session 时间语义。
 
-### 4.5 Weight-KV 运行时资源协同
+### 4.5 全局自动调度下的内存容量边界与性能
 
-模型权重和 KV Cache 是推理过程中两类性质不同但共享物理资源的数据对象。Dense/MoE 路径管理模型参数与 Expert Working Set，KV Runtime 管理随 Session 生命周期动态增长的 KV tensor；三者共同竞争 CPU DRAM 与 backing I/O。
+在 Dense Residency、MoE Expert Working Set、KV Reclaim/Restore 等模块独立验证基础上，进一步将 Weight Residency/Flex Streaming、KV Cache Reclaim 和 MoE Budget Planner 纳入 Global Memory Governor。容量边界实验使用固定 workload：`ctx=2048`、`np=1`、`reqs=1`、`tokens=64`，在 7 个 `memory.high` 压力点下分别测试 Dense 与 MoE。
 
-KV 侧向统一调度层提供 physical resident / resident target、dead/unowned reclaimable、idle live claimant 及 Hot/Cold score、RELEASE/OFFLOAD/PREFETCH action、OFFLOAD write cost、Exact Restore cost、active/protected/shared/generation 安全状态以及 backing I/O result。权重侧保持其现有 Dense/MoE resident、reclaimable、load cost 与 Expert reuse 接口。
+四组策略为：
 
-统一资源关系可概括为：
+- `baseline`：关闭 Weight/KV 治理；
+- `kv_only`：仅启用 KV 治理；
+- `weight_only`：仅启用 Dense/MoE 权重治理；
+- `combined_auto`：权重、KV 与全局自动调度同时启用。
 
-```text
-Global Physical Budget
-   |-- Dense / MoE Resident Management
-   |-- KV Physical Resident Management
-   `-> Unified Action / I/O Scheduling
-```
+共执行 **56 次 runs**，成功 23 次，其余 33 次均在启动阶段因内存边界失败，用于筛选不同策略的最低可运行容量。
 
-各 Backend 保持自身的数据结构、生命周期与 correctness authority，上层 Governor 只负责跨模块预算、动作和 I/O 资源协调，从而避免局部预取、权重加载与 KV 恢复相互争抢有限 DRAM 和存储带宽。
+#### 4.5.1 容量边界与可运行性
+
+| 模型 | baseline | kv_only | weight_only | combined_auto |
+| --- | ---: | ---: | ---: | ---: |
+| Dense | 2/7 | 2/7 | 3/7 | 2/7 |
+| MoE | 1/7 | 1/7 | 6/7 | 6/7 |
+
+各策略最低成功 `memory.high`：
+
+| 模型 | 策略 | 最低成功 memory.high |
+| --- | --- | ---: |
+| Dense | baseline | 2300M |
+| Dense | kv_only | 2300M |
+| Dense | weight_only | 2000M |
+| Dense | combined_auto | 2300M |
+| MoE | baseline | 2800M |
+| MoE | kv_only | 2800M |
+| MoE | weight_only | 1300M |
+| MoE | combined_auto | 1300M |
+
+Dense 模型最低门槛仅由 weight_only 从 2300M 降至 2000M，combined_auto 暂未进一步降低容量边界，说明 Dense 的极低内存瓶颈仍主要来自每 Token 必须遍历全部权重。MoE 则具有明显结构性优势：weight_only 与 combined_auto 均将最低可运行门槛从 2800M 降至 **1300M**，并在 7 个压力点中成功运行 6 个，证明 Expert Buffer 与 Budget Planner 能将 MoE 从接近全量驻留转化为有限动态工作集。
+
+#### 4.5.2 成功运行点吞吐对比
+
+Dense：
+
+| memory.high | baseline | kv_only | weight_only | combined_auto |
+| ---: | ---: | ---: | ---: | ---: |
+| 2000M | -- | -- | 1.87 | -- |
+| 2300M | 1.72 | 2.64 | 2.40 | **2.94** |
+| 2800M | 3.09 | **13.45** | 2.42 | 4.73 |
+
+在 2300M 压力点，combined_auto 吞吐最高，为 2.94 tok/s，优于 baseline、kv_only 与 weight_only，说明联合调度能够在该压力区间更好地平衡 Weight 与 KV 资源。在 2800M，kv_only 达到 13.45 tok/s，但其几乎用满内存限制且无法扩展到更低内存点；combined_auto 保留了权重治理开销，因此吞吐较低，但仍高于 baseline。
+
+MoE：
+
+| memory.high | baseline | kv_only | weight_only | combined_auto |
+| ---: | ---: | ---: | ---: | ---: |
+| 1300M | -- | -- | 1.37 | 1.12 |
+| 1600M | -- | -- | 2.38 | **6.26** |
+| 1800M | -- | -- | **8.51** | 8.28 |
+| 2000M | -- | -- | 8.65 | **9.26** |
+| 2300M | -- | -- | 8.97 | **11.10** |
+| 2800M | 7.34 | **17.60** | 8.85 | 11.46 |
+
+MoE 的 weight_only 与 combined_auto 从 1300M 起即可运行，而 baseline/kv_only 直到 2800M 才成功。combined_auto 在 1600M、2000M、2300M 和 2800M 均优于 weight_only，其中 1600M 从 2.38 tok/s 提升至 6.26 tok/s；1300M 和 1800M 则略低于 weight_only，当前容量边界实验仅 `REPEATS=1`，因此这些单点差异应结合后续重复实验理解。
+
+#### 4.5.3 内存-吞吐权衡
+
+| 模型 | memory.high | 策略 | 峰值 RSS / 吞吐 |
+| --- | ---: | --- | --- |
+| Dense | 2800M | baseline | 2802 MB / 3.09 tok/s |
+| Dense | 2800M | kv_only | 2800 MB / 13.45 tok/s |
+| Dense | 2800M | weight_only | 1921 MB / 2.42 tok/s |
+| Dense | 2800M | combined_auto | 2598 MB / 4.73 tok/s |
+| MoE | 2800M | baseline | 2801 MB / 7.34 tok/s |
+| MoE | 2800M | kv_only | 2800 MB / 17.60 tok/s |
+| MoE | 2800M | weight_only | 1222 MB / 8.85 tok/s |
+| MoE | 2800M | combined_auto | 1955 MB / 11.46 tok/s |
+| MoE | 2300M | weight_only | 1222 MB / 8.97 tok/s |
+| MoE | 2300M | combined_auto | 1643 MB / 11.10 tok/s |
+
+MoE weight_only 将成功点 RSS 压至约 1.2 GB，更偏向“保证可运行性”；combined_auto 则主动使用更多可用内存换取更高吞吐，例如 2300M 下由 1222 MB / 8.97 tok/s 提升至 1643 MB / 11.10 tok/s，体现了 Governor 的“以内存换性能”策略。Dense combined_auto 在 2300M 与 2800M 均能保持高于 baseline 的吞吐，并保留一定内存安全边际。
+
+### 4.6 系统测试结果总结
+
+综合当前实验，FlexKV-OS 已在 Dense、MoE、KV Cache 与 Global Governor 四个层面形成完整的测试证据：
+
+1. **消除重复权重驻留能够直接降低基础 RSS。** 关闭 Repack 后，Dense 与 MoE RSS 分别减少约 3.21 GB 和 2.13 GB，且吞吐不下降。
+2. **Dense 的关键是 Residency、Budget 与 I/O 调度联合优化。** 显式 Residency 将 Stream/token 从 2684 MiB 降至 612 MiB，吞吐从 1.77 提升至 5.18 tok/s；Risk-Aware Lock 能避免激进锁定导致的 OOM，Pin Policy 与 Ahead 决定有限内存如何转化为有效 I/O 收益。
+3. **MoE 的关键是覆盖有效 Expert Working Set。** Buffer 存在明显工作集边界；Budget Planner v2 在 1500 MB hard cap 下使固定预算全部失败的场景转为 3/3 稳定运行；全局容量实验进一步将最低可运行门槛从 baseline 的 2800M 降至 1300M。
+4. **KV Cache 可以按真实物理驻留进行连续容量控制。** F32 KV Resident 可从约 3.00 GiB 压缩至 0.247 GiB，最大节省 91.8%；RELEASE 与 OFFLOAD 分别承担无恢复成本回收和可恢复迁移，Exact Restore 通过 Transfer Group、流水恢复和 Prefault 将物理恢复时间降低 20.62%。
+5. **全局协同能够在容量与吞吐之间动态取舍。** MoE combined_auto 在多数可运行压力点上优于 weight_only，并在维持 1300M 最低可运行门槛的同时，在 1600M、2000M、2300M 等点利用额外内存换取更高吞吐；Dense 在 2300M 点同样由联合调度获得最高吞吐。
+6. **当前结果同时暴露了进一步优化方向。** Dense 极低内存仍受完整权重扫描与存储带宽下界限制；MoE Event Trace 表明过强 Resident 保护可能产生 eviction/reload 放大；Prefetch Admission 在当前 workload 下出现 100% Drop，说明预算与准入策略仍有进一步调优空间。
+
+总体而言，本系统并非依赖单一缓存策略，而是针对 **Dense 权重、MoE Expert、KV Cache** 三类不同生命周期和访问模式的数据对象分别进行显式驻留管理，再由 **Memory Planner + Server Memory Governor** 在全局层面协调内存与 I/O 资源。在有限 DRAM 条件下，系统能够将原本被动的操作系统调页过程转化为模型结构感知、压力感知和收益感知的主动运行时治理，并在显著降低物理内存占用的同时维持可接受的推理性能。
 
 ## 五、功能展示
 
@@ -668,16 +733,16 @@ Global Physical Budget
 
 https://pan.quark.cn/s/3aa676ba1a33
 
----
 
 ## 六、文档信息
 
-- [参赛文档](./docs/阶段性提交参赛文档.pdf)
+- [参赛文档](./docs/参赛文档.pdf)
 - [参赛演示文档](./docs/操作系统设计赛.pptx)
 
----
 
 ## 七、目录索引
+
+> 以下目录突出 FlexKV-OS 的核心实现文件，完整仓库结构以实际代码仓库为准。
 
 ```text
 .
@@ -685,7 +750,7 @@ https://pan.quark.cn/s/3aa676ba1a33
 ├── README.md
 ├── LICENSE
 ├── docs
-│   ├── 阶段性提交参赛文档.pdf
+│   ├── 参赛文档.pdf
 │   ├── 操作系统设计赛.pptx
 │   └── reproduce_kv_cache_optimization.md
 ├── figures
@@ -723,7 +788,6 @@ https://pan.quark.cn/s/3aa676ba1a33
         └── README.md
 ```
 
----
 
 ## 八、正确性与安全边界
 
@@ -740,60 +804,23 @@ FlexKV-OS 的优化作用于数据管理路径，而不修改 Transformer 计算
 9. **`mincore` 用于 Physical Budget、transaction-local relief 与 claimant-exclusive resident attribution**，logical KV bytes、I/O payload 与 physical relief 分开统计；
 10. **Dense Flex 与 MoE Buffer 在推理期 CPU Hook 中互斥接入**，避免同一次执行路径重复控制同一权重。
 
----
+## 九、当前系统不足与未来方向
 
-## 九、当前限制
+尽管当前系统已经完成 Dense 权重、MoE 专家、KV Cache 以及全局 Memory Governor 的核心设计与实现，并在不同内存约束下验证了运行时内存治理机制的有效性，但从面向资源受限环境的大语言模型长期稳定部署角度来看，系统仍存在进一步完善空间。后续工作主要围绕复杂负载下的运行稳定性、极端资源约束下的性能权衡以及系统泛化能力三个方面展开。
 
-当前系统已经完成核心功能验证，但仍存在以下限制：
+### 9.1 复杂负载下的调度稳定性仍需进一步验证
 
-### 9.1 极端内存受限场景下 Dense 性能仍受 I/O 下界限制
+当前系统已经建立加载期 Memory Planner 与运行期 Server Memory Governor 两阶段内存治理机制，并能够根据物理内存压力、权重驻留状态、KV Cache 使用情况以及预取需求动态调整资源配置，在不同内存限制条件下表现出较好的资源适应能力。但现有实验主要针对确定的模型、内存压力点和典型推理负载展开，对于突发请求、多会话长期运行、上下文长度持续变化以及模型访问模式快速切换等复杂动态场景，当前调度策略的长期稳定性和收敛特性仍缺乏充分验证。未来将进一步扩展动态负载与长时间运行实验，重点分析资源调整过程中可能产生的调度抖动、状态切换开销以及局部性能波动，从而进一步提升系统在真实端侧推理负载下的稳定性与鲁棒性。
 
-当可用内存远小于 Dense 模型工作集时，每 Token 仍必须读取大量层权重，系统虽然可以避免 OOM，但吞吐会被 SSD 带宽主导。后续需要进一步优化 Layer Chunk、Block-level Streaming、长期 Pin 和 Cost Model。
+### 9.2 极端内存约束下仍存在内存占用与推理性能之间的固有权衡
 
-### 9.2 跨层共享页识别仍需完善
+本系统通过显式权重驻留、专家工作集管理以及 KV Cache 生命周期控制，可以显著压缩运行时物理内存占用，并将部分原本无法运行的低内存场景转变为可稳定执行状态。但当可用物理内存持续降低时，模型权重、专家数据和运行时状态需要更加频繁地在内存与外部存储之间迁移，系统瓶颈也会逐渐由内存容量转向存储 I/O 和数据恢复开销。因此，进一步压缩物理驻留规模通常会带来更高的数据传输量和推理等待时间，内存占用与推理性能之间仍存在客观的系统级权衡。未来需要结合模型访问规律、当前存储带宽、实时内存压力和数据复用收益，对驻留、回收与预取策略进行更加精细的动态平衡，在满足内存安全约束的同时尽可能降低数据迁移带来的性能损失。
 
-若不同 Layer 的 Tensor 落在同一物理页，系统为保证正确性会保守地避免回收该页。更大规模模型下，共享页比例对可回收内存的影响仍需进一步量化。
+### 9.3 系统泛化能力与实验验证范围仍有进一步扩展空间
 
-### 9.3 KV Exact Restore 仍存在同步恢复开销
+当前系统已经完成 Dense、MoE 和长上下文 KV Cache 等典型场景的验证，并通过不同 memory cap、组合治理和多会话 workload 对系统核心机制进行了测试，但现阶段实验所覆盖的模型规模、模型结构、硬件平台和存储介质仍然有限，主要验证环境仍集中于 CPU 推理与单机 SSD 存储场景。不同模型结构、内存容量、存储带宽以及设备计算能力可能形成不同的最优驻留和调度策略，因此现有实验结果仍需要在更广泛的平台上进行验证。未来将进一步扩展不同参数规模和模型架构，覆盖更多端侧设备与存储介质，并探索 CPU、GPU、NPU 等异构计算环境下统一的权重与 KV Cache 生命周期管理机制，从而提升系统在不同资源受限部署场景中的适应能力和可迁移性。
 
-当前 `llama.cpp` Attention 路径要求本轮计算所需 KV 在进入 Graph 前完整可见，因此被 OFFLOAD 的 Session 必须先完成 Exact Restore，再继续 Attention 计算。现有 Read/Restore Pipeline 已能够实现 `READ(Gi+1) || RESTORE(Gi)`，隐藏后续 Group 的读取等待，但 KV Restore 仍无法与 Attention Compute 真正重叠，因此 Resume latency 会直接暴露在 Session 重访关键路径上。
-
-### 9.4 KV OFFLOAD 写路径仍存在小粒度 I/O 开销
-
-Restore 路径已经通过 Transfer Group 将连续 Block 合并为 grouped `pread`，减少大量小粒度读取；相比之下，OFFLOAD 写路径仍主要以 Block 为单位执行 Backing Write。在集中换出大量 idle KV 时，写侧会产生更多 syscall 和小粒度 I/O 开销，并可能增加与权重、专家读取之间的存储竞争。
-## 九、当前限制
-
-当前系统已经完成核心功能验证，但仍存在以下限制：
-
-### 9.1 极端内存受限场景下 Dense 性能仍受 I/O 下界限制
-
-当可用内存远小于 Dense 模型工作集时，每 Token 仍必须读取大量层权重，系统虽然可以避免 OOM，但吞吐会被 SSD 带宽主导。后续需要进一步优化 Layer Chunk、Block-level Streaming、长期 Pin 和 Cost Model。
-
-### 9.2 跨层共享页识别仍需完善
-
-若不同 Layer 的 Tensor 落在同一物理页，系统为保证正确性会保守地避免回收该页。更大规模模型下，共享页比例对可回收内存的影响仍需进一步量化。
-
-### 9.3 KV Exact Restore 仍存在同步恢复开销
-
-当前 `llama.cpp` Attention 路径要求本轮计算所需 KV 在进入 Graph 前完整可见，因此被 OFFLOAD 的 Session 必须先完成 Exact Restore，再继续 Attention 计算。现有 Read/Restore Pipeline 已能够实现 `READ(Gi+1) || RESTORE(Gi)`，隐藏后续 Group 的读取等待，但 KV Restore 仍无法与 Attention Compute 真正重叠，因此 Resume latency 会直接暴露在 Session 重访关键路径上。
-
-### 9.4 KV Restore 仍受物理页重建和内存复制限制
-
-随着 grouped read 和流水恢复降低 I/O 等待，Restore 开销逐渐转移到目标页建立、Scatter 和 Tensor Copy。在 381 MiB KV Restore 实验中，Prefault 将 97,536 个 minor page fault 从 Scatter 阶段前移，使 `physical_restore_us` 三轮中位数由 179.736 ms 降至 142.672 ms，但真实的 Page Population 和内存复制仍无法消除，因此 CPU 内存带宽仍是大规模 KV 恢复的重要性能限制。
-
----
-
-## 十、后续优化方向
-
-* 进一步降低极端低内存 Dense 场景的 `stream_per_token`；
-* 完善 Dense Planner Cost Model、Lock Search 与 Ring/Ahead 自动规划；
-* 引入更细粒度 Layer Chunk / Block-level Weight Streaming；
-* 完善 MoE Warm Working Set Estimator 与预测/驱逐联合策略；
-* 优化 KV Restore 的物理页重建和 Tensor Copy 路径，进一步降低大规模 Session 恢复时的 CPU 内存带宽开销；
-
----
-
-## 十一、项目亮点
+## 十、项目亮点
 
 - **从局部缓存优化升级为运行时内存治理**：采用加载期 Planner + 运行期 Governor 两阶段设计；
 - **Dense / MoE 结构感知管理**：Dense 以 Layer 为单位，MoE 以 ExpertGroup 为单位，不使用一刀切缓存策略；
@@ -801,14 +828,13 @@ Restore 路径已经通过 Transfer Group 将连续 Block 合并为 grouped `pre
 - **Weight-KV-I/O 全局协调**：统一处理权重、KV Cache、Prefetch 对物理内存和存储带宽的竞争；
 - **预测与正确性解耦**：预测只决定“提前加载什么”，真实访问仍有同步兜底；
 - **回收-确认-再投资闭环**：通过 Reallocation Credit 将真实释放的内存重新投入高收益对象；
-- **KV 物理收益可解释、可归因**：以 Physical Budget View、transaction-local `mincore` 和 claimant-exclusive resident view 区分 logical bytes、I/O bytes 与真实 DRAM relief；
-- **Exact 生命周期与恢复执行器**：RELEASE/OFFLOAD/PREFETCH 配合 fixed-slot backing、transaction/generation、Transfer Group、两级流水、Prefault 与 Graph Gate；
-- **多会话 Cost-aware Hot/Cold**：基于真实 physical relief、OFFLOAD/restore history、reuse 与 churn 对 idle claimant 进行单位物理字节成本排序，并通过 resident lease 抑制往返抖动；
+- **KV 物理收益可解释、可归因**：依托各类视图明确区分逻辑I/O 字节数与真实 DRAM 释放量，使各项内存收益可量化；
+- **Exact 生命周期与恢复执行器**：以三级状态机配合两级流水线、预缺页与计算图门控，构成完整执行层；
+- **多会话 Cost-aware Hot/Cold**：基于真实的物理释放量与历史代价对空闲候选会话进行排序，避免频繁换入换出；
 - **最小侵入式集成 `llama.cpp`**：在模型加载、CPU Backend、KV Cache 和 Server Scheduler 既有路径上扩展，不重写核心推理引擎。
 
----
 
-## 十二、大语言模型使用说明
+## 十一、大语言模型使用说明
 
 项目开发过程中，我们合理使用了大语言模型作为辅助工具，具体使用方式如下：
 
