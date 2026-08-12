@@ -46,7 +46,10 @@ struct llama_moe_buffer_params {
     bool   vnni_q2_swiglu = true;    // allow the VNNI q2 path for fused gate/up SWIGLU
     int    vnni_block = 64;          // activation int8 quantization block; q2 VNNI currently uses 64-column chunks
     int    avx512_prefetch = 0;      // q2-hier kernel prefetch distance in MWQ blocks; 0 disables explicit prefetch
-    size_t budget_bytes = 1024ull * 1024ull * 1024ull; // resident-expert byte budget; 0 = unbounded
+    size_t budget_bytes = 1024ull * 1024ull * 1024ull; // resident-expert byte budget when bounded
+    bool   budget_unbounded = false; // explicit unbounded mode; separates unlimited from a zero-byte bounded budget
+    size_t planner_safe_budget_bytes = 0; // load-time safe budget derived from memory.max
+    size_t planner_floor_bytes = 0;       // non-reclaimable load-time floor
     int    n_workers    = 2;         // parallel prefetch workers (raise to lift effective
                                      // read bandwidth on NVMe: single-thread O_DIRECT
                                      // random reads under-utilise the device)
@@ -76,8 +79,48 @@ struct llama_moe_buffer_params {
     float  pinned_layer_fraction = 0.18f; // max fraction of pinned budget one layer may use
     int    active_window = 4;        // future-use distance protected by Belady-style eviction
     int    group_cooldown_tokens = 0; // protect recently used (layer, expert) groups for N decode-token epochs
+    bool   pressure_adaptive = true; // shrink soft expert-cache protection as resident/budget pressure rises
+    bool   pressure_scale_pin = true; // let pressure shrink the global pinned fraction
+    bool   pressure_scale_layer_pin = true; // let pressure shrink the per-layer pinned cap
+    bool   pressure_scale_window = true; // let pressure shrink future-use active protection
+    bool   pressure_scale_cooldown = true; // let pressure shrink recent-use cooldown protection
+    bool   pressure_scale_spec_guard = true; // let pressure shrink speculative-unused keep penalty
+    double pressure_soft_ratio = 0.88; // resident/budget ratio where pressure adaptation starts
+    double pressure_hard_ratio = 0.97; // resident/budget ratio where soft protection reaches its floor
+    float  pressure_pin_floor = 0.0f;  // minimum effective pinned fraction under hard pressure
     int    pin_refresh_interval = 128; // group touches between top-score pin refreshes
+    double warm_coverage = 0.95;    // target per-layer expert probability mass for warm-start sizing
     std::string sidecar_path;        // optional exact low-bit/MWQ sidecar data source
+};
+
+struct llama_moe_buffer_stats {
+    size_t   resident_bytes = 0;
+    size_t   budget_bytes = 0;
+    bool     budget_unbounded = false;
+    size_t   planner_safe_budget_bytes = 0;
+    size_t   planner_floor_bytes = 0;
+    size_t   expert_bytes = 0;
+    uint64_t streams = 0;
+    uint64_t hits = 0;
+    uint64_t evictions = 0;
+    uint64_t bytes_read = 0;
+    uint64_t cache_hits = 0;
+    uint64_t cache_misses = 0;
+    uint64_t prefetch_hits = 0;
+    uint64_t prefetch_late = 0;
+    uint64_t prefetch_unused = 0;
+    uint64_t prefetch_budget_dropped = 0;
+    size_t   prefetch_budget_bytes = 0;
+    size_t   prefetch_budget_available_bytes = 0;
+    size_t   warm_working_set_bytes = 0;
+    uint64_t warm_working_set_groups = 0;
+    double   warm_working_set_coverage = 0.0;
+};
+
+struct llama_moe_buffer_reclaim_result {
+    uint64_t released_bytes = 0;
+    uint32_t released_groups = 0;
+    bool target_satisfied = false;
 };
 
 std::shared_ptr<llama_moe_buffer_context> llama_moe_buffer_create(const llama_moe_buffer_params & params);
@@ -90,8 +133,24 @@ size_t llama_moe_buffer_expert_bytes(const llama_moe_buffer_context * ctx);
 
 // Override the resident-expert byte budget after registration (for adaptive
 // budgeting computed once the expert total and available memory are known).
-// 0 = unbounded.
 void llama_moe_buffer_set_budget(llama_moe_buffer_context * ctx, size_t budget_bytes);
+
+// Install the load-time memory.max plan. This makes the bounded/unbounded
+// state explicit so a bounded zero-byte budget is not confused with unlimited.
+void llama_moe_buffer_set_budget_plan(
+        llama_moe_buffer_context * ctx,
+        size_t                    budget_bytes,
+        bool                      budget_unbounded,
+        size_t                    planner_safe_budget_bytes,
+        size_t                    planner_floor_bytes);
+
+// Estimate the warm-start resident working set from the registered
+// (layer, expert) groups. Uses observed per-request/historical group scores when
+// present, and the structural top-k/uniform prior before any routing history
+// exists.
+size_t llama_moe_buffer_warm_working_set_bytes(
+        llama_moe_buffer_context * ctx,
+        double                    coverage);
 
 // Register one `*_exps` weight tensor: allocate a full-size anonymous buffer,
 // repoint exps->data to it, and record per-expert file metadata. `fd` is the
@@ -137,5 +196,21 @@ void llama_moe_buffer_prefetch_ranked(
         const int *                experts,
         const float *              scores,
         int                        n_experts);
+
+llama_moe_buffer_stats llama_moe_buffer_get_stats(llama_moe_buffer_context & ctx);
+
+// Reclaim cold resident expert groups using the buffer's existing victim
+// selection. This releases clean anonymous expert pages; the model file/sidecar
+// remains the authoritative source for future reloads.
+llama_moe_buffer_reclaim_result llama_moe_buffer_reclaim_clean(
+        llama_moe_buffer_context & ctx,
+        uint64_t                   target_bytes,
+        uint32_t                   max_groups);
+
+// Set a per-tick speculative prefetch budget. A zero budget disables the gate.
+// Demand loads are never gated by this API.
+void llama_moe_buffer_set_prefetch_budget(
+        llama_moe_buffer_context & ctx,
+        uint64_t                  budget_bytes);
 
 void llama_moe_buffer_print_stats(const llama_moe_buffer_context & ctx);

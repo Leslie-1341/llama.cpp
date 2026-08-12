@@ -18,6 +18,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <cstdlib>
 #endif
 
@@ -39,6 +40,31 @@ struct flex_layer {
     bool   released   = true;         // compute has consumed it (slot reusable)
     bool   always_resident = false;   // fully locked: no streaming needed
     uint64_t last_use = 0;
+};
+
+struct flex_delta_lock_buffer {
+    void * ptr = nullptr;
+    size_t size = 0;
+    size_t used = 0;
+};
+
+struct flex_delta_pin_candidate {
+    int layer = -1;
+    size_t index = 0;
+    llama_flex_tensor tensor;
+    size_t value = 0;
+    double roi = 0.0;
+    size_t dst_offset = 0;
+};
+
+struct flex_delta_pin_job {
+    std::vector<flex_delta_pin_candidate> selected;
+    void * delta = nullptr;
+    size_t alloc_size = 0;
+    size_t used = 0;
+    double value_sum = 0.0;
+    uint64_t requested_bytes = 0;
+    uint64_t submitted_us = 0;
 };
 
 } // namespace
@@ -70,11 +96,15 @@ struct llama_flex_context {
     // persistent balanced-lock buffer (resident for the whole run)
     void *                   lock_buf  = nullptr;
     size_t                   lock_size = 0;
+    std::vector<flex_delta_lock_buffer> delta_lock_bufs;
 
     std::vector<std::thread> workers;
+    std::thread              delta_pin_worker;
     std::deque<int>          queue;        // layer ids to stream
+    std::deque<flex_delta_pin_job> delta_pin_queue;
     std::mutex               mutex;
     std::condition_variable  cv_work;      // wakes IO threads
+    std::condition_variable  cv_delta_pin; // wakes runtime delta-pin worker
     std::condition_variable  cv_ready;     // wakes waiters on layer-ready
     bool                     shutdown = false;
     FILE *                   trace = nullptr;
@@ -89,16 +119,24 @@ struct llama_flex_context {
     double   ewma_compute_us = 0.0;
     double   ewma_wait_us = 0.0;
 
+    bool     prefetch_budget_enabled = false;
+    uint64_t prefetch_budget_bytes = 0;
+    uint64_t prefetch_budget_available_bytes = 0;
+
     ~llama_flex_context() {
         {
             std::lock_guard<std::mutex> lock(mutex);
             shutdown = true;
         }
         cv_work.notify_all();
+        cv_delta_pin.notify_all();
         for (auto & w : workers) {
             if (w.joinable()) {
                 w.join();
             }
+        }
+        if (delta_pin_worker.joinable()) {
+            delta_pin_worker.join();
         }
         if (params.debug_log && stats.read_ops > 0) {
             const double phys_mib = stats.bytes_read_phys / 1048576.0;
@@ -135,6 +173,9 @@ struct llama_flex_context {
             free(p);
         }
         free(lock_buf);
+        for (auto & b : delta_lock_bufs) {
+            free(b.ptr);
+        }
         for (int fd : fds) {
             if (fd >= 0) {
                 close(fd);
@@ -180,6 +221,8 @@ static void flex_trace_locked(
         size_t phys,
         uint64_t us);
 
+static void flex_delta_pin_worker(llama_flex_context * ctx);
+
 static int flex_ring_occupancy_locked(const llama_flex_context & ctx) {
     int n = 0;
     for (int layer : ctx.slot_layer) {
@@ -193,6 +236,9 @@ static int flex_ring_occupancy_locked(const llama_flex_context & ctx) {
 static void flex_note_ahead_locked(llama_flex_context & ctx) {
     const int ahead = flex_effective_ahead(ctx);
     ctx.stats.effective_ahead = ahead;
+    ctx.stats.ewma_io_us = ctx.ewma_io_us;
+    ctx.stats.ewma_compute_us = ctx.ewma_compute_us;
+    ctx.stats.ewma_wait_us = ctx.ewma_wait_us;
     if (ctx.stats.min_effective_ahead == 0 || ahead < ctx.stats.min_effective_ahead) {
         ctx.stats.min_effective_ahead = ahead;
     }
@@ -859,6 +905,9 @@ static void flex_worker(llama_flex_context * ctx) {
             if (t.locked) {
                 continue; // locked tensors live permanently in the lock buffer
             }
+            if (t.delta_locked) {
+                continue; // runtime-pinned tensors live permanently in delta lock buffers
+            }
             size_t p = 0;
             if (!flex_read(ctx, base + t.buf_offset, t.file_idx, t.file_offset, t.size, bounce, bcap, &p)) {
                 ok = false;
@@ -1001,6 +1050,7 @@ void llama_flex_register_tensor(
     auto & L = ctx.layers[layer_id];
     llama_flex_tensor t = tensor;
     t.locked     = false;
+    t.delta_locked = false;
     t.buf_offset = 0; // assigned in finalize once locking is decided
     L.bytes += t.size;
     ctx.max_tensor = std::max(ctx.max_tensor, t.size);
@@ -1158,6 +1208,7 @@ void llama_flex_finalize(llama_flex_context & ctx) {
         ctx.slots[s] = p;
     }
     ctx.stats.ring_bytes = ctx.slot_bytes * (size_t) k;
+    ctx.stats.slot_bytes = ctx.slot_bytes;
     ctx.stats.read_cost_bytes = ctx.params.read_cost_bytes;
     ctx.adaptive_ahead = std::max(1, std::min(ctx.params.prefetch_ahead, flex_ring_room_ahead(ctx)));
     ctx.stats.effective_ahead = flex_effective_ahead(ctx);
@@ -1176,6 +1227,7 @@ void llama_flex_finalize(llama_flex_context & ctx) {
     for (int i = 0; i < nthreads; ++i) {
         ctx.workers.emplace_back(flex_worker, &ctx);
     }
+    ctx.delta_pin_worker = std::thread(flex_delta_pin_worker, &ctx);
 
     if (ctx.params.debug_log) {
         std::fprintf(stderr,
@@ -1183,7 +1235,7 @@ void llama_flex_finalize(llama_flex_context & ctx) {
                 "locked=%.2f MiB stream/token=%.2f MiB io_threads=%d direct_io=%d ahead=%d requested_ahead=%d "
                 "adaptive_ahead=%d max_ahead=%d pin_policy=%s read_cost=%.1f KiB locked_tensors=%llu streamed_tensors=%llu lock_unused=%.2f MiB "
                 "global_rebalance=%d global_locked=%.2f MiB global_tensors=%llu "
-                "sched=%d budget=%.0f MiB fixed=%.0f MiB ring_room=%.0f MiB\n",
+                "planner=%d sched=%d budget=%.0f MiB fixed=%.0f MiB ring_room=%.0f MiB\n",
                 ctx.n_layers, k, ctx.slot_bytes / 1048576.0,
                 ctx.stats.ring_bytes / 1048576.0,
                 ctx.stats.locked_bytes / 1048576.0,
@@ -1199,6 +1251,7 @@ void llama_flex_finalize(llama_flex_context & ctx) {
                 ctx.params.global_rebalance ? 1 : 0,
                 ctx.stats.global_rebalance_bytes / 1048576.0,
                 (unsigned long long) ctx.stats.global_rebalance_tensors,
+                ctx.params.planner_applied ? 1 : 0,
                 ctx.params.sched_auto ? 1 : 0,
                 ctx.stats.sched_budget_bytes / 1048576.0,
                 ctx.stats.sched_fixed_bytes / 1048576.0,
@@ -1218,6 +1271,18 @@ static void flex_request_layer(llama_flex_context & ctx, int layer_id, bool pref
     }
     if (L.state == layer_state::loading) {
         return;
+    }
+    if (prefetch && ctx.prefetch_budget_enabled) {
+        const uint64_t charge = (uint64_t) ctx.slot_bytes;
+        if (charge > ctx.prefetch_budget_available_bytes) {
+            ctx.stats.prefetch_budget_dropped++;
+            flex_trace_locked(ctx, "prefetch_budget_drop", layer_id, -1,
+                    charge, ctx.prefetch_budget_available_bytes, 0);
+            return;
+        }
+        ctx.prefetch_budget_available_bytes -= charge;
+        ctx.stats.prefetch_budget_available_bytes =
+            (size_t) ctx.prefetch_budget_available_bytes;
     }
     if (prefetch) {
         ctx.stats.prefetch_queued++;
@@ -1277,6 +1342,11 @@ void * llama_flex_get_tensor(llama_flex_context & ctx, int layer_id, const std::
         if (t.locked) {
             return (uint8_t *) ctx.lock_buf + t.buf_offset; // always resident
         }
+        if (t.delta_locked &&
+                t.delta_buf_index < ctx.delta_lock_bufs.size() &&
+                ctx.delta_lock_bufs[t.delta_buf_index].ptr != nullptr) {
+            return (uint8_t *) ctx.delta_lock_bufs[t.delta_buf_index].ptr + t.delta_buf_offset;
+        }
         if (L.state != layer_state::resident || L.slot < 0) {
             return nullptr; // streamed tensor, layer not in a slot yet
         }
@@ -1301,9 +1371,650 @@ const llama_flex_stats & llama_flex_get_stats(const llama_flex_context & ctx) {
     return ctx.stats;
 }
 
+void llama_flex_set_prefetch_budget(
+        llama_flex_context & ctx,
+        uint64_t             budget_bytes) {
+    if (!llama_flex_enabled(&ctx)) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(ctx.mutex);
+    ctx.prefetch_budget_enabled = budget_bytes > 0;
+    ctx.prefetch_budget_bytes = budget_bytes;
+    ctx.prefetch_budget_available_bytes = budget_bytes;
+    ctx.stats.prefetch_budget_bytes = (size_t) budget_bytes;
+    ctx.stats.prefetch_budget_available_bytes = (size_t) budget_bytes;
+}
+
+llama_flex_resize_result llama_flex_resize_ring(
+        llama_flex_context & ctx,
+        int                 target_slots) {
+    llama_flex_resize_result result;
+    if (!llama_flex_enabled(&ctx)) {
+        result.reason = "disabled";
+        return result;
+    }
+
+    std::lock_guard<std::mutex> lock(ctx.mutex);
+    result.attempted = true;
+    result.old_slots = (int) ctx.slots.size();
+    result.new_slots = result.old_slots;
+    result.old_bytes = (uint64_t) ctx.stats.ring_bytes;
+    result.new_bytes = result.old_bytes;
+
+    if (ctx.slot_bytes == 0) {
+        result.reason = "zero_slot";
+        return result;
+    }
+
+    target_slots = std::max(1, std::min(target_slots, ctx.n_layers));
+    if (target_slots == result.old_slots) {
+        result.reason = "unchanged";
+        return result;
+    }
+
+    const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+    if (target_slots > result.old_slots) {
+        const int add = target_slots - result.old_slots;
+        std::vector<void *> new_slots;
+        new_slots.reserve(add);
+        for (int i = 0; i < add; ++i) {
+            void * p = nullptr;
+            if (posix_memalign(&p, page, ctx.slot_bytes) != 0 || p == nullptr) {
+                for (void * q : new_slots) {
+                    free(q);
+                }
+                result.reason = "alloc_failed";
+                return result;
+            }
+            new_slots.push_back(p);
+        }
+        for (void * p : new_slots) {
+            ctx.slots.push_back(p);
+            ctx.slot_layer.push_back(-1);
+        }
+        ctx.params.ring_layers = target_slots;
+        ctx.stats.ring_bytes = ctx.slot_bytes * (size_t) target_slots;
+        flex_note_ahead_locked(ctx);
+        result.changed = true;
+        result.new_slots = target_slots;
+        result.new_bytes = (uint64_t) ctx.stats.ring_bytes;
+        result.reason = "grown";
+        if (ctx.params.debug_log) {
+            std::fprintf(stderr,
+                    "llama_flex: resize ring %d -> %d (slot=%.2f MiB total=%.2f MiB)\n",
+                    result.old_slots, result.new_slots,
+                    ctx.slot_bytes / 1048576.0,
+                    ctx.stats.ring_bytes / 1048576.0);
+        }
+        ctx.cv_work.notify_all();
+        return result;
+    }
+
+    int removed = 0;
+    for (int i = (int) ctx.slots.size() - 1; i >= 0 && (int) ctx.slots.size() > target_slots; --i) {
+        if (ctx.slot_layer[i] >= 0) {
+            continue;
+        }
+        free(ctx.slots[i]);
+        ctx.slots.erase(ctx.slots.begin() + i);
+        ctx.slot_layer.erase(ctx.slot_layer.begin() + i);
+        for (auto & L : ctx.layers) {
+            if (L.slot > i) {
+                L.slot--;
+            }
+        }
+        removed++;
+    }
+    ctx.params.ring_layers = (int) ctx.slots.size();
+    ctx.stats.ring_bytes = ctx.slot_bytes * ctx.slots.size();
+    flex_note_ahead_locked(ctx);
+    result.changed = removed > 0;
+    result.new_slots = (int) ctx.slots.size();
+    result.new_bytes = (uint64_t) ctx.stats.ring_bytes;
+    result.reason = result.new_slots == target_slots ? "shrunk" : "busy";
+    if (ctx.params.debug_log && result.changed) {
+        std::fprintf(stderr,
+                "llama_flex: resize ring %d -> %d (slot=%.2f MiB total=%.2f MiB)\n",
+                result.old_slots, result.new_slots,
+                ctx.slot_bytes / 1048576.0,
+                ctx.stats.ring_bytes / 1048576.0);
+    }
+    return result;
+}
+
+static llama_flex_delta_pin_result flex_delta_pin_complete_locked(
+        llama_flex_context & ctx,
+        flex_delta_pin_job & job,
+        uint64_t io_us,
+        uint64_t elapsed_us) {
+    llama_flex_delta_pin_result result;
+    result.attempted = true;
+    result.requested_bytes = job.requested_bytes;
+    result.candidates = job.selected.size();
+    result.io_us = io_us;
+    result.elapsed_us = elapsed_us;
+
+    const size_t buf_index = ctx.delta_lock_bufs.size();
+    ctx.delta_lock_bufs.push_back({ job.delta, job.alloc_size, job.used });
+    job.delta = nullptr;
+    uint64_t pinned = 0;
+    uint64_t pinned_tensors = 0;
+    uint64_t actual_saved = 0;
+    for (const auto & c : job.selected) {
+        if (c.layer < 0 || c.layer >= ctx.n_layers) {
+            continue;
+        }
+        auto & L = ctx.layers[c.layer];
+        if (c.index >= L.tensors.size()) {
+            continue;
+        }
+        auto & t = L.tensors[c.index];
+        if (t.locked || t.delta_locked || t.name != c.tensor.name) {
+            continue;
+        }
+        t.delta_locked = true;
+        t.delta_buf_index = buf_index;
+        t.delta_buf_offset = c.dst_offset;
+        pinned += t.size;
+        pinned_tensors++;
+        actual_saved += t.size;
+        L.stream_bytes = L.stream_bytes > t.size ? L.stream_bytes - t.size : 0;
+        L.always_resident = (L.stream_bytes == 0);
+        ctx.stats.stream_per_token =
+            ctx.stats.stream_per_token > t.size ? ctx.stats.stream_per_token - t.size : 0;
+        ctx.stats.locked_bytes += t.size;
+        ctx.stats.delta_locked_bytes += t.size;
+        ctx.stats.delta_pin_saved_per_token += t.size;
+        ctx.stats.delta_locked_tensors++;
+        if (ctx.stats.streamed_tensors > 0) {
+            ctx.stats.streamed_tensors--;
+        }
+        ctx.stats.locked_tensors++;
+        flex_trace_locked(ctx, "delta_pin", c.layer, -1, t.size, c.value, io_us);
+    }
+
+    if (pinned == 0) {
+        free(ctx.delta_lock_bufs.back().ptr);
+        ctx.delta_lock_bufs.pop_back();
+        ctx.stats.delta_pin_failures++;
+        result.reason = "race_lost";
+        return result;
+    }
+
+    result.changed = true;
+    result.pinned_bytes = pinned;
+    result.saved_per_token_bytes = actual_saved;
+    result.pinned_tensors = pinned_tensors;
+    result.roi = pinned > 0 ? job.value_sum / (double) pinned : 0.0;
+    result.reason = "pinned";
+    return result;
+}
+
+static void flex_delta_pin_worker(llama_flex_context * ctx) {
+    while (true) {
+        flex_delta_pin_job job;
+        {
+            std::unique_lock<std::mutex> lock(ctx->mutex);
+            ctx->cv_delta_pin.wait(lock, [&] {
+                return ctx->shutdown || !ctx->delta_pin_queue.empty();
+            });
+            if (ctx->shutdown && ctx->delta_pin_queue.empty()) {
+                return;
+            }
+            job = std::move(ctx->delta_pin_queue.front());
+            ctx->delta_pin_queue.pop_front();
+            ctx->stats.delta_pin_async_pending = ctx->delta_pin_queue.size();
+        }
+
+        uint8_t * bounce = nullptr;
+        size_t bcap = 0;
+        if (ctx->direct_io_active) {
+            bcap = ctx->max_tensor + 2 * ctx->align;
+            if (posix_memalign((void **) &bounce, ctx->align, bcap) != 0) {
+                bounce = nullptr;
+                bcap = 0;
+            }
+        }
+
+        uint64_t io_us = 0;
+        bool ok = true;
+        for (const auto & c : job.selected) {
+            const uint64_t t0 = now_us();
+            if (!flex_read(ctx,
+                        (uint8_t *) job.delta + c.dst_offset,
+                        c.tensor.file_idx,
+                        c.tensor.file_offset,
+                        c.tensor.size,
+                        bounce,
+                        bcap)) {
+                ok = false;
+                break;
+            }
+            io_us += std::max<uint64_t>(now_us() - t0, 1);
+        }
+        free(bounce);
+
+        const uint64_t elapsed_us = now_us() - job.submitted_us;
+        std::lock_guard<std::mutex> lock(ctx->mutex);
+        ctx->stats.delta_pin_async_last_io_us = io_us;
+        ctx->stats.delta_pin_async_last_elapsed_us = elapsed_us;
+        if (!ok) {
+            free(job.delta);
+            job.delta = nullptr;
+            ctx->stats.delta_pin_failures++;
+            ctx->stats.delta_pin_async_rejected++;
+            continue;
+        }
+        const auto result = flex_delta_pin_complete_locked(*ctx, job, io_us, elapsed_us);
+        if (result.changed) {
+            ctx->stats.delta_pin_async_completed++;
+            if (ctx->params.debug_log) {
+                std::fprintf(stderr,
+                        "llama_flex: async delta pin tensors=%llu bytes=%.2f MiB saved/token=%.2f MiB roi=%.3f io=%.2f ms elapsed=%.2f ms\n",
+                        (unsigned long long) result.pinned_tensors,
+                        result.pinned_bytes / 1048576.0,
+                        result.saved_per_token_bytes / 1048576.0,
+                        result.roi,
+                        io_us / 1000.0,
+                        elapsed_us / 1000.0);
+            }
+        } else {
+            ctx->stats.delta_pin_async_rejected++;
+        }
+    }
+}
+
+llama_flex_delta_pin_result llama_flex_delta_pin_async(
+        llama_flex_context & ctx,
+        uint64_t             budget_bytes,
+        double               min_roi) {
+    const uint64_t fn_t0 = now_us();
+    llama_flex_delta_pin_result result;
+    result.requested_bytes = budget_bytes;
+    if (!llama_flex_enabled(&ctx)) {
+        result.reason = "disabled";
+        result.elapsed_us = now_us() - fn_t0;
+        return result;
+    }
+    if (budget_bytes == 0) {
+        result.reason = "zero_budget";
+        result.elapsed_us = now_us() - fn_t0;
+        return result;
+    }
+
+    std::vector<flex_delta_pin_candidate> candidates;
+    {
+        std::lock_guard<std::mutex> lock(ctx.mutex);
+        result.attempted = true;
+        ctx.stats.delta_pin_attempts++;
+        if (!ctx.delta_pin_queue.empty()) {
+            ctx.stats.delta_pin_async_rejected++;
+            result.reason = "async_pending";
+            result.elapsed_us = now_us() - fn_t0;
+            return result;
+        }
+        for (int il = 0; il < ctx.n_layers; ++il) {
+            const auto & L = ctx.layers[il];
+            if (L.always_resident) {
+                continue;
+            }
+            for (size_t it = 0; it < L.tensors.size(); ++it) {
+                const auto & t = L.tensors[it];
+                if (t.locked || t.delta_locked || t.size == 0 || t.size > budget_bytes) {
+                    continue;
+                }
+                const size_t value = flex_pin_value_bytes(ctx, t);
+                const double roi = (double) value / (double) t.size;
+                if (roi < min_roi) {
+                    continue;
+                }
+                candidates.push_back({ il, it, t, value, roi, 0 });
+            }
+        }
+    }
+    result.candidates = candidates.size();
+    if (candidates.empty()) {
+        result.reason = "no_candidate";
+        result.elapsed_us = now_us() - fn_t0;
+        return result;
+    }
+
+    std::sort(candidates.begin(), candidates.end(),
+            [](const flex_delta_pin_candidate & a, const flex_delta_pin_candidate & b) {
+                if (a.roi != b.roi) {
+                    return a.roi > b.roi;
+                }
+                if (a.value != b.value) {
+                    return a.value > b.value;
+                }
+                if (a.tensor.size != b.tensor.size) {
+                    return a.tensor.size < b.tensor.size;
+                }
+                if (a.layer != b.layer) {
+                    return a.layer < b.layer;
+                }
+                return a.tensor.name < b.tensor.name;
+            });
+
+    flex_delta_pin_job job;
+    job.requested_bytes = budget_bytes;
+    job.submitted_us = now_us();
+    for (auto & c : candidates) {
+        if (job.used + c.tensor.size > budget_bytes) {
+            continue;
+        }
+        c.dst_offset = job.used;
+        job.used += c.tensor.size;
+        job.value_sum += (double) c.value;
+        job.selected.push_back(c);
+    }
+    if (job.selected.empty() || job.used == 0) {
+        result.reason = "below_budget";
+        result.elapsed_us = now_us() - fn_t0;
+        return result;
+    }
+
+    const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+    job.alloc_size = ((job.used + page - 1) / page) * page;
+    if (posix_memalign(&job.delta, page, job.alloc_size) != 0 || job.delta == nullptr) {
+        result.reason = "alloc_failed";
+        result.elapsed_us = now_us() - fn_t0;
+        std::lock_guard<std::mutex> lock(ctx.mutex);
+        ctx.stats.delta_pin_failures++;
+        return result;
+    }
+
+    const uint64_t enqueued_bytes = job.used;
+    const uint64_t enqueued_tensors = job.selected.size();
+    const double enqueued_value_sum = job.value_sum;
+    {
+        std::lock_guard<std::mutex> lock(ctx.mutex);
+        if (!ctx.delta_pin_queue.empty()) {
+            free(job.delta);
+            ctx.stats.delta_pin_async_rejected++;
+            result.reason = "async_pending";
+            result.elapsed_us = now_us() - fn_t0;
+            return result;
+        }
+        ctx.delta_pin_queue.push_back(std::move(job));
+        ctx.stats.delta_pin_async_submitted++;
+        ctx.stats.delta_pin_async_pending = ctx.delta_pin_queue.size();
+    }
+    ctx.cv_delta_pin.notify_one();
+
+    result.changed = false;
+    result.pinned_bytes = enqueued_bytes;
+    result.saved_per_token_bytes = enqueued_bytes;
+    result.pinned_tensors = enqueued_tensors;
+    result.roi = enqueued_bytes > 0 ? enqueued_value_sum / (double) enqueued_bytes : 0.0;
+    result.reason = "async_enqueued";
+    result.elapsed_us = now_us() - fn_t0;
+    return result;
+}
+
+llama_flex_delta_pin_result llama_flex_delta_pin(
+        llama_flex_context & ctx,
+        uint64_t             budget_bytes,
+        double               min_roi) {
+    const uint64_t fn_t0 = now_us();
+    llama_flex_delta_pin_result result;
+    result.requested_bytes = budget_bytes;
+    if (!llama_flex_enabled(&ctx)) {
+        result.reason = "disabled";
+        result.elapsed_us = now_us() - fn_t0;
+        return result;
+    }
+    if (budget_bytes == 0) {
+        result.reason = "zero_budget";
+        result.elapsed_us = now_us() - fn_t0;
+        return result;
+    }
+
+    struct candidate {
+        int layer = -1;
+        size_t index = 0;
+        llama_flex_tensor tensor;
+        size_t value = 0;
+        double roi = 0.0;
+        size_t dst_offset = 0;
+    };
+
+    std::vector<candidate> candidates;
+    {
+        std::lock_guard<std::mutex> lock(ctx.mutex);
+        result.attempted = true;
+        ctx.stats.delta_pin_attempts++;
+        for (int il = 0; il < ctx.n_layers; ++il) {
+            const auto & L = ctx.layers[il];
+            if (L.always_resident) {
+                continue;
+            }
+            for (size_t it = 0; it < L.tensors.size(); ++it) {
+                const auto & t = L.tensors[it];
+                if (t.locked || t.delta_locked || t.size == 0 || t.size > budget_bytes) {
+                    continue;
+                }
+                const size_t value = flex_pin_value_bytes(ctx, t);
+                const double roi = (double) value / (double) t.size;
+                if (roi < min_roi) {
+                    continue;
+                }
+                candidates.push_back({ il, it, t, value, roi, 0 });
+            }
+        }
+    }
+    result.candidates = candidates.size();
+    if (candidates.empty()) {
+        result.reason = "no_candidate";
+        result.elapsed_us = now_us() - fn_t0;
+        return result;
+    }
+
+    std::sort(candidates.begin(), candidates.end(),
+            [](const candidate & a, const candidate & b) {
+                if (a.roi != b.roi) {
+                    return a.roi > b.roi;
+                }
+                if (a.value != b.value) {
+                    return a.value > b.value;
+                }
+                if (a.tensor.size != b.tensor.size) {
+                    return a.tensor.size < b.tensor.size;
+                }
+                if (a.layer != b.layer) {
+                    return a.layer < b.layer;
+                }
+                return a.tensor.name < b.tensor.name;
+            });
+
+    std::vector<candidate> selected;
+    size_t used = 0;
+    double value_sum = 0.0;
+    for (auto & c : candidates) {
+        if (used + c.tensor.size > budget_bytes) {
+            continue;
+        }
+        c.dst_offset = used;
+        used += c.tensor.size;
+        value_sum += (double) c.value;
+        selected.push_back(c);
+    }
+    if (selected.empty() || used == 0) {
+        result.reason = "below_budget";
+        result.elapsed_us = now_us() - fn_t0;
+        return result;
+    }
+
+    const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+    const size_t alloc_size = ((used + page - 1) / page) * page;
+    void * delta = nullptr;
+    if (posix_memalign(&delta, page, alloc_size) != 0 || delta == nullptr) {
+        result.reason = "alloc_failed";
+        result.elapsed_us = now_us() - fn_t0;
+        std::lock_guard<std::mutex> lock(ctx.mutex);
+        ctx.stats.delta_pin_failures++;
+        return result;
+    }
+
+    uint8_t * bounce = nullptr;
+    size_t bcap = 0;
+    if (ctx.direct_io_active) {
+        bcap = ctx.max_tensor + 2 * ctx.align;
+        if (posix_memalign((void **) &bounce, ctx.align, bcap) != 0) {
+            bounce = nullptr;
+            bcap = 0;
+        }
+    }
+
+    uint64_t io_us = 0;
+    bool ok = true;
+    for (const auto & c : selected) {
+        const uint64_t t0 = now_us();
+        if (!flex_read(&ctx,
+                    (uint8_t *) delta + c.dst_offset,
+                    c.tensor.file_idx,
+                    c.tensor.file_offset,
+                    c.tensor.size,
+                    bounce,
+                    bcap)) {
+            ok = false;
+            break;
+        }
+        io_us += std::max<uint64_t>(now_us() - t0, 1);
+    }
+    free(bounce);
+    if (!ok) {
+        free(delta);
+        result.reason = "read_failed";
+        result.io_us = io_us;
+        result.elapsed_us = now_us() - fn_t0;
+        std::lock_guard<std::mutex> lock(ctx.mutex);
+        ctx.stats.delta_pin_failures++;
+        return result;
+    }
+
+    std::lock_guard<std::mutex> lock(ctx.mutex);
+    const size_t buf_index = ctx.delta_lock_bufs.size();
+    ctx.delta_lock_bufs.push_back({ delta, alloc_size, used });
+    uint64_t pinned = 0;
+    uint64_t pinned_tensors = 0;
+    uint64_t actual_saved = 0;
+    for (const auto & c : selected) {
+        if (c.layer < 0 || c.layer >= ctx.n_layers) {
+            continue;
+        }
+        auto & L = ctx.layers[c.layer];
+        if (c.index >= L.tensors.size()) {
+            continue;
+        }
+        auto & t = L.tensors[c.index];
+        if (t.locked || t.delta_locked || t.name != c.tensor.name) {
+            continue;
+        }
+        t.delta_locked = true;
+        t.delta_buf_index = buf_index;
+        t.delta_buf_offset = c.dst_offset;
+        pinned += t.size;
+        pinned_tensors++;
+        actual_saved += t.size;
+        L.stream_bytes = L.stream_bytes > t.size ? L.stream_bytes - t.size : 0;
+        L.always_resident = (L.stream_bytes == 0);
+        ctx.stats.stream_per_token =
+            ctx.stats.stream_per_token > t.size ? ctx.stats.stream_per_token - t.size : 0;
+        ctx.stats.locked_bytes += t.size;
+        ctx.stats.delta_locked_bytes += t.size;
+        ctx.stats.delta_pin_saved_per_token += t.size;
+        ctx.stats.delta_locked_tensors++;
+        if (ctx.stats.streamed_tensors > 0) {
+            ctx.stats.streamed_tensors--;
+        }
+        ctx.stats.locked_tensors++;
+        flex_trace_locked(ctx, "delta_pin", c.layer, -1, t.size, c.value, io_us);
+    }
+
+    if (pinned == 0) {
+        free(ctx.delta_lock_bufs.back().ptr);
+        ctx.delta_lock_bufs.pop_back();
+        result.reason = "race_lost";
+        result.io_us = io_us;
+        result.elapsed_us = now_us() - fn_t0;
+        ctx.stats.delta_pin_failures++;
+        return result;
+    }
+    result.changed = true;
+    result.pinned_bytes = pinned;
+    result.saved_per_token_bytes = actual_saved;
+    result.pinned_tensors = pinned_tensors;
+    result.io_us = io_us;
+    result.elapsed_us = now_us() - fn_t0;
+    result.roi = pinned > 0 ? value_sum / (double) pinned : 0.0;
+    result.reason = "pinned";
+    if (ctx.params.debug_log) {
+        std::fprintf(stderr,
+                "llama_flex: delta pin tensors=%llu bytes=%.2f MiB saved/token=%.2f MiB roi=%.3f\n",
+                (unsigned long long) pinned_tensors,
+                pinned / 1048576.0,
+                actual_saved / 1048576.0,
+                result.roi);
+    }
+    return result;
+}
+
+llama_flex_reclaim_result llama_flex_reclaim_released(
+        llama_flex_context & ctx,
+        uint64_t             target_bytes,
+        uint32_t             max_layers) {
+    llama_flex_reclaim_result result;
+    if (!llama_flex_enabled(&ctx) || target_bytes == 0 || max_layers == 0) {
+        return result;
+    }
+
+    std::lock_guard<std::mutex> lock(ctx.mutex);
+    while (result.released_bytes < target_bytes && result.released_layers < max_layers) {
+        int victim = -1;
+        uint64_t oldest = UINT64_MAX;
+        for (int l = 0; l < ctx.n_layers; ++l) {
+            const auto & L = ctx.layers[l];
+            if (l == ctx.cur_compute_layer || L.always_resident ||
+                    L.slot < 0 || !L.released || L.state != layer_state::resident) {
+                continue;
+            }
+            if (L.last_use < oldest) {
+                oldest = L.last_use;
+                victim = l;
+            }
+        }
+        if (victim < 0) {
+            break;
+        }
+
+        auto & L = ctx.layers[victim];
+        const int slot = L.slot;
+        if (slot >= 0 && slot < (int) ctx.slots.size() && ctx.slots[slot] != nullptr) {
+#if defined(MADV_DONTNEED)
+            madvise(ctx.slots[slot], ctx.slot_bytes, MADV_DONTNEED);
+#endif
+            ctx.slot_layer[slot] = -1;
+        }
+        L.slot = -1;
+        L.state = layer_state::not_resident;
+        L.released = true;
+        L.last_use = now_us();
+        ctx.stats.evictions++;
+        result.released_bytes += (uint64_t) ctx.slot_bytes;
+        result.released_layers++;
+        flex_trace_locked(ctx, "governor_reclaim", victim, slot, ctx.slot_bytes, 0, 0);
+    }
+    result.target_satisfied = result.released_bytes >= target_bytes;
+    return result;
+}
+
 void llama_flex_graph_begin(llama_flex_context & ctx) {
     if (!llama_flex_enabled(&ctx)) {
         return;
+    }
+    if (ctx.cur_compute_layer >= 0) {
+        llama_flex_release_layer(ctx, ctx.cur_compute_layer);
     }
     ctx.cur_compute_layer = -1;
     ctx.last_layer_enter_us = 0;

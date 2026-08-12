@@ -1,3 +1,4 @@
+#include "server-kv-budget-adapter.h"
 #include "server-kv-pressure-action.h"
 #include "server-kv-resume.h"
 
@@ -137,6 +138,20 @@ static server_kv_pressure_unified_action_startup_decision startup_decision(
         setenv("LLAMA_KV_PRESSURE_UNIFIED_ACTION_MAX_BLOCKS", max_blocks, 1);
     }
     return server_kv_pressure_unified_action_startup_decide_from_env();
+}
+
+static void test_startup_rejects_global_legacy_mode_conflict() {
+    std::string error;
+    CHECK(!server_kv_pressure_global_kv_legacy_modes_conflict(false, true, error));
+    CHECK(error.empty());
+
+    error.clear();
+    CHECK(!server_kv_pressure_global_kv_legacy_modes_conflict(true, false, error));
+    CHECK(error.empty());
+
+    error.clear();
+    CHECK(server_kv_pressure_global_kv_legacy_modes_conflict(true, true, error));
+    CHECK(error.find("LLAMA_MEMORY_GOVERNOR_LEGACY_KV_ACTIONS=1") != std::string::npos);
 }
 
 static void test_startup_decision_distinguishes_disabled_and_enabled() {
@@ -1529,7 +1544,96 @@ static void test_v2_shared_soft_offload_becomes_unmet_terminal() {
     CHECK(state.budget_next_action_sample() == 2 + config.budget_unmet_backoff_samples);
 }
 
+static void test_global_kv_budget_adapter_authority_and_physical_credit() {
+    server_kv_budget_adapter adapter;
+    std::string error;
+    unsetenv("LLAMA_KV_RESIDENT_TARGET_BYTES");
+    unsetenv("LLAMA_KV_RESIDENT_TARGET_SOURCE");
+    CHECK(!adapter.initialize_static_target(error).valid());
+
+    llama_kv_physical_budget_view physical;
+    physical.valid = true;
+    physical.resident_available = true;
+    physical.reclaimable_available = true;
+    physical.swapped_metadata_consistent = true;
+    physical.object_id = 11;
+    physical.generation = 3;
+    physical.resident_bytes = 12288;
+    physical.dead_resident_reclaimable_bytes = 4096;
+    CHECK(adapter.set_global_target({ true, 8192, 11, 3 }));
+    auto target = adapter.effective_target();
+    CHECK(target.valid() && std::string(target.source) == "global_dynamic");
+    CHECK(target.source_object_id == 11 && target.source_generation == 3);
+    CHECK(target.basis_generation != target.source_generation);
+
+    server_kv_pressure_unified_action_config config;
+    adapter.apply_effective_target(config);
+    CHECK(config.budget_target_enabled && config.budget_target_bytes == 8192);
+    CHECK(config.budget_source_object_id == 11 && config.budget_source_generation == 3);
+
+    const auto projected = adapter.project_for_governor(physical);
+    CHECK(projected.valid && projected.authority != nullptr);
+    CHECK(projected.object_id == 11 && projected.generation == 3);
+
+    llama_kv_resident_sample before;
+    before.available = true;
+    before.object_id = 11;
+    before.generation = 3;
+    before.resident_bytes = 10000;
+    auto after = before;
+    after.resident_bytes = 7000;
+    const auto credit = server_kv_budget_adapter::confirm_physical_credit(before, after);
+    CHECK(credit.available && credit.value == 3000);
+    auto stale = after;
+    stale.generation = 4;
+    CHECK(!server_kv_budget_adapter::confirm_physical_credit(before, stale).available);
+    auto equal = before;
+    CHECK(!server_kv_budget_adapter::confirm_physical_credit(before, equal).available);
+    auto growth = after;
+    growth.resident_bytes = 11000;
+    CHECK(!server_kv_budget_adapter::confirm_physical_credit(before, growth).available);
+}
+
+static void test_global_target_relaxation_clears_soft_debt_without_prefetch() {
+    auto config = budget_config();
+    server_kv_governor_state state;
+    fake_core core;
+    core.responses = { evaluation(3001), no_candidate_release(3001) };
+    const auto first = server_kv_pressure_execute_governor(
+            config, state, core.ops(), governor_pressure(1, 3001, kv_pressure_state::NORMAL), {},
+            budget_view(12288));
+    CHECK(first.budget_debt_after_bytes == 8192);
+    CHECK(first.observation.release_attempted);
+
+    config.budget_target_bytes = 12288;
+    config.budget_basis_generation += 1;
+    core.requests.clear();
+    core.responses = { evaluation(3002) };
+    const auto relaxed = server_kv_pressure_execute_governor(
+            config, state, core.ops(), governor_pressure(2, 3002, kv_pressure_state::NORMAL), {},
+            budget_view(12288));
+    CHECK(std::string(relaxed.observation.reason) == "budget_target_relaxed");
+    CHECK(core.requests.empty());
+    CHECK(!relaxed.observation.release_attempted && !relaxed.observation.offload_attempted);
+    CHECK(state.budget_debt_bytes() == 0 && !state.soft_offload_armed());
+}
+
+static void test_global_dynamic_target_requires_matching_physical_authority() {
+    auto config = budget_config();
+    config.budget_source = "global_dynamic";
+    config.budget_source_object_id = 99;
+    config.budget_source_generation = 3;
+    server_kv_governor_state state;
+    fake_core core;
+    const auto result = server_kv_pressure_execute_governor(
+            config, state, core.ops(), governor_pressure(1, 3011, kv_pressure_state::NORMAL), {},
+            budget_view(12288));
+    CHECK(std::string(result.observation.reason) == "budget_authority_mismatch");
+    CHECK(core.requests.empty());
+}
+
 int main() {
+    test_startup_rejects_global_legacy_mode_conflict();
     test_startup_decision_distinguishes_disabled_and_enabled();
     test_startup_decision_rejects_invalid_unified_configuration();
     test_startup_decision_preserves_legacy_modes_when_unified_is_not_requested();
@@ -1568,6 +1672,9 @@ int main() {
     test_v2_invalid_pressure_basis_holds_soft_state();
     test_v2_protected_soft_offload_becomes_unmet_terminal();
     test_v2_shared_soft_offload_becomes_unmet_terminal();
+    test_global_kv_budget_adapter_authority_and_physical_credit();
+    test_global_target_relaxation_clears_soft_debt_without_prefetch();
+    test_global_dynamic_target_requires_matching_physical_authority();
 
     std::printf("server KV pressure unified action tests: %d/%d passed\n",
             tests_total - tests_failed, tests_total);

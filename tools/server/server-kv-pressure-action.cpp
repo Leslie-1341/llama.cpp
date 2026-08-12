@@ -383,6 +383,18 @@ server_kv_claimant_score score_claimant_v3(
 
 } // namespace
 
+bool server_kv_pressure_global_kv_legacy_modes_conflict(
+        bool global_target_controlled,
+        bool legacy_kv_actions_enabled,
+        std::string & error) {
+    if (!global_target_controlled || !legacy_kv_actions_enabled) {
+        return false;
+    }
+    error = "target-controlled Global KV path conflicts with "
+            "LLAMA_MEMORY_GOVERNOR_LEGACY_KV_ACTIONS=1";
+    return true;
+}
+
 const char * server_kv_pressure_policy_name(server_kv_pressure_policy policy) {
     switch (policy) {
     case server_kv_pressure_policy::v2:       return "v2";
@@ -584,6 +596,8 @@ void server_kv_governor_state::reset() {
     // V2 step1: clear soft budget state too — handles sleeping/reload boundaries.
     budget_debt_bytes_ = 0;
     budget_basis_generation_ = 0;
+    budget_target_bytes_ = 0;
+    budget_target_relaxed_ = false;
     soft_offload_armed_ = false;
     unmet_budget_bytes_ = 0;
     budget_next_action_sample_ = 0;
@@ -816,12 +830,17 @@ server_kv_pressure_action_result server_kv_pressure_execute_governor(
     result.budget_target_bytes    = config.budget_target_bytes;
     result.budget_basis_generation = config.budget_basis_generation;
     result.budget_source          = config.budget_source ? config.budget_source : "none";
+    result.budget_source_object_id = config.budget_source_object_id;
+    result.budget_source_generation = config.budget_source_generation;
     result.budget_view_valid      = budget_view.valid;
     result.budget_resident_available = budget_view.resident_available;
     result.budget_reclaimable_available = budget_view.reclaimable_available;
     result.budget_resident_bytes  = budget_view.resident_bytes;
     result.budget_dead_resident_reclaimable_bytes = budget_view.dead_resident_reclaimable_bytes;
     result.budget_transient_staging_bound_bytes  = budget_view.transient_staging_bound_bytes;
+    result.budget_view_authority = budget_view.authority ? budget_view.authority : "UNAVAILABLE";
+    result.budget_view_object_id = budget_view.object_id;
+    result.budget_view_generation = budget_view.generation;
     result.budget_debt_before_bytes = state.budget_debt_bytes_;
     result.budget_debt_after_bytes  = state.budget_debt_bytes_;
     result.soft_offload_armed_before = state.soft_offload_armed_;
@@ -874,6 +893,8 @@ server_kv_pressure_action_result server_kv_pressure_execute_governor(
         if (!config.budget_target_enabled || config.budget_target_bytes == 0) {
             state.budget_debt_bytes_ = 0;
             state.budget_basis_generation_ = 0;
+            state.budget_target_bytes_ = 0;
+            state.budget_target_relaxed_ = false;
             state.soft_offload_armed_ = false;
             state.unmet_budget_bytes_ = 0;
             state.budget_next_action_sample_ = 0;
@@ -895,13 +916,39 @@ server_kv_pressure_action_result server_kv_pressure_execute_governor(
         }
 
         result.budget_active = true;
+        if (config.budget_source && std::string(config.budget_source) == "global_dynamic" &&
+                (config.budget_source_object_id == 0 || config.budget_source_generation == 0 ||
+                 config.budget_source_object_id != budget_view.object_id ||
+                 config.budget_source_generation != budget_view.generation)) {
+            observation.reason = "budget_authority_mismatch";
+            return result;
+        }
         result.budget_observed_excess_bytes = derive_budget_excess(config, budget_view);
-        if (state.budget_basis_generation_ != config.budget_basis_generation) {
+        const bool basis_changed = state.budget_basis_generation_ != config.budget_basis_generation;
+        const bool target_changed = state.budget_target_bytes_ != config.budget_target_bytes;
+        if (basis_changed || target_changed) {
+            const bool target_relaxed = state.budget_target_bytes_ != 0 &&
+                config.budget_target_bytes > state.budget_target_bytes_;
             state.budget_basis_generation_ = config.budget_basis_generation;
+            state.budget_target_bytes_ = config.budget_target_bytes;
+            state.budget_target_relaxed_ = target_relaxed;
             state.budget_debt_bytes_ = 0;
             state.soft_offload_armed_ = false;
             state.unmet_budget_bytes_ = 0;
             state.budget_next_action_sample_ = 0;
+        }
+        if (state.budget_target_relaxed_) {
+            state.budget_debt_bytes_ = 0;
+            state.soft_offload_armed_ = false;
+            state.unmet_budget_bytes_ = 0;
+            state.budget_next_action_sample_ = 0;
+            state.budget_target_relaxed_ = false;
+            result.budget_debt_after_bytes = 0;
+            result.soft_offload_armed_after = false;
+            result.budget_next_action_sample = 0;
+            result.unmet_budget_bytes_after = 0;
+            observation.reason = "budget_target_relaxed";
+            return result;
         }
         state.budget_debt_bytes_ = result.budget_observed_excess_bytes;
         result.budget_debt_before_bytes = state.budget_debt_bytes_;
@@ -1499,6 +1546,8 @@ std::string server_kv_pressure_unified_action_format_marker(
         << " budget_active=" << (result.budget_active ? 1 : 0)
         << " budget_target_enabled=" << (result.budget_target_enabled ? 1 : 0)
         << " budget_source=" << (result.budget_source ? result.budget_source : "none")
+        << " budget_source_object_id=" << result.budget_source_object_id
+        << " budget_source_generation=" << result.budget_source_generation
         << " budget_target_bytes=" << result.budget_target_bytes
         << " budget_basis_generation=" << result.budget_basis_generation
         << " budget_view_valid=" << (result.budget_view_valid ? 1 : 0)
@@ -1509,6 +1558,9 @@ std::string server_kv_pressure_unified_action_format_marker(
         << result.budget_dead_resident_reclaimable_bytes
         << " budget_transient_staging_bound_bytes="
         << result.budget_transient_staging_bound_bytes
+        << " budget_view_authority=" << (result.budget_view_authority ? result.budget_view_authority : "UNAVAILABLE")
+        << " budget_view_object_id=" << result.budget_view_object_id
+        << " budget_view_generation=" << result.budget_view_generation
         << " budget_observed_excess_bytes=" << result.budget_observed_excess_bytes
         << " budget_debt_before_bytes=" << result.budget_debt_before_bytes
         << " budget_debt_after_bytes=" << result.budget_debt_after_bytes

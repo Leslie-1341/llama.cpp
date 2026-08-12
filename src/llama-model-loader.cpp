@@ -536,6 +536,7 @@ llama_model_loader::llama_model_loader(
     tensor_buft_overrides = param_tensor_buft_overrides_p;
 
     if (!fname.empty()) {
+        fname_model = fname;
         // Load the main GGUF
         struct ggml_context * ctx = NULL;
         struct gguf_init_params params = {

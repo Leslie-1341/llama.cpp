@@ -21,8 +21,12 @@
 struct server_kv_resident_target_state {
     bool        enabled = false;
     uint64_t    target_bytes = 0;
-    uint64_t    basis_generation = 0;       // bumped on every setter write
-    const char *source = "none";            // "env_static" / "none" / future
+    // Effective target version consumed by the scheduler-owned KV Governor.
+    // This is separate from the physical source identity below.
+    uint64_t    basis_generation = 0;
+    const char *source = "none";            // "env_static" / "global_dynamic" / "none"
+    uint64_t    source_object_id = 0;
+    uint64_t    source_generation = 0;
     bool valid() const { return enabled && target_bytes > 0 && source != nullptr &&
                               std::string(source) != "none"; }
 };
@@ -40,6 +44,7 @@ struct server_kv_budget_view {
     bool     resident_available = false;
     bool     reclaimable_available = false;
     bool     swapped_metadata_consistent = false;
+    const char *authority = "UNAVAILABLE";
     uint64_t object_id = 0;
     uint64_t generation = 0;
     uint64_t resident_bytes = 0;
@@ -71,15 +76,15 @@ struct server_kv_pressure_unified_action_config {
     uint32_t resident_lease_samples = 1;
     uint64_t churn_penalty_us = 1000;
 
-    // V2 step1: soft budget target (independent from pressure).  When
-    // budget_target_enabled && budget_target_bytes > 0, the Governor derives
-    // a soft debt from sample_kv_physical_budget_view().resident_bytes - target
-    // and runs an additional RELEASE→armed OFFLOAD chain ONLY when pressure
-    // is not in PRESSURE/CRITICAL.
+    // Soft budget target is owned by the adapter and consumed only by the
+    // scheduler-owned Governor.  Source identity is separate from the
+    // effective target basis generation.
     bool        budget_target_enabled = false;
     uint64_t    budget_target_bytes = 0;
     uint64_t    budget_basis_generation = 0;
     const char *budget_source = "none";
+    uint64_t    budget_source_object_id = 0;
+    uint64_t    budget_source_generation = 0;
     uint32_t    budget_unmet_backoff_samples = DEFAULT_BUDGET_UNMET_BACKOFF_SAMPLES;
 };
 
@@ -107,6 +112,13 @@ struct server_kv_pressure_unified_action_startup_decision {
 
 server_kv_pressure_unified_action_startup_decision
 server_kv_pressure_unified_action_startup_decide_from_env();
+
+// Startup mode gate for the target-controlled Global KV path.  The legacy
+// Governor KV action path may remain enabled only when the new path is absent.
+bool server_kv_pressure_global_kv_legacy_modes_conflict(
+        bool global_target_controlled,
+        bool legacy_kv_actions_enabled,
+        std::string & error);
 
 struct server_kv_pressure_action_ops {
     std::function<llama_kv_action_result(const llama_kv_action_request &)> execute;
@@ -322,6 +334,8 @@ private:
     // generation change OR when target is disabled (target_bytes==0).
     uint64_t budget_debt_bytes_ = 0;
     uint64_t budget_basis_generation_ = 0;
+    uint64_t budget_target_bytes_ = 0;
+    bool budget_target_relaxed_ = false;
     bool soft_offload_armed_ = false;
     uint64_t unmet_budget_bytes_ = 0;
     uint64_t budget_next_action_sample_ = 0;
@@ -359,12 +373,17 @@ struct server_kv_pressure_action_result {
     uint64_t budget_target_bytes = 0;
     uint64_t budget_basis_generation = 0;
     const char *budget_source = "none";
+    uint64_t budget_source_object_id = 0;
+    uint64_t budget_source_generation = 0;
     bool     budget_view_valid = false;
     bool     budget_resident_available = false;
     bool     budget_reclaimable_available = false;
     uint64_t budget_resident_bytes = 0;             // last view.resident_bytes sampled
     uint64_t budget_dead_resident_reclaimable_bytes = 0;  // last view.dead_resident_reclaimable_bytes
     uint64_t budget_transient_staging_bound_bytes = 0;    // advisory; never subtracted
+    const char * budget_view_authority = "UNAVAILABLE";
+    uint64_t budget_view_object_id = 0;
+    uint64_t budget_view_generation = 0;
     uint64_t budget_observed_excess_bytes = 0;      // saturating_sub(resident, target)
     uint64_t budget_debt_before_bytes = 0;
     uint64_t budget_debt_after_bytes = 0;

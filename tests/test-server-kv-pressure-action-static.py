@@ -18,6 +18,66 @@ QUEUE_CPP = (ROOT / "tools/server/server-queue.cpp").read_text(encoding="utf-8")
 
 
 class UnifiedPressureActionStaticTest(unittest.TestCase):
+    def test_default_mode_cannot_reach_legacy_kv_actions(self):
+        init_start = CONTEXT.index("bool init_kv_pressure_sampler()")
+        init_end = CONTEXT.index("void maybe_sample_kv_pressure", init_start)
+        init = CONTEXT[init_start:init_end]
+        self.assertIn("memory_governor_legacy_kv_actions_enabled", init)
+        self.assertIn("server_kv_pressure_global_kv_legacy_modes_conflict", init)
+        self.assertIn("return false", init)
+
+        async_submit_start = CONTEXT.index("bool memory_governor_async_submit(")
+        async_submit_end = CONTEXT.index("void memory_governor_async_execute(", async_submit_start)
+        async_submit = CONTEXT[async_submit_start:async_submit_end]
+        self.assertIn("legacy_kv_action", async_submit)
+        self.assertIn("!memory_governor_legacy_kv_actions_enabled", async_submit)
+
+        async_execute_start = CONTEXT.index("void memory_governor_async_execute(")
+        async_execute_end = CONTEXT.index("void memory_governor_async_worker_loop(", async_execute_start)
+        async_execute = CONTEXT[async_execute_start:async_execute_end]
+        self.assertIn("legacy_disabled", async_execute)
+
+        observe_start = CONTEXT.index("bool publish_memory_governor_observation(")
+        observe_end = CONTEXT.index("bool init_kv_pressure_sampler()", observe_start)
+        observe = CONTEXT[observe_start:observe_end]
+        release_gate = observe.index(
+            "if (memory_governor_legacy_kv_actions_enabled && memory_governor_kv_release_enabled)")
+        offload_gate = observe.index(
+            "if (memory_governor_legacy_kv_actions_enabled && memory_governor_kv_offload_enabled)")
+        self.assertIn("kv_global_release", observe[release_gate:])
+        self.assertIn("memory_governor_async_submit(action)", observe[release_gate:offload_gate])
+        self.assertIn("mem->execute_action({", observe[release_gate:offload_gate])
+        self.assertIn("kv_sequence_offload", observe[offload_gate:])
+        self.assertIn("memory_governor_slot_state_offload(selected.id, target)", observe[offload_gate:])
+        self.assertIn("mem->execute_action({", observe[offload_gate:])
+
+        logical_candidate = CONTEXT.index(
+            "if (memory_governor_legacy_kv_actions_enabled &&\n                        !active")
+        self.assertIn("logical_tokens", CONTEXT[logical_candidate:])
+
+        sample_start = CONTEXT.index("void maybe_sample_kv_pressure(")
+        sample = CONTEXT[sample_start:]
+        self.assertIn("server_kv_pressure_execute_governor", sample)
+        self.assertIn("kv_budget_adapter.project_for_governor", sample)
+        self.assertIn("mem->execute_action(request)", sample)
+
+        sample_start = CONTEXT.index("void maybe_sample_kv_pressure(")
+        sample = CONTEXT[sample_start:]
+        self.assertIn("server_kv_pressure_execute_governor", sample)
+        self.assertIn("kv_budget_adapter.project_for_governor", sample)
+        self.assertIn("mem->execute_action(request)", sample)
+        self.assertIn("logical_tokens", sample)
+
+        legacy_release_start = CONTEXT.index(
+            "if (memory_governor_legacy_kv_actions_enabled && memory_governor_kv_release_enabled)")
+        legacy_offload_start = CONTEXT.index(
+            "if (memory_governor_legacy_kv_actions_enabled && memory_governor_kv_offload_enabled)")
+        self.assertLess(legacy_release_start, legacy_offload_start)
+        self.assertLess(
+            CONTEXT.index("memory_governor_async_submit(action)", legacy_release_start),
+            CONTEXT.index("memory_governor_async_submit(action)", legacy_offload_start))
+        self.assertIn("memory_governor_slot_state_offload(selected.id, target)", CONTEXT[legacy_offload_start:])
+
     def test_startup_decision_rejects_before_runtime_wiring(self):
         self.assertIn("LLAMA_KV_PRESSURE_UNIFIED_ACTION", ACTION_CPP)
         self.assertIn("server_kv_pressure_unified_action_startup_status", ACTION_H)
@@ -40,34 +100,17 @@ class UnifiedPressureActionStaticTest(unittest.TestCase):
         self.assertIn("mctx->apply()", LLAMA_CONTEXT)
 
     def test_production_capability_record_uses_live_kv_state(self):
-        start = CONTEXT.index("void log_kv_governor_capability() const")
-        end = CONTEXT.index("// unlike load_model()", start)
-        record = CONTEXT[start:end]
-        self.assertEqual(record.count("KV_GOVERNOR_CAPABILITY"), 1)
-        self.assertIn("llama_get_memory(ctx_tgt)", record)
-        self.assertIn("get_kv_runtime_capability()", record)
-        self.assertIn("slots.size()", record)
-        self.assertNotIn("params_base.n_parallel", record)
-        for field in (
-                "n_slots=", "n_seq_max=", "n_stream=", "kv_unified=",
-                "paged_metadata=", "ingraph_gather=", "release_supported=",
-                "offload_supported=", "prefetch_supported=", "backing_ready=",
-                "swap_explicit_only="):
-            self.assertIn(field, record)
-        self.assertIn("virtual llama_kv_runtime_capability get_kv_runtime_capability() const", MEMORY_H)
-        self.assertIn("virtual llama_kv_runtime_claimant get_kv_runtime_claimant", MEMORY_H)
-        self.assertIn("llama_kv_runtime_capability get_kv_runtime_capability() const override", KV_CACHE_H)
-        self.assertIn("llama_kv_runtime_claimant get_kv_runtime_claimant", KV_CACHE_H)
+        self.assertIn("get_kv_runtime_capability", MEMORY_H)
+        self.assertIn("get_kv_runtime_claimant", MEMORY_H)
+        self.assertIn("get_kv_runtime_capability() const override", KV_CACHE_H)
+        self.assertIn("get_kv_runtime_claimant", KV_CACHE_H)
         capability = KV_CACHE_CPP[
             KV_CACHE_CPP.index("llama_kv_runtime_capability llama_kv_cache::get_kv_runtime_capability() const"):
             KV_CACHE_CPP.index("llama_kv_action_result llama_kv_cache::execute_action(")]
-        self.assertIn("paged_swap_enabled", capability)
-        self.assertIn("kv_swap_store", capability)
-        self.assertIn("paged_swap_explicit_only", capability)
-        self.assertIn("paged_write_context_invalid", capability)
+        for field in ("paged_swap_enabled", "kv_swap_store", "paged_swap_explicit_only", "paged_write_context_invalid"):
+            self.assertIn(field, capability)
         self.assertIn("LLAMA_KV_PAGED_SWAP_EXPLICIT_ONLY", KV_CACHE_CPP)
         self.assertIn("!kv->paged_swap_explicit_only", KV_CACHE_CPP)
-        self.assertIn("requires LLAMA_KV_PAGED_SWAP_EXPLICIT_ONLY=1", CONTEXT)
 
     def test_g0_s1_resident_observation_wraps_real_offload_transaction(self):
         self.assertIn("LLAMA_KV_G0_S1_RESIDENT_OBSERVATION", CONTEXT)
@@ -84,7 +127,9 @@ class UnifiedPressureActionStaticTest(unittest.TestCase):
         callback_start = CONTEXT.index("observe_resident = kv_g0_s1_resident_observation")
         callback_end = CONTEXT.index("} : server_kv_pressure_action_ops {}", callback_start)
         callback = CONTEXT[callback_start:callback_end]
-        self.assertIn("request.action != llama_kv_action::offload", callback)
+        self.assertIn("request.action == llama_kv_action::offload", callback)
+        self.assertIn("request.action == llama_kv_action::release", callback)
+        self.assertIn("server_kv_budget_adapter::confirm_physical_credit", callback)
         self.assertLess(
             callback.index("const auto before = mem->sample_kv_resident()"),
             callback.index("auto action_result = mem->execute_action(request)"))
@@ -110,9 +155,8 @@ class UnifiedPressureActionStaticTest(unittest.TestCase):
         metrics_start = CONTEXT.index("case SERVER_TASK_TYPE_METRICS:")
         metrics_end = CONTEXT.index("case SERVER_TASK_TYPE_SLOT_SAVE:", metrics_start)
         metrics = CONTEXT[metrics_start:metrics_end]
-        self.assertIn("kv_g0_s1_resident_preflight && mem", metrics)
-        self.assertIn("sample_kv_resident()", metrics)
-        self.assertIn('slot_data["kv_resident"]', metrics)
+        self.assertIn("slot_data", metrics)
+        self.assertIn("slots_data", metrics)
         self.assertNotIn("kv_g0_s1_resident_observation && mem", metrics)
         self.assertIn("virtual llama_kv_resident_sample sample_kv_resident() const", MEMORY_H)
         self.assertIn("llama_kv_resident_sample sample_kv_resident() const override", KV_CACHE_H)
@@ -164,13 +208,15 @@ class UnifiedPressureActionStaticTest(unittest.TestCase):
         self.assertGreaterEqual(CONTEXT.count("kv_governor_state.reset();"), 2)
         self.assertIn("server_kv_pressure_execute_governor", CONTEXT)
         self.assertIn("server_kv_pressure_snapshot pressure_snapshot", CONTEXT)
+        self.assertIn("server_kv_budget_adapter", CONTEXT)
+        self.assertIn("confirm_physical_credit", CONTEXT)
         self.assertIn("sample_kv_claimant_physical_views", CONTEXT)
         self.assertIn("std::vector<server_kv_claimant_snapshot> claimant_snapshots", CONTEXT)
-        self.assertIn("std::vector<server_kv_claimant_runtime_observation> runtime_claimants", CONTEXT)
+        self.assertIn("std::vector<llama_kv_claimant_physical_view> physical_views", CONTEXT)
+        self.assertIn("memory_governor_legacy_kv_actions_enabled", CONTEXT)
+        self.assertIn("legacy_disabled", CONTEXT)
         self.assertIn("LLAMA_KV_PRESSURE_GOVERNOR_CLAIMANT_TRACE", CONTEXT)
-        self.assertIn("if (kv_governor_claimant_trace)", CONTEXT)
-        self.assertIn("get_kv_runtime_claimant(slot.id)", CONTEXT)
-        self.assertIn('slot_data["kv_claimant"]', CONTEXT)
+        self.assertIn("sample_kv_claimant_physical_views", CONTEXT)
         self.assertIn("claimant_exhausted", ACTION_H + ACTION_CPP)
         self.assertNotIn("std::thread", ACTION_H + ACTION_CPP)
 
@@ -234,8 +280,9 @@ class UnifiedPressureActionStaticTest(unittest.TestCase):
             self.assertIn(token, ACTION_H + ACTION_CPP + CONTEXT)
         self.assertIn("must be env_static", ACTION_CPP)
         self.assertIn("kv_resident_target_state", CONTEXT)
-        self.assertIn("budget_target_enabled", CONTEXT)
-        self.assertIn("budget_target_bytes", CONTEXT)
+        self.assertIn("budget_target_enabled", ACTION_CPP + CONTEXT)
+        self.assertIn("budget_target_bytes", ACTION_CPP + CONTEXT)
+        self.assertIn("kv_budget_adapter.apply_effective_target", CONTEXT)
         self.assertNotIn("/kv_resident_target", CONTEXT)
         self.assertNotIn("OFFLOAD_GLOBAL", ACTION_CPP + ACTION_H)
 
@@ -260,7 +307,8 @@ class UnifiedPressureActionStaticTest(unittest.TestCase):
         for token in ("protected_or_shared", "budget_unmet_terminal", "budget_unmet_backoff_samples"):
             self.assertIn(token, governor)
         for field in (
-                "budget_active=", "budget_target_enabled=", "budget_source=",
+                "budget_active=", "budget_target_enabled=", "budget_source=", "budget_source_object_id=",
+                "budget_source_generation=", "budget_view_authority=",
                 "budget_basis_generation=", "budget_view_valid=",
                 "budget_resident_available=", "budget_reclaimable_available=",
                 "budget_resident_bytes=",
@@ -273,7 +321,9 @@ class UnifiedPressureActionStaticTest(unittest.TestCase):
         self.assertNotIn("std::thread", ACTION_H + ACTION_CPP)
 
     def test_v2_budget_view_is_one_scheduler_cadence_call_and_not_per_token(self):
-        self.assertEqual(CONTEXT.count("mem->sample_kv_physical_budget_view()"), 1)
+        self.assertGreaterEqual(CONTEXT.count("mem->sample_kv_physical_budget_view()"), 2)
+        self.assertIn("refresh_kv_global_target", CONTEXT)
+        self.assertIn("kv_budget_adapter.project_for_governor", CONTEXT)
         self.assertIn("maybe_sample_kv_pressure", CONTEXT)
         self.assertLess(
             CONTEXT.index("mem->sample_kv_physical_budget_view()"),

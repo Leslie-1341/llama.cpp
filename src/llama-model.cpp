@@ -31,6 +31,7 @@
 #include <cstring>
 #include <cmath>
 #include <functional>
+#include <filesystem>
 #include <map>
 #include <numeric>
 #include <regex>
@@ -40,11 +41,19 @@
 #include <utility>
 #include <vector>
 
-// Best estimate of memory this process may use: min(cgroup v2 headroom, MemAvailable).
-// Used by the adaptive streaming budgets (moe-buffer expert budget, flex ring size)
-// to evict/stream only as much as needed to fit. Returns SIZE_MAX if undetermined.
-static size_t llama_detect_available_memory() {
-    size_t avail = SIZE_MAX;
+#if defined(__unix__) || defined(__APPLE__)
+#include <unistd.h>
+#endif
+
+struct llama_cgroup_memory_snapshot {
+    bool valid = false;
+    size_t max_bytes = 0;
+    size_t current_bytes = 0;
+    size_t headroom_bytes = 0;
+};
+
+static llama_cgroup_memory_snapshot llama_read_cgroup_memory_snapshot() {
+    llama_cgroup_memory_snapshot result;
     // This process's own cgroup v2 path (/proc/self/cgroup -> "0::<path>"); reading
     // /sys/fs/cgroup/memory.max directly would give the root limit and miss a cap.
     std::string cg_path;
@@ -64,17 +73,30 @@ static size_t llama_detect_available_memory() {
         if (FILE * f = std::fopen((base + "/memory.max").c_str(), "r")) {
             char buf[64] = {0};
             if (std::fgets(buf, sizeof(buf), f) && std::strncmp(buf, "max", 3) != 0) {
-                size_t cmax = std::strtoull(buf, nullptr, 10);
+                result.max_bytes = std::strtoull(buf, nullptr, 10);
                 size_t cur  = 0;
                 if (FILE * g = std::fopen((base + "/memory.current").c_str(), "r")) {
                     char b2[64] = {0};
                     if (std::fgets(b2, sizeof(b2), g)) cur = std::strtoull(b2, nullptr, 10);
                     std::fclose(g);
                 }
-                avail = std::min(avail, (size_t) (cmax > cur ? cmax - cur : 0));
+                result.current_bytes = cur;
+                result.headroom_bytes = result.max_bytes > cur ? result.max_bytes - cur : 0;
+                result.valid = result.max_bytes > 0;
             }
             std::fclose(f);
         }
+    }
+    return result;
+}
+
+// Best estimate of memory this process may still allocate: min(cgroup v2 headroom, MemAvailable).
+// Used by legacy adaptive streaming budgets. Returns SIZE_MAX if undetermined.
+static size_t llama_detect_available_memory() {
+    size_t avail = SIZE_MAX;
+    const auto cgroup = llama_read_cgroup_memory_snapshot();
+    if (cgroup.valid) {
+        avail = std::min(avail, cgroup.headroom_bytes);
     }
     if (FILE * f = std::fopen("/proc/meminfo", "r")) {
         char line[128];
@@ -88,6 +110,42 @@ static size_t llama_detect_available_memory() {
         std::fclose(f);
     }
     return avail;
+}
+
+static bool llama_env_flag(const char * name, bool default_value = false) {
+    const char * value = std::getenv(name);
+    if (value == nullptr) {
+        return default_value;
+    }
+    return std::atoi(value) > 0;
+}
+
+static bool llama_env_is_set(const char * name) {
+    return std::getenv(name) != nullptr;
+}
+
+static std::string llama_auto_moe_sidecar_path(const std::string & model_path) {
+    if (model_path.empty()) {
+        return {};
+    }
+    std::error_code ec;
+    const std::filesystem::path path(model_path);
+    const std::filesystem::path dir = path.parent_path();
+    const std::string file = path.filename().string();
+    std::vector<std::filesystem::path> candidates;
+    candidates.push_back(path.string() + ".sidecar");
+    if (file.size() > 5 && file.rfind(".gguf") == file.size() - 5) {
+        const std::string stem = file.substr(0, file.size() - 5);
+        candidates.push_back(dir / (stem + ".sidecar"));
+        candidates.push_back(dir / (stem + ".mwq-v2-hier-legacy.sidecar"));
+        candidates.push_back(dir / (stem + ".mwq-v2-hier.sidecar"));
+    }
+    for (const auto & candidate : candidates) {
+        if (std::filesystem::is_regular_file(candidate, ec)) {
+            return candidate.string();
+        }
+    }
+    return {};
 }
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
@@ -1226,19 +1284,50 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const int n_gpu_layers = this->n_gpu_layers();
 
     const bool use_mmap_buffer = true;
+    const auto planner_cgroup = llama_read_cgroup_memory_snapshot();
+    const bool memory_governor_auto_by_cgroup =
+            planner_cgroup.valid && planner_cgroup.max_bytes > 0;
+    const bool memory_governor_requested =
+            llama_env_flag("LLAMA_MEMORY_GOVERNOR") || memory_governor_auto_by_cgroup;
+    const bool memory_governor_auto_backends =
+            llama_env_flag("LLAMA_MEMORY_GOVERNOR_AUTO_BACKENDS", memory_governor_requested);
+    size_t model_weight_bytes = 0;
+    size_t largest_weight_tensor_bytes = 0;
+    for (const auto & it : ml.weights_map) {
+        const size_t nb = ggml_nbytes(it.second.tensor);
+        model_weight_bytes += nb;
+        largest_weight_tensor_bytes = std::max(largest_weight_tensor_bytes, nb);
+    }
+    size_t governor_kv_bytes_per_token = 0;
+    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+        governor_kv_bytes_per_token +=
+            ((size_t) hparams.n_head_kv(il) *
+             ((size_t) hparams.n_embd_head_k(il) + (size_t) hparams.n_embd_head_v(il)) *
+             sizeof(uint16_t));
+    }
+    const size_t detected_avail = memory_governor_auto_backends
+            ? llama_detect_available_memory()
+            : SIZE_MAX;
+    const size_t governor_backend_reserve =
+        largest_weight_tensor_bytes +
+        governor_kv_bytes_per_token * (size_t) std::max<uint32_t>(1, hparams.n_layer);
+    const bool governor_low_memory =
+            memory_governor_auto_backends &&
+            detected_avail != SIZE_MAX &&
+            detected_avail < model_weight_bytes + governor_backend_reserve;
+    const bool model_has_moe = hparams.n_expert > 0;
+
     const bool lazy_v2_requested =
-            std::getenv("LLAMA_LAZY_V2") != nullptr &&
-            std::atoi(std::getenv("LLAMA_LAZY_V2")) > 0;
+            llama_env_flag("LLAMA_LAZY_V2") ||
+            (memory_governor_auto_backends && model_has_moe && !llama_env_is_set("LLAMA_LAZY_V2"));
     const bool lazy_window_requested =
             lazy_v2_requested ||
-            (std::getenv("LLAMA_LAZY_LOADING") != nullptr &&
-             std::atoi(std::getenv("LLAMA_LAZY_LOADING")) > 0) ||
+            llama_env_flag("LLAMA_LAZY_LOADING") ||
             (params.vm_layer_schedule && params.vm_dontneed);
     // FlexInfer-style streaming (llama-flex): mutually exclusive with the mmap
     // window. Requires the same loader conditions (mmap home, no mlock/check).
-    const bool flex_requested =
-            std::getenv("LLAMA_FLEX") != nullptr &&
-            std::atoi(std::getenv("LLAMA_FLEX")) > 0;
+    const bool flex_requested = llama_env_flag("LLAMA_FLEX") ||
+            (memory_governor_auto_backends && !model_has_moe && !llama_env_is_set("LLAMA_FLEX"));
     const bool use_flex =
             flex_requested &&
             !use_mlock &&
@@ -1263,6 +1352,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 use_mlock ? 1 : 0,
                 ml.check_tensors ? 1 : 0,
                 params.vocab_only ? 1 : 0);
+    }
+    if (memory_governor_requested && (governor_low_memory || use_flex || use_lazy_window)) {
+        LLAMA_LOG_INFO("%s: memory governor auto backend: available=%.0f MiB weights=%.0f MiB "
+                "reserve=%.0f MiB flex=%d lazy_window=%d moe=%d\n",
+                __func__,
+                detected_avail / 1048576.0,
+                model_weight_bytes / 1048576.0,
+                governor_backend_reserve / 1048576.0,
+                use_flex ? 1 : 0,
+                use_lazy_window ? 1 : 0,
+                model_has_moe ? 1 : 0);
     }
 
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
@@ -1675,10 +1775,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // the mmap window: their data is repointed to anon buffers and only the
         // routed experts are streamed in. Requires LLAMA_LAZY_V2 (this block).
         const char * moe_buf_env = std::getenv("LLAMA_LAZY_MOE_BUFFER");
-        const bool   use_moe_buffer = moe_buf_env != nullptr && std::atoi(moe_buf_env) > 0;
+        const bool   use_moe_buffer =
+                (moe_buf_env != nullptr && std::atoi(moe_buf_env) > 0) ||
+                (memory_governor_auto_backends && model_has_moe && moe_buf_env == nullptr);
         const bool   moe_auto_budget =
-                std::getenv("LLAMA_LAZY_MOE_BUFFER_AUTO") != nullptr &&
-                std::atoi(std::getenv("LLAMA_LAZY_MOE_BUFFER_AUTO")) > 0;
+                llama_env_flag("LLAMA_LAZY_MOE_BUFFER_AUTO") ||
+                (memory_governor_auto_backends && model_has_moe &&
+                 !llama_env_is_set("LLAMA_LAZY_MOE_BUFFER_AUTO"));
+        double moe_warm_coverage = 0.95;
+        std::string moe_sidecar_source = "none";
         if (use_moe_buffer) {
             llama_moe_buffer_params mp;
             mp.enabled   = true;
@@ -1737,7 +1842,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 mp.avx512_prefetch = std::max(0, std::min(16, std::atoi(v)));
             }
             if (const char * v = std::getenv("LLAMA_LAZY_MOE_BUFFER_MB")) {
-                mp.budget_bytes = (size_t) std::max(0, std::atoi(v)) * 1024ull * 1024ull;
+                const int mb = std::max(0, std::atoi(v));
+                mp.budget_bytes = (size_t) mb * 1024ull * 1024ull;
+                mp.budget_unbounded = mb == 0;
             }
             if (const char * v = std::getenv("LLAMA_LAZY_MOE_BUFFER_WORKERS")) {
                 mp.n_workers = std::max(1, std::atoi(v));
@@ -1793,11 +1900,51 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (const char * v = std::getenv("LLAMA_LAZY_MOE_GROUP_COOLDOWN_TOKENS")) {
                 mp.group_cooldown_tokens = std::max(0, std::atoi(v));
             }
+            if (const char * v = std::getenv("LLAMA_LAZY_MOE_PRESSURE_ADAPTIVE")) {
+                mp.pressure_adaptive = std::atoi(v) > 0;
+            }
+            if (const char * v = std::getenv("LLAMA_LAZY_MOE_PRESSURE_SCALE_PIN")) {
+                mp.pressure_scale_pin = std::atoi(v) > 0;
+            }
+            if (const char * v = std::getenv("LLAMA_LAZY_MOE_PRESSURE_SCALE_LAYER_PIN")) {
+                mp.pressure_scale_layer_pin = std::atoi(v) > 0;
+            }
+            if (const char * v = std::getenv("LLAMA_LAZY_MOE_PRESSURE_SCALE_WINDOW")) {
+                mp.pressure_scale_window = std::atoi(v) > 0;
+            }
+            if (const char * v = std::getenv("LLAMA_LAZY_MOE_PRESSURE_SCALE_COOLDOWN")) {
+                mp.pressure_scale_cooldown = std::atoi(v) > 0;
+            }
+            if (const char * v = std::getenv("LLAMA_LAZY_MOE_PRESSURE_SCALE_SPEC_GUARD")) {
+                mp.pressure_scale_spec_guard = std::atoi(v) > 0;
+            }
+            if (const char * v = std::getenv("LLAMA_LAZY_MOE_PRESSURE_SOFT_RATIO")) {
+                mp.pressure_soft_ratio = std::max(0.50, std::min(0.99, std::atof(v)));
+            }
+            if (const char * v = std::getenv("LLAMA_LAZY_MOE_PRESSURE_HARD_RATIO")) {
+                mp.pressure_hard_ratio = std::max(mp.pressure_soft_ratio + 0.01, std::min(1.20, std::atof(v)));
+            }
+            if (mp.pressure_hard_ratio <= mp.pressure_soft_ratio) {
+                mp.pressure_hard_ratio = std::min(1.20, mp.pressure_soft_ratio + 0.01);
+            }
+            if (const char * v = std::getenv("LLAMA_LAZY_MOE_PRESSURE_PIN_FLOOR")) {
+                mp.pressure_pin_floor = std::max(0.0f, std::min(mp.pinned_fraction, (float) std::atof(v)));
+            }
             if (const char * v = std::getenv("LLAMA_LAZY_MOE_PIN_REFRESH")) {
                 mp.pin_refresh_interval = std::max(1, std::atoi(v));
             }
+            if (const char * v = std::getenv("LLAMA_LAZY_MOE_WARM_COVERAGE")) {
+                mp.warm_coverage = std::max(0.0, std::min(1.0, std::atof(v)));
+            }
+            moe_warm_coverage = mp.warm_coverage;
             if (const char * v = std::getenv("LLAMA_LAZY_MOE_SIDECAR")) {
                 mp.sidecar_path = v;
+                moe_sidecar_source = "env";
+            } else {
+                mp.sidecar_path = llama_auto_moe_sidecar_path(ml.fname_model);
+                if (!mp.sidecar_path.empty()) {
+                    moe_sidecar_source = "auto";
+                }
             }
             pimpl->moe_buffer = llama_moe_buffer_create(mp);
         }
@@ -1807,6 +1954,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
         int moe_registered = 0;
         size_t model_total_bytes = 0;  // sum of all mapped weight bytes (for adaptive budget)
+        std::vector<size_t> moe_layer_group_bytes(hparams.n_layer, 0);
         for (const auto & it : ml.weights_map) {
             const auto & weight = it.second;
             if (weight.idx >= pimpl->mappings.size() || !pimpl->mappings[weight.idx]) {
@@ -1819,6 +1967,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             const ggml_tensor * t = weight.tensor;
             const bool is_exps = ggml_n_dims(t) == 3 && t->ne[2] > 1 &&
                     it.first.find("_exps") != std::string::npos;
+            if (is_exps) {
+                int layer = -1;
+                if (std::sscanf(it.first.c_str(), "blk.%d.", &layer) == 1 &&
+                        layer >= 0 && layer < (int) hparams.n_layer) {
+                    moe_layer_group_bytes[layer] += (size_t) t->nb[2];
+                }
+            }
 
             // Buffer mode owns the expert tensors: repoint them and skip the window.
             if (is_exps && use_moe_buffer && weight.idx < ml.files.size()) {
@@ -1856,29 +2011,149 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // not evictable, so they are subtracted first (they are the OOM floor).
         if (moe_auto_budget && use_moe_buffer && pimpl->moe_buffer) {
             const size_t expert_bytes = llama_moe_buffer_expert_bytes(pimpl->moe_buffer.get());
+            const size_t warm_working_set = llama_moe_buffer_warm_working_set_bytes(
+                    pimpl->moe_buffer.get(), moe_warm_coverage);
             const size_t non_expert   = model_total_bytes > expert_bytes
                     ? model_total_bytes - expert_bytes : 0;
 
-            const size_t avail = llama_detect_available_memory();
-
-            const size_t reserve = 512ull * 1024 * 1024;  // KV + compute scratch headroom
-            size_t budget;
-            if (avail == SIZE_MAX || avail >= non_expert + reserve + expert_bytes) {
-                budget = 0;  // model fits -> no eviction
+            const size_t kv_reserve =
+                governor_kv_bytes_per_token * (size_t) std::max<uint32_t>(1, hparams.n_layer);
+            const size_t reserve = largest_weight_tensor_bytes + kv_reserve;
+            size_t min_expert_group = 0;
+            for (const size_t b : moe_layer_group_bytes) {
+                min_expert_group = std::max(min_expert_group, b);
+            }
+            const size_t floor = non_expert + reserve;
+            const bool finite_limit = planner_cgroup.valid && planner_cgroup.max_bytes > 0;
+            size_t safe_budget = 0;
+            bool budget_unbounded = false;
+            size_t moe_hard_floor = floor;
+            size_t moe_soft_guard = reserve;
+            size_t moe_working_set_floor = 0;
+            const char * moe_budget_reason = "legacy_safe_budget";
+            bool moe_budget_clamped_by_headroom = false;
+            if (finite_limit) {
+                // V2: the old floor treats all non-expert mmap bytes as a hard RSS
+                // floor. In practice a large part of that floor is file-backed and
+                // reclaimable, while too small an expert cache causes massive rereads.
+                // Keep a hard cgroup guard, but let a model-structure working-set
+                // floor compete with the conservative legacy safe budget.
+                const size_t min_guard = 64ull * 1024ull * 1024ull;
+                moe_soft_guard = std::max({ min_guard, largest_weight_tensor_bytes, kv_reserve, min_expert_group });
+                const size_t current_floor = planner_cgroup.current_bytes + moe_soft_guard;
+                moe_hard_floor = std::max(current_floor, reserve);
+                if (planner_cgroup.max_bytes <= moe_hard_floor) {
+                    throw std::runtime_error(format(
+                            "%s: memory planner capacity failure model=moe memory_max=%.0f MiB "
+                            "hard_floor=%.0f MiB legacy_floor=%.0f MiB non_expert=%.0f MiB reserve=%.0f MiB "
+                            "largest_tensor=%.0f MiB kv_reserve=%.0f MiB",
+                            __func__,
+                            planner_cgroup.max_bytes / 1048576.0,
+                            moe_hard_floor / 1048576.0,
+                            floor / 1048576.0,
+                            non_expert / 1048576.0,
+                            reserve / 1048576.0,
+                            largest_weight_tensor_bytes / 1048576.0,
+                            kv_reserve / 1048576.0));
+                }
+                const size_t legacy_safe_budget = planner_cgroup.max_bytes > floor
+                    ? std::min(planner_cgroup.max_bytes - floor, expert_bytes)
+                    : 0;
+                const size_t hard_safe_budget = std::min(planner_cgroup.max_bytes - moe_hard_floor, expert_bytes);
+                moe_working_set_floor = warm_working_set / 3;
+                if (warm_working_set > 0) {
+                    moe_working_set_floor = std::max(moe_working_set_floor, warm_working_set / 4);
+                }
+                if (min_expert_group > 0) {
+                    moe_working_set_floor = std::max(moe_working_set_floor, min_expert_group * (size_t) std::max<uint32_t>(1, hparams.n_expert_used));
+                    moe_working_set_floor = std::max(moe_working_set_floor, min_expert_group);
+                }
+                moe_working_set_floor = std::min(moe_working_set_floor, warm_working_set);
+                moe_working_set_floor = std::min(moe_working_set_floor, expert_bytes);
+                safe_budget = legacy_safe_budget;
+                if (safe_budget < moe_working_set_floor && hard_safe_budget > safe_budget) {
+                    const size_t target = std::min(moe_working_set_floor, hard_safe_budget);
+                    safe_budget = std::max(safe_budget, target);
+                    moe_budget_reason = target < moe_working_set_floor ? "working_set_headroom_clamped" : "working_set_floor";
+                    moe_budget_clamped_by_headroom = target < moe_working_set_floor;
+                }
+                safe_budget = std::min(safe_budget, expert_bytes);
+                if (safe_budget > 0 && min_expert_group > 0 && safe_budget < min_expert_group) {
+                    throw std::runtime_error(format(
+                            "%s: memory planner capacity failure model=moe memory_max=%.0f MiB "
+                            "hard_floor=%.0f MiB safe_budget=%.0f MiB min_expert_group=%.0f MiB",
+                            __func__,
+                            planner_cgroup.max_bytes / 1048576.0,
+                            moe_hard_floor / 1048576.0,
+                            safe_budget / 1048576.0,
+                            min_expert_group / 1048576.0));
+                }
+                budget_unbounded = safe_budget >= expert_bytes;
             } else {
-                const size_t fixed = non_expert + reserve;
-                budget = avail > fixed ? avail - fixed : 0;
-                // keep at least one expert slice resident to make progress
-                if (budget == 0) budget = 64ull * 1024 * 1024;
-                if (budget > expert_bytes) budget = 0;  // would fit -> unbounded
+                const size_t avail = llama_detect_available_memory();
+                safe_budget = (avail == SIZE_MAX || avail >= floor + expert_bytes)
+                    ? expert_bytes
+                    : (avail > floor ? avail - floor : 0);
+                safe_budget = std::min(safe_budget, expert_bytes);
+                budget_unbounded = safe_budget >= expert_bytes;
             }
-            llama_moe_buffer_set_budget(pimpl->moe_buffer.get(), budget);
-            if (std::getenv("LLAMA_LAZY_DEBUG")) {
-                LLAMA_LOG_INFO("%s: moe-buffer adaptive budget=%.0f MiB "
-                        "(avail=%.0f MiB, expert=%.0f MiB, non_expert=%.0f MiB)\n", __func__,
-                        budget / 1048576.0, avail == SIZE_MAX ? -1.0 : avail / 1048576.0,
-                        expert_bytes / 1048576.0, non_expert / 1048576.0);
-            }
+            const size_t budget = budget_unbounded
+                ? 0
+                : std::min(warm_working_set, safe_budget);
+            llama_moe_buffer_set_budget_plan(
+                    pimpl->moe_buffer.get(),
+                    budget,
+                    budget_unbounded,
+                    safe_budget,
+                    moe_hard_floor);
+            std::fprintf(stderr, "%s: memory planner model=moe auto=%d planner_v2=%d memory_max=%.0f MiB "
+                    "memory_current=%.0f MiB floor=%.0f MiB hard_floor=%.0f MiB soft_guard=%.0f MiB "
+                    "available_for_dynamic=%.0f MiB expert=%.0f MiB warm=%.0f MiB min_expert_group=%.0f MiB "
+                    "moe_working_set_floor=%.0f MiB moe_budget=%.0f MiB moe_budget_unbounded=%d "
+                    "moe_budget_reason=%s moe_budget_clamped_by_headroom=%d sidecar=%s sidecar_source=%s\n",
+                    __func__,
+                    memory_governor_auto_backends ? 1 : 0,
+                    finite_limit ? 1 : 0,
+                    finite_limit ? planner_cgroup.max_bytes / 1048576.0 : -1.0,
+                    finite_limit ? planner_cgroup.current_bytes / 1048576.0 : -1.0,
+                    floor / 1048576.0,
+                    moe_hard_floor / 1048576.0,
+                    moe_soft_guard / 1048576.0,
+                    safe_budget / 1048576.0,
+                    expert_bytes / 1048576.0,
+                    warm_working_set / 1048576.0,
+                    min_expert_group / 1048576.0,
+                    moe_working_set_floor / 1048576.0,
+                    budget / 1048576.0,
+                    budget_unbounded ? 1 : 0,
+                    moe_budget_reason,
+                    moe_budget_clamped_by_headroom ? 1 : 0,
+                    moe_sidecar_source == "none" ? "gguf_streaming" : "sidecar",
+                    moe_sidecar_source.c_str());
+            LLAMA_LOG_INFO("%s: memory planner model=moe auto=%d planner_v2=%d memory_max=%.0f MiB "
+                    "memory_current=%.0f MiB floor=%.0f MiB hard_floor=%.0f MiB soft_guard=%.0f MiB "
+                    "available_for_dynamic=%.0f MiB expert=%.0f MiB warm=%.0f MiB min_expert_group=%.0f MiB "
+                    "moe_working_set_floor=%.0f MiB moe_budget=%.0f MiB moe_budget_unbounded=%d "
+                    "moe_budget_reason=%s moe_budget_clamped_by_headroom=%d sidecar=%s sidecar_source=%s\n",
+                    __func__,
+                    memory_governor_auto_backends ? 1 : 0,
+                    finite_limit ? 1 : 0,
+                    finite_limit ? planner_cgroup.max_bytes / 1048576.0 : -1.0,
+                    finite_limit ? planner_cgroup.current_bytes / 1048576.0 : -1.0,
+                    floor / 1048576.0,
+                    moe_hard_floor / 1048576.0,
+                    moe_soft_guard / 1048576.0,
+                    safe_budget / 1048576.0,
+                    expert_bytes / 1048576.0,
+                    warm_working_set / 1048576.0,
+                    min_expert_group / 1048576.0,
+                    moe_working_set_floor / 1048576.0,
+                    budget / 1048576.0,
+                    budget_unbounded ? 1 : 0,
+                    moe_budget_reason,
+                    moe_budget_clamped_by_headroom ? 1 : 0,
+                    moe_sidecar_source == "none" ? "gguf_streaming" : "sidecar",
+                    moe_sidecar_source.c_str());
         }
 
         llama_window_params window_params;
@@ -1977,8 +2252,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     : 4;
             window_params.expert_dontneed = moe_evict != nullptr &&
                     std::atoi(moe_evict) != 0;
-            window_params.clg_predict = clg_env != nullptr &&
-                    std::atoi(clg_env) > 0;
+            window_params.clg_predict =
+                    (clg_env != nullptr && std::atoi(clg_env) > 0) ||
+                    (governor_low_memory && model_has_moe && clg_env == nullptr);
             window_params.clg_delta = clg_delta != nullptr
                     ? std::max(0, std::atoi(clg_delta)) : 1;
             window_params.clg_prefill_threshold = clg_pthr != nullptr
@@ -2037,27 +2313,42 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         fp.enabled = true;
         fp.debug_log   = std::getenv("LLAMA_FLEX_DEBUG") != nullptr;
         fp.direct_io   = std::getenv("LLAMA_FLEX_BUFFERED") == nullptr; // default O_DIRECT
-        const bool flex_ring_explicit    = std::getenv("LLAMA_FLEX_RING")    != nullptr;
-        const bool flex_ahead_explicit   = std::getenv("LLAMA_FLEX_AHEAD")   != nullptr;
-        const bool flex_max_ahead_explicit = std::getenv("LLAMA_FLEX_MAX_AHEAD") != nullptr;
-        const bool flex_threads_explicit = std::getenv("LLAMA_FLEX_THREADS") != nullptr;
-        const bool flex_lock_explicit    = std::getenv("LLAMA_FLEX_LOCK_GB") != nullptr;
-        const bool flex_pin_explicit     = std::getenv("LLAMA_FLEX_PIN_POLICY") != nullptr;
+        const bool governor_respect_flex_env =
+            !memory_governor_requested ||
+            llama_env_flag("LLAMA_MEMORY_GOVERNOR_RESPECT_FLEX_ENV");
+        const bool flex_ring_explicit    = governor_respect_flex_env && std::getenv("LLAMA_FLEX_RING")    != nullptr;
+        const bool flex_ahead_explicit   = governor_respect_flex_env && std::getenv("LLAMA_FLEX_AHEAD")   != nullptr;
+        const bool flex_max_ahead_explicit = governor_respect_flex_env && std::getenv("LLAMA_FLEX_MAX_AHEAD") != nullptr;
+        const bool flex_threads_explicit = governor_respect_flex_env && std::getenv("LLAMA_FLEX_THREADS") != nullptr;
+        const bool flex_lock_explicit    = governor_respect_flex_env && std::getenv("LLAMA_FLEX_LOCK_GB") != nullptr;
+        const bool flex_pin_explicit     = governor_respect_flex_env && std::getenv("LLAMA_FLEX_PIN_POLICY") != nullptr;
+        const bool flex_rebalance_explicit = governor_respect_flex_env && std::getenv("LLAMA_FLEX_GLOBAL_REBALANCE") != nullptr;
+        const bool flex_sched_explicit   = governor_respect_flex_env && std::getenv("LLAMA_FLEX_SCHED") != nullptr;
         const bool flex_auto             = std::getenv("LLAMA_FLEX_AUTO") &&
                 std::atoi(std::getenv("LLAMA_FLEX_AUTO")) > 0;
-        const bool flex_sched            = std::getenv("LLAMA_FLEX_SCHED") &&
-                std::atoi(std::getenv("LLAMA_FLEX_SCHED")) > 0;
+        const bool flex_sched            = flex_sched_explicit
+                ? std::atoi(std::getenv("LLAMA_FLEX_SCHED")) > 0
+                : !model_has_moe;
+        LLAMA_LOG_INFO("%s: flex planner mode sched=%d auto=%d governor=%d moe=%d\n",
+                __func__,
+                flex_sched ? 1 : 0,
+                flex_auto ? 1 : 0,
+                memory_governor_requested ? 1 : 0,
+                model_has_moe ? 1 : 0);
 
-        if (const char * v = std::getenv("LLAMA_FLEX_RING"))    { fp.ring_layers    = std::max(2, std::atoi(v)); }
-        if (const char * v = std::getenv("LLAMA_FLEX_AHEAD"))   { fp.prefetch_ahead = std::max(1, std::atoi(v)); }
-        if (const char * v = std::getenv("LLAMA_FLEX_MAX_AHEAD")) {
+        if (flex_ring_explicit)    { const char * v = std::getenv("LLAMA_FLEX_RING"); fp.ring_layers    = std::max(2, std::atoi(v)); }
+        if (flex_ahead_explicit)   { const char * v = std::getenv("LLAMA_FLEX_AHEAD"); fp.prefetch_ahead = std::max(1, std::atoi(v)); }
+        if (flex_max_ahead_explicit) {
+            const char * v = std::getenv("LLAMA_FLEX_MAX_AHEAD");
             fp.prefetch_ahead_max = std::max(1, std::atoi(v));
         }
-        if (const char * v = std::getenv("LLAMA_FLEX_ADAPTIVE_AHEAD")) {
+        if (governor_respect_flex_env && std::getenv("LLAMA_FLEX_ADAPTIVE_AHEAD")) {
+            const char * v = std::getenv("LLAMA_FLEX_ADAPTIVE_AHEAD");
             fp.adaptive_ahead = std::atoi(v) > 0;
         }
-        if (const char * v = std::getenv("LLAMA_FLEX_THREADS")) { fp.io_threads     = std::max(1, std::atoi(v)); }
-        if (const char * v = std::getenv("LLAMA_FLEX_LOCK_GB")) {
+        if (flex_threads_explicit) { const char * v = std::getenv("LLAMA_FLEX_THREADS"); fp.io_threads = std::max(1, std::atoi(v)); }
+        if (flex_lock_explicit) {
+            const char * v = std::getenv("LLAMA_FLEX_LOCK_GB");
             fp.lock_bytes = (size_t)(std::max(0.0, std::atof(v)) * 1024.0 * 1024.0 * 1024.0);
         }
 
@@ -2068,7 +2359,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // A pre-scan sums layer-tensor bytes (largest layer sizes the ring slot) and
         // non-layer bytes (embedding/output/norm: stay mmap-resident, the OOM floor).
         if (flex_auto || flex_sched) {
+            struct flex_plan_tensor {
+                size_t size = 0;
+                size_t value = 0;
+            };
             std::vector<size_t> layer_bytes(hparams.n_layer, 0);
+            std::vector<std::vector<flex_plan_tensor>> layer_tensors(hparams.n_layer);
             size_t non_layer = 0, layer_total = 0;
             for (const auto & it : ml.weights_map) {
                 const size_t nb = ggml_nbytes(it.second.tensor);
@@ -2077,6 +2373,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                         layer >= 0 && layer < (int) hparams.n_layer) {
                     layer_bytes[layer] += nb;
                     layer_total        += nb;
+                    layer_tensors[layer].push_back({ nb, nb });
                 } else {
                     non_layer += nb;
                 }
@@ -2085,40 +2382,354 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             for (size_t b : layer_bytes) max_layer = std::max(max_layer, b);
 
             const size_t avail   = llama_detect_available_memory();
-            const size_t reserve = 512ull * 1024 * 1024;  // KV + compute scratch headroom
+            uint64_t kv_tokens = std::max<uint32_t>(1, hparams.n_layer);
+            if (const char * tokens = std::getenv("LLAMA_MEMORY_PLANNER_KV_TOKENS")) {
+                kv_tokens = (uint64_t) std::max(1.0, std::atof(tokens));
+            }
+            double kv_factor = 1.0;
+            if (const char * factor = std::getenv("LLAMA_MEMORY_PLANNER_KV_FACTOR")) {
+                kv_factor = std::max(0.0, std::atof(factor));
+            }
+            size_t kv_bytes_per_token = 0;
+            for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                kv_bytes_per_token +=
+                    ((size_t) hparams.n_head_kv(il) *
+                     ((size_t) hparams.n_embd_head_k(il) + (size_t) hparams.n_embd_head_v(il)) *
+                     sizeof(uint16_t));
+            }
+            size_t kv_reserve = (size_t) ((double) kv_bytes_per_token * (double) kv_tokens * kv_factor);
+            if (const char * kv_mb = std::getenv("LLAMA_MEMORY_PLANNER_KV_RESERVE_MB")) {
+                kv_reserve = (size_t) (std::max(0.0, std::atof(kv_mb)) * 1024.0 * 1024.0);
+            }
+            size_t runtime_guard = max_layer;
+            if (const char * guard_mb = std::getenv("LLAMA_MEMORY_PLANNER_RUNTIME_GUARD_MB")) {
+                runtime_guard = (size_t) (std::max(0.0, std::atof(guard_mb)) * 1024.0 * 1024.0);
+            }
+            size_t reserve = runtime_guard + kv_reserve;
+            if (const char * guard_mb = std::getenv("LLAMA_FLEX_HARD_GUARD_MB")) {
+                reserve = (size_t) (std::max(0.0, std::atof(guard_mb)) * 1024.0 * 1024.0);
+            }
             if (flex_sched) {
-                const size_t mib = avail == SIZE_MAX ? SIZE_MAX : avail / 1048576ull;
                 if (!flex_threads_explicit) {
                     fp.io_threads = 4;
                 }
-                if (!flex_ahead_explicit) {
-                    fp.prefetch_ahead = 3;
-                }
-                if (!flex_max_ahead_explicit) {
-                    fp.prefetch_ahead_max = 8;
-                }
-                if (!flex_lock_explicit) {
-                    double lock_gb = 1.0;
-                    if (mib != SIZE_MAX && mib <= 1280) {
-                        lock_gb = 0.75;
-                    } else if (mib != SIZE_MAX && mib >= 3072) {
-                        lock_gb = 1.25;
-                    }
-                    fp.lock_bytes = (size_t)(lock_gb * 1024.0 * 1024.0 * 1024.0);
-                }
                 if (!flex_pin_explicit) {
-                    fp.pin_policy = "attn-first";
+                    fp.pin_policy = "cost-aware";
+                }
+                if (!flex_rebalance_explicit) {
+                    fp.global_rebalance = true;
                 }
                 fp.memory_budget_bytes = avail == SIZE_MAX ? 0 : avail;
                 fp.fixed_bytes = non_layer + reserve;
-                fp.sched_auto = !flex_ring_explicit && fp.memory_budget_bytes > 0;
+                fp.sched_auto = false;
+
+                auto round_page = [](size_t v) {
+                    const size_t page = 4096;
+                    return v == 0 ? page : ((v + page - 1) / page) * page;
+                };
+                auto solve_layer_lock = [](const std::vector<flex_plan_tensor> & tensors, size_t budget) {
+                    if (budget == 0 || tensors.empty()) {
+                        return (size_t) 0;
+                    }
+                    if (tensors.size() > 22) {
+                        std::vector<flex_plan_tensor> sorted = tensors;
+                        std::sort(sorted.begin(), sorted.end(),
+                                [](const flex_plan_tensor & a, const flex_plan_tensor & b) {
+                                    if (a.value != b.value) {
+                                        return a.value > b.value;
+                                    }
+                                    return a.size < b.size;
+                                });
+                        size_t used = 0;
+                        for (const auto & t : sorted) {
+                            if (used + t.size <= budget) {
+                                used += t.size;
+                            }
+                        }
+                        return used;
+                    }
+
+                    const uint64_t masks = 1ull << tensors.size();
+                    size_t best_value = 0;
+                    size_t best_used = 0;
+                    for (uint64_t mask = 1; mask < masks; ++mask) {
+                        size_t used = 0;
+                        size_t value = 0;
+                        bool ok = true;
+                        for (size_t i = 0; i < tensors.size(); ++i) {
+                            if ((mask & (1ull << i)) == 0) {
+                                continue;
+                            }
+                            used += tensors[i].size;
+                            if (used > budget) {
+                                ok = false;
+                                break;
+                            }
+                            value += tensors[i].value;
+                        }
+                        if (ok && (value > best_value || (value == best_value && used > best_used))) {
+                            best_value = value;
+                            best_used = used;
+                        }
+                    }
+                    return best_used;
+                };
+                if (avail != SIZE_MAX && hparams.n_layer > 0 && max_layer > 0) {
+                    const size_t fixed_bytes = non_layer + reserve;
+                    double bw_mib_s = 0.0;
+                    if (const char * bw = std::getenv("LLAMA_FLEX_PLANNER_BW_MBPS")) {
+                        bw_mib_s = std::max(1.0, std::atof(bw));
+                    }
+#if defined(__unix__) || defined(__APPLE__)
+                    if (bw_mib_s <= 0.0 && !ml.files.empty()) {
+                        const size_t probe = std::min<size_t>(4ull * 1024ull * 1024ull, model_weight_bytes);
+                        void * buf = nullptr;
+                        if (probe > 0 && posix_memalign(&buf, 4096, round_page(probe)) == 0 && buf != nullptr) {
+                            const uint64_t t0 = ggml_time_us();
+                            const ssize_t got = pread(ml.files[0]->file_id(), buf, probe, 0);
+                            const uint64_t dt = ggml_time_us() - t0;
+                            if (got > 0 && dt > 0) {
+                                bw_mib_s = ((double) got / 1048576.0) / ((double) dt / 1000000.0);
+                            }
+                            free(buf);
+                        }
+                    }
+#endif
+                    double compute_ms = 0.0;
+                    if (const char * compute = std::getenv("LLAMA_FLEX_PLANNER_COMPUTE_MS")) {
+                        compute_ms = std::max(0.1, std::atof(compute));
+                    }
+                    if (compute_ms <= 0.0) {
+                        const double ops_proxy =
+                            (double) std::max<size_t>(1, layer_total) /
+                            (double) std::max<uint32_t>(1, hparams.n_layer);
+                        compute_ms = std::max(0.1, ops_proxy / (1024.0 * 1024.0 * 1024.0));
+                    }
+
+                    const double io_ms =
+                        bw_mib_s > 0.0
+                            ? ((double) layer_total / 1048576.0) / bw_mib_s * 1000.0
+                            : 0.0;
+                    const double rho = compute_ms > 0.0 ? io_ms / compute_ms : 0.0;
+                    int planned_ahead = 1;
+                    int planned_ring = 2;
+                    if (rho < 0.5) {
+                        planned_ahead = 3;
+                        planned_ring = 5;
+                    } else if (rho <= 2.0) {
+                        planned_ahead = 2;
+                        planned_ring = 4;
+                    }
+                    planned_ring = std::min<int>(planned_ring, (int) hparams.n_layer);
+                    planned_ahead = std::min<int>(planned_ahead, std::max(1, planned_ring - 2));
+
+                    size_t slot = round_page(max_layer);
+                    size_t lock_budget = 0;
+                    size_t locked = 0;
+                    size_t stream = layer_total;
+                    size_t dense_lock_auto_old = 0;
+                    size_t dense_lock_candidate_count = 0;
+                    double dense_lock_risk_ratio = 0.0;
+                    size_t dense_expected_stream_saved = 0;
+                    const char * dense_lock_budget_reason = "legacy_safe_budget";
+                    const char * dense_lock_reject_reason = "none";
+                    auto estimate_locked_stream = [&](size_t candidate_lock, size_t & out_locked, size_t & out_stream, size_t & out_slot) {
+                        const size_t per_layer =
+                            candidate_lock / (size_t) std::max<uint32_t>(1, hparams.n_layer);
+                        out_locked = 0;
+                        out_stream = 0;
+                        size_t max_stream = 0;
+                        for (size_t il = 0; il < layer_tensors.size(); ++il) {
+                            const size_t layer_locked = solve_layer_lock(layer_tensors[il], per_layer);
+                            const size_t layer_stream = layer_bytes[il] > layer_locked
+                                ? layer_bytes[il] - layer_locked : 0;
+                            out_locked += layer_locked;
+                            out_stream += layer_stream;
+                            max_stream = std::max(max_stream, layer_stream);
+                        }
+                        out_slot = round_page(max_stream);
+                    };
+                    for (int iter = 0; iter < 4; ++iter) {
+                        const size_t ring_bytes = slot * (size_t) planned_ring;
+                        const size_t available_lock =
+                            avail > fixed_bytes + ring_bytes
+                                ? avail - fixed_bytes - ring_bytes
+                                : 0;
+                        lock_budget = flex_lock_explicit
+                            ? std::min(fp.lock_bytes, available_lock)
+                            : available_lock;
+                        const size_t per_layer =
+                            lock_budget / (size_t) std::max<uint32_t>(1, hparams.n_layer);
+                        locked = 0;
+                        stream = 0;
+                        size_t max_stream = 0;
+                        for (size_t il = 0; il < layer_tensors.size(); ++il) {
+                            const size_t layer_locked = solve_layer_lock(layer_tensors[il], per_layer);
+                            const size_t layer_stream = layer_bytes[il] > layer_locked
+                                ? layer_bytes[il] - layer_locked : 0;
+                            locked += layer_locked;
+                            stream += layer_stream;
+                            max_stream = std::max(max_stream, layer_stream);
+                        }
+                        slot = round_page(max_stream);
+                    }
+                    dense_lock_auto_old = lock_budget;
+                    dense_lock_candidate_count = 1;
+                    if (!flex_lock_explicit && planner_cgroup.valid && planner_cgroup.max_bytes > 0 &&
+                            layer_total > 0 && stream > layer_total / 3) {
+                        const double risk_limit = 0.88;
+                        const size_t cgroup_cap = (size_t) ((double) planner_cgroup.max_bytes * risk_limit);
+                        const size_t kv_guard = kv_reserve;
+                        const size_t soft_non_layer = non_layer / 4;
+                        const size_t hard_guard = std::max({ runtime_guard, kv_guard, max_layer });
+                        const size_t soft_fixed = soft_non_layer + hard_guard;
+                        const size_t ring_bytes = slot * (size_t) planned_ring;
+                        size_t risk_lock_cap = 0;
+                        if (cgroup_cap > planner_cgroup.current_bytes + soft_fixed + ring_bytes) {
+                            risk_lock_cap = cgroup_cap - planner_cgroup.current_bytes - soft_fixed - ring_bytes;
+                        }
+                        risk_lock_cap = std::min(risk_lock_cap, layer_total);
+                        dense_lock_candidate_count = 2;
+                        if (risk_lock_cap > lock_budget) {
+                            size_t cand_locked = 0;
+                            size_t cand_stream = layer_total;
+                            size_t cand_slot = slot;
+                            estimate_locked_stream(risk_lock_cap, cand_locked, cand_stream, cand_slot);
+                            const size_t saved = stream > cand_stream ? stream - cand_stream : 0;
+                            const size_t added = risk_lock_cap - lock_budget;
+                            const bool useful = saved > 0 && added > 0 && saved * 4 >= added;
+                            if (useful) {
+                                lock_budget = risk_lock_cap;
+                                locked = cand_locked;
+                                stream = cand_stream;
+                                slot = cand_slot;
+                                dense_expected_stream_saved = saved;
+                                dense_lock_budget_reason = "risk_aware_stream_roi";
+                            } else {
+                                dense_lock_reject_reason = "low_stream_roi";
+                            }
+                        } else {
+                            dense_lock_reject_reason = "risk_cap";
+                        }
+                        const size_t resident_estimate = planner_cgroup.current_bytes + soft_fixed +
+                            slot * (size_t) planned_ring + lock_budget;
+                        dense_lock_risk_ratio = planner_cgroup.max_bytes > 0
+                            ? (double) resident_estimate / (double) planner_cgroup.max_bytes
+                            : 0.0;
+                    }
+                    if (!flex_ring_explicit) {
+                        fp.ring_layers = planned_ring;
+                    }
+                    if (!flex_ahead_explicit) {
+                        fp.prefetch_ahead = planned_ahead;
+                    }
+                    if (!flex_max_ahead_explicit) {
+                        fp.prefetch_ahead_max = planned_ahead;
+                    }
+                    if (!flex_lock_explicit) {
+                        fp.lock_bytes = lock_budget;
+                    }
+                    fp.planner_applied = true;
+                    std::fprintf(stderr, "%s: memory planner model=dense auto=%d planner_v2=%d memory_max=%.0f MiB "
+                            "memory_current=%.0f MiB floor=%.0f MiB available_for_dynamic=%.0f MiB "
+                            "ring=%d ahead=%d lock=%.0f MiB locked=%.0f MiB "
+                            "stream_per_token=%.0f MiB slot=%.0f MiB rho=%.3f bw=%.1f MiB/s "
+                            "dense_lock_auto_old=%.0f MiB dense_lock_candidate_count=%zu "
+                            "dense_lock_risk_ratio=%.3f dense_expected_stream_saved=%.0f MiB "
+                            "dense_lock_budget_reason=%s dense_lock_reject_reason=%s\n",
+                            __func__,
+                            memory_governor_auto_backends ? 1 : 0,
+                            planner_cgroup.valid ? 1 : 0,
+                            planner_cgroup.valid ? planner_cgroup.max_bytes / 1048576.0 : -1.0,
+                            planner_cgroup.valid ? planner_cgroup.current_bytes / 1048576.0 : -1.0,
+                            fixed_bytes / 1048576.0,
+                            avail == SIZE_MAX ? -1.0 : (avail > fixed_bytes ? (avail - fixed_bytes) / 1048576.0 : 0.0),
+                            fp.ring_layers,
+                            fp.prefetch_ahead,
+                            fp.lock_bytes / 1048576.0,
+                            locked / 1048576.0,
+                            stream / 1048576.0,
+                            slot / 1048576.0,
+                            rho,
+                            bw_mib_s,
+                            dense_lock_auto_old / 1048576.0,
+                            dense_lock_candidate_count,
+                            dense_lock_risk_ratio,
+                            dense_expected_stream_saved / 1048576.0,
+                            dense_lock_budget_reason,
+                            dense_lock_reject_reason);
+                    LLAMA_LOG_INFO("%s: memory planner model=dense auto=%d planner_v2=%d memory_max=%.0f MiB "
+                            "memory_current=%.0f MiB floor=%.0f MiB available_for_dynamic=%.0f MiB "
+                            "ring=%d ahead=%d lock=%.0f MiB locked=%.0f MiB "
+                            "stream_per_token=%.0f MiB slot=%.0f MiB rho=%.3f bw=%.1f MiB/s "
+                            "dense_lock_auto_old=%.0f MiB dense_lock_candidate_count=%zu "
+                            "dense_lock_risk_ratio=%.3f dense_expected_stream_saved=%.0f MiB "
+                            "dense_lock_budget_reason=%s dense_lock_reject_reason=%s\n",
+                            __func__,
+                            memory_governor_auto_backends ? 1 : 0,
+                            planner_cgroup.valid ? 1 : 0,
+                            planner_cgroup.valid ? planner_cgroup.max_bytes / 1048576.0 : -1.0,
+                            planner_cgroup.valid ? planner_cgroup.current_bytes / 1048576.0 : -1.0,
+                            fixed_bytes / 1048576.0,
+                            avail == SIZE_MAX ? -1.0 : (avail > fixed_bytes ? (avail - fixed_bytes) / 1048576.0 : 0.0),
+                            fp.ring_layers,
+                            fp.prefetch_ahead,
+                            fp.lock_bytes / 1048576.0,
+                            locked / 1048576.0,
+                            stream / 1048576.0,
+                            slot / 1048576.0,
+                            rho,
+                            bw_mib_s,
+                            dense_lock_auto_old / 1048576.0,
+                            dense_lock_candidate_count,
+                            dense_lock_risk_ratio,
+                            dense_expected_stream_saved / 1048576.0,
+                            dense_lock_budget_reason,
+                            dense_lock_reject_reason);
+                    if (fp.debug_log) {
+                        const double stream_mib = (double) stream / 1048576.0;
+                        const double pred_io_ms =
+                            bw_mib_s > 0.0 ? stream_mib / bw_mib_s * 1000.0 : 0.0;
+                        std::fprintf(stderr,
+                                "%s: flex HMB dense ring=%d ahead=%d lock=%.0f MiB "
+                                "locked=%.0f MiB stream/token=%.0f MiB slot=%.0f MiB "
+                                "rho=%.3f bw=%.1f MiB/s io=%.2f ms compute=%.2f ms "
+                                "(avail=%.0f MiB fixed=%.0f MiB non_layer=%.0f MiB runtime_guard=%.0f MiB kv_reserve=%.0f MiB)\n", __func__,
+                                fp.ring_layers, fp.prefetch_ahead,
+                                fp.lock_bytes / 1048576.0,
+                                locked / 1048576.0,
+                                stream / 1048576.0,
+                                slot / 1048576.0,
+                                rho, bw_mib_s, pred_io_ms, compute_ms,
+                                avail / 1048576.0,
+                                fixed_bytes / 1048576.0,
+                                non_layer / 1048576.0,
+                                runtime_guard / 1048576.0,
+                                kv_reserve / 1048576.0);
+                        LLAMA_LOG_INFO("%s: flex HMB dense ring=%d ahead=%d lock=%.0f MiB "
+                                "locked=%.0f MiB stream/token=%.0f MiB slot=%.0f MiB "
+                                "rho=%.3f bw=%.1f MiB/s io=%.2f ms compute=%.2f ms "
+                                "(avail=%.0f MiB fixed=%.0f MiB non_layer=%.0f MiB runtime_guard=%.0f MiB kv_reserve=%.0f MiB)\n", __func__,
+                                fp.ring_layers, fp.prefetch_ahead,
+                                fp.lock_bytes / 1048576.0,
+                                locked / 1048576.0,
+                                stream / 1048576.0,
+                                slot / 1048576.0,
+                                rho, bw_mib_s, pred_io_ms, compute_ms,
+                                avail / 1048576.0,
+                                fixed_bytes / 1048576.0,
+                                non_layer / 1048576.0,
+                                runtime_guard / 1048576.0,
+                                kv_reserve / 1048576.0);
+                        }
+                }
             }
 
             int ring = fp.ring_layers;
-            if (flex_auto && !fp.sched_auto && !flex_ring_explicit) {
+            if (!fp.planner_applied && flex_auto && !fp.sched_auto && !flex_ring_explicit) {
                 ring = (int) hparams.n_layer;             // default: all resident
             }
-            if (flex_auto && !fp.sched_auto && !flex_ring_explicit &&
+            if (!fp.planner_applied && flex_auto && !fp.sched_auto && !flex_ring_explicit &&
                     avail != SIZE_MAX && avail < non_layer + layer_total + reserve) {
                 const size_t fixed = non_layer + reserve;
                 const size_t room  = avail > fixed ? avail - fixed : 0;

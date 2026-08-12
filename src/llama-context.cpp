@@ -1268,6 +1268,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+        mctx->finish_paged_kv_write(llama_paged_kv_write_action::ROLLBACK_PRE_COMPUTE);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }

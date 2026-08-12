@@ -19,6 +19,8 @@ add_library(${TARGET} STATIC
     server-kv-resume.h
     server-kv-pressure-action.cpp
     server-kv-pressure-action.h
+    server-kv-budget-adapter.cpp
+    server-kv-budget-adapter.h
     server-tools.cpp
     server-tools.h
 )
