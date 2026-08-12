@@ -440,9 +440,11 @@ def normalize_pressure_basis(value: Any) -> dict[str, Any]:
 
 
 def normalize_replay(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict) and "lifecycle" not in value:
+        value = {**value, "lifecycle": None}
     replay = validate_mapping(
         value,
-        {"source", "path", "time_dilation", "n_parallel", "session_ids", "admission_timeout_seconds"},
+        {"source", "path", "time_dilation", "n_parallel", "session_ids", "admission_timeout_seconds", "lifecycle"},
         "workload.replay",
     )
     if replay["source"] not in {"transcript", "fixture"}:
@@ -464,6 +466,38 @@ def normalize_replay(value: Any) -> dict[str, Any]:
         raise RunnerError("workload.replay.session_ids must be null or a unique string array")
     admission_timeout = require_finite_positive(
         replay["admission_timeout_seconds"], "workload.replay.admission_timeout_seconds")
+    raw_lifecycle = replay["lifecycle"]
+    if raw_lifecycle is None or raw_lifecycle is False:
+        lifecycle = {"enabled": False, "drain_after_last_arrival": False}
+    else:
+        if raw_lifecycle is True:
+            raw_lifecycle = {}
+        if not isinstance(raw_lifecycle, dict):
+            raise RunnerError("workload.replay.lifecycle must be null, boolean, or object")
+        unknown = set(raw_lifecycle) - {
+            "enabled", "drain_after_last_arrival", "ttl_seconds",
+            "parent_manifest_path", "parent_manifest_sha256", "trace_identity",
+        }
+        if unknown:
+            raise RunnerError(f"workload.replay.lifecycle schema mismatch extra={sorted(unknown)}")
+        enabled = raw_lifecycle.get("enabled", True)
+        drain = raw_lifecycle.get("drain_after_last_arrival", False)
+        if not isinstance(enabled, bool) or not isinstance(drain, bool):
+            raise RunnerError("workload.replay.lifecycle enabled/drain_after_last_arrival must be boolean")
+        lifecycle = {"enabled": enabled, "drain_after_last_arrival": drain}
+        if "ttl_seconds" in raw_lifecycle:
+            lifecycle["ttl_seconds"] = require_finite_positive(raw_lifecycle["ttl_seconds"], "workload.replay.lifecycle.ttl_seconds")
+        for key in ("parent_manifest_path", "parent_manifest_sha256"):
+            if key in raw_lifecycle and (not isinstance(raw_lifecycle[key], str) or not raw_lifecycle[key]):
+                raise RunnerError(f"workload.replay.lifecycle.{key} must be a non-empty string")
+            if key in raw_lifecycle:
+                lifecycle[key] = raw_lifecycle[key]
+        if "trace_identity" in raw_lifecycle:
+            if not isinstance(raw_lifecycle["trace_identity"], dict):
+                raise RunnerError("workload.replay.lifecycle.trace_identity must be an object")
+            lifecycle["trace_identity"] = dict(raw_lifecycle["trace_identity"])
+    if lifecycle["enabled"] and time_dilation <= 0:
+        raise RunnerError("workload.replay.lifecycle requires time_dilation > 0")
     return {
         "source": replay["source"],
         "path": replay["path"],
@@ -471,19 +505,35 @@ def normalize_replay(value: Any) -> dict[str, Any]:
         "n_parallel": n_parallel,
         "session_ids": session_ids,
         "admission_timeout_seconds": admission_timeout,
+        "lifecycle": lifecycle,
     }
 
 
 def load_replay_plan(replay: dict[str, Any]) -> Any:
+    lifecycle_cfg = replay.get("lifecycle", {"enabled": False})
+    enabled = bool(lifecycle_cfg.get("enabled", False))
     try:
-        return load_replay(
+        plan = load_replay(
             replay["source"], replay["path"],
             n_parallel=replay["n_parallel"],
             time_dilation=replay["time_dilation"],
             selected_session_ids=replay["session_ids"],
+            lifecycle=enabled,
         )
     except (OSError, ReplayError) as exc:
         raise RunnerError(f"replay input is invalid: {exc}") from exc
+    if enabled:
+        source_lifecycle = plan.lifecycle or {}
+        if "ttl_seconds" in lifecycle_cfg and abs(float(lifecycle_cfg["ttl_seconds"]) - float(source_lifecycle["ttl_seconds"])) > 1e-9:
+            raise RunnerError("workload.replay.lifecycle TTL differs from replay source identity")
+        if "parent_manifest_path" in lifecycle_cfg and pathlib.Path(lifecycle_cfg["parent_manifest_path"]).resolve() != pathlib.Path(source_lifecycle.get("parent_manifest_path", "")).resolve():
+            raise RunnerError("workload.replay.lifecycle parent manifest path mismatch")
+        if "parent_manifest_sha256" in lifecycle_cfg and source_lifecycle.get("parent_manifest_sha256") != lifecycle_cfg["parent_manifest_sha256"]:
+            raise RunnerError("workload.replay.lifecycle parent manifest SHA mismatch")
+        expected_identity = lifecycle_cfg.get("trace_identity")
+        if expected_identity is not None and expected_identity != source_lifecycle.get("trace_identity"):
+            raise RunnerError("workload.replay.lifecycle trace identity mismatch")
+    return plan
 
 
 def normalize_workload(value: Any) -> dict[str, Any]:
@@ -821,6 +871,9 @@ def validate_spec(raw: Any) -> tuple[dict[str, Any], dict[str, dict[str, Any]], 
     health_timeout = require_finite_positive(spec["health_timeout_seconds"], "health_timeout_seconds")
     request_timeout = require_finite_positive(spec["request_timeout_seconds"], "request_timeout_seconds")
     workload = normalize_workload(spec["workload"])
+    if ("replay" in workload and workload["replay"].get("lifecycle", {}).get("enabled", False)
+            and any(item == "--slot-save-path" or item.startswith("--slot-save-path=") for item in spec["server_args"])):
+        raise RunnerError("lifecycle replay owns --slot-save-path server option")
     cases = normalize_cases(spec["cases"])
     plan = normalize_plan(spec["run_order"], cases)
     budget_sweep = normalize_budget_sweep(
@@ -1688,11 +1741,13 @@ def request_completion_replay(
         slot_id: int,
         raw_dir: pathlib.Path,
         timeout: float,
+        cache_prompt: bool,
         started_at_ns: int,
 ) -> dict[str, Any]:
     if isinstance(slot_id, bool) or not isinstance(slot_id, int) or slot_id < 0:
         raise RunnerError("replay id_slot must be a non-negative integer")
-    cache_prompt = event["turn"] > 1
+    if not isinstance(cache_prompt, bool):
+        raise RunnerError("replay cache_prompt must be boolean")
     body = {
         "prompt": event["prompt_tokens"],
         "n_predict": event["n_predict"],
@@ -1830,6 +1885,494 @@ def validate_replay_slot_capacity(
                 f"required={max_required}")
 
 
+def validate_replay_erased_slot_snapshot(snapshot: dict[str, Any], slot_id: int) -> dict[str, Any]:
+    if snapshot.get("error") is not None or snapshot.get("http_status") != 200:
+        raise RunnerError("post-erase /slots verification failed")
+    slots = snapshot.get("body_json")
+    if not isinstance(slots, list):
+        raise RunnerError("post-erase /slots body is unavailable")
+    matches = [slot for slot in slots if isinstance(slot, dict) and slot.get("id") == slot_id]
+    if len(matches) != 1:
+        raise RunnerError("post-erase /slots slot identity is missing or duplicated")
+    slot = matches[0]
+    if slot.get("is_processing") is not False:
+        raise RunnerError("post-erase slot is still processing")
+    n_prompt_tokens = slot.get("n_prompt_tokens")
+    if isinstance(n_prompt_tokens, bool) or not isinstance(n_prompt_tokens, int) or n_prompt_tokens != 0:
+        raise RunnerError("post-erase slot prompt was not cleared")
+    claimant = slot.get("kv_claimant")
+    required = {"target_blocks", "eligible_resident_blocks", "swapped_blocks", "shared_blocks", "blocked_blocks"}
+    if not isinstance(claimant, dict) or not required.issubset(claimant):
+        raise RunnerError("post-erase KV claimant evidence is missing")
+    counts: dict[str, int] = {}
+    for key in sorted(required):
+        value = claimant.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value != 0:
+            raise RunnerError(f"post-erase KV claimant {key} was not cleared")
+        counts[key] = value
+    return {"slot_id": slot_id, "n_prompt_tokens": n_prompt_tokens, "claimant_counts": counts}
+
+
+def validate_replay_erase_response(
+        status: int, body: bytes, error: str | None, slot_id: int) -> dict[str, Any]:
+    parsed: Any = None
+    try:
+        parsed = json.loads(body.decode("utf-8")) if body else None
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        parsed = None
+    if error is not None or status != 200 or not isinstance(parsed, dict):
+        raise RunnerError(
+            f"replay erase failed slot={slot_id} status={status} error={error or 'invalid JSON'}")
+    if set(parsed) != {"id_slot", "n_erased"} or parsed.get("id_slot") != slot_id:
+        raise RunnerError("replay erase response identity/schema mismatch")
+    n_erased = parsed.get("n_erased")
+    if isinstance(n_erased, bool) or not isinstance(n_erased, int) or n_erased <= 0:
+        raise RunnerError("replay erase n_erased must prove a non-empty prompt was cleared")
+    return {"id_slot": parsed["id_slot"], "n_erased": n_erased, "body": parsed}
+
+
+def replay_arrival_precedes_expiry(arrival_us: int, expiry_us: int) -> bool:
+    return arrival_us < expiry_us
+
+
+def erase_replay_slot(port: int, slot_id: int, timeout: float) -> dict[str, Any]:
+    if isinstance(slot_id, bool) or not isinstance(slot_id, int) or slot_id < 0:
+        raise RunnerError("replay erase slot is invalid")
+    body = b""
+    status = 0
+    error: str | None = None
+    try:
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+        connection.request("POST", f"/slots/{slot_id}?action=erase", body, {"Content-Length": "0"})
+        response = connection.getresponse()
+        status = int(response.status)
+        body = response.read()
+        connection.close()
+    except (OSError, http.client.HTTPException) as exc:
+        error = str(exc)
+    validated = validate_replay_erase_response(status, body, error, slot_id)
+    return {"http_status": status, "body_sha256": sha256_bytes(body), **validated}
+
+
+def lifecycle_event(
+        event_type: str, *, session: dict[str, Any], turn: int, binding: dict[str, Any] | None,
+        runner_generation: int | None, lifecycle_generation: int, arrival_us: int | None = None,
+        completion_us: int | None = None, expiry_us: int | None = None, request_id: str | None = None,
+        trigger: str | None = None, **extra: Any) -> dict[str, Any]:
+    result = {
+        "event": event_type,
+        "logical_session_id": session["logical_session_id"],
+        "lineage_id": session["lineage_id"],
+        "turn": turn,
+        "slot_id": binding.get("slot_id") if binding else None,
+        "seq_id": binding.get("seq_id") if binding else None,
+        "runner_generation": runner_generation,
+        "lifecycle_generation": lifecycle_generation,
+        "arrival_us": arrival_us,
+        "completion_us": completion_us,
+        "expiry_us": expiry_us,
+        "request_id": request_id,
+        "trigger": trigger,
+    }
+    result.update(extra)
+    return result
+
+def run_one_replay_lifecycle(
+        artifact: pathlib.Path,
+        run: dict[str, Any],
+        case: dict[str, Any],
+        spec: dict[str, Any],
+        workload: dict[str, Any],
+        execution_index: int,
+        replay_plan: Any,
+        schedule: list[dict[str, Any]],
+) -> dict[str, Any]:
+    run_dir = artifact / "runs" / run["run_id"]
+    raw_dir = run_dir / "raw"
+    backing_dir = run_dir / "backing"
+    slot_save_dir = run_dir / "slot-cache"
+    raw_dir.mkdir(parents=True)
+    backing_dir.mkdir()
+    slot_save_dir.mkdir()
+    replay_cfg = workload["replay"]
+    lifecycle_cfg = replay_cfg["lifecycle"]
+    ttl_runtime_us = int(round(float(replay_plan.lifecycle["ttl_seconds"]) * replay_cfg["time_dilation"] * 1_000_000))
+    if ttl_runtime_us <= 0:
+        raise RunnerError("lifecycle runtime TTL is not positive")
+    dump(run_dir / "run.json", {
+        "run_id": run["run_id"], "round": run["round"], "run_order": run["run_order"],
+        "case_id": run["case_id"], "execution_index": execution_index, "case": run,
+        "request_plan": schedule, "replay": replay_plan.to_dict(),
+    })
+    port = free_port()
+    env = runtime_environment(spec, case, backing_dir)
+    argv = [*server_argv(spec, port), "--slot-save-path", str(slot_save_dir)]
+    stdout_path, stderr_path = run_dir / "server.stdout", run_dir / "server.stderr"
+    sampler_stdout_path, sampler_stderr_path = run_dir / "sampler.stdout", run_dir / "sampler.stderr"
+    samples_path, responses_path = run_dir / "memory_samples.tsv", run_dir / "responses.jsonl"
+    lifecycle_path = run_dir / "lifecycle.jsonl"
+    server: subprocess.Popen[bytes] | None = None
+    sampler: subprocess.Popen[bytes] | None = None
+    server_identity_record: dict[str, Any] | None = None
+    sampler_identity_record: dict[str, Any] | None = None
+    server_cgroup: dict[str, Any] | None = None
+    runner_cgroup = cgroup_identity(os.getpid())
+    request_records: list[dict[str, Any]] = []
+    admission_records: list[dict[str, Any]] = []
+    lifecycle_records: list[dict[str, Any]] = []
+    lifecycle_error: str | None = None
+    server_cleanup = {"pid": None, "pgid": None, "exit_code": None, "stop_requested": False,
+                       "stop_signal": None, "term_timed_out": False, "kill_timed_out": False,
+                       "pgid_check_complete": False, "residual_process": False}
+    sampler_cleanup = dict(server_cleanup)
+    handles: list[Any] = []
+    started_at_ns = time.monotonic_ns()
+    request_loop_started = False
+    admission = __import__("multi_session_replay", fromlist=["SlotAdmission"]).SlotAdmission(replay_cfg["n_parallel"])
+    sessions = {
+        session.logical_session_id: {
+            "logical_session_id": session.logical_session_id,
+            "lineage_id": session.lineage_id,
+            "state": "ABSENT", "lifecycle_generation": 0, "next_turn": 1,
+            "binding": None, "timer": None,
+        }
+        for session in replay_plan.sessions
+    }
+
+    def clock_us() -> int:
+        return (time.monotonic_ns() - started_at_ns) // 1000
+
+    def emit(record: dict[str, Any]) -> None:
+        lifecycle_records.append(record)
+
+    def timer_due(now_us: int, *, force: bool = False) -> bool:
+        for session in sessions.values():
+            timer = session["timer"]
+            if timer is not None and (force or timer["expiry_us"] <= now_us):
+                return True
+        return False
+
+    def expire_due(now_us: int, *, force: bool = False) -> bool:
+        for session in sorted(sessions.values(), key=lambda item: (item["timer"]["expiry_us"], item["logical_session_id"]) if item["timer"] else (10**30, item["logical_session_id"])):
+            timer = session["timer"]
+            if timer is None or (not force and timer["expiry_us"] > now_us):
+                continue
+            if session["state"] != "IDLE_TTL" or session["binding"] is None or session["lifecycle_generation"] != timer["lifecycle_generation"]:
+                session["timer"] = None
+                continue
+            binding = dict(session["binding"])
+            emit(lifecycle_event("TTL_EXPIRY", session=session, turn=timer["turn"], binding=binding,
+                                 runner_generation=binding["runner_generation"],
+                                 lifecycle_generation=session["lifecycle_generation"],
+                                 completion_us=timer["armed_at_us"], expiry_us=timer["expiry_us"],
+                                 trigger="ttl_timer", timer_id=timer["timer_id"]))
+            erase = erase_replay_slot(port, binding["slot_id"], spec["request_timeout_seconds"])
+            verify_name = f"slots_after_erase_{timer['timer_id']:06d}.json"
+            verify_snapshot = capture_slots(port, run_dir / verify_name, spec["request_timeout_seconds"])
+            validate_replay_erased_slot_snapshot(verify_snapshot, binding["slot_id"])
+            released = admission.release(session["logical_session_id"], now_us)
+            session["binding"] = None
+            session["timer"] = None
+            session["state"] = "DEAD"
+            emit(lifecycle_event("DEAD", session=session, turn=timer["turn"], binding=binding,
+                                 runner_generation=binding["runner_generation"],
+                                 lifecycle_generation=session["lifecycle_generation"],
+                                 completion_us=timer["armed_at_us"], expiry_us=timer["expiry_us"],
+                                 trigger="ttl_timer", timer_id=timer["timer_id"],
+                                 erase_http_status=erase["http_status"], erase_body_sha256=erase["body_sha256"],
+                                 erase_id_slot=erase["id_slot"], erase_n_erased=erase["n_erased"],
+                                 erase_verify_path=verify_name, erase_verify_body_sha256=verify_snapshot["body_sha256"],
+                                 released_us=now_us, release_status=released["status"]))
+            return True
+        return False
+
+    try:
+        server_handle = stdout_path.open("wb"); handles.append(server_handle)
+        server_err_handle = stderr_path.open("wb"); handles.append(server_err_handle)
+        server = subprocess.Popen(argv, cwd=run_dir, env=env, stdout=server_handle,
+                                  stderr=server_err_handle, start_new_session=True)
+        server_identity_record = process_identity(server.pid, argv)
+        server_cgroup = cgroup_scope(cgroup_identity(server.pid), runner_cgroup)
+        expected_memory_max = spec["cgroup"]["expected_memory_max"]
+        if expected_memory_max is not None and server_cgroup.get("memory_max") != expected_memory_max:
+            raise RunnerError("server cgroup memory.max mismatch")
+        if spec["pressure_basis"]["authority"] == "cgroup_finite" and not finite_memory_limit(server_cgroup.get("memory_max")):
+            raise RunnerError("server cgroup does not provide a finite pressure authority")
+        current_file = server_cgroup.get("memory_current_file") or ""
+        sampler_env = dict(os.environ)
+        sampler_env["KV_CONTROLLED_SAMPLE_SCHEMA"] = SAMPLE_SCHEMA
+        sampler_env["KV_CONTROLLED_CGROUP_DIR"] = server_cgroup.get("path") or ""
+        sampler_command = ["bash", str(MEMORY_SAMPLER), "--sample-process", str(server.pid),
+                           str(samples_path), str(backing_dir), str(spec["sampler"]["interval_seconds"]), current_file]
+        sampler_stdout_handle = sampler_stdout_path.open("wb"); handles.append(sampler_stdout_handle)
+        sampler_stderr_handle = sampler_stderr_path.open("wb"); handles.append(sampler_stderr_handle)
+        sampler = subprocess.Popen(sampler_command, cwd=run_dir, env=sampler_env,
+                                   stdout=sampler_stdout_handle, stderr=sampler_stderr_handle,
+                                   start_new_session=True)
+        sampler_identity_record = process_identity(sampler.pid, sampler_command)
+        wait_health(port, server, spec["health_timeout_seconds"])
+        slots_before = capture_slots(port, run_dir / "slots_before.json", spec["request_timeout_seconds"])
+        validate_replay_slot_capacity(slots_before, replay_plan, replay_cfg["n_parallel"])
+        started_at_ns = time.monotonic_ns()
+        request_loop_started = True
+        pending = list(schedule)
+        inflight: dict[Any, dict[str, Any]] = {}
+        inflight_sessions: set[str] = set()
+        queued_recorded: set[str] = set()
+        pre_registered_revisits: dict[int, dict[str, Any]] = {}
+        dispatch_count = 0
+        blocked_since: float | None = None
+        timer_sequence = 0
+        with ThreadPoolExecutor(max_workers=replay_cfg["n_parallel"]) as executor:
+            while pending or inflight or (lifecycle_cfg["drain_after_last_arrival"] and any(item["binding"] is not None for item in sessions.values())):
+                progressed = False
+                done = [future for future in inflight if future.done()]
+                for future in sorted(done, key=lambda item: inflight[item]["dispatch_order"]):
+                    meta = inflight.pop(future)
+                    first = meta["event"]
+                    sid = first["logical_session_id"]
+                    session = sessions[sid]
+                    try:
+                        actual = future.result()
+                    except Exception as exc:
+                        raise RunnerError(f"replay request failed for {first['request_id']}: {exc}") from exc
+                    actual.update({
+                        "dispatch_order": meta["dispatch_order"],
+                        "admitted_us": meta["admitted_us"],
+                        "dispatched_us": actual["started_us"],
+                        "planned_arrival_us": first["planned_arrival_us"],
+                        "arrival_lag_us": max(0, actual["started_us"] - first["planned_arrival_us"]),
+                        "admission_wait_us": max(0, meta["admitted_us"] - first["planned_arrival_us"]),
+                        "service_us": actual["completed_us"] - actual["started_us"],
+                        "runner_generation": meta["binding"]["runner_generation"],
+                        "lifecycle_trigger": meta["trigger"],
+                        "lifecycle_generation": session["lifecycle_generation"],
+                    })
+                    request_records.append(actual)
+                    inflight_sessions.remove(sid)
+                    session["next_turn"] += 1
+                    emit(lifecycle_event("TURN_COMPLETE", session=session, turn=first["turn"], binding=meta["binding"],
+                                         runner_generation=meta["binding"]["runner_generation"],
+                                         lifecycle_generation=session["lifecycle_generation"],
+                                         arrival_us=meta["arrival_us"], completion_us=actual["completed_us"],
+                                         request_id=first["request_id"], trigger=meta["trigger"]))
+                    continuation_arrived = any(
+                        item["logical_session_id"] == sid and item["turn"] == session["next_turn"]
+                        and item["planned_arrival_us"] <= actual["completed_us"] for item in pending)
+                    if continuation_arrived:
+                        session["state"] = "ACTIVE"
+                    else:
+                        timer_sequence += 1
+                        expiry = actual["completed_us"] + ttl_runtime_us
+                        timer = {"timer_id": timer_sequence, "armed_at_us": actual["completed_us"],
+                                 "expiry_us": expiry, "turn": first["turn"],
+                                 "runner_generation": meta["binding"]["runner_generation"],
+                                 "lifecycle_generation": session["lifecycle_generation"]}
+                        session["timer"] = timer
+                        session["state"] = "IDLE_TTL"
+                        emit(lifecycle_event("TTL_ARM", session=session, turn=first["turn"], binding=meta["binding"],
+                                             runner_generation=meta["binding"]["runner_generation"],
+                                             lifecycle_generation=session["lifecycle_generation"],
+                                             completion_us=actual["completed_us"], expiry_us=expiry,
+                                             request_id=first["request_id"], trigger="completion", timer_id=timer_sequence))
+                    progressed = True
+
+                now_us = clock_us()
+                # Arrival wins only when the frozen runtime arrival is strictly before expiry.
+                # Register the revisit before consulting wall-clock timer expiry so scheduler
+                # jitter cannot turn a pre-expiry trace arrival into a false DEAD transition.
+                for first in sorted(
+                        (item for item in pending if item["planned_arrival_us"] <= now_us),
+                        key=lambda item: (item["planned_arrival_us"], item["event_seq"])):
+                    sid = first["logical_session_id"]
+                    session = sessions[sid]
+                    timer = session["timer"]
+                    if (session["state"] != "IDLE_TTL" or timer is None
+                            or first["turn"] != session["next_turn"]
+                            or first["event_seq"] in pre_registered_revisits):
+                        continue
+                    if not replay_arrival_precedes_expiry(
+                            first["planned_arrival_us"], timer["expiry_us"]):
+                        continue
+                    emit(lifecycle_event(
+                        "REVISIT", session=session, turn=first["turn"], binding=session["binding"],
+                        runner_generation=session["binding"]["runner_generation"],
+                        lifecycle_generation=session["lifecycle_generation"],
+                        arrival_us=first["planned_arrival_us"], expiry_us=timer["expiry_us"],
+                        request_id=first["request_id"], trigger="arrival", timer_id=timer["timer_id"],
+                        observed_us=now_us))
+                    pre_registered_revisits[first["event_seq"]] = timer
+                    session["timer"] = None
+                    session["state"] = "ACTIVE"
+                if expire_due(now_us):
+                    progressed = True
+                    continue
+                ready = [item for item in pending if item["planned_arrival_us"] <= now_us]
+                for first in ready:
+                    if len(inflight) >= replay_cfg["n_parallel"]:
+                        break
+                    sid = first["logical_session_id"]
+                    session = sessions[sid]
+                    if sid in inflight_sessions:
+                        continue
+                    if first["turn"] != session["next_turn"]:
+                        raise ReplayError(f"session {sid} turn order is not contiguous")
+                    trigger = "CONTINUATION"
+                    cache_prompt = True
+                    needs_admission = False
+                    registered_revisit = pre_registered_revisits.pop(first["event_seq"], None)
+                    if registered_revisit is not None:
+                        trigger = "REVISIT"
+                    elif session["state"] == "ABSENT":
+                        trigger = "COLD_START"
+                        cache_prompt = False
+                        needs_admission = True
+                    elif session["state"] == "DEAD":
+                        trigger = "COLD_RESTART"
+                        cache_prompt = False
+                        needs_admission = True
+                    elif session["state"] == "IDLE_TTL":
+                        timer = session["timer"]
+                        if timer is None or not replay_arrival_precedes_expiry(
+                                first["planned_arrival_us"], timer["expiry_us"]):
+                            continue
+                        session["timer"] = None
+                        session["state"] = "ACTIVE"
+                        trigger = "REVISIT"
+                        cache_prompt = True
+                        emit(lifecycle_event("REVISIT", session=session, turn=first["turn"], binding=session["binding"],
+                                             runner_generation=session["binding"]["runner_generation"],
+                                             lifecycle_generation=session["lifecycle_generation"],
+                                             arrival_us=first["planned_arrival_us"], expiry_us=timer["expiry_us"],
+                                             request_id=first["request_id"], trigger="arrival", timer_id=timer["timer_id"],
+                                             observed_us=now_us))
+                    elif session["state"] != "ACTIVE":
+                        raise ReplayError(f"session {sid} lifecycle state is invalid")
+                    if needs_admission:
+                        decision = admission.admit(sid, now_us)
+                        if decision["status"] != "admitted":
+                            continue
+                        session["binding"] = {"slot_id": decision["slot_id"], "seq_id": decision["seq_id"],
+                                              "runner_generation": decision["runner_generation"]}
+                        if trigger == "COLD_START":
+                            session["lifecycle_generation"] = 1
+                        elif trigger == "COLD_RESTART":
+                            session["lifecycle_generation"] += 1
+                        admission_records.append({**first, **decision, "observed_us": now_us})
+                        queued_recorded.discard(sid)
+                    binding = dict(session["binding"])
+                    pending.remove(first)
+                    inflight_sessions.add(sid)
+                    dispatch_order = dispatch_count
+                    dispatch_count += 1
+                    if trigger == "COLD_RESTART":
+                        emit(lifecycle_event("COLD_RESTART", session=session, turn=first["turn"], binding=binding,
+                                             runner_generation=binding["runner_generation"],
+                                             lifecycle_generation=session["lifecycle_generation"], arrival_us=first["planned_arrival_us"],
+                                             request_id=first["request_id"], trigger="arrival", observed_us=now_us))
+                    emit(lifecycle_event("TURN_START", session=session, turn=first["turn"], binding=binding,
+                                         runner_generation=binding["runner_generation"],
+                                         lifecycle_generation=session["lifecycle_generation"], arrival_us=first["planned_arrival_us"],
+                                         request_id=first["request_id"], trigger=trigger, observed_us=now_us))
+                    future = executor.submit(request_completion_replay, port, first, binding["slot_id"], raw_dir,
+                                             spec["request_timeout_seconds"], cache_prompt, started_at_ns)
+                    inflight[future] = {"event": first, "binding": binding, "dispatch_order": dispatch_order,
+                                       "admitted_us": max(first["planned_arrival_us"], now_us),
+                                       "arrival_us": first["planned_arrival_us"], "trigger": trigger}
+                    session["state"] = "ACTIVE"
+                    progressed = True
+                if progressed:
+                    blocked_since = None
+                    continue
+                now_us = clock_us()
+                if expire_due(now_us):
+                    continue
+                if inflight:
+                    next_arrival = min((item["planned_arrival_us"] for item in pending), default=None)
+                    next_timer = min((item["timer"]["expiry_us"] for item in sessions.values() if item["timer"]), default=None)
+                    wake = min(value for value in (next_arrival, next_timer) if value is not None) if (next_arrival is not None or next_timer is not None) else None
+                    timeout = None if wake is None or wake <= now_us else (wake - now_us) / 1_000_000.0
+                    wait(list(inflight), timeout=timeout, return_when=FIRST_COMPLETED)
+                    continue
+                if not pending and lifecycle_cfg["drain_after_last_arrival"]:
+                    timers = [item["timer"]["expiry_us"] for item in sessions.values() if item["timer"]]
+                    if timers:
+                        time.sleep(max(0.0, (min(timers) - now_us) / 1_000_000.0))
+                        continue
+                    break
+                next_arrival = min((item["planned_arrival_us"] for item in pending), default=None)
+                next_timer = min((item["timer"]["expiry_us"] for item in sessions.values() if item["timer"]), default=None)
+                if next_arrival is not None or next_timer is not None:
+                    wake = min(value for value in (next_arrival, next_timer) if value is not None)
+                    if wake > now_us:
+                        time.sleep((wake - now_us) / 1_000_000.0)
+                        continue
+                if blocked_since is None:
+                    blocked_since = time.monotonic()
+                if time.monotonic() - blocked_since >= replay_cfg["admission_timeout_seconds"]:
+                    raise RunnerError("replay admission queue cannot drain without lifecycle release")
+                time.sleep(0.01)
+        request_records.sort(key=lambda item: item["dispatch_order"])
+        with responses_path.open("w", encoding="utf-8") as responses:
+            for actual in request_records:
+                responses.write(json.dumps(actual, ensure_ascii=False, sort_keys=True) + "\n")
+        with lifecycle_path.open("w", encoding="utf-8") as journal:
+            for event in lifecycle_records:
+                journal.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+        capture_slots(port, run_dir / "slots_after.json", spec["request_timeout_seconds"])
+    except (OSError, RunnerError, ReplayError, subprocess.SubprocessError) as exc:
+        lifecycle_error = str(exc)
+    finally:
+        with lifecycle_path.open("w", encoding="utf-8") as journal:
+            for event in lifecycle_records:
+                journal.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+        if sampler is not None:
+            sampler_cleanup = terminate_process(sampler, "sampler", 5.0)
+        if server is not None:
+            server_cleanup = terminate_process(server, "server", 10.0)
+        for handle in handles:
+            handle.close()
+    cleanup = {"server": server_cleanup, "sampler": sampler_cleanup,
+               "residual_process": bool(server_cleanup["residual_process"] or sampler_cleanup["residual_process"]),
+               "cleanup_complete": lifecycle_error is None and server_cleanup["exit_code"] == 0
+               and sampler_cleanup["exit_code"] == 0 and not (server_cleanup["residual_process"] or sampler_cleanup["residual_process"])}
+    dump(run_dir / "cleanup.json", cleanup)
+    fidelity = check_fidelity(replay_plan, request_records, n_parallel=replay_cfg["n_parallel"])
+    lifecycle_status = "PASS" if lifecycle_error is None else "FAIL"
+    fidelity["lifecycle"] = {"status": lifecycle_status, "errors": [] if lifecycle_error is None else [lifecycle_error]}
+    replay_record = {"plan": replay_plan.to_dict(), "schedule": schedule,
+                     "admission": admission_records, "events": request_records,
+                     "lifecycle": lifecycle_records, "workload_fidelity": fidelity}
+    dump(run_dir / "replay.json", replay_record)
+    execution = {
+        "run_id": run["run_id"], "round": run["round"], "run_order": run["run_order"],
+        "case_id": run["case_id"], "execution_index": execution_index, "run_mode": spec["run_mode"],
+        "argv": argv, "environment": env, "server_identity": server_identity_record,
+        "server_cgroup": server_cgroup, "pressure_basis": dict(spec["pressure_basis"]),
+        "sampler_identity": sampler_identity_record, "sampler_schema": SAMPLE_SCHEMA,
+        "sampler_argv": ["bash", str(MEMORY_SAMPLER), "--sample-process",
+                         str(server_identity_record["pid"]) if server_identity_record else "NOT_STARTED",
+                         str(samples_path), str(backing_dir), str(spec["sampler"]["interval_seconds"]),
+                         str(server_cgroup.get("memory_current_file", "")) if server_cgroup else ""],
+        "request_loop_started": request_loop_started, "request_count": len(request_records),
+        "qualification": {"idle_seconds": None, "offload_timeout_seconds": None, "resume_request_id": None,
+                          "idle": None, "offload_barrier": None, "resume": None},
+        "characterization": {"idle_seconds": None, "settle_timeout_seconds": None, "target_tolerance_bytes": None,
+                             "resume_request_id": None, "requested_target_bytes": None, "action_target_bytes": None,
+                             "after_fill": None, "idle": None, "settle": None, "release_settled": None,
+                             "settled": None, "resume": None, "after_measurement": None},
+        "replay": replay_record, "lifecycle": {"enabled": True, "ttl_runtime_us": ttl_runtime_us,
+                                                   "slot_save_path": str(slot_save_dir)},
+    }
+    dump(run_dir / "execution.json", execution)
+    if not responses_path.exists():
+        responses_path.write_text("", encoding="utf-8")
+    complete = cleanup["cleanup_complete"] and lifecycle_error is None and fidelity["status"] == "PASS" and lifecycle_status == "PASS"
+    return {"run_id": run["run_id"], "case_id": run["case_id"], "round": run["round"],
+            "run_order": run["run_order"], "execution_index": execution_index,
+            "directory": str(run_dir.relative_to(artifact)), "status": "complete" if complete else "incomplete",
+            "error": lifecycle_error or (None if fidelity["status"] == "PASS" else "workload fidelity failed")}
+
 def run_one_replay(
         artifact: pathlib.Path,
         run: dict[str, Any],
@@ -1838,6 +2381,11 @@ def run_one_replay(
         workload: dict[str, Any],
         execution_index: int,
 ) -> dict[str, Any]:
+    replay_cfg = workload["replay"]
+    replay_plan = load_replay_plan(replay_cfg)
+    schedule = expand_schedule(replay_plan)
+    if replay_cfg.get("lifecycle", {}).get("enabled", False):
+        return run_one_replay_lifecycle(artifact, run, case, spec, workload, execution_index, replay_plan, schedule)
     run_dir = artifact / "runs" / run["run_id"]
     raw_dir = run_dir / "raw"
     backing_dir = run_dir / "backing"
@@ -2023,6 +2571,7 @@ def run_one_replay(
                         binding["slot_id"],
                         raw_dir,
                         spec["request_timeout_seconds"],
+                        first["turn"] > 1,
                         started_at_ns,
                     )
                     inflight[future] = {

@@ -2574,5 +2574,251 @@ class CanonicalBenchmarkTest(unittest.TestCase):
         self.assertEqual(tampered_result["verdict"], "INVALID_ARTIFACT")
 
 
+class LifecycleReplayIntegrationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.helper = CanonicalBenchmarkTest("runTest")
+        self.helper.setUp()
+        self.root = self.helper.root
+        self.fake_server = self.helper.fake_server
+        self.fake_server.write_text(textwrap.dedent("""
+            #!/usr/bin/env python3
+            import argparse, json, os, signal, sys
+            from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+            parser = argparse.ArgumentParser(add_help=False)
+            parser.add_argument('--port', type=int, required=True)
+            parser.add_argument('--host', default='127.0.0.1')
+            parser.add_argument('--slot-save-path', required=True)
+            args, _ = parser.parse_known_args()
+            if not os.path.isdir(args.slot_save_path):
+                raise SystemExit('slot-save-path is not a directory')
+            erase_log = os.environ.get('ERASE_LOG')
+            erase_no_clear = os.environ.get('ERASE_NO_CLEAR') == '1'
+            slot_tokens = {0: 0, 1: 0}
+
+            def slot_record(slot):
+                n_tokens = slot_tokens[slot]
+                return {
+                    'id': slot, 'n_ctx': 1024, 'is_processing': False,
+                    'n_prompt_tokens': n_tokens,
+                    'kv_claimant': {
+                        'epoch': 1, 'exhausted': False, 'valid': True,
+                        'target_blocks': 1 if n_tokens else 0,
+                        'eligible_resident_blocks': 1 if n_tokens else 0,
+                        'swapped_blocks': 0, 'shared_blocks': 0, 'blocked_blocks': 0,
+                    },
+                }
+
+            def stop(_signum, _frame):
+                raise SystemExit(0)
+
+            signal.signal(signal.SIGTERM, stop)
+
+            class Handler(BaseHTTPRequestHandler):
+                def log_message(self, *_args):
+                    pass
+
+                def do_GET(self):
+                    if self.path == '/health':
+                        body = b'{"status":"ok"}'
+                    elif self.path == '/slots':
+                        body = json.dumps([slot_record(0), slot_record(1)]).encode()
+                    else:
+                        self.send_response(404); self.end_headers(); return
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Content-Length', str(len(body)))
+                    self.end_headers(); self.wfile.write(body)
+
+                def do_POST(self):
+                    length = int(self.headers.get('Content-Length', '0'))
+                    raw = self.rfile.read(length)
+                    if self.path.startswith('/slots/') and self.path.endswith('?action=erase'):
+                        slot = int(self.path.split('/')[2].split('?')[0])
+                        if erase_log:
+                            with open(erase_log, 'a', encoding='utf-8') as stream:
+                                stream.write(json.dumps({'path': self.path, 'slot': slot}) + '\\n')
+                        n_erased = slot_tokens[slot]
+                        if not erase_no_clear:
+                            slot_tokens[slot] = 0
+                        payload = {'id_slot': slot, 'n_erased': n_erased}
+                    elif self.path == '/completion':
+                        request = json.loads(raw.decode('utf-8'))
+                        prompt = request.get('prompt', [])
+                        n_predict = int(request.get('n_predict', 0))
+                        slot = int(request['id_slot'])
+                        slot_tokens[slot] = len(prompt) + n_predict
+                        payload = {
+                            'id_slot': slot,
+                            'tokens': list(range(n_predict)),
+                            'tokens_evaluated': len(prompt),
+                            'tokens_predicted': n_predict,
+                        }
+                    else:
+                        self.send_response(404); self.end_headers(); return
+                    body = json.dumps(payload, separators=(',', ':')).encode()
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Content-Length', str(len(body)))
+                    self.end_headers(); self.wfile.write(body)
+
+            ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
+        """).strip() + "\n", encoding="utf-8")
+        self.fake_server.chmod(self.fake_server.stat().st_mode | stat.S_IXUSR)
+
+    def tearDown(self) -> None:
+        self.helper.tearDown()
+
+    def test_completion_driven_revisit_expiry_dead_and_restart(self) -> None:
+        fixture = self.root / 'lifecycle-fixture.json'
+        fixture.write_text(json.dumps({
+            'schema': 'generic-replay/v1',
+            'ttl_seconds': 0.05,
+            'sessions': [
+                {
+                    'logical_session_id': 'A', 'lineage_id': 1,
+                    'turns': [
+                        {'turn': 1, 'timestamp': 0, 'prompt_tokens': [1], 'n_predict': 1},
+                        {'turn': 2, 'timestamp': 10000, 'prompt_tokens': [1, 2], 'n_predict': 1},
+                        {'turn': 3, 'timestamp': 100000, 'prompt_tokens': [1, 2, 3], 'n_predict': 1},
+                    ],
+                },
+                {
+                    'logical_session_id': 'B', 'lineage_id': 2,
+                    'turns': [
+                        {'turn': 1, 'timestamp': 0, 'prompt_tokens': [4], 'n_predict': 1},
+                        {'turn': 2, 'timestamp': 0, 'prompt_tokens': [4, 5], 'n_predict': 1},
+                    ],
+                },
+                {
+                    'logical_session_id': 'C', 'lineage_id': 3,
+                    'turns': [
+                        {'turn': 1, 'timestamp': 20000, 'prompt_tokens': [6], 'n_predict': 1},
+                    ],
+                },
+            ],
+        }), encoding='utf-8')
+        erase_log = self.root / 'erase.jsonl'
+        value = self.helper.spec()
+        value['environment']['ERASE_LOG'] = str(erase_log)
+        value['workload'] = {
+            'warmup': [], 'requests': [], 'repeat': 1,
+            'qualification': None, 'characterization': None,
+            'replay': {
+                'source': 'fixture', 'path': str(fixture), 'time_dilation': 1.0,
+                'n_parallel': 2, 'session_ids': None,
+                'admission_timeout_seconds': 2.0,
+                'lifecycle': {'enabled': True, 'drain_after_last_arrival': True},
+            },
+        }
+        spec = self.helper.write_spec(value, 'lifecycle.json')
+        artifact = self.root / 'lifecycle-artifact'
+        runner = self.helper.run_runner(spec, artifact)
+        self.assertEqual(runner.returncode, 0, runner.stderr)
+        parsed = self.helper.run_parser(artifact)
+        self.assertEqual(parsed.returncode, 0, parsed.stderr)
+        result = json.loads((artifact / 'result.json').read_text(encoding='utf-8'))
+        self.assertEqual(result['verdict'], 'QUALIFICATION_PASS')
+        replay = json.loads(next(artifact.glob('runs/*/replay.json')).read_text(encoding='utf-8'))
+        events = replay['lifecycle']
+        self.assertTrue(any(item.get('event') == 'REVISIT' for item in events))
+        self.assertTrue(any(item.get('event') == 'TTL_EXPIRY' for item in events))
+        self.assertTrue(any(item.get('event') == 'DEAD' for item in events))
+        self.assertTrue(any(item.get('event') == 'TURN_START' and item.get('trigger') == 'COLD_RESTART' for item in events))
+        self.assertTrue(any(item.get('event') == 'TURN_START' and item.get('trigger') == 'CONTINUATION' and item.get('logical_session_id') == 'B' for item in events))
+        self.assertGreater(next(item for item in replay['events'] if item.get('logical_session_id') == 'C')['admission_wait_us'], 0)
+        erase_rows = erase_log.read_text(encoding='utf-8').splitlines()
+        self.assertGreaterEqual(len(erase_rows), 2)
+        execution = json.loads(next(artifact.glob('runs/*/execution.json')).read_text(encoding='utf-8'))
+        self.assertIn('--slot-save-path', execution['argv'])
+        slot_save_path = pathlib.Path(execution['argv'][execution['argv'].index('--slot-save-path') + 1])
+        self.assertTrue(slot_save_path.is_dir())
+        erase_snapshots = list(next(artifact.glob('runs/*')).glob('slots_after_erase_*.json'))
+        self.assertGreaterEqual(len(erase_snapshots), 2)
+        for snapshot_path in erase_snapshots:
+            snapshot = json.loads(snapshot_path.read_text(encoding='utf-8'))
+            slot_id = next(
+                item['erase_id_slot'] for item in events
+                if item.get('event') == 'DEAD' and item.get('erase_verify_path') == snapshot_path.name)
+            load_runner_module().validate_replay_erased_slot_snapshot(snapshot, slot_id)
+
+    def test_lifecycle_expiry_tie_and_erase_response_are_fail_closed(self) -> None:
+        runner_module = load_runner_module()
+        self.assertTrue(runner_module.replay_arrival_precedes_expiry(99, 100))
+        self.assertFalse(runner_module.replay_arrival_precedes_expiry(100, 100))
+        self.assertFalse(runner_module.replay_arrival_precedes_expiry(101, 100))
+        good = b'{"id_slot":0,"n_erased":3}'
+        self.assertEqual(3, runner_module.validate_replay_erase_response(200, good, None, 0)['n_erased'])
+        bad_cases = [
+            (500, good, None, 0),
+            (200, b'not-json', None, 0),
+            (200, b'{"id_slot":1,"n_erased":3}', None, 0),
+            (200, b'{"id_slot":0,"n_erased":3,"extra":1}', None, 0),
+            (200, b'{"id_slot":0,"n_erased":0}', None, 0),
+            (200, good, 'transport-error', 0),
+        ]
+        for status, body, error, slot_id in bad_cases:
+            with self.subTest(status=status, body=body, error=error):
+                with self.assertRaises(runner_module.RunnerError):
+                    runner_module.validate_replay_erase_response(status, body, error, slot_id)
+
+    def test_lifecycle_parser_rejects_premature_slot_reuse_and_generation_drift(self) -> None:
+        parser_module = load_parser_module()
+        fixture = self.root / 'lifecycle-parser-slot-negative.json'
+        fixture.write_text(json.dumps({
+            'schema': 'generic-replay/v1', 'ttl_seconds': 0.1,
+            'sessions': [
+                {'logical_session_id': 'A', 'lineage_id': 1,
+                 'turns': [{'turn': 1, 'timestamp': 0, 'prompt_tokens': [1], 'n_predict': 1}]},
+                {'logical_session_id': 'B', 'lineage_id': 2,
+                 'turns': [{'turn': 1, 'timestamp': 0, 'prompt_tokens': [2], 'n_predict': 1}]},
+            ],
+        }), encoding='utf-8')
+        plan = parser_module.load_replay('fixture', fixture, n_parallel=2, lifecycle=True)
+        cfg = {'time_dilation': 1.0, 'n_parallel': 2,
+               'lifecycle': {'enabled': True, 'drain_after_last_arrival': True}}
+        actual = [
+            {'request_id': 'replay_A_1', 'turn': 1, 'cache_prompt': False,
+             'planned_arrival_us': 0, 'completed_us': 1},
+            {'request_id': 'replay_B_1', 'turn': 1, 'cache_prompt': False,
+             'planned_arrival_us': 0, 'completed_us': 1},
+        ]
+        def start(sid: str, lineage: int, slot: int, generation: int) -> dict[str, object]:
+            return {
+                'event': 'TURN_START', 'logical_session_id': sid, 'lineage_id': lineage,
+                'turn': 1, 'slot_id': slot, 'seq_id': slot, 'runner_generation': generation,
+                'lifecycle_generation': 1, 'arrival_us': 0, 'completion_us': None,
+                'expiry_us': None, 'request_id': f'replay_{sid}_1', 'trigger': 'COLD_START',
+            }
+        with self.assertRaises(parser_module.ParseError):
+            parser_module.validate_replay_lifecycle(
+                'slot-reuse', plan, cfg, actual, [start('A', 1, 0, 1), start('B', 2, 0, 1)])
+        with self.assertRaises(parser_module.ParseError):
+            parser_module.validate_replay_lifecycle(
+                'generation-drift', plan, cfg, actual, [start('A', 1, 0, 2)])
+
+    def test_post_erase_verification_rejects_uncleared_prompt_or_claimant(self) -> None:
+        good = {
+            'http_status': 200, 'error': None,
+            'body_json': [{
+                'id': 0, 'is_processing': False, 'n_prompt_tokens': 0,
+                'kv_claimant': {
+                    'target_blocks': 0, 'eligible_resident_blocks': 0,
+                    'swapped_blocks': 0, 'shared_blocks': 0, 'blocked_blocks': 0,
+                },
+            }],
+        }
+        runner_module = load_runner_module()
+        self.assertEqual(0, runner_module.validate_replay_erased_slot_snapshot(good, 0)['n_prompt_tokens'])
+        bad_prompt = json.loads(json.dumps(good))
+        bad_prompt['body_json'][0]['n_prompt_tokens'] = 1
+        with self.assertRaises(runner_module.RunnerError):
+            runner_module.validate_replay_erased_slot_snapshot(bad_prompt, 0)
+        bad_claimant = json.loads(json.dumps(good))
+        bad_claimant['body_json'][0]['kv_claimant']['swapped_blocks'] = 1
+        with self.assertRaises(runner_module.RunnerError):
+            runner_module.validate_replay_erased_slot_snapshot(bad_claimant, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

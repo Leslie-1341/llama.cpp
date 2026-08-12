@@ -20,6 +20,7 @@ from multi_session_replay import (  # noqa: E402
     expand_schedule,
     load_replay,
     run_fake_schedule,
+    _load_parent_manifest,
 )
 
 
@@ -271,6 +272,75 @@ class MultiSessionReplayTest(unittest.TestCase):
             PARSER.validate_slot_snapshot(
                 mixed, "mixed.slots_before", require_resident=False)
 
+
+
+class LifecycleParserNegativeTest(unittest.TestCase):
+    def test_stale_timer_and_missing_erase_are_rejected(self) -> None:
+        root = pathlib.Path(tempfile.mkdtemp(prefix="gt_trace_lifecycle_negative_"))
+        fixture = root / "fixture.json"
+        fixture.write_text(json.dumps({
+            "schema": "generic-replay/v1", "ttl_seconds": 0.1,
+            "sessions": [{"logical_session_id": "A", "lineage_id": 1,
+                          "turns": [turn(1, 0, [1])]}],
+        }), encoding="utf-8")
+        plan = load_replay("fixture", fixture, n_parallel=1, lifecycle=True)
+        actual = run_fake_schedule(plan)
+        actual[0].update({"lifecycle_trigger": "COLD_START", "lifecycle_generation": 1})
+        row = actual[0]
+        binding = {"slot_id": row["slot_id"], "seq_id": row["seq_id"], "runner_generation": row["runner_generation"]}
+        expiry = row["completed_us"] + 100000
+        base = {
+            "logical_session_id": "A", "lineage_id": 1, "turn": 1,
+            "slot_id": 0, "seq_id": 0, "runner_generation": 1,
+            "lifecycle_generation": 1, "arrival_us": row["dispatched_us"],
+            "completion_us": None, "expiry_us": None, "request_id": row["request_id"],
+            "trigger": "COLD_START",
+        }
+        journal = [
+            {**base, "event": "TURN_START"},
+            {**base, "event": "TURN_COMPLETE", "completion_us": row["completed_us"]},
+            {**base, "event": "TTL_ARM", "arrival_us": None, "completion_us": row["completed_us"],
+             "expiry_us": expiry, "trigger": "completion", "timer_id": 1},
+            {**base, "event": "TTL_EXPIRY", "arrival_us": None, "completion_us": row["completed_us"],
+             "expiry_us": expiry, "request_id": None, "trigger": "ttl_timer", "timer_id": 7},
+        ]
+        with self.assertRaises(PARSER.ParseError):
+            PARSER.validate_replay_lifecycle(
+                "negative", plan,
+                {"time_dilation": 1.0, "lifecycle": {"enabled": True, "drain_after_last_arrival": True}},
+                actual, journal)
+        journal[3]["timer_id"] = 1
+        with self.assertRaises(PARSER.ParseError):
+            PARSER.validate_replay_lifecycle(
+                "negative", plan,
+                {"time_dilation": 1.0, "lifecycle": {"enabled": True, "drain_after_last_arrival": True}},
+                actual, journal)
+
+
+    def test_parent_manifest_sha_and_trace_identity_are_strict(self) -> None:
+        root = pathlib.Path(tempfile.mkdtemp(prefix="gt_trace_parent_identity_"))
+        manifest = {
+            "schema_version": "gt-trace-1a/v2",
+            "trace_key": "traceA", "trace_repo_head": "headA",
+            "trace_file": "trace.jsonl", "trace_file_sha256": "a" * 64,
+            "ttl_calibration_identity": {"frozen_ttl_seconds": 0.25},
+        }
+        path = root / "manifest.json"
+        raw = json.dumps(manifest, sort_keys=True).encode("utf-8")
+        path.write_bytes(raw)
+        parent = {
+            "manifest_path_at_materialization": str(path),
+            "manifest_sha256": hashlib.sha256(raw).hexdigest(),
+            "trace_key": "traceA", "trace_repo_head": "headA",
+            "trace_file": "trace.jsonl", "trace_file_sha256": "a" * 64,
+        }
+        self.assertEqual(0.25, _load_parent_manifest(parent)["ttl_seconds"])
+        bad_sha = dict(parent, manifest_sha256="0" * 64)
+        with self.assertRaises(ReplayError):
+            _load_parent_manifest(bad_sha)
+        bad_trace = dict(parent, trace_key="traceB")
+        with self.assertRaises(ReplayError):
+            _load_parent_manifest(bad_trace)
 
 
 if __name__ == "__main__":

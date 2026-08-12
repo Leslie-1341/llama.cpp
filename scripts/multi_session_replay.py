@@ -17,6 +17,10 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 
+LIFECYCLE_STATES = {"ABSENT", "ACTIVE", "IDLE_TTL", "DEAD"}
+LIFECYCLE_TRIGGERS = {"COLD_START", "CONTINUATION", "REVISIT", "COLD_RESTART"}
+
+
 class ReplayError(ValueError):
     pass
 
@@ -86,6 +90,7 @@ class ReplayPlan:
     events: tuple[ReplayEvent, ...]
     excluded_sessions: tuple[dict[str, Any], ...]
     planned_arrival_origin_us: int
+    lifecycle: dict[str, Any] | None = None
 
     @property
     def planned_session_count(self) -> int:
@@ -96,7 +101,7 @@ class ReplayPlan:
         return len(self.events)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "schema": self.schema,
             "source_path": self.source_path,
             "source_sha256": self.source_sha256,
@@ -122,6 +127,9 @@ class ReplayPlan:
                 for e in self.events
             ],
         }
+        if self.lifecycle is not None:
+            result["lifecycle"] = dict(self.lifecycle)
+        return result
 
 
 def _prompt_sha(tokens: Iterable[int]) -> str:
@@ -172,6 +180,68 @@ def _validate_session_turns(session_id: str, turns: tuple[ReplayEvent, ...]) -> 
         raise ReplayError(f"session {session_id} timestamps move backwards")
 
 
+def _strict_positive_float(value: Any, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) <= 0:
+        raise ReplayError(f"{label} must be finite and positive")
+    return float(value)
+
+
+def _load_parent_manifest(parent: Any) -> dict[str, Any]:
+    if not isinstance(parent, dict):
+        raise ReplayError("transcript parent identity is missing")
+    path_value = parent.get("manifest_path_at_materialization")
+    manifest_sha = _strict_sha(parent.get("manifest_sha256"), "parent.manifest_sha256")
+    if not isinstance(path_value, str) or not path_value:
+        raise ReplayError("transcript parent manifest path is missing")
+    path = Path(path_value).resolve()
+    try:
+        raw = path.read_bytes()
+        manifest = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReplayError(f"cannot reload transcript parent manifest: {exc}") from exc
+    if _sha256_bytes(raw) != manifest_sha:
+        raise ReplayError("transcript parent manifest SHA mismatch")
+    if not isinstance(manifest, dict) or manifest.get("schema_version") != "gt-trace-1a/v2":
+        raise ReplayError("transcript parent manifest schema is unsupported")
+    for key in ("trace_key", "trace_repo_head", "trace_file", "trace_file_sha256"):
+        if parent.get(key) != manifest.get(key):
+            raise ReplayError(f"transcript parent trace identity mismatch at {key}")
+    identity = manifest.get("ttl_calibration_identity")
+    if not isinstance(identity, dict):
+        raise ReplayError("parent ttl_calibration_identity is missing")
+    ttl = _strict_positive_float(identity.get("frozen_ttl_seconds"), "ttl_calibration_identity.frozen_ttl_seconds")
+    return {
+        "ttl_seconds": ttl,
+        "parent_manifest_path": str(path),
+        "parent_manifest_sha256": manifest_sha,
+        "parent_event_stream_sha256": parent.get("event_stream_sha256"),
+        "trace_identity": {
+            "trace_key": manifest["trace_key"],
+            "trace_repo_head": manifest["trace_repo_head"],
+            "trace_file": manifest["trace_file"],
+            "trace_file_sha256": manifest["trace_file_sha256"],
+        },
+    }
+
+
+def _fixture_lifecycle(raw: dict[str, Any]) -> dict[str, Any] | None:
+    value = raw.get("ttl_seconds")
+    lifecycle = raw.get("lifecycle")
+    if isinstance(lifecycle, dict):
+        if value is not None and "ttl_seconds" in lifecycle and lifecycle["ttl_seconds"] != value:
+            raise ReplayError("fixture TTL identity is inconsistent")
+        value = lifecycle.get("ttl_seconds", value)
+    if value is None:
+        return None
+    return {"ttl_seconds": _strict_positive_float(value, "fixture.ttl_seconds"),
+            "source": "fixture"}
+
+
+def _transcript_lifecycle(raw: dict[str, Any]) -> dict[str, Any]:
+    value = _load_parent_manifest(raw.get("parent"))
+    value["source"] = "transcript"
+    return value
+
 def _load_fixture(path: Path, n_parallel: int, selected: set[str] | None) -> ReplayPlan:
     raw, source_sha = _load_json(path)
     if not isinstance(raw, dict) or raw.get("schema") not in {"generic-replay/v1", "gt-trace-1b-b/v1"}:
@@ -215,7 +285,8 @@ def _load_fixture(path: Path, n_parallel: int, selected: set[str] | None) -> Rep
                    for i, e in enumerate(events))
     origin = min(e.planned_ts_us for e in events)
     return ReplayPlan(raw["schema"], str(path), source_sha, 1.0, n_parallel,
-                      tuple(sessions), events, tuple(excluded), origin)
+                      tuple(sessions), events, tuple(excluded), origin,
+                      _fixture_lifecycle(raw))
 
 
 def _load_transcript(path: Path, n_parallel: int, selected: set[str] | None) -> ReplayPlan:
@@ -276,20 +347,31 @@ def _load_transcript(path: Path, n_parallel: int, selected: set[str] | None) -> 
                    for i, e in enumerate(events))
     origin = min(e.planned_ts_us for e in events)
     return ReplayPlan("gt-trace-1b-a/v1", str(path), source_sha, 1.0,
-                      n_parallel, sessions, events, tuple(excluded), origin)
+                      n_parallel, sessions, events, tuple(excluded), origin,
+                      _transcript_lifecycle(raw))
 
 
 def load_replay(source: str, path: str | Path, *, n_parallel: int, time_dilation: float = 1.0,
-                selected_session_ids: Iterable[str] | None = None) -> ReplayPlan:
+                selected_session_ids: Iterable[str] | None = None,
+                lifecycle: bool = False) -> ReplayPlan:
     if isinstance(n_parallel, bool) or not isinstance(n_parallel, int) or n_parallel <= 0:
         raise ReplayError("n_parallel must be positive")
     if isinstance(time_dilation, bool) or not isinstance(time_dilation, (int, float)) or not math.isfinite(float(time_dilation)) or time_dilation < 0:
         raise ReplayError("time_dilation must be finite and non-negative")
+    if not isinstance(lifecycle, bool):
+        raise ReplayError("lifecycle must be boolean")
+    if lifecycle and float(time_dilation) <= 0:
+        raise ReplayError("lifecycle replay requires time_dilation > 0")
     selected = set(selected_session_ids) if selected_session_ids is not None else None
     source_path = Path(path).resolve()
     plan = _load_transcript(source_path, n_parallel, selected) if source == "transcript" else _load_fixture(source_path, n_parallel, selected)
+    if source not in {"transcript", "fixture"}:
+        raise ReplayError("replay source is unsupported")
+    if lifecycle and plan.lifecycle is None:
+        raise ReplayError("lifecycle replay source has no TTL calibration")
     return ReplayPlan(plan.schema, plan.source_path, plan.source_sha256, float(time_dilation),
-                      n_parallel, plan.sessions, plan.events, plan.excluded_sessions, plan.planned_arrival_origin_us)
+                      n_parallel, plan.sessions, plan.events, plan.excluded_sessions,
+                      plan.planned_arrival_origin_us, plan.lifecycle if lifecycle else None)
 
 
 class SlotAdmission:
@@ -332,6 +414,10 @@ class SlotAdmission:
         self.free_slots.append(slot_id)
         self.free_slots.sort()
         return {"status": "finished", "completed_us": now_us, **binding}
+
+    def release(self, session_id: str, now_us: int) -> dict[str, Any]:
+        """Release a slot only after an externally verified erase operation."""
+        return self.finish(session_id, now_us)
 
     def binding(self, session_id: str) -> dict[str, int]:
         if session_id not in self.bindings:
@@ -404,9 +490,19 @@ def check_fidelity(plan: ReplayPlan, executed: list[dict[str, Any]], *, n_parall
         if isinstance(slot_id, bool) or not isinstance(slot_id, int) or not 0 <= slot_id < n_parallel:
             errors.append(f"event {index} has invalid slot_id")
         sid = actual.get("logical_session_id")
-        if sid in live_slots and live_slots[sid] != slot_id:
+        trigger = actual.get("lifecycle_trigger")
+        if trigger is not None and trigger not in LIFECYCLE_TRIGGERS:
+            errors.append(f"event {index} lifecycle trigger is invalid")
+        if trigger == "COLD_RESTART":
+            live_slots[sid] = slot_id
+        elif sid in live_slots and live_slots[sid] != slot_id:
             errors.append(f"session {sid} changed slot while live")
-        live_slots.setdefault(sid, slot_id)
+        else:
+            live_slots.setdefault(sid, slot_id)
+        if trigger in {"COLD_START", "COLD_RESTART"} and actual.get("cache_prompt") is not False:
+            errors.append(f"event {index} cold request cache_prompt must be false")
+        if trigger in {"CONTINUATION", "REVISIT"} and actual.get("cache_prompt") is not True:
+            errors.append(f"event {index} continuation cache_prompt must be true")
         if not isinstance(actual.get("http_status"), int) or actual["http_status"] != 200:
             errors.append(f"event {index} HTTP status is not 200")
         if actual.get("response_token_sha256") is None:

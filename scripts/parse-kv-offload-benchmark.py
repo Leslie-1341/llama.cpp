@@ -331,9 +331,11 @@ def pressure_basis_source(basis: dict[str, Any]) -> str:
 
 
 def normalize_replay(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict) and "lifecycle" not in value:
+        value = {**value, "lifecycle": None}
     replay = exact(
         value,
-        {"source", "path", "time_dilation", "n_parallel", "session_ids", "admission_timeout_seconds"},
+        {"source", "path", "time_dilation", "n_parallel", "session_ids", "admission_timeout_seconds", "lifecycle"},
         "spec.workload.replay",
     )
     if replay["source"] not in {"transcript", "fixture"}:
@@ -352,8 +354,40 @@ def normalize_replay(value: Any) -> dict[str, Any]:
         raise ParseError("spec.workload.replay.session_ids is invalid")
     admission_timeout = require_finite_positive(
         replay["admission_timeout_seconds"], "spec.workload.replay.admission_timeout_seconds")
+    raw_lifecycle = replay["lifecycle"]
+    if raw_lifecycle is None or raw_lifecycle is False:
+        lifecycle = {"enabled": False, "drain_after_last_arrival": False}
+    else:
+        if raw_lifecycle is True:
+            raw_lifecycle = {}
+        if not isinstance(raw_lifecycle, dict):
+            raise ParseError("spec.workload.replay.lifecycle must be null, boolean, or object")
+        unknown = set(raw_lifecycle) - {
+            "enabled", "drain_after_last_arrival", "ttl_seconds",
+            "parent_manifest_path", "parent_manifest_sha256", "trace_identity",
+        }
+        if unknown:
+            raise ParseError(f"spec.workload.replay.lifecycle schema mismatch extra={sorted(unknown)}")
+        enabled = raw_lifecycle.get("enabled", True)
+        drain = raw_lifecycle.get("drain_after_last_arrival", False)
+        if not isinstance(enabled, bool) or not isinstance(drain, bool):
+            raise ParseError("spec.workload.replay.lifecycle enabled/drain_after_last_arrival must be boolean")
+        lifecycle = {"enabled": enabled, "drain_after_last_arrival": drain}
+        if "ttl_seconds" in raw_lifecycle:
+            lifecycle["ttl_seconds"] = require_finite_positive(raw_lifecycle["ttl_seconds"], "spec.workload.replay.lifecycle.ttl_seconds")
+        for key in ("parent_manifest_path", "parent_manifest_sha256"):
+            if key in raw_lifecycle and (not isinstance(raw_lifecycle[key], str) or not raw_lifecycle[key]):
+                raise ParseError(f"spec.workload.replay.lifecycle.{key} must be a non-empty string")
+            if key in raw_lifecycle:
+                lifecycle[key] = raw_lifecycle[key]
+        if "trace_identity" in raw_lifecycle:
+            if not isinstance(raw_lifecycle["trace_identity"], dict):
+                raise ParseError("spec.workload.replay.lifecycle.trace_identity must be an object")
+            lifecycle["trace_identity"] = dict(raw_lifecycle["trace_identity"])
+    if lifecycle["enabled"] and float(replay["time_dilation"]) <= 0:
+        raise ParseError("spec.workload.replay.lifecycle requires time_dilation > 0")
     return {**replay, "time_dilation": float(replay["time_dilation"]),
-            "admission_timeout_seconds": admission_timeout}
+            "admission_timeout_seconds": admission_timeout, "lifecycle": lifecycle}
 
 
 def normalize_workload(workload: Any) -> dict[str, Any]:
@@ -620,6 +654,10 @@ def validate_spec(spec: Any) -> tuple[dict[str, dict[str, Any]], list[dict[str, 
     if not isinstance(value["server_args"], list) or any(not isinstance(item, str) for item in value["server_args"]):
         raise ParseError("spec.server_args is invalid")
     reject_canonical_server_args(value["server_args"], "spec.server_args")
+    if isinstance(value.get("workload"), dict) and "replay" in value["workload"]:
+        replay_args = set(value["server_args"])
+        if replay_args.intersection({"--parallel", "-np", "--cache-idle-slots", "--no-cache-idle-slots", "--context-shift", "--no-context-shift"}):
+            raise ParseError("spec replay workload contains runner-owned multi-session server options")
     if not isinstance(value["environment"], dict) or any(
         not isinstance(key, str) or not isinstance(item, str) for key, item in value["environment"].items()
     ):
@@ -627,6 +665,9 @@ def validate_spec(spec: Any) -> tuple[dict[str, dict[str, Any]], list[dict[str, 
     reject_canonical_kv_environment(value["environment"], "spec.environment")
     pressure_basis = normalize_pressure_basis(value["pressure_basis"])
     workload = normalize_workload(value["workload"])
+    if ("replay" in workload and workload["replay"].get("lifecycle", {}).get("enabled", False)
+            and any(item == "--slot-save-path" or item.startswith("--slot-save-path=") for item in value["server_args"])):
+        raise ParseError("spec lifecycle replay contains runner-owned --slot-save-path")
     if "replay" in workload:
         if value["run_mode"] != "qualification" or value["run_kind"] != "qualification":
             raise ParseError("replay workload is restricted to qualification mode")
@@ -2800,6 +2841,243 @@ def validate_characterization_causality(
     }
 
 
+def validate_replay_erased_slot_snapshot(
+        snapshot: dict[str, Any], slot_id: int, label: str) -> dict[str, Any]:
+    slots = snapshot.get("body_json")
+    if not isinstance(slots, list):
+        raise ParseError(f"{label}: post-erase /slots body is unavailable")
+    matches = [slot for slot in slots if isinstance(slot, dict) and slot.get("id") == slot_id]
+    if len(matches) != 1:
+        raise ParseError(f"{label}: post-erase slot identity is missing or duplicated")
+    slot = matches[0]
+    if slot.get("is_processing") is not False:
+        raise ParseError(f"{label}: post-erase slot is still processing")
+    n_prompt_tokens = slot.get("n_prompt_tokens")
+    if isinstance(n_prompt_tokens, bool) or not isinstance(n_prompt_tokens, int) or n_prompt_tokens != 0:
+        raise ParseError(f"{label}: post-erase prompt was not cleared")
+    claimant = slot.get("kv_claimant")
+    required = {"target_blocks", "eligible_resident_blocks", "swapped_blocks", "shared_blocks", "blocked_blocks"}
+    if not isinstance(claimant, dict) or not required.issubset(claimant):
+        raise ParseError(f"{label}: post-erase KV claimant evidence is missing")
+    counts: dict[str, int] = {}
+    for key in sorted(required):
+        value = claimant.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value != 0:
+            raise ParseError(f"{label}: post-erase KV claimant {key} was not cleared")
+        counts[key] = value
+    return {"slot_id": slot_id, "n_prompt_tokens": n_prompt_tokens, "claimant_counts": counts}
+
+
+def validate_replay_lifecycle(
+        label: str, replay_plan: Any, replay_cfg: dict[str, Any],
+        actual: list[dict[str, Any]], journal: list[dict[str, Any]],
+        run_dir: pathlib.Path | None = None) -> dict[str, Any]:
+    if not replay_cfg.get("lifecycle", {}).get("enabled", False):
+        return {"status": "DISABLED", "errors": []}
+    lifecycle = replay_plan.lifecycle or {}
+    ttl_runtime_us = int(round(float(lifecycle["ttl_seconds"]) * replay_cfg["time_dilation"] * 1_000_000))
+    if ttl_runtime_us <= 0:
+        raise ParseError(f"{label}: lifecycle runtime TTL is invalid")
+    by_request = {row["request_id"]: row for row in actual}
+    if len(by_request) != len(actual):
+        raise ParseError(f"{label}: lifecycle request identity is duplicated")
+    allowed = {"TURN_START", "TURN_COMPLETE", "TTL_ARM", "REVISIT", "TTL_EXPIRY", "DEAD", "COLD_RESTART"}
+    sessions = {
+        session.logical_session_id: {
+            "lineage_id": session.lineage_id, "state": "ABSENT", "generation": 0,
+            "binding": None, "timer": None, "next_turn": 1, "inflight": None,
+            "revisit_pending": False, "restart_pending": False, "last_event": None,
+            "last_completion": None, "last_start": None,
+        }
+        for session in replay_plan.sessions
+    }
+    starts: dict[str, int] = {}
+    completes: dict[str, int] = {}
+    pending_idle: set[str] = set()
+    previous_events: list[dict[str, Any]] = []
+    timer_ids: set[int] = set()
+    slot_owners: dict[int, str] = {}
+    slot_generations: dict[int, int] = {}
+    for index, event in enumerate(journal):
+        if not isinstance(event, dict) or event.get("event") not in allowed:
+            raise ParseError(f"{label}: lifecycle event {index} is invalid")
+        sid = event.get("logical_session_id")
+        if sid not in sessions or event.get("lineage_id") != sessions[sid]["lineage_id"]:
+            raise ParseError(f"{label}: lifecycle event {index} session identity mismatch")
+        session = sessions[sid]
+        kind = event["event"]
+        request_id = event.get("request_id")
+        row = by_request.get(request_id) if request_id is not None else None
+        binding = (event.get("slot_id"), event.get("seq_id"), event.get("runner_generation"))
+        if event.get("slot_id") is not None:
+            slot_id = event.get("slot_id")
+            runner_generation = event.get("runner_generation")
+            if (event.get("seq_id") != slot_id or isinstance(slot_id, bool)
+                    or not isinstance(slot_id, int) or not 0 <= slot_id < replay_plan.n_parallel
+                    or isinstance(runner_generation, bool) or not isinstance(runner_generation, int)
+                    or runner_generation <= 0):
+                raise ParseError(f"{label}: lifecycle event {index} slot/seq/generation is invalid")
+        if kind == "COLD_RESTART":
+            if session["state"] != "DEAD" or not session["last_event"] or session["last_event"].get("event") != "DEAD" or row is None:
+                raise ParseError(f"{label}: COLD_RESTART is not after DEAD")
+            if row.get("lifecycle_trigger") != "COLD_RESTART" or row.get("cache_prompt") is not False:
+                raise ParseError(f"{label}: COLD_RESTART request cache_prompt is invalid")
+            if event.get("turn") != session["next_turn"] or event.get("lifecycle_generation") != session["generation"] + 1:
+                raise ParseError(f"{label}: COLD_RESTART generation/turn is invalid")
+            if event.get("arrival_us") != row.get("planned_arrival_us"):
+                raise ParseError(f"{label}: COLD_RESTART arrival differs from frozen replay arrival")
+            session["generation"] += 1
+            session["restart_pending"] = binding
+        elif kind == "TURN_START":
+            if row is None or request_id in starts or event.get("turn") != row.get("turn"):
+                raise ParseError(f"{label}: lifecycle TURN_START is missing, duplicated, or mismatched")
+            trigger = event.get("trigger")
+            if trigger not in {"COLD_START", "CONTINUATION", "REVISIT", "COLD_RESTART"}:
+                raise ParseError(f"{label}: lifecycle TURN_START trigger is invalid")
+            expected_turn = session["next_turn"]
+            if event.get("turn") != expected_turn or session["inflight"] is not None:
+                raise ParseError(f"{label}: lifecycle TURN_START order is invalid")
+            if trigger == "COLD_START":
+                if session["state"] != "ABSENT" or session["generation"] != 0 or row.get("cache_prompt") is not False:
+                    raise ParseError(f"{label}: invalid cold start lifecycle")
+                session["generation"] = 1
+            elif trigger == "COLD_RESTART":
+                if (session["state"] != "DEAD" or row.get("cache_prompt") is not False
+                        or session["restart_pending"] != binding):
+                    raise ParseError(f"{label}: invalid cold restart lifecycle")
+                session["restart_pending"] = False
+            elif trigger == "REVISIT":
+                timer = session["timer"]
+                if session["state"] != "IDLE_TTL" or timer is None or row.get("cache_prompt") is not True:
+                    raise ParseError(f"{label}: invalid revisit state or cache_prompt")
+                if event.get("arrival_us") is None or event["arrival_us"] >= timer["expiry_us"]:
+                    raise ParseError(f"{label}: revisit is not before expiry")
+                if binding != session["binding"] or event.get("lifecycle_generation") != session["generation"] or not session["revisit_pending"]:
+                    raise ParseError(f"{label}: revisit changed generation or slot")
+                session["timer"] = None
+                session["revisit_pending"] = False
+            else:
+                if session["state"] != "ACTIVE" or row.get("cache_prompt") is not True:
+                    raise ParseError(f"{label}: invalid continuation state or cache_prompt")
+                if session["last_completion"] is None or row.get("planned_arrival_us", 0) > session["last_completion"]:
+                    raise ParseError(f"{label}: continuation did not arrive during prior request")
+                pending_idle.discard(sid)
+            if session["binding"] is not None and trigger not in {"COLD_RESTART", "COLD_START"} and binding != session["binding"]:
+                raise ParseError(f"{label}: lifecycle slot changed without restart")
+            slot_id, _seq_id, runner_generation = binding
+            if trigger in {"COLD_START", "COLD_RESTART"}:
+                owner = slot_owners.get(slot_id)
+                if owner is not None:
+                    raise ParseError(f"{label}: slot {slot_id} was reused before prior DEAD")
+                expected_runner_generation = slot_generations.get(slot_id, 0) + 1
+                if runner_generation != expected_runner_generation:
+                    raise ParseError(f"{label}: slot {slot_id} runner_generation did not advance exactly once")
+                slot_generations[slot_id] = runner_generation
+                slot_owners[slot_id] = sid
+            elif slot_owners.get(slot_id) != sid or slot_generations.get(slot_id) != runner_generation:
+                raise ParseError(f"{label}: live session slot ownership/generation drift")
+            session["binding"] = binding
+            if event.get("lifecycle_generation") != session["generation"]:
+                raise ParseError(f"{label}: lifecycle generation mismatch")
+            if event.get("arrival_us") != row.get("planned_arrival_us"):
+                raise ParseError(f"{label}: lifecycle arrival timestamp differs from frozen replay arrival")
+            session["inflight"] = request_id
+            session["last_start"] = event.get("arrival_us")
+            starts[request_id] = index
+        elif kind == "TURN_COMPLETE":
+            if row is None or request_id not in starts or request_id in completes or session["inflight"] != request_id:
+                raise ParseError(f"{label}: lifecycle TURN_COMPLETE is missing, duplicated, or out of order")
+            if event.get("completion_us") != row.get("completed_us") or event.get("turn") != row.get("turn"):
+                raise ParseError(f"{label}: lifecycle completion timestamp/turn mismatch")
+            if event.get("lifecycle_generation") != session["generation"] or binding != session["binding"]:
+                raise ParseError(f"{label}: lifecycle completion identity mismatch")
+            session["inflight"] = None
+            session["state"] = "ACTIVE"
+            session["last_completion"] = event.get("completion_us")
+            session["next_turn"] += 1
+            pending_idle.add(sid)
+            completes[request_id] = index
+        elif kind == "TTL_ARM":
+            if sid not in pending_idle or session["inflight"] is not None or session["binding"] is None:
+                raise ParseError(f"{label}: invalid TTL_ARM ordering")
+            timer_id = event.get("timer_id")
+            if isinstance(timer_id, bool) or not isinstance(timer_id, int) or timer_id in timer_ids:
+                raise ParseError(f"{label}: invalid or duplicate timer identity")
+            if event.get("completion_us") != session["last_completion"] or event.get("expiry_us") != session["last_completion"] + ttl_runtime_us:
+                raise ParseError(f"{label}: TTL_ARM timing mismatch")
+            if binding != session["binding"] or event.get("lifecycle_generation") != session["generation"]:
+                raise ParseError(f"{label}: TTL_ARM identity mismatch")
+            session["timer"] = {"timer_id": timer_id, "expiry_us": event["expiry_us"], "turn": event["turn"]}
+            session["state"] = "IDLE_TTL"
+            pending_idle.remove(sid)
+            timer_ids.add(timer_id)
+        elif kind == "REVISIT":
+            timer = session["timer"]
+            if session["state"] != "IDLE_TTL" or timer is None or request_id not in by_request:
+                raise ParseError(f"{label}: invalid REVISIT state")
+            if event.get("arrival_us") is None or event["arrival_us"] >= timer["expiry_us"]:
+                raise ParseError(f"{label}: REVISIT is not before expiry")
+            if event.get("request_id") != request_id or event.get("lifecycle_generation") != session["generation"] or binding != session["binding"]:
+                raise ParseError(f"{label}: REVISIT identity mismatch")
+            if event.get("arrival_us") != by_request[request_id].get("planned_arrival_us"):
+                raise ParseError(f"{label}: REVISIT arrival differs from frozen replay arrival")
+            session["revisit_pending"] = True
+        elif kind == "TTL_EXPIRY":
+            timer = session["timer"]
+            if timer is None or session["state"] != "IDLE_TTL" or session["inflight"] is not None:
+                raise ParseError(f"{label}: stale, premature, or inflight TTL_EXPIRY")
+            if event.get("timer_id") != timer["timer_id"] or event.get("expiry_us") != timer["expiry_us"]:
+                raise ParseError(f"{label}: stale timer identity was not ignored")
+            if event.get("lifecycle_generation") != session["generation"] or binding != session["binding"]:
+                raise ParseError(f"{label}: TTL_EXPIRY generation/slot mismatch")
+        elif kind == "DEAD":
+            timer = session["timer"]
+            if timer is None or session["state"] != "IDLE_TTL" or not session["last_event"] or session["last_event"].get("event") == "TURN_COMPLETE":
+                raise ParseError(f"{label}: DEAD is not after a valid TTL expiry")
+            if session["last_event"].get("event") != "TTL_EXPIRY" or event.get("timer_id") != timer["timer_id"]:
+                raise ParseError(f"{label}: DEAD lacks valid TTL_EXPIRY evidence")
+            if event.get("erase_http_status") != 200 or event.get("erase_id_slot") != session["binding"][0]:
+                raise ParseError(f"{label}: DEAD erase HTTP evidence is invalid")
+            if isinstance(event.get("erase_n_erased"), bool) or not isinstance(event.get("erase_n_erased"), int) or event["erase_n_erased"] <= 0:
+                raise ParseError(f"{label}: DEAD erase did not prove a non-empty prompt was cleared")
+            if not isinstance(event.get("erase_body_sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", event["erase_body_sha256"]):
+                raise ParseError(f"{label}: DEAD erase body hash is invalid")
+            timer_id = timer["timer_id"]
+            expected_verify_name = f"slots_after_erase_{timer_id:06d}.json"
+            if event.get("erase_verify_path") != expected_verify_name:
+                raise ParseError(f"{label}: DEAD post-erase snapshot identity is invalid")
+            if not isinstance(event.get("erase_verify_body_sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", event["erase_verify_body_sha256"]):
+                raise ParseError(f"{label}: DEAD post-erase snapshot hash is invalid")
+            if run_dir is None:
+                raise ParseError(f"{label}: DEAD post-erase snapshot cannot be independently verified")
+            verify_snapshot = validate_slot_snapshot(
+                run_dir / expected_verify_name, f"{label}.{expected_verify_name}", require_resident=False)
+            if verify_snapshot.get("body_sha256") != event["erase_verify_body_sha256"]:
+                raise ParseError(f"{label}: DEAD post-erase snapshot hash drift")
+            validate_replay_erased_slot_snapshot(
+                verify_snapshot, session["binding"][0], f"{label}.{expected_verify_name}")
+            slot_id = session["binding"][0]
+            if slot_owners.get(slot_id) != sid:
+                raise ParseError(f"{label}: DEAD slot ownership is inconsistent")
+            del slot_owners[slot_id]
+            session["state"] = "DEAD"
+            session["binding"] = None
+            session["timer"] = None
+        session["last_event"] = event
+        previous_events.append(event)
+    for request_id in by_request:
+        if starts.get(request_id) is None or completes.get(request_id) is None:
+            raise ParseError(f"{label}: every request must have exactly one TURN_START and TURN_COMPLETE")
+    if pending_idle:
+        raise ParseError(f"{label}: completed lifecycle turn has no TTL_ARM or continuation")
+    if replay_cfg.get("lifecycle", {}).get("drain_after_last_arrival", False) and any(item["binding"] is not None for item in sessions.values()):
+        raise ParseError(f"{label}: drain_after_last_arrival did not reach DEAD")
+    return {"status": "PASS", "errors": [], "event_count": len(journal),
+            "turn_start_count": len(starts), "turn_complete_count": len(completes),
+            "dead_count": sum(1 for item in journal if item.get("event") == "DEAD"),
+            "revisit_count": sum(1 for item in journal if item.get("event") == "TURN_START" and item.get("trigger") == "REVISIT"),
+            "ttl_expiry_count": sum(1 for item in journal if item.get("event") == "TTL_EXPIRY")}
+
 def parse_replay_run(
         artifact: pathlib.Path,
         plan: dict[str, Any],
@@ -2820,20 +3098,40 @@ def parse_replay_run(
         replay_plan = load_replay(replay_cfg["source"], replay_cfg["path"],
                                   n_parallel=replay_cfg["n_parallel"],
                                   time_dilation=replay_cfg["time_dilation"],
-                                  selected_session_ids=replay_cfg["session_ids"])
+                                  selected_session_ids=replay_cfg["session_ids"],
+                                  lifecycle=replay_cfg.get("lifecycle", {}).get("enabled", False))
     except (OSError, ReplayError) as exc:
         raise ParseError(f"{label}: replay source cannot be reloaded: {exc}") from exc
+    if replay_cfg.get("lifecycle", {}).get("enabled", False):
+        source_lifecycle = replay_plan.lifecycle or {}
+        lifecycle_cfg = replay_cfg["lifecycle"]
+        if "ttl_seconds" in lifecycle_cfg and abs(float(lifecycle_cfg["ttl_seconds"]) - float(source_lifecycle["ttl_seconds"])) > 1e-9:
+            raise ParseError(f"{label}: lifecycle TTL differs from source identity")
+        if "parent_manifest_path" in lifecycle_cfg and pathlib.Path(lifecycle_cfg["parent_manifest_path"]).resolve() != pathlib.Path(source_lifecycle.get("parent_manifest_path", "")).resolve():
+            raise ParseError(f"{label}: lifecycle parent manifest path mismatch")
+        if "parent_manifest_sha256" in lifecycle_cfg and lifecycle_cfg["parent_manifest_sha256"] != source_lifecycle.get("parent_manifest_sha256"):
+            raise ParseError(f"{label}: lifecycle parent manifest SHA mismatch")
+        if "trace_identity" in lifecycle_cfg and lifecycle_cfg["trace_identity"] != source_lifecycle.get("trace_identity"):
+            raise ParseError(f"{label}: lifecycle trace identity mismatch")
     expected_schedule = expand_schedule(replay_plan)
     if run.get("request_plan") != expected_schedule:
         raise ParseError(f"{label}: replay request schedule drift")
-    execution = exact(read_json(run_dir / "execution.json"), EXECUTION_KEYS, f"{label}.execution", {"replay"})
+    execution = exact(read_json(run_dir / "execution.json"), EXECUTION_KEYS, f"{label}.execution", {"replay", "lifecycle"})
     if any(execution[key] != plan[key] for key in ("run_id", "round", "run_order", "case_id")):
         raise ParseError(f"{label}: replay execution identity mismatch")
     if execution["execution_index"] != expected_execution_index or execution["run_mode"] != "qualification":
         raise ParseError(f"{label}: replay execution mode/order mismatch")
+    if replay_cfg.get("lifecycle", {}).get("enabled", False):
+        execution_lifecycle = execution.get("lifecycle")
+        if not isinstance(execution_lifecycle, dict) or execution_lifecycle.get("enabled") is not True:
+            raise ParseError(f"{label}: replay execution lifecycle identity is missing")
     expected_argv = [spec["binary"], "--host", "127.0.0.1", "--port", execution["argv"][execution["argv"].index("--port") + 1],
                      "--model", spec["model"], *spec["server_args"], "--parallel", str(replay_cfg["n_parallel"]),
                      "--no-cache-idle-slots", "--no-context-shift"]
+    if replay_cfg.get("lifecycle", {}).get("enabled", False):
+        expected_argv.extend(["--slot-save-path", str(run_dir / "slot-cache")])
+        if execution.get("lifecycle", {}).get("slot_save_path") != str(run_dir / "slot-cache"):
+            raise ParseError(f"{label}: lifecycle slot-save path identity mismatch")
     if execution["argv"] != expected_argv:
         raise ParseError(f"{label}: replay server argv does not match canonical multi-session options")
     validate_process_identity(execution["server_identity"], execution["argv"], f"{label}.server_identity")
@@ -2891,6 +3189,8 @@ def parse_replay_run(
                     "http_status", "headers", "request_sha256", "body_path", "body_bytes", "body_sha256",
                     "response_json", "response_slot_id", "tokens_evaluated", "tokens_predicted",
                     "response_token_sha256", "error"}
+        if replay_cfg.get("lifecycle", {}).get("enabled", False):
+            required.update({"lifecycle_trigger", "lifecycle_generation"})
         if set(row) != required:
             raise ParseError(f"{label}: replay response schema mismatch at line {line_number}")
         if row["request_id"] in seen:
@@ -2903,7 +3203,11 @@ def parse_replay_run(
             raise ParseError(f"{label}: replay completion slot/status mismatch")
         if row["prompt_token_count"] != len(row["prompt_tokens"]):
             raise ParseError(f"{label}: replay prompt token count mismatch")
-        if row["cache_prompt"] is not (row["turn"] > 1):
+        if replay_cfg.get("lifecycle", {}).get("enabled", False):
+            expected_cache = row.get("lifecycle_trigger") in {"CONTINUATION", "REVISIT"}
+        else:
+            expected_cache = row["turn"] > 1
+        if row["cache_prompt"] is not expected_cache:
             raise ParseError(f"{label}: replay cache_prompt lifecycle mismatch")
         if isinstance(row["runner_generation"], bool) or not isinstance(row["runner_generation"], int) or row["runner_generation"] <= 0:
             raise ParseError(f"{label}: replay runner generation is invalid")
@@ -2955,13 +3259,34 @@ def parse_replay_run(
             raise ParseError(f"{label}: replay admission_wait_us is inconsistent")
         if row["service_us"] != row["completed_us"] - row["dispatched_us"]:
             raise ParseError(f"{label}: replay service_us is inconsistent")
+        if replay_cfg.get("lifecycle", {}).get("enabled", False):
+            if row["lifecycle_trigger"] not in {"COLD_START", "CONTINUATION", "REVISIT", "COLD_RESTART"}:
+                raise ParseError(f"{label}: replay lifecycle trigger is invalid")
+            if isinstance(row["lifecycle_generation"], bool) or not isinstance(row["lifecycle_generation"], int) or row["lifecycle_generation"] <= 0:
+                raise ParseError(f"{label}: replay lifecycle generation is invalid")
         actual.append(row)
     if len(actual) != len(expected_schedule):
         raise ParseError(f"{label}: replay response count mismatch")
+    lifecycle_records: list[dict[str, Any]] = []
+    if replay_cfg.get("lifecycle", {}).get("enabled", False):
+        lifecycle_path = run_dir / "lifecycle.jsonl"
+        if not lifecycle_path.is_file():
+            raise ParseError(f"{label}: lifecycle journal is missing")
+        for line_number, line in enumerate(lifecycle_path.read_text(encoding="utf-8").splitlines(), 1):
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ParseError(f"{label}: invalid lifecycle journal line {line_number}: {exc}") from exc
+            if not isinstance(event, dict):
+                raise ParseError(f"{label}: lifecycle journal line {line_number} is not an object")
+            lifecycle_records.append(event)
+    lifecycle_verdict = validate_replay_lifecycle(
+        label, replay_plan, replay_cfg, actual, lifecycle_records, run_dir=run_dir)
     fidelity = check_fidelity(replay_plan, actual, n_parallel=replay_cfg["n_parallel"])
+    fidelity["lifecycle"] = lifecycle_verdict
     if fidelity["status"] != "PASS":
         raise ParseError(f"{label}: workload_fidelity failed: {fidelity['errors']}")
-    replay_artifact = exact(read_json(run_dir / "replay.json"), {"plan", "schedule", "admission", "events", "workload_fidelity"}, f"{label}.replay")
+    replay_artifact = exact(read_json(run_dir / "replay.json"), {"plan", "schedule", "admission", "events", "workload_fidelity"}, f"{label}.replay", {"lifecycle"})
     admitted_sessions = {item.get("logical_session_id") for item in replay_artifact["admission"] if item.get("status") in {"admitted", "already_live", "finished"}}
     planned_sessions = {item["logical_session_id"] for item in expected_schedule}
     if admitted_sessions != planned_sessions:
@@ -2972,6 +3297,9 @@ def parse_replay_run(
         raise ParseError(f"{label}: replay artifact schedule/fidelity record drift")
     if replay_artifact["events"] != actual:
         raise ParseError(f"{label}: replay artifact event journal differs from responses authority")
+    if replay_cfg.get("lifecycle", {}).get("enabled", False):
+        if replay_artifact.get("lifecycle") != lifecycle_records:
+            raise ParseError(f"{label}: replay lifecycle journal differs from lifecycle.jsonl")
     if execution.get("replay") != replay_artifact:
         raise ParseError(f"{label}: execution replay journal differs from replay.json")
     return {"run_id": label, "case_id": plan["case_id"], "round": plan["round"], "policy": plan["policy"],
