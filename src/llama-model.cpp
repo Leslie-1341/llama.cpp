@@ -1900,6 +1900,36 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (const char * v = std::getenv("LLAMA_LAZY_MOE_GROUP_COOLDOWN_TOKENS")) {
                 mp.group_cooldown_tokens = std::max(0, std::atoi(v));
             }
+            if (const char * v = std::getenv("LLAMA_LAZY_MOE_PRESSURE_ADAPTIVE")) {
+                mp.pressure_adaptive = std::atoi(v) > 0;
+            }
+            if (const char * v = std::getenv("LLAMA_LAZY_MOE_PRESSURE_SCALE_PIN")) {
+                mp.pressure_scale_pin = std::atoi(v) > 0;
+            }
+            if (const char * v = std::getenv("LLAMA_LAZY_MOE_PRESSURE_SCALE_LAYER_PIN")) {
+                mp.pressure_scale_layer_pin = std::atoi(v) > 0;
+            }
+            if (const char * v = std::getenv("LLAMA_LAZY_MOE_PRESSURE_SCALE_WINDOW")) {
+                mp.pressure_scale_window = std::atoi(v) > 0;
+            }
+            if (const char * v = std::getenv("LLAMA_LAZY_MOE_PRESSURE_SCALE_COOLDOWN")) {
+                mp.pressure_scale_cooldown = std::atoi(v) > 0;
+            }
+            if (const char * v = std::getenv("LLAMA_LAZY_MOE_PRESSURE_SCALE_SPEC_GUARD")) {
+                mp.pressure_scale_spec_guard = std::atoi(v) > 0;
+            }
+            if (const char * v = std::getenv("LLAMA_LAZY_MOE_PRESSURE_SOFT_RATIO")) {
+                mp.pressure_soft_ratio = std::max(0.50, std::min(0.99, std::atof(v)));
+            }
+            if (const char * v = std::getenv("LLAMA_LAZY_MOE_PRESSURE_HARD_RATIO")) {
+                mp.pressure_hard_ratio = std::max(mp.pressure_soft_ratio + 0.01, std::min(1.20, std::atof(v)));
+            }
+            if (mp.pressure_hard_ratio <= mp.pressure_soft_ratio) {
+                mp.pressure_hard_ratio = std::min(1.20, mp.pressure_soft_ratio + 0.01);
+            }
+            if (const char * v = std::getenv("LLAMA_LAZY_MOE_PRESSURE_PIN_FLOOR")) {
+                mp.pressure_pin_floor = std::max(0.0f, std::min(mp.pinned_fraction, (float) std::atof(v)));
+            }
             if (const char * v = std::getenv("LLAMA_LAZY_MOE_PIN_REFRESH")) {
                 mp.pin_refresh_interval = std::max(1, std::atoi(v));
             }

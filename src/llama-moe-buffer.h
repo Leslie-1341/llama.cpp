@@ -79,6 +79,15 @@ struct llama_moe_buffer_params {
     float  pinned_layer_fraction = 0.18f; // max fraction of pinned budget one layer may use
     int    active_window = 4;        // future-use distance protected by Belady-style eviction
     int    group_cooldown_tokens = 0; // protect recently used (layer, expert) groups for N decode-token epochs
+    bool   pressure_adaptive = true; // shrink soft expert-cache protection as resident/budget pressure rises
+    bool   pressure_scale_pin = true; // let pressure shrink the global pinned fraction
+    bool   pressure_scale_layer_pin = true; // let pressure shrink the per-layer pinned cap
+    bool   pressure_scale_window = true; // let pressure shrink future-use active protection
+    bool   pressure_scale_cooldown = true; // let pressure shrink recent-use cooldown protection
+    bool   pressure_scale_spec_guard = true; // let pressure shrink speculative-unused keep penalty
+    double pressure_soft_ratio = 0.88; // resident/budget ratio where pressure adaptation starts
+    double pressure_hard_ratio = 0.97; // resident/budget ratio where soft protection reaches its floor
+    float  pressure_pin_floor = 0.0f;  // minimum effective pinned fraction under hard pressure
     int    pin_refresh_interval = 128; // group touches between top-score pin refreshes
     double warm_coverage = 0.95;    // target per-layer expert probability mass for warm-start sizing
     std::string sidecar_path;        // optional exact low-bit/MWQ sidecar data source

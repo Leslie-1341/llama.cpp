@@ -1016,6 +1016,60 @@ static size_t moe_budget_reference_bytes(const llama_moe_buffer_context & ctx) {
     return moe_budget_unbounded(ctx) ? ctx.expert_total : ctx.params.budget_bytes;
 }
 
+static double moe_pressure_ratio_locked(const llama_moe_buffer_context & ctx) {
+    if (!ctx.params.pressure_adaptive || moe_budget_unbounded(ctx) || ctx.params.budget_bytes == 0) {
+        return 0.0;
+    }
+    return (double) ctx.resident_bytes / (double) ctx.params.budget_bytes;
+}
+
+static double moe_pressure_scale_locked(const llama_moe_buffer_context & ctx) {
+    const double ratio = moe_pressure_ratio_locked(ctx);
+    const double soft = std::max(0.0, ctx.params.pressure_soft_ratio);
+    const double hard = std::max(soft + 1.0e-6, ctx.params.pressure_hard_ratio);
+    if (ratio <= soft) {
+        return 0.0;
+    }
+    if (ratio >= hard) {
+        return 1.0;
+    }
+    return (ratio - soft) / (hard - soft);
+}
+
+static float moe_effective_pinned_fraction_locked(const llama_moe_buffer_context & ctx) {
+    if (!ctx.params.pressure_adaptive || !ctx.params.pressure_scale_pin) {
+        return ctx.params.pinned_fraction;
+    }
+    const double scale = moe_pressure_scale_locked(ctx);
+    const float floor = std::max(0.0f, std::min(ctx.params.pinned_fraction, ctx.params.pressure_pin_floor));
+    const float effective = (float) ((double) ctx.params.pinned_fraction * (1.0 - scale));
+    return std::max(floor, effective);
+}
+
+static float moe_effective_pinned_layer_fraction_locked(const llama_moe_buffer_context & ctx) {
+    if (!ctx.params.pressure_adaptive || !ctx.params.pressure_scale_layer_pin) {
+        return ctx.params.pinned_layer_fraction;
+    }
+    const double scale = moe_pressure_scale_locked(ctx);
+    return std::max(0.0f, (float) ((double) ctx.params.pinned_layer_fraction * (1.0 - scale)));
+}
+
+static int moe_effective_active_window_locked(const llama_moe_buffer_context & ctx) {
+    if (!ctx.params.pressure_adaptive || !ctx.params.pressure_scale_window) {
+        return ctx.params.active_window;
+    }
+    const double scale = moe_pressure_scale_locked(ctx);
+    return std::max(0, (int) std::floor((double) ctx.params.active_window * (1.0 - scale)));
+}
+
+static int moe_effective_group_cooldown_tokens_locked(const llama_moe_buffer_context & ctx) {
+    if (!ctx.params.pressure_adaptive || !ctx.params.pressure_scale_cooldown) {
+        return ctx.params.group_cooldown_tokens;
+    }
+    const double scale = moe_pressure_scale_locked(ctx);
+    return std::max(0, (int) std::floor((double) ctx.params.group_cooldown_tokens * (1.0 - scale)));
+}
+
 // ---- forward decls of internals ----
 static void moe_stream_slice(llama_moe_buffer_context & ctx, moe_managed & m, int e, bool touch, int target_bits, int rank,
         bool group_fill = true, bool demand_async = false);
@@ -2393,29 +2447,34 @@ static bool moe_group_has_inflight_or_queued(const llama_moe_buffer_context & ct
 }
 
 static bool moe_group_is_active(const llama_moe_buffer_context & ctx, const moe_group_state & g) {
-    if (g.next_use_epoch == UINT64_MAX || ctx.params.active_window <= 0) {
+    if (g.next_use_epoch == UINT64_MAX) {
         return false;
     }
     if (g.next_use_epoch <= ctx.exec_epoch) {
         return true;
     }
-    return g.next_use_epoch - ctx.exec_epoch <= (uint64_t) ctx.params.active_window;
+    const int active_window = moe_effective_active_window_locked(ctx);
+    if (active_window <= 0) {
+        return false;
+    }
+    return g.next_use_epoch - ctx.exec_epoch <= (uint64_t) active_window;
 }
 
 static bool moe_group_is_recently_used(const llama_moe_buffer_context & ctx, const moe_group_state & g) {
     if (g.last_used_epoch == 0) {
         return false;
     }
-    const uint64_t guard = (uint64_t) std::max(2, ctx.params.active_window);
+    const uint64_t guard = (uint64_t) std::max(2, moe_effective_active_window_locked(ctx));
     return ctx.exec_epoch <= g.last_used_epoch || ctx.exec_epoch - g.last_used_epoch <= guard;
 }
 
 static bool moe_group_in_cooldown(const llama_moe_buffer_context & ctx, const moe_group_state & g) {
-    if (ctx.params.group_cooldown_tokens <= 0 || g.last_used_token_epoch == 0) {
+    const int cooldown_tokens = moe_effective_group_cooldown_tokens_locked(ctx);
+    if (cooldown_tokens <= 0 || g.last_used_token_epoch == 0) {
         return false;
     }
     return ctx.profile_token_epoch <= g.last_used_token_epoch ||
-            ctx.profile_token_epoch - g.last_used_token_epoch <= (uint64_t) ctx.params.group_cooldown_tokens;
+            ctx.profile_token_epoch - g.last_used_token_epoch <= (uint64_t) cooldown_tokens;
 }
 
 static bool moe_group_used_within_tokens(const llama_moe_buffer_context & ctx, const moe_group_state & g, int n_tokens) {
@@ -5291,7 +5350,7 @@ static moe_evict_protect_result moe_group_evict_protect_locked(
                 r.recent_age == UINT64_MAX || opt.recent_tokens <= 0 ? 0.0 :
                 (double) std::max<int64_t>(0,
                         (int64_t) opt.recent_tokens + 1 - (int64_t) r.recent_age);
-            const int exec_guard = std::max(2, ctx.params.active_window);
+            const int exec_guard = std::max(2, moe_effective_active_window_locked(ctx));
             const double recent_exec_strength =
                 r.recent_exec_age == UINT64_MAX ? 0.0 :
                 (double) std::max<int64_t>(0,
@@ -5432,7 +5491,7 @@ static moe_evict_protect_result moe_group_evict_protect_locked(
             r.recent_age == UINT64_MAX || opt.recent_tokens <= 0 ? 0.0 :
             (double) std::max<int64_t>(0,
                     (int64_t) opt.recent_tokens + 1 - (int64_t) r.recent_age);
-        const int exec_guard = std::max(2, ctx.params.active_window);
+        const int exec_guard = std::max(2, moe_effective_active_window_locked(ctx));
         const double recent_exec_strength =
             r.recent_exec_age == UINT64_MAX ? 0.0 :
             (double) std::max<int64_t>(0,
@@ -6122,7 +6181,8 @@ static void moe_group_future_hint_locked(llama_moe_buffer_context & ctx, int lay
 }
 
 static void moe_refresh_pins_locked(llama_moe_buffer_context & ctx) {
-    if (moe_budget_unbounded(ctx) || ctx.params.pinned_fraction <= 0.0f) {
+    const float effective_pinned_fraction = moe_effective_pinned_fraction_locked(ctx);
+    if (moe_budget_unbounded(ctx) || effective_pinned_fraction <= 0.0f) {
         for (auto & kv : ctx.groups) {
             kv.second.pinned = false;
         }
@@ -6161,8 +6221,9 @@ static void moe_refresh_pins_locked(llama_moe_buffer_context & ctx) {
         return a.bytes > b.bytes;
     });
 
-    const size_t pin_budget = (size_t) ((double) moe_budget_reference_bytes(ctx) * (double) ctx.params.pinned_fraction);
-    const size_t layer_budget = (size_t) ((double) pin_budget * (double) std::max(0.0f, ctx.params.pinned_layer_fraction));
+    const float effective_pinned_layer_fraction = moe_effective_pinned_layer_fraction_locked(ctx);
+    const size_t pin_budget = (size_t) ((double) moe_budget_reference_bytes(ctx) * (double) effective_pinned_fraction);
+    const size_t layer_budget = (size_t) ((double) pin_budget * (double) effective_pinned_layer_fraction);
     std::unordered_map<int, size_t> by_layer_bytes;
     size_t used = 0;
     for (const pin_candidate & c : candidates) {
@@ -7510,7 +7571,8 @@ static bool moe_evict_lru(
                 low_score_ceil - g.hot_score) * 16384.0;
         const double dist_score = dist == UINT64_MAX ? 1.0e9 : (double) dist * 8192.0;
         const double recent_penalty = recent ? 1.0e8 : 0.0;
-        const double spec_guard_penalty = speculative_unused && !spec_evictable ? 4.0e8 : 0.0;
+        const double pressure_scale = ctx.params.pressure_scale_spec_guard ? moe_pressure_scale_locked(ctx) : 0.0;
+        const double spec_guard_penalty = speculative_unused && !spec_evictable ? 4.0e8 * (1.0 - pressure_scale) : 0.0;
         const double size_bonus = (double) bytes / 1048576.0;
         const double bit_bonus = moe_group_resident_bit_score(ctx, m->layer, e) * 8.0;
         const double high_penalty = high_sequence || moe_group_is_hot(ctx, m->layer, e) ? 5.0e8 : 0.0;
@@ -15286,6 +15348,23 @@ static void moe_print_stats_impl(const llama_moe_buffer_context & ctx, const cha
             (unsigned long long) ctx.direct_swiglu_fail_kernelpair.load(),
             (unsigned long long) ctx.direct_swiglu_fail_native_prepare.load(),
             (unsigned long long) ctx.direct_swiglu_fail_other.load());
+    std::fprintf(stderr,
+            "%s: pressure={adaptive:%d,scale_pin:%d,scale_layer_pin:%d,scale_window:%d,scale_cooldown:%d,scale_spec_guard:%d,ratio:%.3f,scale:%.3f,soft:%.3f,hard:%.3f,eff_pin:%.3f,eff_layer_pin:%.3f,eff_window:%d,eff_cooldown:%d}\n",
+            prefix,
+            ctx.params.pressure_adaptive ? 1 : 0,
+            ctx.params.pressure_scale_pin ? 1 : 0,
+            ctx.params.pressure_scale_layer_pin ? 1 : 0,
+            ctx.params.pressure_scale_window ? 1 : 0,
+            ctx.params.pressure_scale_cooldown ? 1 : 0,
+            ctx.params.pressure_scale_spec_guard ? 1 : 0,
+            moe_pressure_ratio_locked(ctx),
+            moe_pressure_scale_locked(ctx),
+            ctx.params.pressure_soft_ratio,
+            ctx.params.pressure_hard_ratio,
+            (double) moe_effective_pinned_fraction_locked(ctx),
+            (double) moe_effective_pinned_layer_fraction_locked(ctx),
+            moe_effective_active_window_locked(ctx),
+            moe_effective_group_cooldown_tokens_locked(ctx));
     std::fprintf(stderr,
             "%s: demand_async={plans:%llu,groups:%llu,submitted:%llu,joined:%llu,dedup:%llu,"
             "slices:%llu,failed:%llu,wait_us:%llu,wall_us:%llu,batch_runs:%llu,"
