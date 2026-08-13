@@ -321,17 +321,37 @@ class UnifiedPressureActionStaticTest(unittest.TestCase):
         self.assertNotIn("std::thread", ACTION_H + ACTION_CPP)
 
     def test_v2_budget_view_is_one_scheduler_cadence_call_and_not_per_token(self):
-        self.assertGreaterEqual(CONTEXT.count("mem->sample_kv_physical_budget_view()"), 2)
-        self.assertIn("refresh_kv_global_target", CONTEXT)
-        self.assertIn("kv_budget_adapter.project_for_governor", CONTEXT)
-        self.assertIn("maybe_sample_kv_pressure", CONTEXT)
-        self.assertLess(
-            CONTEXT.index("mem->sample_kv_physical_budget_view()"),
-            CONTEXT.index("server_kv_pressure_execute_governor"))
+        sample_start = CONTEXT.index("void maybe_sample_kv_pressure(bool idle)")
+        sample_end = CONTEXT.index("// --- Bounded destructive release evaluation", sample_start)
+        sample = CONTEXT[sample_start:sample_end]
+        self.assertEqual(sample.count("sample_kv_physical_budget_view()"), 1)
+        self.assertIn("const auto physical_view = capture_physical_budget_view();", sample)
+        self.assertIn("publish_memory_governor_observation(", sample)
+        self.assertIn("refresh_kv_global_target(physical_view)", sample)
+        self.assertIn("project_for_governor(physical_view)", sample)
+        self.assertIn("project(physical_view)", sample)
+        self.assertNotIn("sample_count ==", sample)
+        self.assertNotIn("kv_physical_budget_snapshot", CONTEXT)
         update_start = CONTEXT.index("void update_slots()")
         update_end = CONTEXT.index("if (all_idle)", update_start)
         self.assertIn("maybe_sample_kv_pressure(all_idle)", CONTEXT[update_start:update_end])
         self.assertNotIn("sample_kv_physical_budget_view()", LLAMA_CONTEXT)
+
+    def test_v2_budget_view_identity_is_fail_closed_and_not_reused(self):
+        refresh_start = CONTEXT.index("void refresh_kv_global_target(")
+        refresh_end = CONTEXT.index("bool publish_memory_governor_observation(", refresh_start)
+        refresh = CONTEXT[refresh_start:refresh_end]
+        self.assertIn("!physical_view.valid", refresh)
+        self.assertIn("physical_view.object_id", refresh)
+        self.assertIn("physical_view.generation", refresh)
+        self.assertIn("kv_physical_credit_pending = {};", refresh)
+        self.assertIn("kv_budget_adapter.project(physical_view)", refresh)
+        observe_start = CONTEXT.index("bool publish_memory_governor_observation(")
+        observe_end = CONTEXT.index("bool init_kv_pressure_sampler()", observe_start)
+        observe = CONTEXT[observe_start:observe_end]
+        self.assertIn("physical_view.valid", observe)
+        self.assertIn("physical_view.resident_available", observe)
+        self.assertIn("kv_budget_adapter.project(physical_view)", observe)
 
     def test_v2_reclaimable_view_does_not_reuse_swap_disabled_gate(self):
         sampler = KV_CACHE_CPP[

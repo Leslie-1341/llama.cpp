@@ -830,8 +830,6 @@ private:
     server_kv_budget_adapter kv_budget_adapter;
     server_kv_resident_target_state kv_resident_target_state;
     server_kv_global_budget_view kv_global_budget_view;
-    llama_kv_physical_budget_view kv_physical_budget_snapshot;
-    uint64_t kv_physical_budget_snapshot_sample = 0;
     server_kv_budget_scalar kv_physical_credit_pending;
     server_kv_governor_state kv_governor_state;
 
@@ -2881,28 +2879,8 @@ private:
         memory_governor_async_reset_inflight();
     }
 
-    void refresh_kv_global_target() {
-        auto * mem = ctx_tgt ? llama_get_memory(ctx_tgt) : nullptr;
-        if (!mem) {
-            kv_budget_adapter.clear_global_target();
-            kv_resident_target_state = kv_budget_adapter.effective_target();
-            kv_budget_adapter.apply_effective_target(kv_pressure_unified_action_config);
-            kv_global_budget_view = {};
-            kv_physical_budget_snapshot = {};
-            kv_physical_budget_snapshot_sample = 0;
-            kv_physical_credit_pending = {};
-            return;
-        }
-
-        const uint64_t sample_count = kv_pressure_runtime.sample_count();
-        if (sample_count != 0 && kv_physical_budget_snapshot_sample == sample_count) {
-            kv_resident_target_state = kv_budget_adapter.effective_target();
-            kv_budget_adapter.apply_effective_target(kv_pressure_unified_action_config);
-            return;
-        }
-        const auto physical_view = mem->sample_kv_physical_budget_view();
-        kv_physical_budget_snapshot = physical_view;
-        kv_physical_budget_snapshot_sample = sample_count;
+    void refresh_kv_global_target(
+            const llama_kv_physical_budget_view & physical_view) {
         kv_global_budget_view = kv_budget_adapter.project(physical_view);
         if (kv_physical_credit_pending.available &&
                 (!physical_view.valid ||
@@ -2939,25 +2917,24 @@ private:
     bool publish_memory_governor_observation(
             bool idle,
             uint64_t sample_count,
-            const kv_pressure_telemetry * telemetry) {
+            const kv_pressure_telemetry * telemetry,
+            const llama_kv_physical_budget_view & physical_view) {
         if (!memory_governor_observe_enabled) {
             return false;
         }
         const auto memory_governor_observe_t0 = std::chrono::steady_clock::now();
 
         llama_kv_release_budget_snapshot kv_budget;
-        llama_kv_physical_budget_view kv_physical_view;
         uint64_t confirmed_kv_physical_credit_bytes = 0;
         bool kv_memory_present = false;
         if (ctx_tgt && llama_get_memory(ctx_tgt)) {
             kv_memory_present = true;
             auto * mem = llama_get_memory(ctx_tgt);
-            kv_physical_view = mem->sample_kv_physical_budget_view();
-            kv_global_budget_view = kv_budget_adapter.project(kv_physical_view);
+            kv_global_budget_view = kv_budget_adapter.project(physical_view);
             if (kv_physical_credit_pending.available &&
-                    kv_physical_view.valid && kv_physical_view.resident_available &&
-                    kv_physical_credit_pending.object_id == kv_physical_view.object_id &&
-                    kv_physical_credit_pending.generation == kv_physical_view.generation) {
+                    physical_view.valid && physical_view.resident_available &&
+                    kv_physical_credit_pending.object_id == physical_view.object_id &&
+                    kv_physical_credit_pending.generation == physical_view.generation) {
                 confirmed_kv_physical_credit_bytes = kv_physical_credit_pending.value;
             }
             if (memory_governor_legacy_kv_actions_enabled) {
@@ -5415,10 +5392,17 @@ private:
     void maybe_sample_kv_pressure(bool idle) {
         const auto now = server_kv_pressure_runtime::clock::now();
         const bool observe_due = memory_governor_observe_due(now);
+        auto * mem = ctx_tgt ? llama_get_memory(ctx_tgt) : nullptr;
+        const auto capture_physical_budget_view = [&]() {
+            return mem ? mem->sample_kv_physical_budget_view()
+                       : llama_kv_physical_budget_view{};
+        };
 
         if (!kv_pressure_sampler_owner) {
             if (observe_due) {
-                publish_memory_governor_observation(idle, 0, nullptr);
+                const auto physical_view = capture_physical_budget_view();
+                publish_memory_governor_observation(
+                        idle, 0, nullptr, physical_view);
             }
             return;
         }
@@ -5426,8 +5410,9 @@ private:
         if (!kv_pressure_runtime.sample_due(now)) {
             if (observe_due) {
                 const auto telemetry = kv_pressure_sampler_owner->telemetry();
+                const auto physical_view = capture_physical_budget_view();
                 publish_memory_governor_observation(
-                        idle, kv_pressure_runtime.sample_count(), &telemetry);
+                        idle, kv_pressure_runtime.sample_count(), &telemetry, physical_view);
             }
             return;
         }
@@ -5439,11 +5424,12 @@ private:
             const std::string marker = server_kv_pressure_format_marker(event);
             SRV_INF("%s\n", marker.c_str());
         }
+        const auto physical_view = capture_physical_budget_view();
         bool destructive_phase_did_work = false;
         if (observe_due) {
             const auto telemetry = kv_pressure_sampler_owner->telemetry();
             destructive_phase_did_work = publish_memory_governor_observation(
-                    idle, kv_pressure_runtime.sample_count(), &telemetry);
+                    idle, kv_pressure_runtime.sample_count(), &telemetry, physical_view);
         }
 
         // Per-sample defensive gating: at most one of dry-run or bounded
@@ -5547,14 +5533,12 @@ private:
         // prior core no_candidate result arms a later decision. ---
         {
             const auto telemetry = kv_pressure_sampler_owner->telemetry();
-            refresh_kv_global_target();
+            refresh_kv_global_target(physical_view);
             if (kv_pressure_unified_action_config.enabled) {
-                auto * mem = ctx_tgt ? llama_get_memory(ctx_tgt) : nullptr;
                 server_kv_budget_view budget_view;
                 if (mem && kv_pressure_unified_action_config.budget_target_enabled) {
-                    const auto view = mem->sample_kv_physical_budget_view();
-                    budget_view = kv_budget_adapter.project_for_governor(view);
-                    kv_global_budget_view = kv_budget_adapter.project(view);
+                    budget_view = kv_budget_adapter.project_for_governor(physical_view);
+                    kv_global_budget_view = kv_budget_adapter.project(physical_view);
                 }
                 const uint64_t decision_id = ++kv_decision_next;
                 server_kv_pressure_snapshot pressure_snapshot {
