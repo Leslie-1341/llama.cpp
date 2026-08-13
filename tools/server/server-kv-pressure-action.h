@@ -274,6 +274,10 @@ public:
     // the epoch AND erases history (cost / churn / lease) — the previous cost
     // evidence no longer describes the live KV object.
     void clear_claimant_lineage(llama_seq_id seq_id);
+    // Called by the scheduler owner after a slot has reached IDLE and its
+    // protection/task state has been cleared.  This only requalifies a
+    // transient soft-budget hold; it never executes a KV action.
+    void claimant_eligibility_changed(llama_seq_id seq_id, uint64_t epoch);
     void invalidate_all_claimants();
 
     server_kv_claimant_history claimant_history(llama_seq_id seq_id, uint64_t epoch) const;
@@ -307,6 +311,9 @@ public:
     bool soft_offload_armed() const { return soft_offload_armed_; }
     uint64_t unmet_budget_bytes() const { return unmet_budget_bytes_; }
     uint64_t budget_next_action_sample() const { return budget_next_action_sample_; }
+    const std::map<llama_seq_id, uint64_t> & transient_budget_claimants() const {
+        return transient_budget_claimants_;
+    }
 
 private:
     friend server_kv_pressure_action_result server_kv_pressure_execute_governor(
@@ -339,6 +346,11 @@ private:
     bool soft_offload_armed_ = false;
     uint64_t unmet_budget_bytes_ = 0;
     uint64_t budget_next_action_sample_ = 0;
+    // Transient soft-budget hold set: seq -> epoch captured the first time the
+    // decision scored them as ACTIVE (live producer).  The set is consulted at
+    // the very top of every soft-budget decision to decide whether to skip the
+    // scoring/scan loop and wait for an ACTIVE→IDLE requalification.
+    std::map<llama_seq_id, uint64_t> transient_budget_claimants_;
 };
 
 struct server_kv_pressure_action_result {

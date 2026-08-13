@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 static int tests_total = 0;
@@ -1436,8 +1437,10 @@ static void test_v2_unmet_budget_terminates_correctness_protected_chasing() {
 
     fake_core terminal;
     terminal.responses = { evaluation(3022) };
+    // Pure structural terminals (protected / shared) — ACTIVE claimants are
+    // exercised by the dedicated transient lifecycle test below.
     const std::vector<server_kv_claimant_snapshot> protected_claimants = {
-        claimant(1, true), claimant(2, false, true), claimant(3, false, false, true),
+        claimant(1, false, true), claimant(2, false, true), claimant(3, false, false, true),
     };
     const auto result = server_kv_pressure_execute_governor(
             config, state, terminal.ops(), governor_pressure(2, 3022,
@@ -1448,6 +1451,7 @@ static void test_v2_unmet_budget_terminates_correctness_protected_chasing() {
     CHECK(result.unmet_budget_bytes_after == 8192);
     CHECK(state.unmet_budget_bytes() == 8192);
     CHECK(!state.idle_follow_up_pending());
+    CHECK(state.transient_budget_claimants().empty());
     for (const auto & request : terminal.requests) {
         CHECK(request.action != llama_kv_action::prefetch);
         CHECK(!request.correctness_required);
@@ -1618,6 +1622,138 @@ static void test_global_target_relaxation_clears_soft_debt_without_prefetch() {
     CHECK(state.budget_debt_bytes() == 0 && !state.soft_offload_armed());
 }
 
+// Global-KV-A lifecycle: arm soft OFFLOAD → ACTIVE claimant produces no
+// eligible candidate → transient wait recorded → next sample short-circuits
+// without re-scoring → invalidate_claimant (slot reset, epoch rollover) →
+// claimant_eligibility_changed requalifies and rearms idle_follow_up →
+// same seq IDLE → next decision reselects and submits OFFLOAD.  Validates
+// that the ACTIVE→IDLE requalification path closes the qualification gap
+// surfaced by the 6913-token run, without busy-looping on every sample and
+// without disturbing the structural terminal paths (protected / shared /
+// exhausted / stale / no_physical_relief / resident_lease).
+static void test_global_kv_a_active_to_idle_requalification_lifecycle() {
+    const auto config = budget_config();
+    server_kv_governor_state state;
+
+    // Step 1: arm soft OFFLOAD on the soft-budget chain (NORMAL pressure).
+    fake_core arm;
+    arm.responses = { evaluation(3101), no_candidate_release(3101) };
+    server_kv_pressure_execute_governor(
+            config, state, arm.ops(), governor_pressure(1, 3101,
+                kv_pressure_state::NORMAL), {}, budget_view(12288));
+    CHECK(state.soft_offload_armed());
+    CHECK(state.budget_debt_bytes() > 0);
+
+    // Step 2: ACTIVE claimant on seq 1 — scoring finds no eligible candidate.
+    auto active_producer = claimant(1, true);
+    fake_core blocked;
+    blocked.responses = { evaluation(3102) };
+    const auto blocked_result = server_kv_pressure_execute_governor(
+            config, state, blocked.ops(), governor_pressure(2, 3102,
+                kv_pressure_state::NORMAL), { active_producer }, budget_view(12288));
+    CHECK(blocked.requests.size() == 1);
+    CHECK(blocked.requests[0].action == llama_kv_action::evaluate);
+    CHECK(!blocked_result.observation.offload_attempted);
+    CHECK(std::string(blocked_result.observation.reason) ==
+            "budget_waiting_for_claimant_transition");
+    CHECK(state.transient_budget_claimants().size() == 1);
+    CHECK(state.transient_budget_claimants().count(1) == 1);
+    CHECK(state.unmet_budget_bytes() == state.budget_debt_bytes());
+    CHECK(!state.soft_offload_armed());
+    CHECK(!state.idle_follow_up_pending());
+
+    // Step 3: next sample — the transient wait set should short-circuit the
+    // decision WITHOUT calling evaluate/offload again (no busy-loop).
+    fake_core idle_held;
+    const auto held_result = server_kv_pressure_execute_governor(
+            config, state, idle_held.ops(), governor_pressure(3, 3103,
+                kv_pressure_state::NORMAL), { active_producer }, budget_view(12288));
+    CHECK(idle_held.requests.empty());
+    CHECK(std::string(held_result.observation.reason) ==
+            "budget_waiting_for_claimant_transition");
+    CHECK(state.transient_budget_claimants().size() == 1);
+
+    // Step 4: simulate the slot's release path.  server_slot::reset() invokes
+    // callback_on_claimant_epoch_invalidate which calls invalidate_claimant
+    // (this is the epoch rollover path).  The transient record must migrate
+    // across the rollover so the matching requalification epoch lines up.
+    const uint64_t epoch_before = state.claimant_epoch(1);
+    state.invalidate_claimant(1);
+    const uint64_t epoch_after = state.claimant_epoch(1);
+    CHECK(epoch_after != epoch_before);
+    CHECK(state.transient_budget_claimants().count(1) == 1);
+    CHECK(state.transient_budget_claimants().at(1) == epoch_after);
+
+    // Step 5: callback_on_release calls claimant_eligibility_changed with the
+    // post-reset epoch.  The transient wait must clear, idle_follow_up must
+    // be rearmed (debt is still > 0), soft_offload_armed_ must be rearmed.
+    state.claimant_eligibility_changed(1, epoch_after);
+    CHECK(state.transient_budget_claimants().empty());
+    CHECK(state.unmet_budget_bytes() == 0);
+    CHECK(state.soft_offload_armed());
+    CHECK(state.idle_follow_up_pending());
+    // Crucially: eligibility_changed must NOT have executed any KV action.
+    CHECK(idle_held.requests.empty());
+
+    // Step 6: same seq now IDLE — next decision picks the same seq and
+    // submits an OFFLOAD.  The snapshot's epoch must mirror the post-reset
+    // governor epoch, otherwise the score would be marked epoch_mismatch and
+    // no eligible candidate would be picked.  The offload relieves the full
+    // debt (8192 bytes) so soft_offload_armed / idle_follow_up_pending both
+    // clear after the action.
+    auto idle_claimant = claimant(1, false);
+    idle_claimant.epoch = epoch_after;
+    fake_core idle_offload;
+    idle_offload.responses = { evaluation(3104), offload_result(3104, 8192) };
+    const auto offload_result_action = server_kv_pressure_execute_governor(
+            config, state, idle_offload.ops(), governor_pressure(4, 3104,
+                kv_pressure_state::NORMAL), { idle_claimant }, budget_view(12288));
+    CHECK(idle_offload.requests.size() == 2);
+    CHECK(idle_offload.requests[0].action == llama_kv_action::evaluate);
+    CHECK(idle_offload.requests[1].action == llama_kv_action::offload);
+    CHECK(idle_offload.requests[1].seq_id == 1);
+    CHECK(offload_result_action.observation.offload_attempted);
+    CHECK(offload_result_action.selected_seq_id == 1);
+    CHECK(offload_result_action.selected_claimant_epoch == epoch_after);
+    CHECK(std::string(offload_result_action.observation.reason) ==
+            "budget_offload_submitted");
+    CHECK(offload_result_action.budget_debt_after_bytes == 0);
+    CHECK(!state.soft_offload_armed());
+    CHECK(!state.idle_follow_up_pending());
+}
+
+// Minimal static assertions on the WIP simplification: the legacy transient
+// accessors (transient_budget_unmet_/lifecycle_follow_up_pending_/
+// consume_lifecycle_follow_up) are gone, the transient wait set is exposed
+// only for tests, and the eligibility notification does not execute an
+// action by itself.  The header-level accessors were dropped; we exercise the
+// observable behavior (no transient wait side-effects on a clean slate,
+// no spurious soft-offload rearm) to make the contract explicit.
+static void test_global_kv_a_static_assertions() {
+    server_kv_governor_state state;
+    CHECK(!state.idle_follow_up_pending());
+    CHECK(state.transient_budget_claimants().empty());
+    CHECK(state.budget_debt_bytes() == 0);
+    // Direct notification with no prior transient record and no debt must be
+    // a pure no-op (no arming, no action, no crash).  This is the contract
+    // the callback_on_release path relies on when the slot reaches IDLE
+    // without having ever been captured as ACTIVE in a transient wait set.
+    state.claimant_eligibility_changed(7, 1);
+    CHECK(!state.soft_offload_armed());
+    CHECK(!state.idle_follow_up_pending());
+    CHECK(state.transient_budget_claimants().empty());
+
+    // Notification with a stale epoch (post hard-lineage-loss) must also be a
+    // no-op.  After clear_claimant_lineage the seq is at the post-clear epoch
+    // and no transient record exists.
+    state.clear_claimant_lineage(7);
+    const uint64_t cleared_epoch = state.claimant_epoch(7);
+    state.claimant_eligibility_changed(7, cleared_epoch == 1 ? 2 : 1);
+    CHECK(!state.soft_offload_armed());
+    CHECK(!state.idle_follow_up_pending());
+    CHECK(state.transient_budget_claimants().empty());
+}
+
 static void test_global_dynamic_target_requires_matching_physical_authority() {
     auto config = budget_config();
     config.budget_source = "global_dynamic";
@@ -1675,6 +1811,8 @@ int main() {
     test_global_kv_budget_adapter_authority_and_physical_credit();
     test_global_target_relaxation_clears_soft_debt_without_prefetch();
     test_global_dynamic_target_requires_matching_physical_authority();
+    test_global_kv_a_active_to_idle_requalification_lifecycle();
+    test_global_kv_a_static_assertions();
 
     std::printf("server KV pressure unified action tests: %d/%d passed\n",
             tests_total - tests_failed, tests_total);

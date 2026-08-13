@@ -601,6 +601,7 @@ void server_kv_governor_state::reset() {
     soft_offload_armed_ = false;
     unmet_budget_bytes_ = 0;
     budget_next_action_sample_ = 0;
+    transient_budget_claimants_.clear();
 }
 
 uint64_t server_kv_governor_state::claimant_epoch(llama_seq_id seq_id) const {
@@ -629,6 +630,14 @@ void server_kv_governor_state::invalidate_claimant(llama_seq_id seq_id) {
     if (it != claimant_history_.end() && it->second.epoch != 0) {
         it->second.epoch = next_epoch;
     }
+    // Migrate any transient soft-budget hold for this claimant across the
+    // ordinary epoch rollover too — the slot's eligibility wait set must
+    // survive a turn boundary, otherwise an ACTIVE→IDLE transition that lands
+    // exactly on the next turn would miss the requalification path.
+    auto transient_it = transient_budget_claimants_.find(seq_id);
+    if (transient_it != transient_budget_claimants_.end()) {
+        transient_it->second = next_epoch;
+    }
 }
 
 void server_kv_governor_state::clear_claimant_lineage(llama_seq_id seq_id) {
@@ -640,6 +649,44 @@ void server_kv_governor_state::clear_claimant_lineage(llama_seq_id seq_id) {
     exhausted_claimants_.erase(seq_id);
     failure_counts_.erase(seq_id);
     claimant_history_.erase(seq_id);
+    // Hard lineage loss also drops the transient soft-budget wait record —
+    // the live KV object is gone, so any eligibility requalification against
+    // the old lineage is meaningless.
+    transient_budget_claimants_.erase(seq_id);
+}
+
+void server_kv_governor_state::claimant_eligibility_changed(
+        llama_seq_id seq_id, uint64_t epoch) {
+    if (seq_id < 0 || epoch == 0) {
+        return;
+    }
+    // The seq/epoch pair must match the live claimant epoch AND a transient
+    // wait record for that seq/epoch.  An ACTIVE→IDLE transition can only
+    // requalify the soft-budget hold that the corresponding ACTIVE decision
+    // recorded; a stale epoch (post-reset, post-lineage-loss) must not silently
+    // unstick the governor.
+    if (epoch != claimant_epoch(seq_id)) {
+        return;
+    }
+    const auto it = transient_budget_claimants_.find(seq_id);
+    if (it == transient_budget_claimants_.end() || it->second != epoch) {
+        return;
+    }
+    // The ACTIVE→IDLE lifecycle change invalidates the previous "no candidate"
+    // conclusion: drop the entire transient wait set and let the next decision
+    // rescore from scratch.  We do NOT execute a KV action here — the owner
+    // scheduler is responsible for waking the next maintenance pass via the
+    // existing idle_follow_up_pending_ authority.
+    transient_budget_claimants_.clear();
+    unmet_budget_bytes_ = 0;
+    budget_next_action_sample_ = 0;
+    if (budget_debt_bytes_ > 0) {
+        soft_offload_armed_ = true;
+        idle_follow_up_pending_ = true;
+    } else {
+        soft_offload_armed_ = false;
+        idle_follow_up_pending_ = false;
+    }
 }
 
 server_kv_claimant_history server_kv_governor_state::claimant_history(
@@ -936,6 +983,10 @@ server_kv_pressure_action_result server_kv_pressure_execute_governor(
             state.soft_offload_armed_ = false;
             state.unmet_budget_bytes_ = 0;
             state.budget_next_action_sample_ = 0;
+            // A basis or target change invalidates any transient wait: the
+            // prior debt no longer applies and the prior ACTIVE capture does
+            // not describe the new basis.
+            state.transient_budget_claimants_.clear();
         }
         if (state.budget_target_relaxed_) {
             state.budget_debt_bytes_ = 0;
@@ -960,12 +1011,44 @@ server_kv_pressure_action_result server_kv_pressure_execute_governor(
             state.soft_offload_armed_ = false;
             state.unmet_budget_bytes_ = 0;
             state.budget_next_action_sample_ = 0;
+            // No debt means no transient wait is meaningful — drop it so the
+            // next debt recurrence starts from a clean slate.
+            state.transient_budget_claimants_.clear();
             observation.reason = "budget_target_satisfied";
             result.budget_debt_after_bytes = 0;
             result.soft_offload_armed_after = false;
             result.budget_next_action_sample = 0;
             result.unmet_budget_bytes_after = 0;
             return result;
+        }
+
+        // Transient ACTIVE wait short-circuit.  If the previous decision
+        // recorded ACTIVE blockers into the transient wait set AND the live
+        // claimant epochs still match those captures AND the same scoring
+        // window is in flight (no basis/target change, no view jump), we
+        // hold without rescoring to avoid a busy-loop re-evaluate every
+        // sample while the producer is still live.  An explicit
+        // ACTIVE→IDLE requalification (claimant_eligibility_changed) will
+        // clear the wait set and rearm soft_offload_armed_.
+        if (!state.transient_budget_claimants_.empty()) {
+            bool all_match = true;
+            for (const auto & entry : state.transient_budget_claimants_) {
+                if (entry.second == 0 || entry.second != state.claimant_epoch(entry.first)) {
+                    all_match = false;
+                    break;
+                }
+            }
+            if (all_match) {
+                observation.reason = "budget_waiting_for_claimant_transition";
+                result.soft_offload_armed_after = state.soft_offload_armed_;
+                result.budget_next_action_sample = state.budget_next_action_sample_;
+                result.unmet_budget_bytes_after = state.unmet_budget_bytes_;
+                return result;
+            }
+            // Some captures are stale (post-reset epoch mismatch that did not
+            // trigger a basis/target change): drop the wait and let the next
+            // step rescore from scratch.
+            state.transient_budget_claimants_.clear();
         }
 
         // A terminal unmet-budget result is held until the view improves, the
@@ -1132,10 +1215,42 @@ server_kv_pressure_action_result server_kv_pressure_execute_governor(
             for (size_t rank = 0; rank < result.scores.size(); ++rank) {
                 result.scores[rank].rank = (uint32_t) rank;
             }
+            // Distinguish ACTIVE blockers (transient — the producer may go IDLE
+            // soon, so we hold the soft-budget debt and wait for an explicit
+            // requalification) from structural terminals (protected / shared /
+            // exhausted / stale / no_physical_relief / resident_lease) which
+            // are correctness- or capability-bound and MUST continue to fail
+            // closed through the existing budget_unmet_terminal path.
+            std::vector<server_kv_claimant_score> active_blockers;
+            active_blockers.reserve(result.scores.size());
+            for (const auto & score : result.scores) {
+                if (score.exclusion == server_kv_claimant_exclusion::active) {
+                    active_blockers.push_back(score);
+                }
+            }
             const auto selected = std::find_if(
                     result.scores.begin(), result.scores.end(),
                     [](const server_kv_claimant_score & score) { return score.eligible; });
-            if (selected == result.scores.end()) {
+            if (selected == result.scores.end() && !active_blockers.empty()) {
+                // Every claimant in this decision is excluded; at least one
+                // is a live ACTIVE producer.  Capture (seq, current_epoch)
+                // pairs into the transient wait set so the next decision
+                // can short-circuit on the same condition without re-scoring.
+                for (const auto & score : active_blockers) {
+                    state.transient_budget_claimants_[score.seq_id] =
+                        state.claimant_epoch(score.seq_id);
+                }
+                // Keep budget_debt_bytes_ untouched; set unmet_budget_bytes_ to
+                // the current debt so callers see a consistent snapshot, and
+                // mark a clear transient wait reason.  Do NOT enter
+                // budget_unmet_terminal or its ordinary backoff — that path
+                // is reserved for the structural terminals above.
+                state.unmet_budget_bytes_ = state.budget_debt_bytes_;
+                state.soft_offload_armed_ = false;
+                state.idle_follow_up_pending_ = false;
+                state.budget_next_action_sample_ = 0;
+                observation.reason = "budget_waiting_for_claimant_transition";
+            } else if (selected == result.scores.end()) {
                 state.unmet_budget_bytes_ = state.budget_debt_bytes_;
                 state.soft_offload_armed_ = false;
                 state.idle_follow_up_pending_ = false;

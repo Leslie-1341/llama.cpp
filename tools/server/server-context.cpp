@@ -1443,6 +1443,22 @@ private:
                     }
                 }
 #endif
+                // ACTIVE→IDLE requalification for the soft-budget transient
+                // hold.  The slot has already gone through reset(), which
+                // advanced the claimant epoch via callback_on_claimant_epoch_invalidate.
+                // Sample the post-reset epoch so the notification matches the
+                // claimant epoch currently stored in the governor state, then
+                // ask the governor to requalify any transient wait that
+                // captured this seq.  The governor only mutates its transient
+                // bookkeeping and may re-arm idle_follow_up_pending_; it never
+                // executes a KV action.  The existing queue_tasks.idle_update
+                // wakeup path is what drives the next maintenance pass.
+                if (id_slot >= 0) {
+                    const uint64_t released_epoch =
+                        kv_governor_state.claimant_epoch(id_slot);
+                    kv_governor_state.claimant_eligibility_changed(
+                            id_slot, released_epoch);
+                }
                 queue_tasks.pop_deferred_task(id_slot);
             };
             slot.callback_on_claimant_epoch_invalidate = [this](int id_slot) {
