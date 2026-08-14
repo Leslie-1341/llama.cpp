@@ -512,7 +512,7 @@ MoE Buffer 存在明显的 Working-Set Boundary。低于活跃 Expert 工作集�
 
 所有固定预算策略均无法在 1500 MB hard cap 下稳定运行，而 Auto Planner v2 根据当前工作集和安全边界自动选择 836 MB Expert Buffer，实现 3/3 成功。该结果直接验证了 Working-Set-Aware Budget Planner 对低内存可运行性的价值。
 
-![](./figures/test/fig01_repack_optimization.png)
+![](./figures/test/fig07_moe_budget_planner.png)
 
 #### 4.3.3 Pressure-Aware Full Adaptive 跨内存预算测试
 
