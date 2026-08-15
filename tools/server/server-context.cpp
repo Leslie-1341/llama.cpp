@@ -95,6 +95,72 @@ static std::string format_kv_g0_s1_resident_observation(
 }
 #endif
 
+#if defined(__linux__)
+static std::string format_kv_resident_preflight_observation(
+        uint64_t timestamp_mono_ns,
+        uint64_t sample_count,
+        const llama_kv_physical_budget_view & view,
+        const server_kv_resident_target_state & target,
+        bool observation_only) {
+    std::ostringstream out;
+    out << "kv_resident_preflight_observation"
+        << " timestamp_mono_ns=" << timestamp_mono_ns
+        << " sample_count=" << sample_count
+        << " whole_valid=" << (view.valid ? 1 : 0)
+        << " resident_available=" << (view.resident_available ? 1 : 0)
+        << " reclaimable_available=" << (view.reclaimable_available ? 1 : 0)
+        << " swapped_metadata_consistent=" << (view.swapped_metadata_consistent ? 1 : 0)
+        << " object_id=" << view.object_id
+        << " generation=" << view.generation
+        << " page_size=" << view.page_size
+        << " total_bytes=" << view.total_bytes
+        << " resident_bytes=" << view.resident_bytes
+        << " transient_staging_bound_bytes=" << view.transient_staging_bound_bytes
+        << " n_blocks=" << view.n_blocks
+        << " n_owned_blocks=" << view.n_owned_blocks
+        << " n_shared_blocks=" << view.n_shared_blocks
+        << " resident_block_count=" << view.resident_block_count
+        << " swapped_block_count=" << view.swapped_block_count
+        << " released_block_count=" << view.released_block_count
+        << " pending_write_block_count=" << view.pending_write_block_count
+        << " invalid_block_count=" << view.invalid_block_count
+        << " unused_block_count=" << view.unused_block_count
+        << " global_target_enabled=" << (target.valid() ? 1 : 0)
+        << " global_target_source=" << (target.source ? target.source : "none")
+        << " global_target_bytes=" << target.target_bytes
+        << " global_target_basis_generation=" << target.basis_generation
+        << " observation_only=" << (observation_only ? 1 : 0);
+    return out.str();
+}
+
+static std::string format_kv_resident_preflight_claimant(
+        uint64_t timestamp_mono_ns,
+        uint64_t sample_count,
+        llama_seq_id seq_id,
+        uint64_t claimant_epoch,
+        bool active,
+        const llama_kv_claimant_physical_view & view) {
+    std::ostringstream out;
+    out << "kv_resident_preflight_claimant"
+        << " timestamp_mono_ns=" << timestamp_mono_ns
+        << " sample_count=" << sample_count
+        << " seq_id=" << seq_id
+        << " claimant_epoch=" << claimant_epoch
+        << " active=" << (active ? 1 : 0)
+        << " valid=" << (view.valid ? 1 : 0)
+        << " available=" << (view.available ? 1 : 0)
+        << " authoritative=" << (view.authoritative ? 1 : 0)
+        << " shared=" << (view.shared ? 1 : 0)
+        << " object_id=" << view.object_id
+        << " generation=" << view.generation
+        << " exclusive_resident_bytes=" << view.estimated_exclusive_resident_bytes
+        << " exclusive_resident_blocks=" << view.exclusive_resident_blocks
+        << " swapped_bytes=" << view.estimated_swapped_bytes
+        << " swapped_blocks=" << view.swapped_blocks;
+    return out.str();
+}
+#endif
+
 static bool server_env_flag(const char * name, bool default_value = false) {
     const char * value = std::getenv(name);
     if (value == nullptr) {
@@ -839,6 +905,7 @@ private:
     bool memory_governor_auto_backends_enabled = false;
     bool memory_governor_observe_enabled = false;
     server_kv_pressure_runtime::time_point memory_governor_observe_last {};
+    uint64_t kv_resident_preflight_sample_count = 0;
     uint32_t memory_governor_observe_interval_ms = 1000;
     bool memory_governor_clean_reclaim_enabled = false;
     uint64_t memory_governor_clean_reclaim_target_bytes = 0;
@@ -1611,6 +1678,7 @@ private:
     void init_memory_governor_observer_from_env() {
         memory_governor_observe_enabled = false;
         memory_governor_observe_last = server_kv_pressure_runtime::time_point {};
+        kv_resident_preflight_sample_count = 0;
         memory_governor_observe_interval_ms = 1000;
         memory_governor_clean_reclaim_enabled = false;
         memory_governor_clean_reclaim_target_bytes = 0;
@@ -5405,6 +5473,67 @@ private:
         return true;
     }
 
+    void emit_resident_preflight_observation(
+            uint64_t sample_count,
+            const llama_kv_physical_budget_view & physical_view) {
+        if (!kv_g0_s1_resident_preflight) {
+            return;
+        }
+        auto * mem = ctx_tgt ? llama_get_memory(ctx_tgt) : nullptr;
+        if (!mem) {
+            return;
+        }
+
+        const uint64_t timestamp_mono_ns =
+            (uint64_t) std::max<int64_t>(0, ggml_time_us()) * 1000;
+        const bool observation_only =
+            !kv_pressure_unified_action_config.enabled &&
+            !memory_governor_auto_backends_enabled &&
+            !memory_governor_legacy_kv_actions_enabled &&
+            !memory_governor_clean_reclaim_enabled &&
+            !memory_governor_kv_release_enabled &&
+            !memory_governor_kv_offload_enabled &&
+            !memory_governor_kv_soft_budget_enabled &&
+            !memory_governor_prefetch_budget_enabled &&
+            !memory_governor_global_optimizer_enabled &&
+            !memory_governor_reallocation_enabled &&
+            !memory_governor_dense_repin_enabled &&
+            !memory_governor_dense_runtime_ring_shrink_enabled &&
+            !memory_governor_moe_budget_dynamic_enabled &&
+            !memory_governor_async_actions_enabled &&
+            !kv_pressure_dry_run_config.enabled &&
+            !kv_pressure_bounded_release_config.enabled &&
+            !kv_resident_target_state.valid();
+
+        SRV_INF("%s\n", format_kv_resident_preflight_observation(
+                timestamp_mono_ns, sample_count, physical_view,
+                kv_resident_target_state, observation_only).c_str());
+
+        std::vector<llama_seq_id> claimant_ids;
+        claimant_ids.reserve(slots.size());
+        for (const auto & slot : slots) {
+            claimant_ids.push_back(slot.id);
+        }
+        const auto claimant_views = mem->sample_kv_claimant_physical_views(claimant_ids);
+        for (const auto & slot : slots) {
+            const auto view_it = std::find_if(
+                    claimant_views.begin(), claimant_views.end(),
+                    [&slot](const llama_kv_claimant_physical_view & view) {
+                        return view.seq_id == slot.id;
+                    });
+            llama_kv_claimant_physical_view view;
+            view.seq_id = slot.id;
+            if (view_it != claimant_views.end()) {
+                view = *view_it;
+            }
+            const bool active = slot.is_processing() || slot.task != nullptr;
+            SRV_INF("%s\n", format_kv_resident_preflight_claimant(
+                    timestamp_mono_ns, sample_count, slot.id,
+                    kv_governor_state.claimant_epoch(slot.id), active, view).c_str());
+        }
+        memory_governor_observe_last = server_kv_pressure_runtime::clock::now();
+    }
+
     void maybe_sample_kv_pressure(bool idle) {
         const auto now = server_kv_pressure_runtime::clock::now();
         const bool observe_due = memory_governor_observe_due(now);
@@ -5417,18 +5546,28 @@ private:
         if (!kv_pressure_sampler_owner) {
             if (observe_due) {
                 const auto physical_view = capture_physical_budget_view();
-                publish_memory_governor_observation(
-                        idle, 0, nullptr, physical_view);
+                if (kv_g0_s1_resident_preflight) {
+                    emit_resident_preflight_observation(
+                            ++kv_resident_preflight_sample_count, physical_view);
+                } else {
+                    publish_memory_governor_observation(
+                            idle, 0, nullptr, physical_view);
+                }
             }
             return;
         }
 
         if (!kv_pressure_runtime.sample_due(now)) {
             if (observe_due) {
-                const auto telemetry = kv_pressure_sampler_owner->telemetry();
                 const auto physical_view = capture_physical_budget_view();
-                publish_memory_governor_observation(
-                        idle, kv_pressure_runtime.sample_count(), &telemetry, physical_view);
+                if (kv_g0_s1_resident_preflight) {
+                    emit_resident_preflight_observation(
+                            ++kv_resident_preflight_sample_count, physical_view);
+                } else {
+                    const auto telemetry = kv_pressure_sampler_owner->telemetry();
+                    publish_memory_governor_observation(
+                            idle, kv_pressure_runtime.sample_count(), &telemetry, physical_view);
+                }
             }
             return;
         }
@@ -5441,6 +5580,14 @@ private:
             SRV_INF("%s\n", marker.c_str());
         }
         const auto physical_view = capture_physical_budget_view();
+        if (kv_g0_s1_resident_preflight) {
+            if (observe_due) {
+                emit_resident_preflight_observation(
+                        ++kv_resident_preflight_sample_count, physical_view);
+            }
+            return;
+        }
+
         bool destructive_phase_did_work = false;
         if (observe_due) {
             const auto telemetry = kv_pressure_sampler_owner->telemetry();
@@ -5938,8 +6085,9 @@ private:
             std::strcmp(resident_observation, "both") == 0;
         kv_g0_s1_resident_observation = resident_observation_both ||
             (resident_observation && std::strcmp(resident_observation, "1") == 0);
-        kv_g0_s1_resident_preflight = resident_observation_both ||
-            (resident_observation && std::strcmp(resident_observation, "preflight") == 0);
+        const char * resident_preflight = std::getenv("LLAMA_KV_RESIDENT_PREFLIGHT");
+        kv_g0_s1_resident_preflight = resident_preflight &&
+            std::strcmp(resident_preflight, "1") == 0;
         const char * resume_stage_timing = std::getenv("LLAMA_KV_RESUME_STAGE_TIMING");
         kv_resume_stage_timing = resume_stage_timing && std::strcmp(resume_stage_timing, "1") == 0;
 #if defined(__linux__)

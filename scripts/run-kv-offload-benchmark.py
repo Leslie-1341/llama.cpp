@@ -43,7 +43,9 @@ SUPPORTED_LOADING_MODES = {"exact"}
 SUPPORTED_RESTORES = {"k1_sync", "k2_pipeline"}
 SUPPORTED_PREFAULTS = {"off", "r2"}
 SUPPORTED_RUN_KINDS = {"qualification", "formal"}
-SUPPORTED_RUN_MODES = {"qualification", "characterization"}
+SUPPORTED_RUN_MODES = {"qualification", "characterization", "resident_preflight"}
+RESIDENT_PREFLIGHT_DEFAULT_SAMPLE_INTERVAL = 0.10
+RESIDENT_PREFLIGHT_MIN_SAMPLES = 10
 CASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 SAMPLE_SCHEMA = "v2"
 DEFAULT_SAMPLE_INTERVAL = 0.10
@@ -536,13 +538,49 @@ def load_replay_plan(replay: dict[str, Any]) -> Any:
     return plan
 
 
+def normalize_resident_preflight(value: Any) -> dict[str, Any]:
+    if value is None:
+        return None
+    config = validate_mapping(
+        value,
+        {"sample_interval_seconds", "min_samples", "window_timeout_seconds"},
+        "workload.resident_preflight",
+    )
+    interval = require_finite_positive(
+        config["sample_interval_seconds"],
+        "workload.resident_preflight.sample_interval_seconds",
+    )
+    if abs(interval - RESIDENT_PREFLIGHT_DEFAULT_SAMPLE_INTERVAL) > 1e-9:
+        raise RunnerError("workload.resident_preflight.sample_interval_seconds must be 0.1")
+    min_samples = config["min_samples"]
+    if isinstance(min_samples, bool) or not isinstance(min_samples, int) or min_samples < RESIDENT_PREFLIGHT_MIN_SAMPLES:
+        raise RunnerError(
+            f"workload.resident_preflight.min_samples must be >= {RESIDENT_PREFLIGHT_MIN_SAMPLES}")
+    timeout = require_finite_positive(
+        config["window_timeout_seconds"],
+        "workload.resident_preflight.window_timeout_seconds",
+    )
+    if timeout < interval * min_samples:
+        raise RunnerError(
+            "workload.resident_preflight.window_timeout_seconds is too short "
+            "for the requested sample window")
+    return {
+        "sample_interval_seconds": interval,
+        "min_samples": min_samples,
+        "window_timeout_seconds": timeout,
+    }
+
+
 def normalize_workload(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise RunnerError("workload must be an object")
     replay = normalize_replay(value["replay"]) if "replay" in value else None
+    resident_preflight = normalize_resident_preflight(value.get("resident_preflight")) if "resident_preflight" in value else None
     expected_keys = {"warmup", "requests", "repeat", "qualification", "characterization"}
     if replay is not None:
         expected_keys.add("replay")
+    if "resident_preflight" in value:
+        expected_keys.add("resident_preflight")
     workload = validate_mapping(value, expected_keys, "workload")
     if not isinstance(workload["warmup"], list) or not isinstance(workload["requests"], list):
         raise RunnerError("workload warmup/requests must be arrays")
@@ -553,7 +591,8 @@ def normalize_workload(value: Any) -> dict[str, Any]:
             raise RunnerError("workload.replay cannot be combined with legacy requests or qualification/characterization")
         return {
             "warmup": [], "requests": [], "repeat": 1,
-            "qualification": None, "characterization": None, "replay": replay,
+            "qualification": None, "characterization": None,
+            "replay": replay, "resident_preflight": resident_preflight,
         }
     ids = [item["request_id"] for item in warmup + requests]
     if len(ids) != len(set(ids)):
@@ -627,12 +666,15 @@ def normalize_workload(value: Any) -> dict[str, Any]:
             "resume_request_id": resume_request_id,
         }
 
+    if resident_preflight is not None:
+        raise RunnerError("workload.resident_preflight requires a replay workload")
     return {
         "warmup": warmup,
         "requests": requests,
         "repeat": repeat,
         "qualification": qualification,
         "characterization": characterization,
+        "resident_preflight": None,
     }
 
 
@@ -884,6 +926,8 @@ def validate_spec(raw: Any) -> tuple[dict[str, Any], dict[str, dict[str, Any]], 
     ):
         raise RunnerError("spec.environment must map strings to strings")
     reject_canonical_kv_environment(spec["environment"])
+    if spec["run_mode"] != "resident_preflight" and "LLAMA_KV_RESIDENT_PREFLIGHT" in spec["environment"]:
+        raise RunnerError("LLAMA_KV_RESIDENT_PREFLIGHT is restricted to resident_preflight")
     pressure_basis = normalize_pressure_basis(spec["pressure_basis"])
     sampler = validate_mapping(spec["sampler"], {"interval_seconds"}, "sampler")
     sampler_interval = require_finite_positive(sampler["interval_seconds"], "sampler.interval_seconds")
@@ -914,15 +958,26 @@ def validate_spec(raw: Any) -> tuple[dict[str, Any], dict[str, dict[str, Any]], 
     if any(item["policy"] == "release_only" for item in plan) and spec["run_mode"] != "characterization":
         raise RunnerError("release_only policy is available only in characterization mode")
     if "replay" in workload:
-        if spec["run_mode"] != "qualification" or spec["run_kind"] != "qualification":
+        if spec["run_mode"] == "resident_preflight":
+            if spec["run_kind"] != "qualification" or workload["resident_preflight"] is None:
+                raise RunnerError(
+                    "resident_preflight requires qualification run_kind and workload.resident_preflight")
+            if workload["replay"]["lifecycle"]["enabled"]:
+                raise RunnerError("resident_preflight cannot enable replay lifecycle")
+        elif spec["run_mode"] != "qualification" or spec["run_kind"] != "qualification":
             raise RunnerError("replay workload is restricted to qualification mode")
     elif spec["run_mode"] == "qualification":
         if workload["qualification"] is None or workload["characterization"] is not None:
             raise RunnerError(
                 "qualification mode requires only workload.qualification configuration")
+    elif spec["run_mode"] == "resident_preflight":
+        raise RunnerError("resident_preflight requires a replay workload")
     elif workload["characterization"] is None or workload["qualification"] is not None:
         raise RunnerError(
             "characterization mode requires only workload.characterization configuration")
+    if spec["run_mode"] == "resident_preflight" and any(
+            item["policy"] != "resident" for item in plan):
+        raise RunnerError("resident_preflight is policy-neutral and requires resident cases")
     if spec["run_kind"] == "formal":
         if len({item["round"] for item in plan}) < 2:
             raise RunnerError("formal run requires at least two independent rounds")
@@ -987,6 +1042,7 @@ def expanded_request_plan(
 
 def runtime_environment(
         spec: dict[str, Any], case: dict[str, Any], backing_dir: pathlib.Path) -> dict[str, str]:
+    resident_preflight = spec["run_mode"] == "resident_preflight"
     env = {
         "HOME": "/tmp",
         "LANG": "C",
@@ -1013,6 +1069,26 @@ def runtime_environment(
         "LLAMA_KV_PAGED_RESTORE_PREFAULT_PROBE": "1" if case["prefault"] == "r2" else "0",
         "LLAMA_KV_SWAP_DIR": str(backing_dir),
     }
+    if resident_preflight:
+        env.update({
+            "LLAMA_MEMORY_GOVERNOR": "0",
+            "LLAMA_MEMORY_GOVERNOR_OBSERVE": "1",
+            "LLAMA_MEMORY_GOVERNOR_OBSERVE_MS": "100",
+            "LLAMA_MEMORY_GOVERNOR_AUTO_BACKENDS": "0",
+            "LLAMA_MEMORY_GOVERNOR_KV_RELEASE": "0",
+            "LLAMA_MEMORY_GOVERNOR_KV_OFFLOAD": "0",
+            "LLAMA_MEMORY_GOVERNOR_KV_SOFT_BUDGET": "0",
+            "LLAMA_MEMORY_GOVERNOR_CLEAN_RECLAIM": "0",
+            "LLAMA_MEMORY_GOVERNOR_GLOBAL_OPTIMIZER": "0",
+            "LLAMA_MEMORY_GOVERNOR_REALLOCATION": "0",
+            "LLAMA_MEMORY_GOVERNOR_DENSE_REPIN": "0",
+            "LLAMA_MEMORY_GOVERNOR_DENSE_RING_SHRINK": "0",
+            "LLAMA_MEMORY_GOVERNOR_MOE_BUDGET_DYNAMIC": "0",
+            "LLAMA_MEMORY_GOVERNOR_ASYNC_ACTIONS": "0",
+            "LLAMA_KV_PRESSURE_UNIFIED_ACTION": "0",
+            "LLAMA_KV_PRESSURE_GOVERNOR_CLAIMANT_TRACE": "0",
+            "LLAMA_KV_RESIDENT_PREFLIGHT": "1",
+        })
     pressure_basis = spec["pressure_basis"]
     if pressure_basis["authority"] == "rss_absolute":
         env.update({
@@ -1021,6 +1097,26 @@ def runtime_environment(
             "LLAMA_KV_CRITICAL_RSS_KB": str(pressure_basis["critical_kb"]),
         })
     env.update(spec["environment"])
+    if resident_preflight:
+        env.update({
+            "LLAMA_MEMORY_GOVERNOR": "0",
+            "LLAMA_MEMORY_GOVERNOR_OBSERVE": "1",
+            "LLAMA_MEMORY_GOVERNOR_OBSERVE_MS": "100",
+            "LLAMA_MEMORY_GOVERNOR_AUTO_BACKENDS": "0",
+            "LLAMA_MEMORY_GOVERNOR_KV_RELEASE": "0",
+            "LLAMA_MEMORY_GOVERNOR_KV_OFFLOAD": "0",
+            "LLAMA_MEMORY_GOVERNOR_KV_SOFT_BUDGET": "0",
+            "LLAMA_MEMORY_GOVERNOR_CLEAN_RECLAIM": "0",
+            "LLAMA_MEMORY_GOVERNOR_GLOBAL_OPTIMIZER": "0",
+            "LLAMA_MEMORY_GOVERNOR_REALLOCATION": "0",
+            "LLAMA_MEMORY_GOVERNOR_DENSE_REPIN": "0",
+            "LLAMA_MEMORY_GOVERNOR_DENSE_RING_SHRINK": "0",
+            "LLAMA_MEMORY_GOVERNOR_MOE_BUDGET_DYNAMIC": "0",
+            "LLAMA_MEMORY_GOVERNOR_ASYNC_ACTIONS": "0",
+            "LLAMA_KV_PRESSURE_UNIFIED_ACTION": "0",
+            "LLAMA_KV_PRESSURE_GOVERNOR_CLAIMANT_TRACE": "0",
+            "LLAMA_KV_RESIDENT_PREFLIGHT": "1",
+        })
     if case["policy"] == "resident":
         env.update({
             "LLAMA_KV_PRESSURE_UNIFIED_ACTION": "0",
@@ -2117,8 +2213,8 @@ def validate_replay_model_binding(replay_plan: Any, spec: dict[str, Any]) -> Non
         raise RunnerError("model-bound replay source binary SHA is invalid")
     if sha256_file(pathlib.Path(spec["model"])) != expected_model_sha:
         raise RunnerError("replay model bytes differ from the model-bound transcript")
-    if replay_plan.schema == "gt-trace-1b-q1-derived/v1" and sha256_file(pathlib.Path(spec["binary"])) != transcript_binary_sha:
-        raise RunnerError("derived replay binary bytes differ from the model-bound parent transcript")
+    if sha256_file(pathlib.Path(spec["binary"])) != transcript_binary_sha:
+        raise RunnerError("replay binary bytes differ from the model-bound transcript")
 
 
 def validate_replay_slot_capacity(
@@ -2653,6 +2749,7 @@ def run_one_replay(
 ) -> dict[str, Any]:
     replay_cfg = workload["replay"]
     replay_plan = load_replay_plan(replay_cfg)
+    validate_replay_model_binding(replay_plan, spec)
     schedule = expand_schedule(replay_plan)
     if replay_cfg.get("lifecycle", {}).get("enabled", False):
         return run_one_replay_lifecycle(artifact, run, case, spec, workload, execution_index, replay_plan, schedule)
@@ -2663,7 +2760,6 @@ def run_one_replay(
     backing_dir.mkdir()
     replay_cfg = workload["replay"]
     replay_plan = load_replay_plan(replay_cfg)
-    validate_replay_model_binding(replay_plan, spec)
     schedule = expand_schedule(replay_plan)
     dump(run_dir / "run.json", {
         "run_id": run["run_id"], "round": run["round"], "run_order": run["run_order"],
@@ -3078,6 +3174,406 @@ def run_one_replay(
             "error": lifecycle_error or (None if fidelity["status"] == "PASS" else "workload fidelity failed")}
 
 
+def _resident_preflight_decode_marker(
+        fields: dict[str, str], numeric: set[str], booleans: set[str],
+        required: set[str], label: str) -> dict[str, Any]:
+    if set(fields) != required:
+        raise RunnerError(f"{label} marker schema mismatch")
+    result: dict[str, Any] = {}
+    for key in numeric:
+        value = fields[key]
+        if not value.isdigit():
+            raise RunnerError(f"{label}.{key} is not a non-negative integer")
+        result[key] = int(value)
+    for key in booleans:
+        if fields[key] not in {"0", "1"}:
+            raise RunnerError(f"{label}.{key} is not boolean")
+        result[key] = fields[key] == "1"
+    result["global_target_source"] = fields.get("global_target_source")
+    return result
+
+
+def collect_resident_preflight_window(
+        stderr_path: pathlib.Path,
+        start_offset: int,
+        config: dict[str, Any],
+        ab_seq_ids: set[int],
+        c_seq_id: int | None,
+        window: str,
+        stop_future: Any = None,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    whole_required = {
+        "timestamp_mono_ns", "sample_count", "whole_valid", "resident_available",
+        "reclaimable_available", "swapped_metadata_consistent", "object_id", "generation",
+        "page_size", "total_bytes", "resident_bytes", "transient_staging_bound_bytes",
+        "n_blocks", "n_owned_blocks", "n_shared_blocks", "resident_block_count",
+        "swapped_block_count", "released_block_count", "pending_write_block_count",
+        "invalid_block_count", "unused_block_count", "global_target_enabled",
+        "global_target_source", "global_target_bytes", "global_target_basis_generation",
+        "observation_only",
+    }
+    whole_numeric = whole_required - {
+        "whole_valid", "resident_available", "reclaimable_available",
+        "swapped_metadata_consistent", "global_target_enabled", "global_target_source",
+        "observation_only",
+    }
+    whole_booleans = {
+        "whole_valid", "resident_available", "reclaimable_available",
+        "swapped_metadata_consistent", "global_target_enabled", "observation_only",
+    }
+    claimant_required = {
+        "timestamp_mono_ns", "sample_count", "seq_id", "claimant_epoch", "active",
+        "valid", "available", "authoritative", "shared", "object_id", "generation",
+        "exclusive_resident_bytes", "exclusive_resident_blocks", "swapped_bytes", "swapped_blocks",
+    }
+    claimant_numeric = claimant_required - {"active", "valid", "available", "authoritative", "shared"}
+    claimant_booleans = {"active", "valid", "available", "authoritative", "shared"}
+    deadline = time.monotonic() + float(config["window_timeout_seconds"])
+    groups: dict[tuple[int, int], dict[str, Any]] = {}
+    last_read = start_offset
+    pending = b""
+
+    def read_markers() -> None:
+        nonlocal last_read, pending
+        try:
+            with stderr_path.open("rb") as stream:
+                stream.seek(last_read)
+                data = stream.read()
+                last_read += len(data)
+        except OSError as exc:
+            raise RunnerError(f"resident_preflight cannot read server stderr: {exc}") from exc
+        data = pending + data
+        complete, separator, pending = data.rpartition(b"\n")
+        if not separator:
+            pending = data
+            return
+        for line in complete.splitlines():
+            line = line.decode("utf-8", errors="replace")
+            whole = parse_marker_fields(line, "kv_resident_preflight_observation")
+            if whole is not None:
+                decoded = _resident_preflight_decode_marker(
+                    whole, whole_numeric, whole_booleans, whole_required, "resident observation")
+                key = (decoded["timestamp_mono_ns"], decoded["sample_count"])
+                if "whole" in groups.setdefault(key, {}):
+                    raise RunnerError("resident_preflight duplicate whole-KV sample")
+                groups[key]["whole"] = decoded
+                continue
+            claimant = parse_marker_fields(line, "kv_resident_preflight_claimant")
+            if claimant is None:
+                continue
+            decoded = _resident_preflight_decode_marker(
+                claimant, claimant_numeric, claimant_booleans, claimant_required,
+                "claimant observation")
+            key = (decoded["timestamp_mono_ns"], decoded["sample_count"])
+            group = groups.setdefault(key, {})
+            claimants = group.setdefault("claimants", {})
+            seq_id = decoded["seq_id"]
+            if seq_id in claimants:
+                raise RunnerError("resident_preflight duplicate claimant sample")
+            claimants[seq_id] = decoded
+
+    def valid_group(group: dict[str, Any]) -> bool:
+        whole = group.get("whole")
+        claimants = group.get("claimants", {})
+        if whole is None or not whole["whole_valid"] or not whole["resident_available"]:
+            return False
+        if not whole["reclaimable_available"] or not whole["swapped_metadata_consistent"]:
+            raise RunnerError("resident_preflight whole-KV reclaim/swap authority is unavailable")
+        if whole["object_id"] <= 0 or whole["generation"] <= 0 or whole["page_size"] <= 0 or whole["total_bytes"] <= 0:
+            raise RunnerError("resident_preflight whole-KV identity is invalid")
+        if not whole["observation_only"] or whole["global_target_enabled"] or whole["global_target_bytes"] != 0:
+            raise RunnerError("resident_preflight observed a Global target")
+        if whole["global_target_source"] not in {"none", "UNAVAILABLE"}:
+            raise RunnerError("resident_preflight observed a non-empty Global target source")
+        for seq_id in ab_seq_ids:
+            view = claimants.get(seq_id)
+            if view is None:
+                return False
+            if not view["valid"] or not view["available"] or not view["authoritative"] or view["shared"]:
+                raise RunnerError("resident_preflight A/B claimant authority is unavailable or shared")
+            if view["active"]:
+                return False
+        c_view = claimants.get(c_seq_id) if c_seq_id is not None else None
+        if window == "ABC_ACTIVE":
+            return (
+                c_view is not None and c_view["active"] and c_view["valid"]
+                and c_view["available"] and c_view["authoritative"]
+                and not c_view["shared"])
+        return c_view is None or not c_view["active"]
+
+    while time.monotonic() < deadline:
+        if stop_future is not None and stop_future.done():
+            stop_future.result()
+            raise RunnerError(
+                f"resident_preflight {window} request completed before the sample window")
+        read_markers()
+        ordered = []
+        for key, group in sorted(groups.items(), key=lambda item: (item[0][1], item[0][0])):
+            if not valid_group(group):
+                continue
+            whole = group["whole"]
+            if whole["sample_count"] != key[1] or whole["timestamp_mono_ns"] != key[0]:
+                raise RunnerError("resident_preflight marker identity drift")
+            ordered.append((key, group))
+        run: list[tuple[tuple[int, int], dict[str, Any]]] = []
+        for key, group in ordered:
+            if not run or (
+                    key[1] == run[-1][0][1] + 1
+                    and key[0] > run[-1][0][0]
+                    and key[0] - run[-1][0][0] <= int(
+                        float(config["sample_interval_seconds"])
+                        * 1_000_000_000 * 2)):
+                run.append((key, group))
+            else:
+                run = [(key, group)]
+            if len(run) >= int(config["min_samples"]):
+                return [
+                    {
+                        "timestamp_mono_ns": item["whole"]["timestamp_mono_ns"],
+                        "sample_count": item["whole"]["sample_count"],
+                        "whole": item["whole"],
+                        "claimants": {
+                            str(seq): view for seq, view in item.get("claimants", {}).items()
+                        },
+                    }
+                    for _, item in run[:int(config["min_samples"])]
+                ], {
+                    "started_mono_ns": run[0][0][0],
+                    "finished_mono_ns": run[int(config["min_samples"]) - 1][0][0],
+                    "stderr_end_offset": last_read,
+                }
+        time.sleep(0.01)
+    raise RunnerError(f"resident_preflight {window} sample window is incomplete")
+
+
+def run_one_resident_preflight_replay(
+        artifact: pathlib.Path,
+        run: dict[str, Any],
+        case: dict[str, Any],
+        spec: dict[str, Any],
+        workload: dict[str, Any],
+        execution_index: int,
+) -> dict[str, Any]:
+    replay_cfg = workload["replay"]
+    preflight_cfg = workload["resident_preflight"]
+    replay_plan = load_replay_plan(replay_cfg)
+    validate_replay_model_binding(replay_plan, spec)
+    if replay_cfg["lifecycle"]["enabled"] or replay_plan.fixture_contract is not None:
+        raise RunnerError("resident_preflight cannot reuse lifecycle or Q1 phase-contract replay")
+    if replay_cfg["n_parallel"] < 3:
+        raise RunnerError("resident_preflight requires at least three replay slots")
+    sessions = {session.logical_session_id: session for session in replay_plan.sessions}
+    if set(sessions) != {"A", "B", "C"} or any(len(session.turns) != 1 for session in sessions.values()):
+        raise RunnerError("resident_preflight replay must contain exactly one turn for A, B, and C")
+    schedule = expand_schedule(replay_plan)
+    events = {sid: [item for item in schedule if item["logical_session_id"] == sid][0]
+              for sid in ("A", "B", "C")}
+    run_dir = artifact / "runs" / run["run_id"]
+    raw_dir = run_dir / "raw"
+    backing_dir = run_dir / "backing"
+    raw_dir.mkdir(parents=True)
+    backing_dir.mkdir()
+    dump(run_dir / "run.json", {
+        "run_id": run["run_id"], "round": run["round"], "run_order": run["run_order"],
+        "case_id": run["case_id"], "execution_index": execution_index, "case": run,
+        "request_plan": schedule,
+    })
+    port = free_port()
+    env = runtime_environment(spec, case, backing_dir)
+    argv = server_argv(spec, port)
+    stdout_path, stderr_path = run_dir / "server.stdout", run_dir / "server.stderr"
+    sampler_stdout_path, sampler_stderr_path = run_dir / "sampler.stdout", run_dir / "sampler.stderr"
+    samples_path, responses_path = run_dir / "memory_samples.tsv", run_dir / "responses.jsonl"
+    resident_samples_path = run_dir / "resident_preflight_samples.jsonl"
+    server: subprocess.Popen[bytes] | None = None
+    sampler: subprocess.Popen[bytes] | None = None
+    handles: list[Any] = []
+    server_identity_record: dict[str, Any] | None = None
+    sampler_identity_record: dict[str, Any] | None = None
+    server_cgroup: dict[str, Any] | None = None
+    runner_cgroup = cgroup_identity(os.getpid())
+    started_at_ns = time.monotonic_ns()
+    request_records: list[dict[str, Any]] = []
+    admission_records: list[dict[str, Any]] = []
+    bindings: dict[str, dict[str, int]] = {}
+    windows: dict[str, Any] = {"AB_RESIDENT": None, "ABC_ACTIVE": None}
+    collected_samples: list[dict[str, Any]] = []
+    lifecycle_error: str | None = None
+    request_loop_started = False
+    server_cleanup = {"pid": None, "pgid": None, "exit_code": None, "stop_requested": False,
+                       "stop_signal": None, "term_timed_out": False, "kill_timed_out": False,
+                       "pgid_check_complete": False, "residual_process": False}
+    sampler_cleanup = dict(server_cleanup)
+    try:
+        server_handle = stdout_path.open("wb"); handles.append(server_handle)
+        server_err_handle = stderr_path.open("wb"); handles.append(server_err_handle)
+        server = subprocess.Popen(argv, cwd=run_dir, env=env, stdout=server_handle,
+                                  stderr=server_err_handle, start_new_session=True)
+        server_identity_record = process_identity(server.pid, argv)
+        server_cgroup = cgroup_scope(cgroup_identity(server.pid), runner_cgroup)
+        expected_memory_max = spec["cgroup"]["expected_memory_max"]
+        if expected_memory_max is not None and server_cgroup.get("memory_max") != expected_memory_max:
+            raise RunnerError("server cgroup memory.max mismatch")
+        if spec["pressure_basis"]["authority"] == "cgroup_finite" and not finite_memory_limit(server_cgroup.get("memory_max")):
+            raise RunnerError("server cgroup does not provide a finite pressure authority")
+        current_file = server_cgroup.get("memory_current_file") or ""
+        sampler_env = dict(os.environ)
+        sampler_env["KV_CONTROLLED_SAMPLE_SCHEMA"] = SAMPLE_SCHEMA
+        sampler_env["KV_CONTROLLED_CGROUP_DIR"] = server_cgroup.get("path") or ""
+        sampler_command = ["bash", str(MEMORY_SAMPLER), "--sample-process", str(server.pid),
+                           str(samples_path), str(backing_dir), str(spec["sampler"]["interval_seconds"]), current_file]
+        sampler_stdout_handle = sampler_stdout_path.open("wb"); handles.append(sampler_stdout_handle)
+        sampler_stderr_handle = sampler_stderr_path.open("wb"); handles.append(sampler_stderr_handle)
+        sampler = subprocess.Popen(sampler_command, cwd=run_dir, env=sampler_env,
+                                   stdout=sampler_stdout_handle, stderr=sampler_stderr_handle,
+                                   start_new_session=True)
+        sampler_identity_record = process_identity(sampler.pid, sampler_command)
+        wait_health(port, server, spec["health_timeout_seconds"])
+        capture_slots(port, run_dir / "slots_before.json", spec["request_timeout_seconds"])
+        request_loop_started = True
+        admission = __import__("multi_session_replay", fromlist=["SlotAdmission"]).SlotAdmission(3)
+        dispatch_order = 0
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures: dict[Any, tuple[str, dict[str, Any], dict[str, int], int]] = {}
+
+            def dispatch(sid: str) -> Any:
+                nonlocal dispatch_order
+                event = events[sid]
+                decision = admission.admit(sid, (time.monotonic_ns() - started_at_ns) // 1000)
+                if decision["status"] != "admitted":
+                    raise RunnerError(f"resident_preflight session {sid} was not admitted")
+                binding = {"slot_id": decision["slot_id"], "seq_id": decision["seq_id"],
+                           "runner_generation": decision["runner_generation"]}
+                bindings[sid] = binding
+                admission_records.append({**event, **decision, "observed_us": (time.monotonic_ns() - started_at_ns) // 1000})
+                order = dispatch_order
+                dispatch_order += 1
+                future = executor.submit(
+                    request_completion_replay, port, event, binding["slot_id"], raw_dir,
+                    spec["request_timeout_seconds"], False, started_at_ns)
+                futures[future] = (sid, event, binding, order)
+                return future
+
+            dispatch("A")
+            dispatch("B")
+            for future in list(futures):
+                sid, event, binding, order = futures[future]
+                actual = future.result()
+                actual.update({
+                    "dispatch_order": order, "admitted_us": actual["started_us"],
+                    "dispatched_us": actual["started_us"], "planned_arrival_us": event["planned_arrival_us"],
+                    "arrival_lag_us": max(0, actual["started_us"] - event["planned_arrival_us"]),
+                    "admission_wait_us": max(0, actual["started_us"] - event["planned_arrival_us"]),
+                    "service_us": actual["completed_us"] - actual["started_us"],
+                    "runner_generation": binding["runner_generation"],
+                })
+                request_records.append(actual)
+                admission_records.append({**event, **binding, "status": "resident_idle", "completed_us": actual["completed_us"]})
+            ab_offset = stderr_path.stat().st_size
+            ab_samples, ab_window = collect_resident_preflight_window(
+                stderr_path, ab_offset, preflight_cfg,
+                {bindings["A"]["seq_id"], bindings["B"]["seq_id"]}, None,
+                "AB_RESIDENT")
+            for sample in ab_samples:
+                sample["window"] = "AB_RESIDENT"
+            collected_samples.extend(ab_samples)
+            ab_stderr_end_offset = ab_window.pop("stderr_end_offset")
+            windows["AB_RESIDENT"] = {**ab_window, "sample_count": len(ab_samples)}
+
+            c_offset = ab_stderr_end_offset
+            c_dispatch_ns = time.monotonic_ns()
+            c_future = dispatch("C")
+            abc_samples, abc_window = collect_resident_preflight_window(
+                stderr_path, c_offset, preflight_cfg,
+                {bindings["A"]["seq_id"], bindings["B"]["seq_id"]}, bindings["C"]["seq_id"],
+                "ABC_ACTIVE", stop_future=c_future)
+            for sample in abc_samples:
+                sample["window"] = "ABC_ACTIVE"
+            collected_samples.extend(abc_samples)
+            windows["ABC_ACTIVE"] = {
+                **abc_window, "sample_count": len(abc_samples),
+                "dispatch_started_mono_ns": c_dispatch_ns,
+            }
+            sid, event, binding, order = futures[c_future]
+            actual = c_future.result()
+            actual.update({
+                "dispatch_order": order, "admitted_us": actual["started_us"],
+                "dispatched_us": actual["started_us"], "planned_arrival_us": event["planned_arrival_us"],
+                "arrival_lag_us": max(0, actual["started_us"] - event["planned_arrival_us"]),
+                "admission_wait_us": max(0, actual["started_us"] - event["planned_arrival_us"]),
+                "service_us": actual["completed_us"] - actual["started_us"],
+                "runner_generation": binding["runner_generation"],
+            })
+            request_records.append(actual)
+            admission_records.append({**event, **binding, "status": "completed", "completed_us": actual["completed_us"]})
+        request_records.sort(key=lambda item: item["dispatch_order"])
+        with responses_path.open("w", encoding="utf-8") as responses:
+            for actual in request_records:
+                responses.write(json.dumps(actual, ensure_ascii=False, sort_keys=True) + "\n")
+        capture_slots(port, run_dir / "slots_after.json", spec["request_timeout_seconds"])
+    except (OSError, RunnerError, ReplayError, subprocess.SubprocessError) as exc:
+        lifecycle_error = str(exc)
+    finally:
+        if collected_samples:
+            with resident_samples_path.open("w", encoding="utf-8") as stream:
+                for sample in collected_samples:
+                    stream.write(json.dumps(sample, ensure_ascii=False, sort_keys=True) + "\n")
+        else:
+            resident_samples_path.write_text("", encoding="utf-8")
+        if sampler is not None:
+            sampler_cleanup = terminate_process(sampler, "sampler", 5.0)
+        if server is not None:
+            server_cleanup = terminate_process(server, "server", 10.0)
+        for handle in handles:
+            handle.close()
+    cleanup = {"server": server_cleanup, "sampler": sampler_cleanup,
+               "residual_process": bool(server_cleanup["residual_process"] or sampler_cleanup["residual_process"]),
+               "cleanup_complete": lifecycle_error is None and server_cleanup["exit_code"] == 0
+               and sampler_cleanup["exit_code"] == 0 and not (server_cleanup["residual_process"] or sampler_cleanup["residual_process"])}
+    dump(run_dir / "cleanup.json", cleanup)
+    fidelity = check_fidelity(replay_plan, request_records, n_parallel=replay_cfg["n_parallel"])
+    replay_record = {"plan": replay_plan.to_dict(), "schedule": schedule,
+                     "admission": admission_records, "events": request_records,
+                     "workload_fidelity": fidelity,
+                     "resident_preflight": {"samples_path": "resident_preflight_samples.jsonl",
+                                             "windows": windows, "bindings": bindings}}
+    dump(run_dir / "replay.json", replay_record)
+    resident_preflight_record = {
+        "mode": "resident_preflight", "sample_interval_seconds": preflight_cfg["sample_interval_seconds"],
+        "min_samples": preflight_cfg["min_samples"],
+        "window_timeout_seconds": preflight_cfg["window_timeout_seconds"],
+        "samples_path": "resident_preflight_samples.jsonl", "bindings": bindings, "windows": windows,
+    }
+    execution = {
+        "run_id": run["run_id"], "round": run["round"], "run_order": run["run_order"],
+        "case_id": run["case_id"], "execution_index": execution_index, "run_mode": spec["run_mode"],
+        "argv": argv, "environment": env, "server_identity": server_identity_record,
+        "server_cgroup": server_cgroup, "pressure_basis": dict(spec["pressure_basis"]),
+        "sampler_identity": sampler_identity_record, "sampler_schema": SAMPLE_SCHEMA,
+        "sampler_argv": ["bash", str(MEMORY_SAMPLER), "--sample-process",
+                         str(server_identity_record["pid"]) if server_identity_record else "NOT_STARTED",
+                         str(samples_path), str(backing_dir), str(spec["sampler"]["interval_seconds"]),
+                         str(server_cgroup.get("memory_current_file", "")) if server_cgroup else ""],
+        "request_loop_started": request_loop_started, "request_count": len(request_records),
+        "qualification": {"idle_seconds": None, "offload_timeout_seconds": None, "resume_request_id": None,
+                          "idle": None, "offload_barrier": None, "resume": None},
+        "characterization": {"idle_seconds": None, "settle_timeout_seconds": None, "target_tolerance_bytes": None,
+                             "resume_request_id": None, "requested_target_bytes": None, "action_target_bytes": None,
+                             "after_fill": None, "idle": None, "settle": None, "release_settled": None,
+                             "settled": None, "resume": None, "after_measurement": None},
+        "replay": replay_record, "resident_preflight": resident_preflight_record,
+    }
+    dump(run_dir / "execution.json", execution)
+    if not responses_path.exists():
+        responses_path.write_text("", encoding="utf-8")
+    complete = cleanup["cleanup_complete"] and lifecycle_error is None and fidelity["status"] == "PASS" \
+        and all(windows.values()) and all(item["sample_count"] >= preflight_cfg["min_samples"] for item in windows.values())
+    return {"run_id": run["run_id"], "case_id": run["case_id"], "round": run["round"],
+            "run_order": run["run_order"], "execution_index": execution_index,
+            "directory": str(run_dir.relative_to(artifact)), "status": "complete" if complete else "incomplete",
+            "error": lifecycle_error or (None if fidelity["status"] == "PASS" else "workload fidelity failed")}
+
+
 def run_one(
         artifact: pathlib.Path,
         run: dict[str, Any],
@@ -3087,6 +3583,9 @@ def run_one(
         execution_index: int,
 ) -> dict[str, Any]:
     if "replay" in workload:
+        if spec["run_mode"] == "resident_preflight":
+            return run_one_resident_preflight_replay(
+                artifact, run, case, spec, workload, execution_index)
         return run_one_replay(artifact, run, case, spec, workload, execution_index)
     run_dir = artifact / "runs" / run["run_id"]
     raw_dir = run_dir / "raw"

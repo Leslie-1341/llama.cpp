@@ -26,7 +26,9 @@ SUPPORTED_LOADING_MODES = {"exact"}
 SUPPORTED_RESTORES = {"k1_sync", "k2_pipeline"}
 SUPPORTED_PREFAULTS = {"off", "r2"}
 SUPPORTED_RUN_KINDS = {"qualification", "formal"}
-SUPPORTED_RUN_MODES = {"qualification", "characterization"}
+SUPPORTED_RUN_MODES = {"qualification", "characterization", "resident_preflight"}
+RESIDENT_PREFLIGHT_DEFAULT_SAMPLE_INTERVAL = 0.10
+RESIDENT_PREFLIGHT_MIN_SAMPLES = 10
 CASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 UINT = re.compile(r"^[0-9]+$")
 SIGNED_INT = re.compile(r"^-?[0-9]+$")
@@ -390,13 +392,49 @@ def normalize_replay(value: Any) -> dict[str, Any]:
             "admission_timeout_seconds": admission_timeout, "lifecycle": lifecycle}
 
 
+def normalize_resident_preflight(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    config = exact(
+        value,
+        {"sample_interval_seconds", "min_samples", "window_timeout_seconds"},
+        "spec.workload.resident_preflight",
+    )
+    interval = require_finite_positive(
+        config["sample_interval_seconds"],
+        "spec.workload.resident_preflight.sample_interval_seconds",
+    )
+    if abs(interval - RESIDENT_PREFLIGHT_DEFAULT_SAMPLE_INTERVAL) > 1e-9:
+        raise ParseError("spec.workload.resident_preflight.sample_interval_seconds must be 0.1")
+    min_samples = config["min_samples"]
+    if isinstance(min_samples, bool) or not isinstance(min_samples, int) or min_samples < RESIDENT_PREFLIGHT_MIN_SAMPLES:
+        raise ParseError(
+            f"spec.workload.resident_preflight.min_samples must be >= {RESIDENT_PREFLIGHT_MIN_SAMPLES}")
+    timeout = require_finite_positive(
+        config["window_timeout_seconds"],
+        "spec.workload.resident_preflight.window_timeout_seconds",
+    )
+    if timeout < interval * min_samples:
+        raise ParseError(
+            "spec.workload.resident_preflight.window_timeout_seconds is too short "
+            "for the requested sample window")
+    return {
+        "sample_interval_seconds": interval,
+        "min_samples": min_samples,
+        "window_timeout_seconds": timeout,
+    }
+
+
 def normalize_workload(workload: Any) -> dict[str, Any]:
     if not isinstance(workload, dict):
         raise ParseError("spec.workload must be an object")
     replay = normalize_replay(workload["replay"]) if "replay" in workload else None
+    resident_preflight = normalize_resident_preflight(workload.get("resident_preflight")) if "resident_preflight" in workload else None
     expected_keys = {"warmup", "requests", "repeat", "qualification", "characterization"}
     if replay is not None:
         expected_keys.add("replay")
+    if "resident_preflight" in workload:
+        expected_keys.add("resident_preflight")
     value = exact(workload, expected_keys, "spec.workload")
     if not isinstance(value["warmup"], list) or not isinstance(value["requests"], list):
         raise ParseError("spec.workload warmup/requests must be arrays")
@@ -404,7 +442,8 @@ def normalize_workload(workload: Any) -> dict[str, Any]:
         if value["warmup"] or value["requests"] or value["qualification"] is not None or value["characterization"] is not None:
             raise ParseError("spec.workload.replay cannot be combined with legacy workload")
         return {"warmup": [], "requests": [], "repeat": 1,
-                "qualification": None, "characterization": None, "replay": replay}
+                "qualification": None, "characterization": None,
+                "replay": replay, "resident_preflight": resident_preflight}
     all_requests = value["warmup"] + value["requests"]
     ids: list[str] = []
     for index, item in enumerate(all_requests):
@@ -486,6 +525,9 @@ def normalize_workload(workload: Any) -> dict[str, Any]:
             "target_tolerance_bytes": tolerance,
             "resume_request_id": resume_request_id,
         }
+    if resident_preflight is not None:
+        raise ParseError("spec.workload.resident_preflight requires a replay workload")
+    normalized["resident_preflight"] = None
     return normalized
 
 
@@ -689,12 +731,20 @@ def validate_spec(spec: Any) -> tuple[dict[str, dict[str, Any]], list[dict[str, 
             and any(item == "--slot-save-path" or item.startswith("--slot-save-path=") for item in value["server_args"])):
         raise ParseError("spec lifecycle replay contains runner-owned --slot-save-path")
     if "replay" in workload:
-        if value["run_mode"] != "qualification" or value["run_kind"] != "qualification":
+        if value["run_mode"] == "resident_preflight":
+            if value["run_kind"] != "qualification" or workload["resident_preflight"] is None:
+                raise ParseError(
+                    "resident_preflight requires qualification run_kind and workload.resident_preflight")
+            if workload["replay"]["lifecycle"]["enabled"]:
+                raise ParseError("resident_preflight cannot enable replay lifecycle")
+        elif value["run_mode"] != "qualification" or value["run_kind"] != "qualification":
             raise ParseError("replay workload is restricted to qualification mode")
     elif value["run_mode"] == "qualification":
         if workload["qualification"] is None or workload["characterization"] is not None:
             raise ParseError(
                 "qualification mode requires only workload.qualification configuration")
+    elif value["run_mode"] == "resident_preflight":
+        raise ParseError("resident_preflight requires a replay workload")
     elif workload["characterization"] is None or workload["qualification"] is not None:
         raise ParseError(
             "characterization mode requires only workload.characterization configuration")
@@ -767,6 +817,9 @@ def validate_spec(spec: Any) -> tuple[dict[str, dict[str, Any]], list[dict[str, 
             "kv_target_bytes": case["kv_target_bytes"],
             "action_target_bytes": case["action_target_bytes"],
         })
+    if value["run_mode"] == "resident_preflight" and any(
+            item["policy"] != "resident" for item in plan):
+        raise ParseError("resident_preflight is policy-neutral and requires resident cases")
     validate_cross_policy_single_switch(plan)
     validate_budget_sweep(
         value.get("budget_sweep"), cases, plan, max_blocks, value["run_kind"])
@@ -1478,6 +1531,36 @@ def validate_resident_observation(value: Any, label: str) -> dict[str, Any]:
     return value
 
 
+RESIDENT_PREFLIGHT_WHOLE_REQUIRED = {
+    "timestamp_mono_ns", "sample_count", "whole_valid", "resident_available",
+    "reclaimable_available", "swapped_metadata_consistent", "object_id", "generation",
+    "page_size", "total_bytes", "resident_bytes", "transient_staging_bound_bytes",
+    "n_blocks", "n_owned_blocks", "n_shared_blocks", "resident_block_count",
+    "swapped_block_count", "released_block_count", "pending_write_block_count",
+    "invalid_block_count", "unused_block_count", "global_target_enabled",
+    "global_target_source", "global_target_bytes", "global_target_basis_generation",
+    "observation_only",
+}
+RESIDENT_PREFLIGHT_WHOLE_NUMERIC = RESIDENT_PREFLIGHT_WHOLE_REQUIRED - {
+    "whole_valid", "resident_available", "reclaimable_available",
+    "swapped_metadata_consistent", "global_target_enabled", "global_target_source",
+    "observation_only",
+}
+RESIDENT_PREFLIGHT_WHOLE_BOOL = {
+    "whole_valid", "resident_available", "reclaimable_available",
+    "swapped_metadata_consistent", "global_target_enabled", "observation_only",
+}
+RESIDENT_PREFLIGHT_CLAIMANT_REQUIRED = {
+    "timestamp_mono_ns", "sample_count", "seq_id", "claimant_epoch", "active",
+    "valid", "available", "authoritative", "shared", "object_id", "generation",
+    "exclusive_resident_bytes", "exclusive_resident_blocks", "swapped_bytes", "swapped_blocks",
+}
+RESIDENT_PREFLIGHT_CLAIMANT_NUMERIC = RESIDENT_PREFLIGHT_CLAIMANT_REQUIRED - {
+    "active", "valid", "available", "authoritative", "shared",
+}
+RESIDENT_PREFLIGHT_CLAIMANT_BOOL = {"active", "valid", "available", "authoritative", "shared"}
+
+
 def validate_optional_resident_observation(value: Any, label: str) -> dict[str, Any] | None:
     """Validate the /slots kv_resident union without inventing physical authority.
 
@@ -1575,10 +1658,16 @@ def validate_execution_environment(execution: dict[str, Any], case: dict[str, An
     if case["policy"] in SWAP_POLICIES and env.get("LLAMA_KV_PRESSURE_POLICY", "v2") != case["policy"]:
         raise ParseError(f"{label}: policy environment does not match case")
     expected_resident_observation = (
-        "both" if case["policy"] in SWAP_POLICIES and spec["run_mode"] == "characterization"
+        "preflight" if spec["run_mode"] == "resident_preflight"
+        else "both" if case["policy"] in SWAP_POLICIES and spec["run_mode"] == "characterization"
         else "1" if case["policy"] in SWAP_POLICIES else "preflight")
     if env.get("LLAMA_KV_G0_S1_RESIDENT_OBSERVATION") != expected_resident_observation:
         raise ParseError(f"{label}: physical resident observation mode mismatch")
+    if spec["run_mode"] == "resident_preflight":
+        if env.get("LLAMA_KV_RESIDENT_PREFLIGHT") != "1":
+            raise ParseError(f"{label}: resident_preflight explicit switch is missing or disabled")
+    elif "LLAMA_KV_RESIDENT_PREFLIGHT" in env:
+        raise ParseError(f"{label}: non-resident_preflight execution contains the Q2 switch")
     basis = spec["pressure_basis"]
     if basis["authority"] == "rss_absolute":
         for key, expected in {
@@ -1611,6 +1700,47 @@ def validate_execution_environment(execution: dict[str, Any], case: dict[str, An
             raise ParseError(f"{label}: {case['policy']} action target environment mismatch")
         if env.get("LLAMA_KV_PRESSURE_UNIFIED_ACTION_MAX_BLOCKS") != str(spec["max_blocks"]):
             raise ParseError(f"{label}: {case['policy']} action max-blocks environment mismatch")
+    if spec["run_mode"] == "resident_preflight":
+        if case["policy"] != "resident":
+            raise ParseError(f"{label}: resident_preflight reached a non-resident policy")
+        validate_resident_preflight_environment(env, label)
+
+
+
+def validate_resident_preflight_environment(
+        env: dict[str, str], label: str) -> None:
+    expected = {
+        "LLAMA_MEMORY_GOVERNOR": "0",
+        "LLAMA_MEMORY_GOVERNOR_OBSERVE": "1",
+        "LLAMA_MEMORY_GOVERNOR_OBSERVE_MS": "100",
+        "LLAMA_MEMORY_GOVERNOR_AUTO_BACKENDS": "0",
+        "LLAMA_MEMORY_GOVERNOR_KV_RELEASE": "0",
+        "LLAMA_MEMORY_GOVERNOR_KV_OFFLOAD": "0",
+        "LLAMA_MEMORY_GOVERNOR_KV_SOFT_BUDGET": "0",
+        "LLAMA_MEMORY_GOVERNOR_CLEAN_RECLAIM": "0",
+        "LLAMA_MEMORY_GOVERNOR_GLOBAL_OPTIMIZER": "0",
+        "LLAMA_MEMORY_GOVERNOR_REALLOCATION": "0",
+        "LLAMA_MEMORY_GOVERNOR_DENSE_REPIN": "0",
+        "LLAMA_MEMORY_GOVERNOR_DENSE_RING_SHRINK": "0",
+        "LLAMA_MEMORY_GOVERNOR_MOE_BUDGET_DYNAMIC": "0",
+        "LLAMA_MEMORY_GOVERNOR_ASYNC_ACTIONS": "0",
+        "LLAMA_KV_PRESSURE_UNIFIED_ACTION": "0",
+        "LLAMA_KV_PRESSURE_GOVERNOR_CLAIMANT_TRACE": "0",
+        "LLAMA_KV_G0_S1_RESIDENT_OBSERVATION": "preflight",
+    }
+    if env.get("LLAMA_KV_RESIDENT_PREFLIGHT") != "1":
+        raise ParseError(f"{label}: resident_preflight explicit switch is missing or disabled")
+    for key, value in expected.items():
+        if env.get(key) != value:
+            raise ParseError(f"{label}: resident_preflight is not observation-only at {key}")
+    for key in (
+        "LLAMA_MEMORY_GOVERNOR_PREFETCH_BUDGET_MB_PER_TICK",
+        "LLAMA_MEMORY_GOVERNOR_PREFETCH_BUDGET_AUTO",
+        "LLAMA_MEMORY_GOVERNOR_PREFETCH_BUDGET_RUNTIME_AUTO",
+        "LLAMA_KV_RESIDENT_TARGET_BYTES", "LLAMA_KV_RESIDENT_TARGET_SOURCE",
+    ):
+        if key in env:
+            raise ParseError(f"{label}: resident_preflight contains a Global target or prefetch budget")
 
 
 def validate_action_target_markers(
@@ -3444,6 +3574,266 @@ def validate_replay_lifecycle(
             "revisit_count": sum(1 for item in journal if item.get("event") == "TURN_START" and item.get("trigger") == "REVISIT"),
             "ttl_expiry_count": sum(1 for item in journal if item.get("event") == "TTL_EXPIRY")}
 
+def _resident_preflight_summary(values: list[int]) -> dict[str, Any]:
+    if not values:
+        raise ParseError("resident_preflight window has no resident samples")
+    return {
+        "n": len(values), "min": min(values), "median": percentile(values, 0.50),
+        "max": max(values), "spread": max(values) - min(values),
+    }
+
+
+def validate_resident_preflight_action_free(
+        stderr: str, actions: list[dict[str, str]], io_records: list[dict[str, str]],
+        resumes: list[dict[str, str]], timings: list[dict[str, str]], label: str) -> None:
+    if actions:
+        raise ParseError(f"{label}: resident_preflight observed a unified action marker")
+    if resumes or timings:
+        raise ParseError(f"{label}: resident_preflight observed PREFETCH/restore telemetry")
+    forbidden_tokens = {
+        "kv_g0_s1_resident_observation", "kv_pressure_unified_action",
+        "memory_governor_async_action", "kv_resume_order_event", "kv_resume_stage_timing",
+    }
+    for line in stderr.splitlines():
+        words = set(line.split())
+        observed_forbidden = forbidden_tokens & words
+        if observed_forbidden:
+            token = sorted(observed_forbidden)[0]
+            raise ParseError(f"{label}: resident_preflight observed state-changing telemetry: {token}")
+        if "erase" in line.lower():
+            raise ParseError(f"{label}: resident_preflight observed slot erase telemetry")
+        if "global_dynamic" in line:
+            raise ParseError(f"{label}: resident_preflight observed a global_dynamic target")
+        if "memory_governor_observe" in words:
+            fields = parse_fields(line, "memory_governor_observe", set(), f"{label}.observe")
+            for key in (
+                "kv_release_attempted", "kv_offload_attempted", "kv_release_state_changed",
+                "kv_offload_state_changed", "kv_soft_budget_enabled", "kv_soft_target_bytes",
+                "kv_soft_release_target_bytes", "kv_soft_offload_target_bytes",
+            ):
+                if key in fields and (not UINT.fullmatch(fields[key]) or int(fields[key]) != 0):
+                    raise ParseError(f"{label}: resident_preflight observed a Global/action change at {key}")
+    io_fields = (
+        "block_swap_out_calls", "block_swap_in_calls", "backing_read_syscalls",
+        "backing_write_syscalls", "bytes_read", "bytes_written",
+    )
+    for io in io_records:
+        if any(int(io[key]) != 0 for key in io_fields):
+            raise ParseError(f"{label}: resident_preflight observed swap I/O")
+        if any(int(io[key]) != 0 for key in RESTORE_ACTIVITY_FIELDS):
+            raise ParseError(f"{label}: resident_preflight observed restore activity")
+
+
+def validate_resident_preflight_samples(
+        run_dir: pathlib.Path, record: dict[str, Any], workload: dict[str, Any],
+        label: str, admission_records: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    expected = workload["resident_preflight"]
+    if expected is None:
+        raise ParseError(f"{label}: resident_preflight configuration is missing")
+    record = exact(
+        record,
+        {"mode", "sample_interval_seconds", "min_samples", "window_timeout_seconds",
+         "samples_path", "bindings", "windows"},
+        f"{label}.resident_preflight",
+    )
+    if record["mode"] != "resident_preflight":
+        raise ParseError(f"{label}: resident_preflight mode identity is invalid")
+    for key in ("sample_interval_seconds", "window_timeout_seconds"):
+        if record[key] != expected[key]:
+            raise ParseError(f"{label}: resident_preflight {key} differs from workload")
+    if record["min_samples"] != expected["min_samples"]:
+        raise ParseError(f"{label}: resident_preflight min_samples differs from workload")
+    sample_path = pathlib.Path(record["samples_path"])
+    if sample_path.is_absolute() or ".." in sample_path.parts:
+        raise ParseError(f"{label}: resident_preflight samples path escapes artifact")
+    sample_file = run_dir / sample_path
+    if not sample_file.is_file():
+        raise ParseError(f"{label}: resident_preflight samples file is missing")
+    bindings = exact(record["bindings"], {"A", "B", "C"}, f"{label}.resident_preflight.bindings")
+    for sid, binding in bindings.items():
+        binding = exact(binding, {"slot_id", "seq_id", "runner_generation"},
+                        f"{label}.resident_preflight.binding.{sid}")
+        for key in ("slot_id", "seq_id", "runner_generation"):
+            require_nonnegative_int(binding[key], f"{label}.resident_preflight.binding.{sid}.{key}")
+        if binding["runner_generation"] <= 0:
+            raise ParseError(f"{label}: resident_preflight runner generation is invalid")
+    slot_ids = [bindings[sid]["slot_id"] for sid in ("A", "B", "C")]
+    seq_ids = [bindings[sid]["seq_id"] for sid in ("A", "B", "C")]
+    if len(set(slot_ids)) != 3 or len(set(seq_ids)) != 3:
+        raise ParseError(f"{label}: resident_preflight A/B/C slot or seq identity is not unique")
+    if admission_records is not None:
+        if not isinstance(admission_records, list):
+            raise ParseError(f"{label}: resident_preflight admission journal is invalid")
+        observed: dict[str, tuple[int, int, int]] = {}
+        for index, admission in enumerate(admission_records):
+            if not isinstance(admission, dict) or admission.get("logical_session_id") not in bindings:
+                raise ParseError(f"{label}: resident_preflight admission[{index}] session identity is invalid")
+            sid = admission["logical_session_id"]
+            binding = tuple(admission.get(key) for key in ("slot_id", "seq_id", "runner_generation"))
+            if any(isinstance(value, bool) or not isinstance(value, int) for value in binding):
+                raise ParseError(f"{label}: resident_preflight admission[{index}] binding is invalid")
+            if sid in observed and observed[sid] != binding:
+                raise ParseError(f"{label}: resident_preflight admission binding drift for {sid}")
+            observed[sid] = binding
+        if set(observed) != set(bindings) or any(
+                observed[sid] != tuple(bindings[sid][key] for key in ("slot_id", "seq_id", "runner_generation"))
+                for sid in bindings):
+            raise ParseError(f"{label}: resident_preflight admission-to-seq lineage mismatch")
+    windows = exact(record["windows"], {"AB_RESIDENT", "ABC_ACTIVE"}, f"{label}.resident_preflight.windows")
+    rows: dict[str, list[dict[str, Any]]] = {"AB_RESIDENT": [], "ABC_ACTIVE": []}
+    claimant_epochs: dict[int, int] = {}
+    for line_number, line in enumerate(sample_file.read_text(encoding="utf-8").splitlines(), 1):
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ParseError(f"{label}: invalid resident_preflight sample line {line_number}") from exc
+        row = exact(row, {"window", "timestamp_mono_ns", "sample_count", "whole", "claimants"},
+                    f"{label}.resident_preflight.sample[{line_number}]")
+        if row["window"] not in rows:
+            raise ParseError(f"{label}: unknown resident_preflight window")
+        for key in ("timestamp_mono_ns", "sample_count"):
+            require_nonnegative_int(row[key], f"{label}.resident_preflight.sample.{key}")
+        whole = exact(row["whole"], RESIDENT_PREFLIGHT_WHOLE_REQUIRED,
+                      f"{label}.resident_preflight.sample.whole")
+        for key in RESIDENT_PREFLIGHT_WHOLE_NUMERIC:
+            require_nonnegative_int(whole[key], f"{label}.resident_preflight.whole.{key}")
+        for key in RESIDENT_PREFLIGHT_WHOLE_BOOL:
+            if not isinstance(whole[key], bool):
+                raise ParseError(f"{label}: resident_preflight whole boolean is invalid")
+        if not isinstance(whole["global_target_source"], str) or not whole["global_target_source"]:
+            raise ParseError(f"{label}: resident_preflight Global target source is invalid")
+        if (
+                not whole["whole_valid"] or not whole["resident_available"]
+                or not whole["reclaimable_available"]
+                or not whole["swapped_metadata_consistent"]
+                or not whole["observation_only"]):
+            raise ParseError(f"{label}: resident_preflight whole-KV authority is unavailable")
+        if whole["object_id"] <= 0 or whole["generation"] <= 0 or whole["page_size"] <= 0 or whole["total_bytes"] <= 0:
+            raise ParseError(f"{label}: resident_preflight whole-KV identity is invalid")
+        if whole["global_target_enabled"] or whole["global_target_bytes"] != 0 or whole["global_target_source"] not in {"none", "UNAVAILABLE"}:
+            raise ParseError(f"{label}: resident_preflight contains a Global dynamic target")
+        claimants = row["claimants"]
+        if not isinstance(claimants, dict):
+            raise ParseError(f"{label}: resident_preflight claimant map is invalid")
+        decoded_claimants: dict[int, dict[str, Any]] = {}
+        for seq_text, value in claimants.items():
+            if not isinstance(seq_text, str) or not UINT.fullmatch(seq_text):
+                raise ParseError(f"{label}: resident_preflight claimant id is invalid")
+            claimant = exact(value, RESIDENT_PREFLIGHT_CLAIMANT_REQUIRED,
+                             f"{label}.resident_preflight.claimant")
+            for key in RESIDENT_PREFLIGHT_CLAIMANT_NUMERIC:
+                require_nonnegative_int(claimant[key], f"{label}.resident_preflight.claimant.{key}")
+            for key in RESIDENT_PREFLIGHT_CLAIMANT_BOOL:
+                if not isinstance(claimant[key], bool):
+                    raise ParseError(f"{label}: resident_preflight claimant boolean is invalid")
+            seq_id = int(seq_text)
+            if claimant["seq_id"] != seq_id or claimant["timestamp_mono_ns"] != row["timestamp_mono_ns"] or claimant["sample_count"] != row["sample_count"]:
+                raise ParseError(f"{label}: resident_preflight claimant/sample identity drift")
+            if claimant["claimant_epoch"] <= 0:
+                raise ParseError(f"{label}: resident_preflight claimant epoch is invalid")
+            previous_epoch = claimant_epochs.setdefault(seq_id, claimant["claimant_epoch"])
+            if previous_epoch != claimant["claimant_epoch"]:
+                raise ParseError(f"{label}: resident_preflight claimant epoch drift")
+            if claimant["object_id"] != whole["object_id"] or claimant["generation"] != whole["generation"]:
+                raise ParseError(f"{label}: resident_preflight claimant physical identity drift")
+            decoded_claimants[seq_id] = claimant
+        for sid in ("A", "B"):
+            seq_id = bindings[sid]["seq_id"]
+            claimant = decoded_claimants.get(seq_id)
+            if claimant is None:
+                raise ParseError(f"{label}: resident_preflight {sid} claimant sample is missing")
+            if not claimant["valid"] or not claimant["available"] or not claimant["authoritative"] or claimant["shared"]:
+                raise ParseError(f"{label}: resident_preflight {sid} claimant authority is unavailable/shared")
+            if claimant["active"]:
+                raise ParseError(f"{label}: resident_preflight {sid} is not idle")
+        c_claimant = decoded_claimants.get(bindings["C"]["seq_id"])
+        if row["window"] == "AB_RESIDENT":
+            if c_claimant is not None and c_claimant["active"]:
+                raise ParseError(f"{label}: C became active during AB_RESIDENT")
+        elif (
+                c_claimant is None or not c_claimant["active"]
+                or not c_claimant["valid"] or not c_claimant["available"]
+                or not c_claimant["authoritative"] or c_claimant["shared"]):
+            raise ParseError(f"{label}: C is not an authoritative active claimant during ABC_ACTIVE")
+        rows[row["window"]].append({"whole": whole, "claimants": decoded_claimants,
+                                     "timestamp_mono_ns": row["timestamp_mono_ns"],
+                                     "sample_count": row["sample_count"]})
+    all_rows = rows["AB_RESIDENT"] + rows["ABC_ACTIVE"]
+    if not all_rows:
+        raise ParseError(f"{label}: resident_preflight has no samples")
+    identity = {(item["whole"]["object_id"], item["whole"]["generation"]) for item in all_rows}
+    if len(identity) != 1:
+        raise ParseError(f"{label}: resident_preflight object/generation drift")
+    for window_name, samples in rows.items():
+        metadata = exact(windows[window_name], {"started_mono_ns", "finished_mono_ns", "sample_count"} | ({"dispatch_started_mono_ns"} if window_name == "ABC_ACTIVE" else set()), f"{label}.resident_preflight.{window_name}")
+        if len(samples) < expected["min_samples"] or metadata["sample_count"] != len(samples):
+            raise ParseError(f"{label}: resident_preflight {window_name} sample count is insufficient")
+        for key in ("started_mono_ns", "finished_mono_ns"):
+            require_nonnegative_int(metadata[key], f"{label}.resident_preflight.{window_name}.{key}")
+        if metadata["finished_mono_ns"] < metadata["started_mono_ns"]:
+            raise ParseError(f"{label}: resident_preflight {window_name} timing is invalid")
+        if samples[0]["timestamp_mono_ns"] < metadata["started_mono_ns"] or samples[-1]["timestamp_mono_ns"] > metadata["finished_mono_ns"]:
+            raise ParseError(f"{label}: resident_preflight {window_name} sample is outside window metadata")
+        if window_name == "ABC_ACTIVE":
+            require_nonnegative_int(metadata["dispatch_started_mono_ns"], f"{label}.resident_preflight.ABC_ACTIVE.dispatch_started_mono_ns")
+            if samples[0]["timestamp_mono_ns"] <= metadata["dispatch_started_mono_ns"]:
+                raise ParseError(f"{label}: ABC_ACTIVE sample preceded C dispatch")
+        previous = None
+        expected_interval_ns = int(expected["sample_interval_seconds"] * 1_000_000_000)
+        for sample in samples:
+            if previous is not None:
+                delta_ns = sample["timestamp_mono_ns"] - previous["timestamp_mono_ns"]
+                if (
+                        sample["sample_count"] != previous["sample_count"] + 1
+                        or delta_ns < expected_interval_ns // 2
+                        or delta_ns > expected_interval_ns * 2):
+                    raise ParseError(f"{label}: resident_preflight {window_name} samples are not consecutive 100ms observations")
+            previous = sample
+    if windows["ABC_ACTIVE"]["dispatch_started_mono_ns"] <= windows["AB_RESIDENT"]["finished_mono_ns"]:
+        raise ParseError(f"{label}: ABC_ACTIVE dispatch overlaps AB_RESIDENT window")
+    resident_values = {
+        name: [sample["whole"]["resident_bytes"] for sample in samples]
+        for name, samples in rows.items()
+    }
+    combined_samples = all_rows
+    exclusive = {}
+    for sid in ("A", "B"):
+        seq_id = bindings[sid]["seq_id"]
+        values = [sample["claimants"][seq_id]["exclusive_resident_bytes"] for sample in combined_samples]
+        blocks = [sample["claimants"][seq_id]["exclusive_resident_blocks"] for sample in combined_samples]
+        exclusive[sid] = {"resident_bytes_lower_bound": min(values), "resident_blocks_lower_bound": min(blocks)}
+    combined_bytes = [
+        sample["claimants"][bindings["A"]["seq_id"]]["exclusive_resident_bytes"]
+        + sample["claimants"][bindings["B"]["seq_id"]]["exclusive_resident_bytes"]
+        for sample in combined_samples
+    ]
+    combined_blocks = [
+        sample["claimants"][bindings["A"]["seq_id"]]["exclusive_resident_blocks"]
+        + sample["claimants"][bindings["B"]["seq_id"]]["exclusive_resident_blocks"]
+        for sample in combined_samples
+    ]
+    return {
+        "status": "PASS",
+        "sample_path": str(sample_path),
+        "R_AB": _resident_preflight_summary(resident_values["AB_RESIDENT"]),
+        "R_ABC": _resident_preflight_summary(resident_values["ABC_ACTIVE"]),
+        "exclusive_estimate": {
+            "authority": "claimant_physical_view",
+            "A": exclusive["A"], "B": exclusive["B"],
+            "combined_resident_bytes_lower_bound": min(combined_bytes),
+            "combined_resident_blocks_lower_bound": min(combined_blocks),
+        },
+        "Relief_A": exclusive["A"],
+        "Relief_B": exclusive["B"],
+        "combined_exclusive_resident_bytes_lower_bound": min(combined_bytes),
+        "combined_exclusive_resident_blocks_lower_bound": min(combined_blocks),
+        "object_id": next(iter(identity))[0], "generation": next(iter(identity))[1],
+        "windows": {name: {"sample_count": len(samples), "first_sample_count": samples[0]["sample_count"],
+                            "last_sample_count": samples[-1]["sample_count"]}
+                    for name, samples in rows.items()},
+    }
+
+
 def parse_replay_run(
         artifact: pathlib.Path,
         plan: dict[str, Any],
@@ -3482,11 +3872,14 @@ def parse_replay_run(
     expected_schedule = expand_schedule(replay_plan)
     if run.get("request_plan") != expected_schedule:
         raise ParseError(f"{label}: replay request schedule drift")
-    execution = exact(read_json(run_dir / "execution.json"), EXECUTION_KEYS, f"{label}.execution", {"replay", "lifecycle"})
+    execution = exact(
+        read_json(run_dir / "execution.json"), EXECUTION_KEYS, f"{label}.execution",
+        {"replay", "lifecycle", "resident_preflight"})
     if any(execution[key] != plan[key] for key in ("run_id", "round", "run_order", "case_id")):
         raise ParseError(f"{label}: replay execution identity mismatch")
-    if execution["execution_index"] != expected_execution_index or execution["run_mode"] != "qualification":
+    if execution["execution_index"] != expected_execution_index or execution["run_mode"] not in {"qualification", "resident_preflight"}:
         raise ParseError(f"{label}: replay execution mode/order mismatch")
+    validate_execution_environment(execution, case, label, spec)
     if replay_cfg.get("lifecycle", {}).get("enabled", False):
         execution_lifecycle = execution.get("lifecycle")
         if not isinstance(execution_lifecycle, dict) or execution_lifecycle.get("enabled") is not True:
@@ -3659,7 +4052,10 @@ def parse_replay_run(
     fidelity["lifecycle"] = lifecycle_verdict
     if fidelity["status"] != "PASS":
         raise ParseError(f"{label}: workload_fidelity failed: {fidelity['errors']}")
-    replay_artifact = exact(read_json(run_dir / "replay.json"), {"plan", "schedule", "admission", "events", "workload_fidelity"}, f"{label}.replay", {"lifecycle", "phase_evidence"})
+    replay_artifact = exact(
+        read_json(run_dir / "replay.json"),
+        {"plan", "schedule", "admission", "events", "workload_fidelity"},
+        f"{label}.replay", {"lifecycle", "phase_evidence", "resident_preflight"})
     admitted_sessions = {item.get("logical_session_id") for item in replay_artifact["admission"] if item.get("status") in {"admitted", "already_live", "finished"}}
     planned_sessions = {item["logical_session_id"] for item in expected_schedule}
     if admitted_sessions != planned_sessions:
@@ -3675,6 +4071,48 @@ def parse_replay_run(
             raise ParseError(f"{label}: replay lifecycle journal differs from lifecycle.jsonl")
     if execution.get("replay") != replay_artifact:
         raise ParseError(f"{label}: execution replay journal differs from replay.json")
+    if spec["run_mode"] == "resident_preflight":
+        if replay_plan.fixture_contract is not None:
+            raise ParseError(f"{label}: resident_preflight reused a Q1 phase contract")
+        stderr = (run_dir / "server.stderr").read_text(encoding="utf-8", errors="replace")
+        actions = marker_records(stderr, "kv_pressure_unified_action", ACTION_REQUIRED, f"{label}.action")
+        io_records = marker_records(stderr, "KV_PAGED_IO_STATS", IO_REQUIRED, f"{label}.io")
+        if not io_records:
+            raise ParseError(f"{label}: resident_preflight is missing KV_PAGED_IO_STATS")
+        for io in io_records:
+            numeric_fields(io, IO_REQUIRED, f"{label}.io")
+            boolean_fields(io, IO_BOOL, f"{label}.io")
+        resumes = marker_records(stderr, "kv_resume_order_event", RESUME_REQUIRED, f"{label}.resume")
+        timings = marker_records(stderr, "kv_resume_stage_timing", TIMING_REQUIRED, f"{label}.timing")
+        validate_resident_preflight_action_free(stderr, actions, io_records, resumes, timings, label)
+        preflight = validate_resident_preflight_samples(
+            run_dir, execution.get("resident_preflight"), workload, label,
+            replay_artifact["admission"])
+        replay_preflight = exact(
+            replay_artifact.get("resident_preflight"),
+            {"samples_path", "windows", "bindings"}, f"{label}.replay.resident_preflight")
+        execution_preflight = exact(
+            execution.get("resident_preflight"),
+            {"mode", "sample_interval_seconds", "min_samples", "window_timeout_seconds", "samples_path", "bindings", "windows"},
+            f"{label}.execution.resident_preflight")
+        if replay_preflight["samples_path"] != preflight["sample_path"] or replay_preflight["windows"] != execution_preflight["windows"] or replay_preflight["bindings"] != execution_preflight["bindings"]:
+            raise ParseError(f"{label}: resident_preflight replay journal drift")
+        return {"run_id": label, "case_id": plan["case_id"], "round": plan["round"], "policy": plan["policy"],
+                "server_exit_code": server_cleanup["exit_code"], "sampler_exit_code": sampler_cleanup["exit_code"],
+                "samples": validate_sampler(run_dir / "memory_samples.tsv", execution["server_identity"], label),
+                "memory": memory_statistics(validate_sampler(run_dir / "memory_samples.tsv", execution["server_identity"], label)),
+                "slots_before": slots_before, "slots_after": validate_slot_snapshot(run_dir / "slots_after.json", f"{label}.slots_after", require_resident=False),
+                "responses": actual, "service_failures": [], "actions": [], "resident_observations": [],
+                "qualified_offload_pairs": [], "offload_physical_relief_bytes": 0,
+                "qualification_round_trip": None, "characterization": None,
+                "resume_events": [], "resume_timings": [], "io": io_records[-1],
+                "statistics": response_statistics(actual), "workload_fidelity": fidelity,
+                "replay": replay_artifact, "resident_preflight": preflight,
+                "R_AB": preflight["R_AB"], "R_ABC": preflight["R_ABC"],
+                "exclusive_estimate": preflight["exclusive_estimate"],
+                "Relief_A": preflight["Relief_A"], "Relief_B": preflight["Relief_B"],
+                "combined_exclusive_resident_bytes_lower_bound": preflight["combined_exclusive_resident_bytes_lower_bound"],
+                "combined_exclusive_resident_blocks_lower_bound": preflight["combined_exclusive_resident_blocks_lower_bound"]}
     if replay_plan.fixture_contract is None:
         return {"run_id": label, "case_id": plan["case_id"], "round": plan["round"], "policy": plan["policy"],
                 "server_exit_code": server_cleanup["exit_code"], "sampler_exit_code": sampler_cleanup["exit_code"],
@@ -4057,7 +4495,8 @@ def validate_formal_pressure_authority(
         raise ParseError("formal budget run requires real finite cgroup pressure authority")
 
 
-def validate_replay_model_binding(model_binding: Any, artifact_model_sha: Any) -> None:
+def validate_replay_model_binding(
+        model_binding: Any, artifact_model_sha: Any, artifact_binary_sha: Any) -> None:
     """Bind replay to the transcript model while retaining binary provenance validation."""
     if not isinstance(model_binding, dict):
         raise ParseError("replay transcript model identity is missing")
@@ -4069,6 +4508,8 @@ def validate_replay_model_binding(model_binding: Any, artifact_model_sha: Any) -
         raise ParseError("replay transcript binary SHA is invalid")
     if transcript_model_sha != artifact_model_sha:
         raise ParseError("replay transcript model SHA differs from artifact model identity")
+    if transcript_binary_sha != artifact_binary_sha:
+        raise ParseError("replay transcript binary SHA differs from artifact binary identity")
 
 
 def validate_derived_replay_parent(
@@ -4483,7 +4924,8 @@ def validate_manifest(artifact: pathlib.Path) -> tuple[dict[str, Any], dict[str,
         replay_source = read_json(replay_path)
         if workload["replay"]["source"] == "transcript":
             model_binding = replay_source.get("model") if isinstance(replay_source, dict) else None
-            validate_replay_model_binding(model_binding, provenance["model"]["sha256"])
+            validate_replay_model_binding(
+                model_binding, provenance["model"]["sha256"], provenance["binary"].get("sha256"))
         elif isinstance(replay_source, dict) and replay_source.get("schema") == "gt-trace-1b-q1-derived/v1":
             validate_derived_replay_parent(
                 replay_source, provenance["model"]["sha256"],
@@ -5248,6 +5690,31 @@ def parse_artifact(artifact: pathlib.Path) -> tuple[str, dict[str, Any]]:
                 "planned_turns": sum(item["workload_fidelity"]["planned_turns"] for item in replay_results),
                 "completed_turns": sum(item["workload_fidelity"]["completed_turns"] for item in replay_results),
             }
+            if manifest["spec"]["run_mode"] == "resident_preflight":
+                preflight_runs = [item["resident_preflight"] for item in replay_results]
+                if fidelity["status"] != "PASS":
+                    verdict = "INVALID_ARTIFACT"
+                else:
+                    verdict = "RESIDENT_PREFLIGHT_PASS"
+                result = {
+                    "schema_version": SCHEMA_VERSION,
+                    "protocol": PROTOCOL,
+                    "artifact_id": manifest["artifact_id"],
+                    "run_kind": manifest["spec"]["run_kind"],
+                    "run_mode": manifest["spec"]["run_mode"],
+                    "verdict": verdict,
+                    "errors": [],
+                    "planned_runs": plan,
+                    "workload_fidelity": fidelity,
+                    "replay_runs": replay_results,
+                    "resident_preflight_runs": preflight_runs,
+                    "R_AB": preflight_runs[0]["R_AB"] if len(preflight_runs) == 1 else [item["R_AB"] for item in preflight_runs],
+                    "R_ABC": preflight_runs[0]["R_ABC"] if len(preflight_runs) == 1 else [item["R_ABC"] for item in preflight_runs],
+                    "exclusive_estimate": preflight_runs[0]["exclusive_estimate"] if len(preflight_runs) == 1 else [item["exclusive_estimate"] for item in preflight_runs],
+                    "target": {"status": "NOT_COMPUTED", "frozen": False},
+                    "telemetry_gaps": TELEMETRY_GAPS,
+                }
+                return result["verdict"], result
             result = {
                 "schema_version": SCHEMA_VERSION,
                 "protocol": PROTOCOL,
