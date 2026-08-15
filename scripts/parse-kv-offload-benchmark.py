@@ -641,6 +641,26 @@ def validate_budget_sweep(
     }
 
 
+def validate_cross_policy_single_switch(plan: list[dict[str, Any]], label: str = "cross-policy") -> None:
+    policies = sorted({item["policy"] for item in plan if item["policy"] in SWAP_POLICIES})
+    if len(policies) < 2:
+        return
+    comparable = (
+        "kv_representation", "loading_mode", "restore", "prefault",
+        "kv_target_bytes", "action_target_bytes",
+    )
+    by_policy: dict[str, list[dict[str, Any]]] = {policy: [] for policy in policies}
+    for item in sorted(plan, key=lambda value: (value["round"], value["run_order"])):
+        if item["policy"] in by_policy:
+            by_policy[item["policy"]].append(item)
+    reference_policy = policies[0]
+    reference = [tuple(item[key] for key in comparable) for item in by_policy[reference_policy]]
+    for policy in policies[1:]:
+        current = [tuple(item[key] for key in comparable) for item in by_policy[policy]]
+        if current != reference:
+            raise ParseError(
+                f"{label}: policies {reference_policy} and {policy} differ outside policy")
+
 def validate_spec(spec: Any) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     value = exact(spec, SPEC_KEYS, "spec", {"budget_sweep"})
     if value["schema_version"] != SCHEMA_VERSION or value["protocol"] != PROTOCOL:
@@ -747,6 +767,7 @@ def validate_spec(spec: Any) -> tuple[dict[str, dict[str, Any]], list[dict[str, 
             "kv_target_bytes": case["kv_target_bytes"],
             "action_target_bytes": case["action_target_bytes"],
         })
+    validate_cross_policy_single_switch(plan)
     validate_budget_sweep(
         value.get("budget_sweep"), cases, plan, max_blocks, value["run_kind"])
     if (
@@ -829,6 +850,66 @@ def _parse_v3_score_records(scores_value: str, label: str) -> list[dict[str, str
     return records
 
 
+def parse_claimant_epoch_map(value: str, label: str) -> dict[int, int]:
+    if value == "none":
+        return {}
+    if not isinstance(value, str) or not value:
+        raise ParseError(f"{label}: claimant runtime history is missing")
+    result: dict[int, int] = {}
+    for index, group in enumerate(value.split(";")):
+        cells = group.split(":")
+        if len(cells) != 10:
+            raise ParseError(f"{label}: claimant[{index}] field count is invalid")
+        if (
+            not UINT.fullmatch(cells[0])
+            or not UINT.fullmatch(cells[1])
+            or int(cells[1]) <= 0
+            or any(cell not in {"0", "1"} for cell in cells[2:5])
+            or any(not UINT.fullmatch(cell) for cell in cells[5:])
+        ):
+            raise ParseError(f"{label}: claimant[{index}] epoch/runtime fields are invalid")
+        seq_id = int(cells[0])
+        epoch = int(cells[1])
+        if seq_id in result:
+            raise ParseError(f"{label}: claimant seq_id is duplicated")
+        result[seq_id] = epoch
+    return result
+
+
+def _u64_add(lhs: int, rhs: int) -> int:
+    return min((1 << 64) - 1, lhs + rhs)
+
+
+def validate_v3_score_formula(
+        scores: list[dict[str, str]], decision_fallback: str, label: str) -> None:
+    eligible = [score for score in scores if score["eligible"] == "1"]
+    expected_order = []
+    for score in eligible:
+        seq_id = int(score["seq_id"])
+        if score["cost_aware"] == "1":
+            reuse = int(score["reuse_probability_ppm"])
+            restore = (int(score["expected_restore_gate_cost_us"]) * reuse) // 1_000_000 if reuse else 0
+            expected_cost = _u64_add(
+                _u64_add(int(score["expected_offload_write_cost_us"]), restore),
+                int(score["churn_penalty_us"]))
+            if expected_cost != int(score["expected_cost_us"]):
+                raise ParseError(f"{label}: score {seq_id} expected_cost_us formula mismatch")
+            scaled = min((1 << 64) - 1, expected_cost * 1_000_000)
+            expected_total = min((1 << 63) - 1, scaled // max(int(score["estimated_physical_bytes"]), 1))
+        else:
+            expected_total = int(score["idle_age_score"])
+        if int(score["total"]) != expected_total:
+            raise ParseError(f"{label}: score {seq_id} total formula mismatch")
+        expected_order.append((score, expected_total))
+    if decision_fallback == "none":
+        expected_order.sort(key=lambda item: (item[1], int(item[0]["seq_id"])))
+    else:
+        expected_order.sort(key=lambda item: (-int(item[0]["idle_age_score"]), int(item[0]["seq_id"])))
+    expected_seq = [item[0]["seq_id"] for item in expected_order]
+    actual_seq = [score["seq_id"] for score in eligible]
+    if actual_seq != expected_seq:
+        raise ParseError(f"{label}: score order does not match current C++ V3 authority")
+
 def validate_action_v3_audit(action: dict[str, str], case: dict[str, Any], label: str) -> None:
     # Canonical V3 tightening (review-fix item 4): a V3 decision marker must carry
     # a single comparable ranking authority.  Fail-closed when the cost feedback or
@@ -854,7 +935,6 @@ def validate_action_v3_audit(action: dict[str, str], case: dict[str, Any], label
     score_records = _parse_v3_score_records(action.get("scores", "none"), label)
     if not is_offload:
         return
-
     selected_seq_id = int(action["selected_seq_id"])
     if selected_seq_id < 0:
         raise ParseError(f"{label}: OFFLOAD attempted without a non-negative selected_seq_id")
@@ -862,7 +942,7 @@ def validate_action_v3_audit(action: dict[str, str], case: dict[str, Any], label
     selected_score: dict[str, str] | None = None
     seen_selected = False
     eligible_before: list[int] = []
-    for record in score_records:
+    for score_index, record in enumerate(score_records):
         for key in SCORE_NUMERIC_FIELDS:
             value = record[key]
             if not UINT.fullmatch(value):
@@ -881,7 +961,7 @@ def validate_action_v3_audit(action: dict[str, str], case: dict[str, Any], label
             raise ParseError(f"{label}: cost-aware claimant must carry no fallback reason")
         if record["cost_aware"] == "0" and record["fallback_reason"] == "none" and record["eligible"] == "1":
             raise ParseError(f"{label}: eligible non-cost-aware claimant must record a fallback reason")
-        if int(record["rank"]) != len(eligible_before):
+        if int(record["rank"]) != score_index:
             raise ParseError(f"{label}: score rank {record['rank']} is out of order")
         seq_id = int(record["seq_id"])
         if record["eligible"] == "1":
@@ -926,6 +1006,8 @@ def validate_action_v3_audit(action: dict[str, str], case: dict[str, Any], label
             raise ParseError(
                 f"{label}: marker decision_fallback={marker_fallback!r} but no eligible "
                 f"non-cost-aware claimant exists to justify the fallback")
+
+    validate_v3_score_formula(score_records, action["decision_fallback"], label)
 
     if state_changed:
         # Physical feedback is the V3 production signal: when an OFFLOAD actually
@@ -1027,6 +1109,290 @@ def offload_physical_relief_from_pairs(
     # release_only / unmatched) yields 0. Only real physical authority is used;
     # action.bytes / relieved_bytes / logical KV bytes never substitute here.
     return sum(item["resident_drop_bytes"] for item in offload_pairs)
+
+
+# Phase evidence contract: which logical sessions/seq set must carry positive
+# physical evidence per phase. prepare-offload/prepare-restore need both A and B
+# to have acted; final-competition binds A/B as candidates but only the single
+# selected victim actually offloads; post-final-restore only the selected victim
+# restores. These predicate the *evidence* set per phase, independent of the A/B
+# slot binding (every phase still binds both A/B slots).
+CANONICAL_PHASE_ORDER = ["prepare-offload", "prepare-restore",
+                         "final-competition", "post-final-restore"]
+
+
+def phase_requires_ab_pair_evidence(phase_id: str) -> bool:
+    # prepare-offload: both A and B must each complete a real state-changing
+    # OFFLOAD with a transaction-local physical resident drop.
+    return phase_id == "prepare-offload"
+
+
+def phase_requires_ab_restore_evidence(phase_id: str) -> bool:
+    # prepare-restore: both A and B must each have a positive Exact restore.
+    return phase_id == "prepare-restore"
+
+
+def phase_requires_single_victim_evidence(phase_id: str) -> bool:
+    # final-competition: A/B are both eligible candidates, but only one
+    # state-changing OFFLOAD victim is permitted.
+    return phase_id == "final-competition"
+
+
+def phase_requires_selected_restore_evidence(phase_id: str) -> bool:
+    # post-final-restore: only the selected victim may restore; non-selected
+    # candidates must perform no positive restore.
+    return phase_id == "post-final-restore"
+
+
+def phase_evidence_seq_set(
+        phase_id: str, window: dict[str, Any],
+        actions: list[dict[str, str]],
+        observations: list[dict[str, str]],
+        resumes: list[dict[str, str]],
+        expected_source: str) -> set[int]:
+    # Return the set of seq_ids that carry the *positive physical evidence* the
+    # contract requires for this phase. For prepare phases this is the A/B seq
+    # set (so the caller can assert both acted); for final-competition this is
+    # the set of A/B candidate seqs that actually performed a qualifying
+    # state-changing OFFLOAD (caller asserts exactly one); for post-final-restore
+    # this is the set of positive restore seqs (caller asserts it equals the
+    # selected single-victim set).
+    if phase_requires_ab_pair_evidence(phase_id):
+        pairs = qualified_offload_pairs(actions, observations, expected_source)
+        return {pair["seq_id"] for pair in pairs}
+    if phase_requires_ab_restore_evidence(phase_id):
+        positive = [event for event in resumes
+                    if event["phase"] == "prefetch"
+                    and event["outcome"] == "completed"
+                    and event["graph_allowed"] == "1"]
+        return {int(event["seq_id"]) for event in positive}
+    if phase_requires_single_victim_evidence(phase_id):
+        pairs = qualified_offload_pairs(actions, observations, expected_source)
+        return {pair["seq_id"] for pair in pairs}
+    if phase_requires_selected_restore_evidence(phase_id):
+        positive = [event for event in resumes
+                    if event["phase"] == "prefetch"
+                    and event["outcome"] == "completed"
+                    and event["graph_allowed"] == "1"]
+        return {int(event["seq_id"]) for event in positive}
+    return set()
+
+
+
+
+def replay_prepare_offload_feedback(
+        actions: list[dict[str, str]], observations: list[dict[str, str]],
+        expected_source: str, expected_seq_ids: set[int], label: str) -> dict[int, dict[str, int]]:
+    actions_by_seq: dict[int, list[dict[str, str]]] = {}
+    for action in actions:
+        if action.get("offload_attempted") == "1" and action.get("state_changed") == "1":
+            seq_id = int(action["selected_seq_id"])
+            if seq_id in expected_seq_ids:
+                actions_by_seq.setdefault(seq_id, []).append(action)
+    if set(actions_by_seq) != expected_seq_ids or any(
+            len(items) != 1 for items in actions_by_seq.values()):
+        raise ParseError(f"{label}: A/B state-changing OFFLOAD action is missing or duplicated")
+    pairs = qualified_offload_pairs(actions, observations, expected_source)
+    pairs_by_seq: dict[int, list[dict[str, Any]]] = {}
+    for pair in pairs:
+        pairs_by_seq.setdefault(pair["seq_id"], []).append(pair)
+    if set(pairs_by_seq) != expected_seq_ids:
+        raise ParseError(f"{label}: prepare OFFLOAD feedback does not cover exactly A/B")
+    if any(len(items) != 1 for items in pairs_by_seq.values()):
+        raise ParseError(f"{label}: prepare OFFLOAD feedback is missing or duplicated")
+
+    feedback: dict[int, dict[str, int]] = {}
+    for seq_id, items in pairs_by_seq.items():
+        pair = items[0]
+        action = pair["action"]
+        observation = pair["resident_observation"]
+        required = {
+            "selected_claimant_epoch", "action_elapsed_us", "bytes",
+            "physical_relief_available", "physical_relief_bytes",
+            "physical_object_id", "physical_generation",
+        }
+        if not required.issubset(action):
+            raise ParseError(f"{label}: prepare OFFLOAD feedback fields are missing")
+        if any(not UINT.fullmatch(action[key]) for key in required - {"physical_relief_available"}):
+            raise ParseError(f"{label}: prepare OFFLOAD feedback fields are invalid")
+        epoch = int(action["selected_claimant_epoch"])
+        elapsed_us = int(action["action_elapsed_us"])
+        offload_bytes = int(action["bytes"])
+        relief_bytes = int(action["physical_relief_bytes"])
+        object_id = int(action["physical_object_id"])
+        generation = int(action["physical_generation"])
+        if (
+            action["physical_relief_available"] != "1"
+            or epoch <= 0
+            or elapsed_us <= 0
+            or offload_bytes <= 0
+            or relief_bytes <= 0
+            or object_id <= 0
+            or generation <= 0
+            or relief_bytes != pair["resident_drop_bytes"]
+            or pair["before_object_id"] != object_id
+            or pair["after_object_id"] != object_id
+            or pair["before_generation"] != generation
+            or pair["after_generation"] != generation
+            or int(observation["before_object_id"]) != object_id
+            or int(observation["after_object_id"]) != object_id
+            or int(observation["before_generation"]) != generation
+            or int(observation["after_generation"]) != generation
+        ):
+            raise ParseError(f"{label}: prepare OFFLOAD physical feedback lineage is inconsistent")
+        feedback[seq_id] = {
+            "seq_id": seq_id,
+            "epoch": epoch,
+            "decision_id": pair["decision_id"],
+            "transaction_id": pair["transaction_id"],
+            "object_id": object_id,
+            "generation": generation,
+            "offload_elapsed_us": elapsed_us,
+            "offload_bytes": offload_bytes,
+            "physical_relief_bytes": relief_bytes,
+        }
+    return feedback
+
+
+def replay_prepare_restore_feedback(
+        resumes: list[dict[str, str]], timings: list[dict[str, str]],
+        offload_feedback: dict[int, dict[str, int]], label: str) -> dict[int, dict[str, int]]:
+    expected_seq_ids = set(offload_feedback)
+    if not expected_seq_ids:
+        raise ParseError(f"{label}: prepare OFFLOAD feedback is empty")
+    if any(int(event["seq_id"]) not in expected_seq_ids for event in resumes):
+        raise ParseError(f"{label}: prepare restore contains an unknown seq_id")
+    if any(int(timing["seq_id"]) not in expected_seq_ids for timing in timings):
+        raise ParseError(f"{label}: prepare restore timing contains an unknown seq_id")
+
+    feedback: dict[int, dict[str, int]] = {}
+    for seq_id, offload in offload_feedback.items():
+        seq_resumes = [event for event in resumes if int(event["seq_id"]) == seq_id]
+        seq_timings = [timing for timing in timings if int(timing["seq_id"]) == seq_id]
+        positive_prefetch = [
+            event for event in seq_resumes
+            if event["phase"] == "prefetch"
+            and event["action"] == "prefetch"
+            and event["outcome"] == "completed"
+            and event["graph_allowed"] == "1"
+        ]
+        positive_graph_gate = [
+            event for event in seq_resumes
+            if event["phase"] == "graph_gate"
+            and event["action"] == "prefetch"
+            and event["outcome"] == "completed"
+            and event["graph_allowed"] == "1"
+        ]
+        if len(positive_prefetch) != 1 or len(positive_graph_gate) != 1 or len(seq_timings) != 1:
+            raise ParseError(f"{label}: prepare restore evidence is missing or duplicated for seq {seq_id}")
+        evidence = validate_resume_restore_evidence(
+            seq_resumes,
+            seq_timings,
+            {seq_id: {offload["epoch"]}},
+            f"{label}.seq[{seq_id}]")
+        prefetch = evidence["prefetch"]
+        graph_gate = evidence["graph_gate"]
+        timing = evidence["timing"]
+        if (
+            prefetch["decision_id"] != graph_gate["decision_id"]
+            or prefetch["transaction_id"] != graph_gate["transaction_id"]
+            or prefetch["seq_id"] != graph_gate["seq_id"]
+            or prefetch["claimant_epoch"] != graph_gate["claimant_epoch"]
+            or timing["decision_id"] != prefetch["decision_id"]
+            or timing["transaction_id"] != prefetch["transaction_id"]
+            or timing["seq_id"] != prefetch["seq_id"]
+            or int(prefetch["claimant_epoch"]) != offload["epoch"]
+            or int(timing["restored_bytes"]) <= 0
+            or int(timing["gate_us"]) <= 0
+        ):
+            raise ParseError(f"{label}: prepare restore identity or timing is inconsistent for seq {seq_id}")
+        feedback[seq_id] = {
+            "seq_id": seq_id,
+            "epoch": offload["epoch"],
+            "decision_id": int(prefetch["decision_id"]),
+            "transaction_id": int(prefetch["transaction_id"]),
+            "restore_bytes": int(timing["restored_bytes"]),
+            "restore_gate_us": int(timing["gate_us"]),
+        }
+    return feedback
+
+
+def validate_prepare_feedback_history(
+        final_action: dict[str, str], scores: list[dict[str, str]],
+        offload_feedback: dict[int, dict[str, int]],
+        restore_feedback: dict[int, dict[str, int]],
+        expected_seq_ids: set[int], selected_seq_id: int, label: str) -> dict[int, dict[str, int]]:
+    if set(offload_feedback) != expected_seq_ids or set(restore_feedback) != expected_seq_ids:
+        raise ParseError(f"{label}: prepare feedback does not cover exactly A/B")
+    claimant_epochs = parse_claimant_epoch_map(final_action.get("claimants", "none"), f"{label}.claimants")
+    required_history = {
+        "expected_offload_write_cost_us", "expected_restore_gate_cost_us",
+        "last_offload_bytes", "last_restore_bytes", "actual_relief_bytes",
+        "round_trip_count", "physical_object_id", "physical_generation",
+    }
+    history: dict[int, dict[str, int]] = {}
+    for seq_id in sorted(expected_seq_ids):
+        matching = [score for score in scores if int(score.get("seq_id", "-1")) == seq_id]
+        if len(matching) != 1:
+            raise ParseError(f"{label}: final score history for seq {seq_id} is missing or duplicated")
+        score = matching[0]
+        if not required_history.issubset(score):
+            raise ParseError(f"{label}: final score history fields for seq {seq_id} are missing")
+        if score.get("eligible") != "1" or score.get("cost_aware") != "1" or score.get("fallback_reason") != "none":
+            raise ParseError(f"{label}: final score history for seq {seq_id} is not cost-aware")
+        if any(not UINT.fullmatch(score[key]) for key in required_history):
+            raise ParseError(f"{label}: final score history for seq {seq_id} is invalid")
+        offload = offload_feedback[seq_id]
+        restore = restore_feedback[seq_id]
+        if (
+            int(score["expected_offload_write_cost_us"]) != offload["offload_elapsed_us"]
+            or int(score["expected_restore_gate_cost_us"]) != restore["restore_gate_us"]
+            or int(score["last_offload_bytes"]) != offload["offload_bytes"]
+            or int(score["last_restore_bytes"]) != restore["restore_bytes"]
+            or int(score["actual_relief_bytes"]) != offload["physical_relief_bytes"]
+            or int(score["round_trip_count"]) < 1
+            or int(score["physical_object_id"]) != offload["object_id"]
+            or int(score["physical_generation"]) != offload["generation"]
+            or claimant_epochs.get(seq_id) != offload["epoch"]
+        ):
+            raise ParseError(f"{label}: final score history does not derive from prepare feedback for seq {seq_id}")
+        history[seq_id] = {
+            "seq_id": seq_id,
+            "object_id": int(score["physical_object_id"]),
+            "generation": int(score["physical_generation"]),
+            "epoch": claimant_epochs[seq_id],
+            "offload_elapsed_us": int(score["expected_offload_write_cost_us"]),
+            "restore_gate_us": int(score["expected_restore_gate_cost_us"]),
+            "offload_bytes": int(score["last_offload_bytes"]),
+            "restore_bytes": int(score["last_restore_bytes"]),
+            "physical_relief_bytes": int(score["actual_relief_bytes"]),
+            "round_trip_count": int(score["round_trip_count"]),
+        }
+    if selected_seq_id not in expected_seq_ids:
+        raise ParseError(f"{label}: selected seq is outside prepare feedback authority")
+    if (
+        int(final_action["selected_claimant_epoch"]) != claimant_epochs.get(selected_seq_id)
+        or int(final_action["physical_object_id"]) != offload_feedback[selected_seq_id]["object_id"]
+        or int(final_action["physical_generation"]) != offload_feedback[selected_seq_id]["generation"]
+    ):
+        raise ParseError(f"{label}: selected final claimant lineage differs from prepare feedback")
+    return history
+
+def final_competition_selected_victim(
+        final_actions: list[dict[str, str]],
+        final_observations: list[dict[str, str]],
+        expected_source: str,
+        ab_candidate_seqs: set[int]) -> dict[str, Any] | None:
+    # The final-competition selected victim must NOT be derived from the last
+    # action marker (which may be a trailing no-op). Instead it is the unique
+    # qualifying state-changing OFFLOAD + transaction-local resident-drop pair
+    # within the final window whose seq belongs to the A/B candidate set. Zero
+    # or more than one such pair is fail-closed (returns None).
+    pairs = qualified_offload_pairs(final_actions, final_observations, expected_source)
+    victim_pairs = [pair for pair in pairs if pair["seq_id"] in ab_candidate_seqs]
+    if len(victim_pairs) != 1:
+        return None
+    return victim_pairs[0]
 
 
 def stderr_window(data: bytes, start_offset: int, end_offset: int, label: str) -> str:
@@ -3183,12 +3549,13 @@ def parse_replay_run(
             raise ParseError(f"{label}: replay response line {line_number} is not an object")
         required = {"event_seq", "logical_session_id", "lineage_id", "turn", "planned_ts_us", "planned_arrival_us",
                     "prompt_tokens", "prompt_sha256", "prompt_token_count", "n_predict", "request_id", "slot_id", "seq_id",
-                    "runner_generation", "cache_prompt", "claimant_epoch", "physical_object_id", "physical_generation",
-                    "dispatch_order", "admitted_us", "dispatched_us", "completed_us", "arrival_lag_us",
-                    "admission_wait_us", "service_us", "started_mono_ns", "started_us", "finished_mono_ns",
-                    "http_status", "headers", "request_sha256", "body_path", "body_bytes", "body_sha256",
-                    "response_json", "response_slot_id", "tokens_evaluated", "tokens_predicted",
-                    "response_token_sha256", "error"}
+                    "source", "source_lineage_id", "source_turn", "phase_id", "reference_completion_tokens",
+                    "reference_completion_sha256", "runner_generation", "cache_prompt", "claimant_epoch",
+                    "physical_object_id", "physical_generation", "dispatch_order", "admitted_us", "dispatched_us",
+                    "completed_us", "arrival_lag_us", "admission_wait_us", "service_us", "started_mono_ns",
+                    "started_us", "finished_mono_ns", "http_status", "headers", "request_sha256", "body_path",
+                    "body_bytes", "body_sha256", "response_json", "response_tokens", "response_slot_id",
+                    "tokens_evaluated", "tokens_predicted", "response_token_sha256", "response_token_count", "error"}
         if replay_cfg.get("lifecycle", {}).get("enabled", False):
             required.update({"lifecycle_trigger", "lifecycle_generation"})
         if set(row) != required:
@@ -3236,8 +3603,14 @@ def parse_replay_run(
         if not isinstance(tokens, list) or len(tokens) != row["n_predict"] or row["tokens_predicted"] != row["n_predict"] or row["tokens_evaluated"] != len(row["prompt_tokens"]):
             raise ParseError(f"{label}: replay token conservation mismatch")
         token_sha = sha256_bytes(json.dumps(tokens, separators=(",", ":")).encode("utf-8"))
+        if row["response_tokens"] != tokens or row["response_token_count"] != len(tokens):
+            raise ParseError(f"{label}: replay response token payload/count mismatch")
         if row["response_token_sha256"] != token_sha:
             raise ParseError(f"{label}: replay response token SHA mismatch")
+        expected_tokens = row.get("reference_completion_tokens", [])
+        expected_sha = row.get("reference_completion_sha256", "")
+        if expected_tokens and (tokens != expected_tokens or expected_sha != token_sha):
+            raise ParseError(f"{label}: MODEL_BOUND_REAL reference completion oracle mismatch")
         body_path = pathlib.Path(row["body_path"])
         if body_path.is_absolute() or ".." in body_path.parts:
             raise ParseError(f"{label}: replay response body escapes artifact")
@@ -3286,7 +3659,7 @@ def parse_replay_run(
     fidelity["lifecycle"] = lifecycle_verdict
     if fidelity["status"] != "PASS":
         raise ParseError(f"{label}: workload_fidelity failed: {fidelity['errors']}")
-    replay_artifact = exact(read_json(run_dir / "replay.json"), {"plan", "schedule", "admission", "events", "workload_fidelity"}, f"{label}.replay", {"lifecycle"})
+    replay_artifact = exact(read_json(run_dir / "replay.json"), {"plan", "schedule", "admission", "events", "workload_fidelity"}, f"{label}.replay", {"lifecycle", "phase_evidence"})
     admitted_sessions = {item.get("logical_session_id") for item in replay_artifact["admission"] if item.get("status") in {"admitted", "already_live", "finished"}}
     planned_sessions = {item["logical_session_id"] for item in expected_schedule}
     if admitted_sessions != planned_sessions:
@@ -3302,13 +3675,43 @@ def parse_replay_run(
             raise ParseError(f"{label}: replay lifecycle journal differs from lifecycle.jsonl")
     if execution.get("replay") != replay_artifact:
         raise ParseError(f"{label}: execution replay journal differs from replay.json")
+    if replay_plan.fixture_contract is None:
+        return {"run_id": label, "case_id": plan["case_id"], "round": plan["round"], "policy": plan["policy"],
+                "server_exit_code": server_cleanup["exit_code"], "sampler_exit_code": sampler_cleanup["exit_code"],
+                "samples": validate_sampler(run_dir / "memory_samples.tsv", execution["server_identity"], label),
+                "memory": memory_statistics(validate_sampler(run_dir / "memory_samples.tsv", execution["server_identity"], label)),
+                "slots_before": slots_before, "slots_after": validate_slot_snapshot(run_dir / "slots_after.json", f"{label}.slots_after", require_resident=False),
+                "responses": actual, "service_failures": [], "actions": [], "resident_observations": [],
+                "qualified_offload_pairs": [], "offload_physical_relief_bytes": 0,
+                "qualification_round_trip": None, "characterization": None,
+                "resume_events": [], "resume_timings": [], "io": {},
+                "statistics": {}, "workload_fidelity": fidelity,
+                "replay": replay_artifact}
+    phase_evidence = validate_replay_phase_evidence(
+        execution.get("qualification"), replay_plan, actual, replay_artifact,
+        run_dir, case, spec, label)
+    raw_phase_evidence = {
+        "phase_windows": phase_evidence["phase_windows"],
+        "erase_actions": phase_evidence["erase_actions"],
+    }
+    if replay_artifact.get("phase_evidence") != raw_phase_evidence:
+        raise ParseError(f"{label}: replay phase evidence differs from parser recomputation")
+    if execution.get("replay", {}).get("phase_evidence") != raw_phase_evidence:
+        raise ParseError(f"{label}: execution replay phase evidence differs from parser recomputation")
     return {"run_id": label, "case_id": plan["case_id"], "round": plan["round"], "policy": plan["policy"],
             "server_exit_code": server_cleanup["exit_code"], "sampler_exit_code": sampler_cleanup["exit_code"],
-            "samples": [], "memory": {}, "slots_before": None, "slots_after": None, "responses": actual,
-            "service_failures": [], "actions": [], "resident_observations": [], "qualified_offload_pairs": [],
-            "offload_physical_relief_bytes": 0, "qualification_round_trip": None, "characterization": None,
-            "resume_events": [], "resume_timings": [], "io": {}, "statistics": {},
-            "workload_fidelity": fidelity, "replay": replay_artifact}
+            "samples": validate_sampler(run_dir / "memory_samples.tsv", execution["server_identity"], label),
+            "memory": memory_statistics(validate_sampler(run_dir / "memory_samples.tsv", execution["server_identity"], label)),
+            "slots_before": slots_before, "slots_after": validate_slot_snapshot(run_dir / "slots_after.json", f"{label}.slots_after", require_resident=False),
+            "responses": actual, "service_failures": [], "actions": phase_evidence["actions"],
+            "resident_observations": phase_evidence["resident_observations"],
+            "qualified_offload_pairs": phase_evidence["qualified_offload_pairs"],
+            "offload_physical_relief_bytes": phase_evidence["offload_physical_relief_bytes"],
+            "qualification_round_trip": phase_evidence["qualification_round_trip"], "characterization": None,
+            "resume_events": phase_evidence["resume_events"], "resume_timings": phase_evidence["resume_timings"],
+            "io": phase_evidence["io"], "statistics": response_statistics(actual),
+            "workload_fidelity": fidelity, "replay": replay_artifact,
+            "phase_evidence": phase_evidence}
 
 
 def parse_run(artifact: pathlib.Path, plan: dict[str, Any], case: dict[str, Any], workload: dict[str, Any], expected_execution_index: int, spec: dict[str, Any]) -> dict[str, Any]:
@@ -3668,6 +4071,387 @@ def validate_replay_model_binding(model_binding: Any, artifact_model_sha: Any) -
         raise ParseError("replay transcript model SHA differs from artifact model identity")
 
 
+def validate_derived_replay_parent(
+        source: dict[str, Any], artifact_model_sha: Any,
+        artifact_binary_sha: Any, label: str) -> None:
+    derived = source.get("derived_from")
+    if not isinstance(derived, dict) or set(derived) != {"transcript_path", "transcript_sha256"}:
+        raise ParseError(f"{label}: derived_from parent identity is missing")
+    parent_path_value = derived.get("transcript_path")
+    if not isinstance(parent_path_value, str) or not parent_path_value:
+        raise ParseError(f"{label}: parent transcript path is invalid")
+    parent_path = pathlib.Path(parent_path_value).expanduser().resolve()
+    parent = read_json(parent_path)
+    if not isinstance(parent, dict):
+        raise ParseError(f"{label}: parent transcript is not an object")
+    parent_file_sha = sha256_file(parent_path)
+    transcript_sha = derived.get("transcript_sha256")
+    if not isinstance(transcript_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", transcript_sha):
+        raise ParseError(f"{label}: parent transcript SHA is invalid")
+    if parent.get("transcript_sha256") != transcript_sha:
+        raise ParseError(f"{label}: parent transcript oracle SHA mismatch")
+    try:
+        from trace_compiler.runtime_materialize import load_transcript
+        load_transcript(parent_path)
+    except Exception as exc:
+        raise ParseError(f"{label}: parent transcript validation failed: {exc}") from exc
+    if parent.get("schema_version") != "gt-trace-1b-a/v1":
+        raise ParseError(f"{label}: parent transcript schema is unsupported")
+    if parent.get("materialization_status") != "MODEL_BOUND_REAL" or parent.get("materialize_mode") != "direct_token_ids":
+        raise ParseError(f"{label}: parent transcript is not MODEL_BOUND_REAL direct_token_ids")
+    reference_pass = parent.get("reference_pass")
+    if not isinstance(reference_pass, dict) or reference_pass.get("completed") is not True:
+        raise ParseError(f"{label}: parent reference completion is incomplete")
+    if reference_pass.get("reference_completion_role") != "qualification_observation_only":
+        raise ParseError(f"{label}: parent reference completion role is invalid")
+    if reference_pass.get("formal_correctness_oracle") != "future_resident_multi_session_baseline":
+        raise ParseError(f"{label}: parent correctness oracle is invalid")
+    turns = parent.get("turns")
+    if not isinstance(turns, list) or not turns:
+        raise ParseError(f"{label}: parent transcript has no turns")
+    for index, turn in enumerate(turns, 1):
+        if not isinstance(turn, dict):
+            raise ParseError(f"{label}: parent turn {index} is not an object")
+        completion = turn.get("reference_completion_tokens")
+        completion_sha = turn.get("reference_completion_sha256")
+        if not isinstance(completion, list) or not isinstance(completion_sha, str):
+            raise ParseError(f"{label}: parent turn {index} lacks completion oracle")
+        if turn.get("n_predict") != len(completion) or completion_sha != sha256_bytes(
+                json.dumps(completion, separators=(",", ":")).encode("utf-8")):
+            raise ParseError(f"{label}: parent turn {index} completion oracle mismatch")
+    model = parent.get("model")
+    if not isinstance(model, dict) or model.get("identity_status") != "REAL":
+        raise ParseError(f"{label}: parent model identity is not REAL")
+    for key in ("model_sha256", "binary_sha256"):
+        if not isinstance(model.get(key), str) or not re.fullmatch(r"[0-9a-f]{64}", model[key]):
+            raise ParseError(f"{label}: parent model {key} is invalid")
+    if model["model_sha256"] != artifact_model_sha:
+        raise ParseError(f"{label}: parent model SHA differs from artifact model")
+    if isinstance(artifact_binary_sha, str) and model["binary_sha256"] != artifact_binary_sha:
+        raise ParseError(f"{label}: parent binary SHA differs from artifact binary")
+    if source.get("derived_from", {}).get("parent_file_sha256") is not None and source["derived_from"]["parent_file_sha256"] != parent_file_sha:
+        raise ParseError(f"{label}: parent file SHA differs from derived identity")
+
+
+
+
+def replay_admission_seq_authority(
+        admission: Any, actual: list[dict[str, Any]], label: str) -> dict[str, int]:
+    if not isinstance(admission, list):
+        raise ParseError(f"{label}: replay admission journal is missing")
+    bindings: dict[str, set[int]] = {"A": set(), "B": set()}
+    binding_statuses = {"admitted", "already_live", "finished", "lineage_live"}
+    for index, item in enumerate(admission):
+        if not isinstance(item, dict):
+            raise ParseError(f"{label}: admission record {index} is not an object")
+        sid = item.get("logical_session_id")
+        if sid not in bindings:
+            continue
+        status = item.get("status")
+        seq_id = item.get("seq_id")
+        slot_id = item.get("slot_id")
+        if status == "queued":
+            if seq_id is not None or slot_id is not None:
+                raise ParseError(f"{label}: queued {sid} admission record carries a forged binding")
+            continue
+        if status not in binding_statuses:
+            raise ParseError(f"{label}: {sid} admission record has an invalid binding status")
+        if (
+            isinstance(seq_id, bool)
+            or not isinstance(seq_id, int)
+            or seq_id < 0
+            or isinstance(slot_id, bool)
+            or not isinstance(slot_id, int)
+            or slot_id != seq_id
+        ):
+            raise ParseError(f"{label}: {sid} admission binding is missing, forged, or inconsistent")
+        bindings[sid].add(seq_id)
+    for sid, seqs in bindings.items():
+        if len(seqs) != 1:
+            raise ParseError(f"{label}: {sid} admission mapping is missing or drifted")
+    if len({next(iter(seqs)) for seqs in bindings.values()}) != 2:
+        raise ParseError(f"{label}: A/B admission mappings share or duplicate a seq")
+    authority = {sid: next(iter(seqs)) for sid, seqs in bindings.items()}
+    for index, row in enumerate(actual):
+        sid = row.get("logical_session_id")
+        if sid not in authority:
+            continue
+        if row.get("seq_id") != authority[sid] or row.get("slot_id") != authority[sid]:
+            raise ParseError(f"{label}: response event {index} disagrees with admission seq authority")
+    return authority
+
+
+def validate_replay_phase_window_bindings(
+        phase_id: str, window: dict[str, Any], ab_seq_ids: set[int],
+        selected_seq_id: int | None, label: str) -> set[int]:
+    if window.get("session_ids") != ["A", "B"]:
+        raise ParseError(f"{label}: {phase_id} window A/B binding is invalid")
+    seq_ids = window.get("seq_ids")
+    expected_seq_ids = window.get("expected_seq_ids")
+    if (
+        not isinstance(seq_ids, list)
+        or any(isinstance(item, bool) or not isinstance(item, int) or item < 0 for item in seq_ids)
+        or seq_ids != sorted(seq_ids)
+        or len(set(seq_ids)) != len(seq_ids)
+        or expected_seq_ids != seq_ids
+    ):
+        raise ParseError(f"{label}: {phase_id} window seq binding is invalid or forged")
+    window_seq_ids = set(seq_ids)
+    if phase_id != "post-final-restore":
+        if window_seq_ids != ab_seq_ids:
+            raise ParseError(f"{label}: {phase_id} window seq_ids do not match admission authority")
+    else:
+        if len(window_seq_ids) != 1 or not window_seq_ids.issubset(ab_seq_ids):
+            raise ParseError(f"{label}: post-final-restore window seq_id is outside A/B authority")
+        if selected_seq_id is not None and window_seq_ids != {selected_seq_id}:
+            raise ParseError(f"{label}: post-final-restore window seq_id differs from selected victim")
+    return window_seq_ids
+
+def validate_replay_phase_evidence(
+        qualification: Any, replay_plan: Any, actual: list[dict[str, Any]],
+        replay_artifact: dict[str, Any], run_dir: pathlib.Path, case: dict[str, Any],
+        spec: dict[str, Any], label: str) -> dict[str, Any]:
+    contract = replay_plan.fixture_contract
+    if contract is None:
+        if isinstance(qualification, dict) and (
+                qualification.get("phase_windows") or qualification.get("erase_actions")):
+            raise ParseError(f"{label}: non-derived replay contains qualification phase evidence")
+        return {
+            "status": "NOT_APPLICABLE", "phase_windows": [], "erase_actions": [],
+            "actions": [], "resident_observations": [], "qualified_offload_pairs": [],
+            "offload_physical_relief_bytes": 0, "resume_events": [], "resume_timings": [],
+            "io": {}, "qualification_round_trip": None,
+        }
+    if not isinstance(qualification, dict):
+        raise ParseError(f"{label}: derived replay qualification record is missing")
+    phase_windows = qualification.get("phase_windows")
+    erase_actions = qualification.get("erase_actions")
+    if not isinstance(phase_windows, list) or not isinstance(erase_actions, list):
+        raise ParseError(f"{label}: derived replay phase evidence is missing")
+    phase_order = list(contract["phase_order"])
+    if len(phase_windows) != len(phase_order):
+        raise ParseError(f"{label}: derived replay does not contain all phase windows")
+    stderr_data = (run_dir / "server.stderr").read_bytes()
+    admission = replay_artifact.get("admission")
+    admission_authority = replay_admission_seq_authority(admission, actual, label)
+    ab_admission_seq_ids = set(admission_authority.values())
+    previous_end = None
+    normalized_windows: list[dict[str, Any]] = []
+    all_actions: list[dict[str, str]] = []
+    all_observations: list[dict[str, str]] = []
+    all_resumes: list[dict[str, str]] = []
+    all_timings: list[dict[str, str]] = []
+    phase_records: dict[str, dict[str, Any]] = {}
+    for index, window in enumerate(phase_windows):
+        if not isinstance(window, dict):
+            raise ParseError(f"{label}: phase window {index} is not an object")
+        required = {
+            "status", "phase_id", "started_mono_ns", "completed_mono_ns", "duration_ns",
+            "stderr_start_offset", "stderr_end_offset", "expected_seq_ids", "evidence",
+            "phase_index", "session_ids", "seq_ids",
+        }
+        if set(window) != required:
+            raise ParseError(f"{label}: phase window {index} schema mismatch")
+        if window["status"] != "passed" or window["phase_id"] != phase_order[index] or window["phase_index"] != index:
+            raise ParseError(f"{label}: phase window order/status is invalid")
+        phase_id = phase_order[index]
+        window_seq_ids = validate_replay_phase_window_bindings(
+            phase_id, window, ab_admission_seq_ids, None, f"{label}.phase[{index}]")
+        for key in ("started_mono_ns", "completed_mono_ns", "duration_ns", "stderr_start_offset", "stderr_end_offset"):
+            require_nonnegative_int(window[key], f"{label}.phase[{index}].{key}")
+        if window["completed_mono_ns"] < window["started_mono_ns"] or window["duration_ns"] != window["completed_mono_ns"] - window["started_mono_ns"]:
+            raise ParseError(f"{label}: phase window timing is inconsistent")
+        if window["stderr_end_offset"] <= window["stderr_start_offset"] or window["stderr_end_offset"] > len(stderr_data):
+            raise ParseError(f"{label}: phase window stderr offsets are invalid")
+        if previous_end is not None and window["stderr_start_offset"] != previous_end:
+            raise ParseError(f"{label}: phase stderr windows are not contiguous")
+        previous_end = window["stderr_end_offset"]
+        text = stderr_window(stderr_data, window["stderr_start_offset"], window["stderr_end_offset"], f"{label}.phase[{index}]")
+        actions = marker_records(text, "kv_pressure_unified_action", ACTION_REQUIRED, f"{label}.phase[{index}].action")
+        observations = marker_records(text, "kv_g0_s1_resident_observation", RESIDENT_OBSERVATION_REQUIRED, f"{label}.phase[{index}].resident")
+        resumes = marker_records(text, "kv_resume_order_event", RESUME_REQUIRED, f"{label}.phase[{index}].resume")
+        timings = marker_records(text, "kv_resume_stage_timing", TIMING_REQUIRED, f"{label}.phase[{index}].timing")
+        for action in actions:
+            validate_action_fields(action, f"{label}.phase[{index}].action")
+            boolean_fields(action, ACTION_BOOL, f"{label}.phase[{index}].action")
+        for observation in observations:
+            numeric_fields(observation, RESIDENT_OBSERVATION_NUMERIC, f"{label}.phase[{index}].resident")
+            boolean_fields(observation, RESIDENT_OBSERVATION_BOOL, f"{label}.phase[{index}].resident")
+        for event in resumes:
+            numeric_fields(event, {"decision_id", "seq_id", "claimant_epoch", "transaction_id"}, f"{label}.phase[{index}].resume")
+            boolean_fields(event, RESUME_BOOL, f"{label}.phase[{index}].resume")
+        for timing in timings:
+            numeric_fields(timing, TIMING_REQUIRED, f"{label}.phase[{index}].timing")
+        expected_source = pressure_basis_source(spec["pressure_basis"])
+        evidence_seqs = phase_evidence_seq_set(
+            phase_id, window, actions, observations, resumes, expected_source)
+        expected_seq_ids = set(window["seq_ids"])
+        if phase_requires_ab_pair_evidence(phase_id):
+            # prepare-offload: both A and B must each complete a real OFFLOAD with
+            # a transaction-local physical drop.
+            if evidence_seqs != expected_seq_ids:
+                raise ParseError(f"{label}: {phase_id} lacks A/B OFFLOAD physical-drop evidence")
+        elif phase_requires_ab_restore_evidence(phase_id):
+            # prepare-restore: both A and B must each have a positive Exact restore.
+            if evidence_seqs != expected_seq_ids:
+                raise ParseError(f"{label}: {phase_id} lacks positive A/B restore evidence")
+        elif phase_requires_single_victim_evidence(phase_id):
+            # final-competition: A/B must both be eligible candidates, but only a
+            # single state-changing OFFLOAD victim is permitted. The unique-victim
+            # fail-closed check runs in the final block against the A/B candidate
+            # set; here the window only needs the A/B candidates to be present in
+            # the phase's eligible score records (checked in the final block).
+            if len(evidence_seqs) > 1:
+                raise ParseError(f"{label}: final-competition window has multiple state-changing OFFLOAD victims")
+        elif phase_requires_selected_restore_evidence(phase_id):
+            # post-final-restore: only the selected victim may restore; the window
+            # already binds exactly the selected victim seq, and non-selected
+            # candidates must perform no positive restore.
+            if evidence_seqs != expected_seq_ids:
+                raise ParseError(f"{label}: post-final-restore evidence does not bind the selected victim")
+        phase_records[phase_id] = {
+            "actions": actions,
+            "observations": observations,
+            "resumes": resumes,
+            "timings": timings,
+        }
+        all_actions.extend(actions); all_observations.extend(observations)
+        all_resumes.extend(resumes); all_timings.extend(timings)
+        normalized_windows.append(dict(window))
+
+    if any(item.get("logical_session_id") in {"A", "B"} for item in erase_actions):
+        raise ParseError(f"{label}: A/B lineage was erased before qualification ended")
+    c_erases = [item for item in erase_actions if item.get("logical_session_id") == contract["control_session_id"]]
+    if len(c_erases) != 1 or c_erases[0].get("phase_id") != contract["explicit_erase"]["phase_id"]:
+        raise ParseError(f"{label}: derived replay C explicit erase evidence is missing or duplicated")
+    for sid in ("A", "B"):
+        live = [item for item in admission if item.get("logical_session_id") == sid and item.get("status") == "lineage_live"]
+        if not live:
+            raise ParseError(f"{label}: {sid} lineage was not kept live through qualification")
+    c_records = [item for item in admission if item.get("logical_session_id") == "C" and item.get("seq_id") is not None]
+    if not c_records:
+        raise ParseError(f"{label}: control session C has no bound claimant")
+    c_seq = c_records[-1]["seq_id"]
+    expected_source = pressure_basis_source(spec["pressure_basis"])
+    prepare_feedback_record: dict[str, Any] | None = None
+    prepare_offload_feedback: dict[int, dict[str, int]] | None = None
+    prepare_restore_feedback: dict[int, dict[str, int]] | None = None
+    if case["policy"] == "v3":
+        prepare_offload = phase_records.get("prepare-offload")
+        prepare_restore = phase_records.get("prepare-restore")
+        if prepare_offload is None or prepare_restore is None:
+            raise ParseError(f"{label}: V3 prepare feedback phase records are missing")
+        prepare_offload_feedback = replay_prepare_offload_feedback(
+            prepare_offload["actions"], prepare_offload["observations"],
+            expected_source, ab_admission_seq_ids, f"{label}.prepare-offload")
+        prepare_restore_feedback = replay_prepare_restore_feedback(
+            prepare_restore["resumes"], prepare_restore["timings"],
+            prepare_offload_feedback, f"{label}.prepare-restore")
+    final_text = stderr_window(stderr_data, phase_windows[2]["stderr_start_offset"], phase_windows[2]["stderr_end_offset"], f"{label}.final")
+    final_actions = marker_records(final_text, "kv_pressure_unified_action", ACTION_REQUIRED, f"{label}.final.action")
+    if not final_actions:
+        raise ParseError(f"{label}: final competition has no action marker")
+    validate_action_target_markers(final_actions, case, spec, f"{label}.final.action")
+    ab_seq = set(ab_admission_seq_ids)
+    expected_source = pressure_basis_source(spec["pressure_basis"])
+    final_observations = marker_records(final_text, "kv_g0_s1_resident_observation", RESIDENT_OBSERVATION_REQUIRED, f"{label}.final.resident")
+    # The selected final victim must NOT be derived from the last action marker
+    # (a trailing no-op marker must not redefine the selection). It is the unique
+    # qualifying state-changing OFFLOAD + transaction-local resident-drop pair in
+    # the final window whose seq belongs to the A/B candidate set; zero or more
+    # than one such pair is fail-closed.
+    victim_pair = final_competition_selected_victim(
+        final_actions, final_observations, expected_source, ab_seq)
+    if victim_pair is None:
+        raise ParseError(f"{label}: final-competition has no unique qualifying state-changing OFFLOAD victim within A/B candidates")
+    selected_seq = victim_pair["seq_id"]
+    # Bind final_action to the victim pair's own action marker, not the window
+    # tail, so a trailing no-op cannot shadow the real selection.
+    final_action = victim_pair["action"]
+    score_records = _parse_v3_score_records(final_action.get("scores", "none"), f"{label}.final.score")
+    eligible = [record for record in score_records if record["eligible"] == "1"]
+    if len(eligible) < 2:
+        raise ParseError(f"{label}: final competition has fewer than two eligible candidates")
+    selected = next((record for record in eligible if int(record["seq_id"]) == selected_seq), None)
+    if selected is None or int(selected["rank"]) != 0:
+        raise ParseError(f"{label}: selected final claimant is not rank zero")
+    for seq_id in ab_seq:
+        record = next((item for item in eligible if int(item["seq_id"]) == seq_id), None)
+        if record is None:
+            raise ParseError(f"{label}: A/B claimant is not eligible in final score")
+        if case["policy"] == "v3" and (record["cost_aware"] != "1" or record["fallback_reason"] != "none" or final_action.get("decision_fallback") != "none"):
+            raise ParseError(f"{label}: V3 A/B final claimant is not fully cost-aware")
+    history_record: dict[int, dict[str, int]] | None = None
+    if prepare_offload_feedback is not None and prepare_restore_feedback is not None:
+        history_record = validate_prepare_feedback_history(
+            final_action,
+            score_records,
+            prepare_offload_feedback,
+            prepare_restore_feedback,
+            ab_seq,
+            selected_seq,
+            f"{label}.final.prepare-feedback")
+        prepare_feedback_record = {
+            "offload": {str(seq_id): dict(value) for seq_id, value in prepare_offload_feedback.items()},
+            "restore": {str(seq_id): dict(value) for seq_id, value in prepare_restore_feedback.items()},
+            "history": {str(seq_id): dict(value) for seq_id, value in history_record.items()},
+        }
+    c_score = next((item for item in score_records if int(item["seq_id"]) == int(c_seq)), None)
+    if c_score is None or c_score["exclusion"] not in {"active", "protected"}:
+        raise ParseError(f"{label}: control session C was not safety-excluded from ranking")
+    matching = next((pair for pair in qualified_offload_pairs(final_actions, final_observations, expected_source) if pair["seq_id"] == selected_seq and pair["decision_id"] == int(final_action["decision_id"]) and pair["transaction_id"] == int(final_action["transaction_id"])), None)
+    if matching is None or final_action.get("physical_relief_available") != "1" or int(final_action["physical_relief_bytes"]) != matching["resident_drop_bytes"]:
+        raise ParseError(f"{label}: final physical relief does not match transaction-local resident drop")
+    selected_score = selected
+    if int(final_action["physical_object_id"]) != int(selected_score["physical_object_id"]) or int(final_action["physical_generation"]) != int(selected_score["physical_generation"]):
+        raise ParseError(f"{label}: final OFFLOAD physical identity differs from selected score")
+    io_records = marker_records(stderr_data.decode("utf-8", errors="replace"), "KV_PAGED_IO_STATS", IO_REQUIRED, f"{label}.io")
+    if not io_records:
+        raise ParseError(f"{label}: replay IO evidence is missing")
+    final_events: dict[str, Any] = {}
+    post_events: dict[str, Any] = {}
+    for sid in ("A", "B"):
+        final_candidates = [event for event in replay_plan.events if event.logical_session_id == sid and event.phase_id == "final-competition"]
+        post_candidates = [event for event in replay_plan.events if event.logical_session_id == sid and event.phase_id == "post-final-restore"]
+        if not final_candidates or not post_candidates:
+            raise ParseError(f"{label}: final/post-final phase is missing a required {sid} event")
+        final_events[sid] = max(final_candidates, key=lambda event: event.turn)
+        post_events[sid] = max(post_candidates, key=lambda event: event.turn)
+    for sid in ("A", "B"):
+        if (final_events[sid].prompt_tokens, final_events[sid].n_predict, final_events[sid].reference_completion_tokens) != (post_events[sid].prompt_tokens, post_events[sid].n_predict, post_events[sid].reference_completion_tokens):
+            raise ParseError(f"{label}: post-final request differs from final fixed request for {sid}")
+    validate_replay_phase_window_bindings(
+        "post-final-restore", phase_windows[3], ab_admission_seq_ids,
+        selected_seq, f"{label}.phase[3]")
+    post_window = phase_windows[3]
+    post_text = stderr_window(
+        stderr_data, post_window["stderr_start_offset"],
+        post_window["stderr_end_offset"], f"{label}.post-final")
+    post_events_marker = marker_records(
+        post_text, "kv_resume_order_event", RESUME_REQUIRED, f"{label}.post-final.resume")
+    post_positive = [event for event in post_events_marker
+                     if event.get("phase") == "prefetch"
+                     and event.get("outcome") == "completed"
+                     and event.get("graph_allowed") == "1"]
+    if not any(int(event["seq_id"]) == selected_seq for event in post_positive):
+        raise ParseError(f"{label}: selected final claimant has no positive post-final restore")
+    if any(int(event["seq_id"]) != selected_seq for event in post_positive):
+        raise ParseError(f"{label}: non-selected claimant performed a post-final restore")
+    return {
+        "status": "PASS", "phase_windows": normalized_windows, "erase_actions": list(erase_actions),
+        "actions": all_actions, "resident_observations": all_observations,
+        "qualified_offload_pairs": qualified_offload_pairs(all_actions, all_observations, pressure_basis_source(spec["pressure_basis"])),
+        "offload_physical_relief_bytes": sum(item["resident_drop_bytes"] for item in qualified_offload_pairs(all_actions, all_observations, pressure_basis_source(spec["pressure_basis"]))),
+        "resume_events": all_resumes, "resume_timings": all_timings,
+        "io": io_records[-1],
+        "qualification_round_trip": {
+            "status": "PASS",
+            "selected_seq_id": selected_seq,
+            **({"prepare_feedback": prepare_feedback_record}
+               if prepare_feedback_record is not None else {}),
+        },
+    }
+
 def validate_manifest(artifact: pathlib.Path) -> tuple[dict[str, Any], dict[str, dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     manifest = exact(read_json(artifact / "manifest.json"), MANIFEST_REQUIRED, "manifest", MANIFEST_OPTIONAL)
     reject_runner_verdict(manifest)
@@ -3694,11 +4478,16 @@ def validate_manifest(artifact: pathlib.Path) -> tuple[dict[str, Any], dict[str,
     if git["capture_mode"] not in {"archival_clean", "diagnostic_dirty"}:
         raise ParseError("manifest.provenance.git capture_mode is invalid")
     cases, plan, workload = validate_spec(manifest["spec"])
-    if "replay" in workload and workload["replay"]["source"] == "transcript":
-        transcript_path = pathlib.Path(workload["replay"]["path"])
-        transcript = read_json(transcript_path)
-        model_binding = transcript.get("model") if isinstance(transcript, dict) else None
-        validate_replay_model_binding(model_binding, provenance["model"]["sha256"])
+    if "replay" in workload:
+        replay_path = pathlib.Path(workload["replay"]["path"])
+        replay_source = read_json(replay_path)
+        if workload["replay"]["source"] == "transcript":
+            model_binding = replay_source.get("model") if isinstance(replay_source, dict) else None
+            validate_replay_model_binding(model_binding, provenance["model"]["sha256"])
+        elif isinstance(replay_source, dict) and replay_source.get("schema") == "gt-trace-1b-q1-derived/v1":
+            validate_derived_replay_parent(
+                replay_source, provenance["model"]["sha256"],
+                provenance["binary"]["sha256"], "manifest.derived_replay")
     if manifest["spec"]["run_kind"] == "formal" and (git["capture_mode"] != "archival_clean" or git["dirty_status"]):
         raise ParseError("formal artifact is not from a clean worktree")
     for item in plan:

@@ -814,12 +814,14 @@ class CanonicalBenchmarkTest(unittest.TestCase):
 
         def v3_score(seq_id: str, eligible: str, rank: str, *, cost_aware: bool,
                      exclusion: str = "none", fallback_reason: str = "none",
-                     physical_bytes: str = "4096", expected_cost: str = "150",
+                     physical_bytes: str = "4096", expected_cost: str = "1125",
                      physical_object_id: str = "11", physical_generation: str = "3") -> str:
             cells = {f: "0" for f in parser.SCORE_FIELDS}
             cells.update({
                 "seq_id": seq_id, "eligible": eligible, "exclusion": exclusion,
-                "total": "10", "idle_age_score": "1000", "logical_kv_score": "1",
+                "total": (str((int(expected_cost) * 1_000_000) // max(int(physical_bytes), 1))
+                          if cost_aware else "1000"),
+                "idle_age_score": "1000", "logical_kv_score": "1",
                 "reclaimable_score": "0", "lcp_n_past_penalty": "0",
                 "io_cost_penalty": "0", "failure_penalty": "0", "rank": rank,
                 "cost_aware": "1" if cost_aware else "0",
@@ -2818,6 +2820,463 @@ class LifecycleReplayIntegrationTest(unittest.TestCase):
         bad_claimant['body_json'][0]['kv_claimant']['swapped_blocks'] = 1
         with self.assertRaises(runner_module.RunnerError):
             runner_module.validate_replay_erased_slot_snapshot(bad_claimant, 0)
+
+
+class PhaseEvidenceContractTest(unittest.TestCase):
+    """Directed tests for the V3-1B-Q1 four-phase evidence contract.
+
+    These exercise the extracted phase-evidence predicates directly against
+    field dicts, without standing up the full fake-server artifact pipeline.
+    """
+
+    def _offload_action(self, seq_id: int, decision_id: int = 1,
+                        transaction_id: int = 7, epoch: int = 1) -> dict[str, str]:
+        action = dict(ACTION_FIELDS)
+        action["selected_seq_id"] = str(seq_id)
+        action["decision_id"] = str(decision_id)
+        action["transaction_id"] = str(transaction_id)
+        action["selected_claimant_epoch"] = str(epoch)
+        return action
+
+    def _resident_drop(self, seq_id: int, decision_id: int = 1,
+                       transaction_id: int = 7) -> dict[str, str]:
+        return {
+            "source": "paged_sample_mincore", "action": "offload",
+            "decision_id": str(decision_id), "seq_id": str(seq_id),
+            "transaction_id": str(transaction_id), "server_pid": "123",
+            "before_available": "1", "before_object_id": "1", "before_generation": "1",
+            "before_page_size": "4096", "before_total_bytes": "8192",
+            "before_resident_bytes": "8192", "before_total_pages": "2",
+            "before_resident_pages": "2",
+            "after_available": "1", "after_object_id": "1", "after_generation": "1",
+            "after_page_size": "4096", "after_total_bytes": "8192",
+            "after_resident_bytes": "4096", "after_total_pages": "2",
+            "after_resident_pages": "1",
+        }
+
+    def _resume_event(self, seq_id: int, decision_id: int = 1,
+                      transaction_id: int = 7, epoch: int = 1,
+                      phase: str = "prefetch", outcome: str = "completed",
+                      graph_allowed: str = "1") -> dict[str, str]:
+        return {
+            "phase": phase, "decision_id": str(decision_id), "seq_id": str(seq_id),
+            "claimant_epoch": str(epoch), "transaction_id": str(transaction_id),
+            "action": "offload-reuse", "outcome": outcome, "reason": "none",
+            "graph_allowed": graph_allowed,
+        }
+
+    def test_final_competition_single_victim_passes(self) -> None:
+        parser = load_parser_module()
+        ab = {0, 1}
+        action = self._offload_action(0)
+        observation = self._resident_drop(0)
+        victim = parser.final_competition_selected_victim(
+            [action], [observation], "RSS_ABSOLUTE", ab)
+        self.assertIsNotNone(victim)
+        self.assertEqual(victim["seq_id"], 0)
+        self.assertIs(victim["action"], action)
+
+    def test_final_competition_two_victims_fail_closed(self) -> None:
+        parser = load_parser_module()
+        ab = {0, 1}
+        actions = [self._offload_action(0, decision_id=1, transaction_id=7),
+                   self._offload_action(1, decision_id=2, transaction_id=8)]
+        observations = [self._resident_drop(0, decision_id=1, transaction_id=7),
+                        self._resident_drop(1, decision_id=2, transaction_id=8)]
+        # Two concurrent state-changing OFFLOAD victims in the same decision set
+        # is ambiguous and must fail closed.
+        self.assertIsNone(parser.final_competition_selected_victim(
+            actions, observations, "RSS_ABSOLUTE", ab))
+
+    def test_final_competition_no_victim_fail_closed(self) -> None:
+        parser = load_parser_module()
+        ab = {0, 1}
+        # An OFFLOAD action with no transaction-local resident drop is not a
+        # qualifying victim pair; the final window must fail closed.
+        actions = [self._offload_action(0)]
+        self.assertIsNone(parser.final_competition_selected_victim(
+            actions, [], "RSS_ABSOLUTE", ab))
+        # A victim outside the A/B candidate set is not selectable.
+        victim_outside = self._offload_action(9, decision_id=3, transaction_id=9)
+        obs_outside = self._resident_drop(9, decision_id=3, transaction_id=9)
+        self.assertIsNone(parser.final_competition_selected_victim(
+            [victim_outside], [obs_outside], "RSS_ABSOLUTE", ab))
+
+    def test_final_competition_trailing_noop_marker_does_not_shadow_victim(self) -> None:
+        parser = load_parser_module()
+        ab = {0, 1}
+        victim_action = self._offload_action(0, decision_id=1, transaction_id=7)
+        victim_obs = self._resident_drop(0, decision_id=1, transaction_id=7)
+        # A later no-op marker (state_changed=0, no resident drop) that names a
+        # different selected_seq_id must not redefine the qualifying victim.
+        noop = dict(ACTION_FIELDS)
+        noop["decision_id"] = "5"
+        noop["transaction_id"] = "11"
+        noop["selected_seq_id"] = "1"
+        noop["state_changed"] = "0"
+        noop["outcome"] = "no_op"
+        noop["offload_attempted"] = "0"
+        actions = [victim_action, noop]
+        observations = [victim_obs]
+        victim = parser.final_competition_selected_victim(
+            actions, observations, "RSS_ABSOLUTE", ab)
+        self.assertIsNotNone(victim)
+        self.assertEqual(victim["seq_id"], 0)
+        self.assertIs(victim["action"], victim_action)
+
+    def test_phase_evidence_seq_set_separates_ab_binding_from_evidence_count(self) -> None:
+        parser = load_parser_module()
+        ab_seqs = {0, 1}
+        # prepare-offload: both A and B must each carry positive evidence.
+        prepare_off_window = {"seq_ids": [0, 1]}
+        prepare_off_actions = [self._offload_action(0, 1, 7),
+                               self._offload_action(1, 2, 8)]
+        prepare_off_obs = [self._resident_drop(0, 1, 7),
+                           self._resident_drop(1, 2, 8)]
+        self.assertEqual(parser.phase_evidence_seq_set(
+            "prepare-offload", prepare_off_window, prepare_off_actions,
+            prepare_off_obs, [], "RSS_ABSOLUTE"), ab_seqs)
+        # final-competition: the A/B candidate set binds two seqs, but only one
+        # state-changing OFFLOAD victim appears in positive evidence.
+        final_window = {"seq_ids": [0, 1]}
+        final_actions = [self._offload_action(0, 1, 7)]
+        final_obs = [self._resident_drop(0, 1, 7)]
+        self.assertEqual(parser.phase_evidence_seq_set(
+            "final-competition", final_window, final_actions,
+            final_obs, [], "RSS_ABSOLUTE"), {0})
+        # post-final-restore: the window binds only the single selected victim,
+        # and its positive restore evidence set is a singleton, not the A/B pair.
+        post_window = {"seq_ids": [0]}
+        post_resumes = [self._resume_event(0)]
+        self.assertEqual(parser.phase_evidence_seq_set(
+            "post-final-restore", post_window, [], [],
+            post_resumes, "RSS_ABSOLUTE"), {0})
+
+    def test_post_final_only_selected_restore_passes(self) -> None:
+        parser = load_parser_module()
+        post_window = {"seq_ids": [0]}
+        post_resumes = [self._resume_event(0)]
+        evidence = parser.phase_evidence_seq_set(
+            "post-final-restore", post_window, [], [], post_resumes, "RSS_ABSOLUTE")
+        self.assertEqual(evidence, set(post_window["seq_ids"]))
+
+    def test_post_final_non_selected_restore_fails(self) -> None:
+        parser = load_parser_module()
+        # The window binds the single selected victim (seq 0), but a non-selected
+        # claimant (seq 1) performing a positive restore must surface as evidence
+        # outside the selected set.
+        post_window = {"seq_ids": [0]}
+        post_resumes = [self._resume_event(0), self._resume_event(1, decision_id=4, transaction_id=9)]
+        evidence = parser.phase_evidence_seq_set(
+            "post-final-restore", post_window, [], [], post_resumes, "RSS_ABSOLUTE")
+        self.assertEqual(evidence, {0, 1})
+        self.assertNotEqual(evidence, set(post_window["seq_ids"]))
+
+    def test_runner_victim_trailing_noop_marker_does_not_shadow_victim(self) -> None:
+        # Runner and parser must share one authority over the final victim: the
+        # unique qualifying state-changing OFFLOAD + transaction-local resident
+        # drop pair within A/B. A trailing no-op action marker after the real
+        # OFFLOAD must not redefine the selection, and runner must select the same
+        # victim as the parser so the post-final restore barrier advances to the
+        # correct claimant.
+        runner = load_runner_module()
+        parser = load_parser_module()
+        ab = {0, 1}
+        victim_action = self._offload_action(0, decision_id=1, transaction_id=7)
+        victim_obs = self._resident_drop(0, decision_id=1, transaction_id=7)
+        noop = dict(ACTION_FIELDS)
+        noop["decision_id"] = "5"
+        noop["transaction_id"] = "11"
+        noop["selected_seq_id"] = "1"
+        noop["state_changed"] = "0"
+        noop["outcome"] = "no_op"
+        noop["offload_attempted"] = "0"
+        text = (marker("kv_g0_s1_resident_observation", victim_obs) + "\n"
+                + marker("kv_pressure_unified_action", victim_action) + "\n"
+                + marker("kv_pressure_unified_action", noop) + "\n")
+        runner_victim = runner.final_competition_victim(text, "RSS_ABSOLUTE", ab)
+        parser_victim = parser.final_competition_selected_victim(
+            [victim_action, noop], [victim_obs], "RSS_ABSOLUTE", ab)
+        self.assertIsNotNone(runner_victim)
+        self.assertIsNotNone(parser_victim)
+        self.assertEqual(runner_victim["seq_id"], 0)
+        self.assertEqual(runner_victim["seq_id"], parser_victim["seq_id"])
+        self.assertEqual(
+            (runner_victim["decision_id"], runner_victim["transaction_id"]),
+            (parser_victim["decision_id"], parser_victim["transaction_id"]))
+        # The trailing no-op (selected_seq_id=1) did not become the victim.
+        self.assertNotEqual(runner_victim["seq_id"], 1)
+
+    def test_runner_victim_multiple_victims_fail_closed(self) -> None:
+        # Two concurrent state-changing OFFLOAD victims in A/B within the same
+        # final window is ambiguous; both runner and parser must fail closed
+        # (return None) rather than committing to one selection.
+        runner = load_runner_module()
+        parser = load_parser_module()
+        ab = {0, 1}
+        a_action = self._offload_action(0, decision_id=1, transaction_id=7)
+        a_obs = self._resident_drop(0, decision_id=1, transaction_id=7)
+        b_action = self._offload_action(1, decision_id=2, transaction_id=8)
+        b_obs = self._resident_drop(1, decision_id=2, transaction_id=8)
+        text = (marker("kv_g0_s1_resident_observation", a_obs) + "\n"
+                + marker("kv_pressure_unified_action", a_action) + "\n"
+                + marker("kv_g0_s1_resident_observation", b_obs) + "\n"
+                + marker("kv_pressure_unified_action", b_action) + "\n")
+        self.assertIsNone(runner.final_competition_victim(text, "RSS_ABSOLUTE", ab))
+        self.assertIsNone(parser.final_competition_selected_victim(
+            [a_action, b_action], [a_obs, b_obs], "RSS_ABSOLUTE", ab))
+
+
+    def test_runner_final_victim_uses_frozen_barrier_window(self) -> None:
+        runner = load_runner_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            stderr_path = pathlib.Path(tmp) / "server.stderr"
+            a_action = self._offload_action(0, decision_id=1, transaction_id=7)
+            a_observation = self._resident_drop(0, decision_id=1, transaction_id=7)
+            stderr_path.write_text(
+                marker("kv_g0_s1_resident_observation", a_observation) + "\n"
+                + marker("kv_pressure_unified_action", a_action) + "\n",
+                encoding="utf-8",
+            )
+            barrier_end = stderr_path.stat().st_size
+            b_action = self._offload_action(1, decision_id=2, transaction_id=8)
+            b_observation = self._resident_drop(1, decision_id=2, transaction_id=8)
+            with stderr_path.open("a", encoding="utf-8") as stream:
+                stream.write(marker("kv_g0_s1_resident_observation", b_observation) + "\n")
+                stream.write(marker("kv_pressure_unified_action", b_action) + "\n")
+            frozen = runner.complete_stderr_window(stderr_path, 0, barrier_end)
+            victim = runner.final_competition_victim(frozen, "RSS_ABSOLUTE", {0, 1})
+            self.assertIsNotNone(victim)
+            self.assertEqual(victim["seq_id"], 0)
+            self.assertNotIn("transaction_id=8", frozen)
+
+    def test_replay_admission_seq_authority_is_independent_and_fail_closed(self) -> None:
+        parser = load_parser_module()
+        admission = [
+            {"logical_session_id": "A", "status": "admitted", "slot_id": 4, "seq_id": 4},
+            {"logical_session_id": "B", "status": "admitted", "slot_id": 9, "seq_id": 9},
+            {"logical_session_id": "A", "status": "lineage_live", "slot_id": 4, "seq_id": 4},
+            {"logical_session_id": "B", "status": "lineage_live", "slot_id": 9, "seq_id": 9},
+        ]
+        actual = [
+            {"logical_session_id": "A", "slot_id": 4, "seq_id": 4},
+            {"logical_session_id": "B", "slot_id": 9, "seq_id": 9},
+        ]
+        self.assertEqual(
+            {"A": 4, "B": 9},
+            parser.replay_admission_seq_authority(admission, actual, "valid"),
+        )
+        invalid = {
+            "missing": [item for item in admission if item["logical_session_id"] != "B"],
+            "drift": admission + [{"logical_session_id": "A", "status": "lineage_live", "slot_id": 5, "seq_id": 5}],
+            "duplicate": [
+                *[item for item in admission if item["logical_session_id"] != "B"],
+                {"logical_session_id": "B", "status": "lineage_live", "slot_id": 4, "seq_id": 4},
+            ],
+            "forged": [
+                {**item, "slot_id": 5} if item["logical_session_id"] == "A" and item["status"] == "admitted" else item
+                for item in admission
+            ],
+        }
+        for name, candidate in invalid.items():
+            with self.subTest(name=name):
+                with self.assertRaises(parser.ParseError):
+                    parser.replay_admission_seq_authority(candidate, actual, name)
+
+    def test_replay_phase_windows_match_admission_authority_and_selected_victim(self) -> None:
+        parser = load_parser_module()
+
+        def window(seq_ids: list[int], expected: list[int] | None = None) -> dict[str, object]:
+            return {
+                "session_ids": ["A", "B"],
+                "seq_ids": list(seq_ids),
+                "expected_seq_ids": list(seq_ids if expected is None else expected),
+            }
+
+        self.assertEqual(
+            {4, 9},
+            parser.validate_replay_phase_window_bindings(
+                "final-competition", window([4, 9]), {4, 9}, None, "valid"),
+        )
+        for name, candidate in {
+            "window_drift": window([4, 5]),
+            "window_duplicate": window([4, 4]),
+            "window_forged_expected": window([4, 9], [4, 5]),
+            "window_wrong_session": {**window([4, 9]), "session_ids": ["A", "C"]},
+        }.items():
+            with self.subTest(name=name):
+                with self.assertRaises(parser.ParseError):
+                    parser.validate_replay_phase_window_bindings(
+                        "prepare-offload", candidate, {4, 9}, None, name)
+        self.assertEqual(
+            {4},
+            parser.validate_replay_phase_window_bindings(
+                "post-final-restore", window([4]), {4, 9}, 4, "post-valid"),
+        )
+        for selected in (9, None):
+            with self.subTest(selected=selected):
+                candidate = window([4]) if selected is not None else window([3])
+                with self.assertRaises(parser.ParseError):
+                    parser.validate_replay_phase_window_bindings(
+                        "post-final-restore", candidate, {4, 9}, selected, "post-invalid")
+
+
+    def _feedback_offload_action(
+            self, seq_id: int, decision_id: int, transaction_id: int,
+            epoch: int = 1, elapsed_us: int = 13, offload_bytes: int = 4096,
+            relief_bytes: int = 4096, object_id: int = 1, generation: int = 1) -> dict[str, str]:
+        action = self._offload_action(seq_id, decision_id, transaction_id, epoch)
+        action.update({
+            "action_elapsed_us": str(elapsed_us),
+            "bytes": str(offload_bytes),
+            "physical_relief_available": "1",
+            "physical_relief_bytes": str(relief_bytes),
+            "physical_object_id": str(object_id),
+            "physical_generation": str(generation),
+        })
+        return action
+
+    def _feedback_resident_drop(
+            self, seq_id: int, decision_id: int, transaction_id: int,
+            object_id: int = 1, generation: int = 1) -> dict[str, str]:
+        observation = self._resident_drop(seq_id, decision_id, transaction_id)
+        observation.update({
+            "before_object_id": str(object_id),
+            "after_object_id": str(object_id),
+            "before_generation": str(generation),
+            "after_generation": str(generation),
+        })
+        return observation
+
+    def _feedback_restore(
+            self, seq_id: int, decision_id: int, transaction_id: int,
+            epoch: int = 1, restored_bytes: int = 4096, gate_us: int = 7,
+    ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+        prefetch = self._resume_event(
+            seq_id, decision_id, transaction_id, epoch,
+            phase="prefetch", outcome="completed", graph_allowed="1")
+        prefetch["action"] = "prefetch"
+        graph_gate = dict(prefetch)
+        graph_gate["phase"] = "graph_gate"
+        timing = {
+            "decision_id": str(decision_id), "seq_id": str(seq_id),
+            "transaction_id": str(transaction_id), "restored_blocks": "1",
+            "restored_bytes": str(restored_bytes), "queue_us": "1",
+            "gate_us": str(gate_us), "graph_us": "1", "total_us": "9",
+        }
+        return [prefetch, graph_gate], [timing]
+
+    def _prepare_feedback_fixture(self):
+        parser = load_parser_module()
+        offload_actions = [
+            self._feedback_offload_action(0, 1, 7),
+            self._feedback_offload_action(1, 2, 8),
+        ]
+        offload_observations = [
+            self._feedback_resident_drop(0, 1, 7),
+            self._feedback_resident_drop(1, 2, 8),
+        ]
+        offload_feedback = parser.replay_prepare_offload_feedback(
+            offload_actions, offload_observations, "RSS_ABSOLUTE", {0, 1}, "fixture.offload")
+        resumes: list[dict[str, str]] = []
+        timings: list[dict[str, str]] = []
+        for seq_id, decision_id, transaction_id in ((0, 11, 17), (1, 12, 18)):
+            seq_resumes, seq_timings = self._feedback_restore(
+                seq_id, decision_id, transaction_id)
+            resumes.extend(seq_resumes)
+            timings.extend(seq_timings)
+        restore_feedback = parser.replay_prepare_restore_feedback(
+            resumes, timings, offload_feedback, "fixture.restore")
+        final_action = self._feedback_offload_action(0, 30, 70)
+        final_action["claimants"] = (
+            "0:1:1:0:1:1:1:0:0:0;1:1:1:0:1:1:1:0:0:0")
+        scores = []
+        for seq_id in (0, 1):
+            offload = offload_feedback[seq_id]
+            restore = restore_feedback[seq_id]
+            scores.append({
+                "seq_id": str(seq_id), "eligible": "1", "cost_aware": "1",
+                "fallback_reason": "none",
+                "expected_offload_write_cost_us": str(offload["offload_elapsed_us"]),
+                "expected_restore_gate_cost_us": str(restore["restore_gate_us"]),
+                "last_offload_bytes": str(offload["offload_bytes"]),
+                "last_restore_bytes": str(restore["restore_bytes"]),
+                "actual_relief_bytes": str(offload["physical_relief_bytes"]),
+                "round_trip_count": "1",
+                "physical_object_id": str(offload["object_id"]),
+                "physical_generation": str(offload["generation"]),
+            })
+        return parser, offload_feedback, restore_feedback, final_action, scores, resumes, timings
+
+    def test_prepare_feedback_history_propagates_for_both_claimants(self) -> None:
+        parser, offload, restore, final_action, scores, _, _ = self._prepare_feedback_fixture()
+        history = parser.validate_prepare_feedback_history(
+            final_action, scores, offload, restore, {0, 1}, 0, "fixture.history")
+        self.assertEqual(13, history[0]["offload_elapsed_us"])
+        self.assertEqual(7, history[1]["restore_gate_us"])
+        self.assertEqual(4096, history[0]["physical_relief_bytes"])
+        self.assertEqual(1, history[1]["round_trip_count"])
+
+    def test_prepare_feedback_offload_cost_mismatch_fails_closed(self) -> None:
+        parser, offload, restore, final_action, scores, _, _ = self._prepare_feedback_fixture()
+        scores[0] = dict(scores[0])
+        scores[0]["expected_offload_write_cost_us"] = "99"
+        with self.assertRaises(parser.ParseError):
+            parser.validate_prepare_feedback_history(
+                final_action, scores, offload, restore, {0, 1}, 0, "offload-cost")
+
+    def test_prepare_feedback_restore_gate_or_bytes_mismatch_fails_closed(self) -> None:
+        parser, offload, restore, final_action, scores, _, _ = self._prepare_feedback_fixture()
+        for field, value in {
+            "expected_restore_gate_cost_us": "99",
+            "last_restore_bytes": "9999",
+        }.items():
+            with self.subTest(field=field):
+                candidate = [dict(score) for score in scores]
+                candidate[0][field] = value
+                with self.assertRaises(parser.ParseError):
+                    parser.validate_prepare_feedback_history(
+                        final_action, candidate, offload, restore, {0, 1}, 0, f"restore-{field}")
+
+    def test_prepare_feedback_missing_positive_restore_fails_closed(self) -> None:
+        parser, offload, _, _, _, resumes, timings = self._prepare_feedback_fixture()
+        resumes = [event for event in resumes if event["seq_id"] != "1"]
+        timings = [timing for timing in timings if timing["seq_id"] != "1"]
+        with self.assertRaises(parser.ParseError):
+            parser.replay_prepare_restore_feedback(
+                resumes, timings, offload, "restore-missing")
+
+    def test_prepare_feedback_stale_object_generation_or_epoch_fails_closed(self) -> None:
+        parser, offload, restore, final_action, scores, _, _ = self._prepare_feedback_fixture()
+        for field, value in {
+            "physical_object_id": "2",
+            "physical_generation": "2",
+        }.items():
+            with self.subTest(field=field):
+                candidate = [dict(score) for score in scores]
+                candidate[0][field] = value
+                with self.assertRaises(parser.ParseError):
+                    parser.validate_prepare_feedback_history(
+                        final_action, candidate, offload, restore, {0, 1}, 0, f"stale-{field}")
+        stale_epoch_action = dict(final_action)
+        stale_epoch_action["claimants"] = stale_epoch_action["claimants"].replace(
+            "0:1:", "0:2:", 1)
+        with self.assertRaises(parser.ParseError):
+            parser.validate_prepare_feedback_history(
+                stale_epoch_action, scores, offload, restore, {0, 1}, 0, "stale-epoch")
+
+    def test_prepare_feedback_missing_history_or_round_trip_fails_closed(self) -> None:
+        parser, offload, restore, final_action, scores, _, _ = self._prepare_feedback_fixture()
+        no_round_trip = [dict(score) for score in scores]
+        no_round_trip[0]["round_trip_count"] = "0"
+        with self.assertRaises(parser.ParseError):
+            parser.validate_prepare_feedback_history(
+                final_action, no_round_trip, offload, restore, {0, 1}, 0, "round-trip")
+        missing_history = [dict(score) for score in scores]
+        missing_history[0].pop("last_restore_bytes")
+        with self.assertRaises(parser.ParseError):
+            parser.validate_prepare_feedback_history(
+                final_action, missing_history, offload, restore, {0, 1}, 0, "history-missing")
 
 
 if __name__ == "__main__":

@@ -824,6 +824,31 @@ def normalize_budget_sweep(
     }
 
 
+def validate_cross_policy_single_switch(
+        cases: dict[str, dict[str, Any]], plan: list[dict[str, Any]], label: str = "cross-policy") -> None:
+    policies = sorted({item["policy"] for item in plan if item["policy"] in SWAP_POLICIES})
+    if len(policies) < 2:
+        return
+    comparable = (
+        "kv_representation", "loading_mode", "restore", "prefault",
+        "kv_target_bytes", "action_target_bytes",
+    )
+    by_policy: dict[str, list[dict[str, Any]]] = {policy: [] for policy in policies}
+    for item in sorted(plan, key=lambda value: (value["round"], value["run_order"])):
+        if item["policy"] in by_policy:
+            by_policy[item["policy"]].append(item)
+    reference_policy = policies[0]
+    reference = [tuple(item[key] for key in comparable) for item in by_policy[reference_policy]]
+    for policy in policies[1:]:
+        current = [tuple(item[key] for key in comparable) for item in by_policy[policy]]
+        if current != reference:
+            raise RunnerError(
+                f"{label}: policies {reference_policy} and {policy} differ outside policy")
+    for policy, items in by_policy.items():
+        if any(item["policy"] != policy for item in items):
+            raise RunnerError(f"{label}: policy identity drift in planned runs")
+
+
 def validate_spec(raw: Any) -> tuple[dict[str, Any], dict[str, dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     if isinstance(raw, dict):
         raw = dict(raw)
@@ -876,6 +901,7 @@ def validate_spec(raw: Any) -> tuple[dict[str, Any], dict[str, dict[str, Any]], 
         raise RunnerError("lifecycle replay owns --slot-save-path server option")
     cases = normalize_cases(spec["cases"])
     plan = normalize_plan(spec["run_order"], cases)
+    validate_cross_policy_single_switch(cases, plan)
     budget_sweep = normalize_budget_sweep(
         spec.get("budget_sweep"), cases, plan, max_blocks, spec["run_kind"])
     if (
@@ -1218,9 +1244,10 @@ def qualifying_offload_action(
     migrated_bytes = uint_marker_field(fields, "bytes")
     relieved_bytes = uint_marker_field(fields, "relieved_bytes")
     shortfall_bytes = uint_marker_field(fields, "shortfall_bytes")
+    sample_count = uint_marker_field(fields, "sample_count")
     if None in (
             decision_id, transaction_id, seq_id, claimant_epoch, budget_excess, blocks,
-            migrated_bytes, relieved_bytes, shortfall_bytes):
+            migrated_bytes, relieved_bytes, shortfall_bytes, sample_count):
         return None
     if (
         fields.get("state") != "NORMAL"
@@ -1230,6 +1257,7 @@ def qualifying_offload_action(
         or fields.get("pressure_basis_valid") != "1"
         or fields.get("budget_active") != "1"
         or claimant_epoch <= 0
+        or sample_count <= 0
         or budget_excess <= 0
         or fields.get("offload_attempted") != "1"
         or fields.get("outcome") != "completed"
@@ -1307,6 +1335,198 @@ def find_offload_barrier_pair(text: str, expected_source: str) -> dict[str, int]
         }
     return None
 
+def find_offload_barrier_pairs(
+        text: str, expected_source: str, expected_seq_ids: set[int]) -> dict[int, dict[str, Any]]:
+    actions: dict[tuple[int, int, int], dict[str, str]] = {}
+    observations: dict[tuple[int, int, int], dict[str, int]] = {}
+    for line in text.splitlines():
+        action = parse_marker_fields(line, "kv_pressure_unified_action")
+        if action is not None:
+            key = qualifying_offload_action(action, expected_source)
+            if key is not None and key[2] in expected_seq_ids:
+                actions[key] = action
+        observation = parse_marker_fields(line, "kv_g0_s1_resident_observation")
+        if observation is not None:
+            qualified = qualifying_resident_drop(observation)
+            if qualified is not None and qualified[0][2] in expected_seq_ids:
+                observations[qualified[0]] = qualified[1]
+    result: dict[int, dict[str, Any]] = {}
+    for key, action in actions.items():
+        observation = observations.get(key)
+        if observation is None:
+            continue
+        decision_id, transaction_id, seq_id = key
+        claimant_epoch = uint_marker_field(action, "selected_claimant_epoch")
+        if claimant_epoch is None or claimant_epoch <= 0:
+            continue
+        if seq_id in result:
+            continue
+        result[seq_id] = {
+            "decision_id": decision_id,
+            "transaction_id": transaction_id,
+            "seq_id": seq_id,
+            "selected_claimant_epoch": claimant_epoch,
+            "before_object_id": observation["before_object_id"],
+            "before_generation": observation["before_generation"],
+            "before_resident_bytes": observation["before_resident_bytes"],
+            "after_object_id": observation["after_object_id"],
+            "after_generation": observation["after_generation"],
+            "after_resident_bytes": observation["after_resident_bytes"],
+            "resident_drop_bytes": observation["before_resident_bytes"] - observation["after_resident_bytes"],
+            "action": dict(action),
+            "resident_observation": dict(observation),
+        }
+    return result
+
+
+def final_competition_victim(
+        text: str, expected_source: str,
+        ab_candidate_seqs: set[int]) -> dict[str, Any] | None:
+    # The final-competition selected victim must NOT come from the last action
+    # marker (a trailing no-op must not redefine the selection), nor from any
+    # score expectation or policy guess. It is the unique qualifying
+    # state-changing OFFLOAD + transaction-local resident-drop pair within the
+    # final window whose seq belongs to the A/B candidate set. Zero or more than
+    # one such pair is fail-closed. This mirrors the parser's
+    # final_competition_selected_victim so runner and parser share one authority
+    # over which final window element is the victim; the two implementations are
+    # kept in lock-step by the PhaseEvidenceContractTest parity cases.
+    actions: dict[tuple[int, int, int], dict[str, str]] = {}
+    observations: dict[tuple[int, int, int], list[dict[str, int]]] = {}
+    for line in text.splitlines():
+        action = parse_marker_fields(line, "kv_pressure_unified_action")
+        if action is not None:
+            key = qualifying_offload_action(action, expected_source)
+            if key is not None and key[2] in ab_candidate_seqs:
+                actions[key] = action
+        observation = parse_marker_fields(line, "kv_g0_s1_resident_observation")
+        if observation is not None:
+            qualified = qualifying_resident_drop(observation)
+            if qualified is not None and qualified[0][2] in ab_candidate_seqs:
+                observations.setdefault(qualified[0], []).append(qualified[1])
+    victim_pairs: list[dict[str, Any]] = []
+    for key, action in actions.items():
+        decision_id, transaction_id, seq_id = key
+        claimant_epoch = uint_marker_field(action, "selected_claimant_epoch")
+        if claimant_epoch is None or claimant_epoch <= 0:
+            continue
+        for observation in observations.get(key, []):
+            victim_pairs.append({
+                "decision_id": decision_id,
+                "transaction_id": transaction_id,
+                "seq_id": seq_id,
+                "selected_claimant_epoch": claimant_epoch,
+                "before_object_id": observation["before_object_id"],
+                "before_generation": observation["before_generation"],
+                "before_resident_bytes": observation["before_resident_bytes"],
+                "after_object_id": observation["after_object_id"],
+                "after_generation": observation["after_generation"],
+                "after_resident_bytes": observation["after_resident_bytes"],
+                "resident_drop_bytes": (
+                    observation["before_resident_bytes"] - observation["after_resident_bytes"]),
+                "action": dict(action),
+                "resident_observation": dict(observation),
+            })
+    if len(victim_pairs) != 1:
+        return None
+    return victim_pairs[0]
+
+
+def find_positive_restore_evidence(text: str, expected_seq_ids: set[int]) -> dict[int, dict[str, int]]:
+    events: dict[tuple[int, int, int, int], dict[str, str]] = {}
+    timings: dict[tuple[int, int, int], dict[str, str]] = {}
+    sample_counts: list[int] = []
+    for line in text.splitlines():
+        action = parse_marker_fields(line, "kv_pressure_unified_action")
+        if action is not None:
+            sample_count = uint_marker_field(action, "sample_count")
+            if sample_count is not None and sample_count > 0:
+                sample_counts.append(sample_count)
+        event = parse_marker_fields(line, "kv_resume_order_event")
+        if event is not None and event.get("phase") in {"prefetch", "graph_gate"} and event.get("outcome") == "completed" and event.get("graph_allowed") == "1":
+            seq = uint_marker_field(event, "seq_id")
+            decision = uint_marker_field(event, "decision_id")
+            transaction = uint_marker_field(event, "transaction_id")
+            epoch = uint_marker_field(event, "claimant_epoch")
+            if None not in (seq, decision, transaction, epoch) and seq in expected_seq_ids:
+                events[(decision, transaction, seq, epoch)] = event
+        timing = parse_marker_fields(line, "kv_resume_stage_timing")
+        if timing is not None:
+            seq = uint_marker_field(timing, "seq_id")
+            decision = uint_marker_field(timing, "decision_id")
+            transaction = uint_marker_field(timing, "transaction_id")
+            if None not in (seq, decision, transaction) and seq in expected_seq_ids:
+                timings[(decision, transaction, seq)] = timing
+    result: dict[int, dict[str, int]] = {}
+    if not sample_counts:
+        return result
+    sample_count = max(sample_counts)
+    for key, event in events.items():
+        timing = timings.get(key[:3])
+        if timing is None:
+            continue
+        restored = uint_marker_field(timing, "restored_bytes")
+        total = uint_marker_field(timing, "total_us")
+        gate = uint_marker_field(timing, "gate_us")
+        if restored is None or total is None or gate is None:
+            continue
+        if restored <= 0 or total <= 0 or gate <= 0:
+            continue
+        result[key[2]] = {
+            "decision_id": key[0], "transaction_id": key[1], "seq_id": key[2],
+            "claimant_epoch": key[3], "restored_bytes": restored,
+            "restore_gate_us": gate, "total_us": total, "sample_count": sample_count,
+        }
+    return result
+
+
+def _complete_phase_window(stderr_path: pathlib.Path, start_offset: int) -> tuple[str, int]:
+    return complete_stderr_suffix(stderr_path, start_offset)
+
+
+def wait_replay_phase_barrier(
+        stderr_path: pathlib.Path, start_offset: int, timeout_seconds: float,
+        phase_id: str, expected_source: str, expected_seq_ids: set[int],
+        server: subprocess.Popen[bytes]) -> dict[str, Any]:
+    if phase_id not in {"prepare-offload", "prepare-restore", "final-competition", "post-final-restore"}:
+        raise RunnerError(f"unsupported replay qualification phase: {phase_id}")
+    started = time.monotonic_ns()
+    deadline = time.monotonic() + timeout_seconds
+    last_offset = start_offset
+    while True:
+        text, end_offset = _complete_phase_window(stderr_path, start_offset)
+        last_offset = max(last_offset, end_offset)
+        if phase_id == "prepare-offload":
+            evidence = find_offload_barrier_pairs(text, expected_source, expected_seq_ids)
+            passed = expected_seq_ids.issubset(evidence)
+        elif phase_id in {"prepare-restore", "post-final-restore"}:
+            evidence = find_positive_restore_evidence(text, expected_seq_ids)
+            passed = expected_seq_ids.issubset(evidence)
+        else:
+            evidence = find_offload_barrier_pairs(text, expected_source, expected_seq_ids)
+            passed = bool(evidence)
+        if passed:
+            finished = time.monotonic_ns()
+            return {
+                "status": "passed", "phase_id": phase_id,
+                "started_mono_ns": started, "completed_mono_ns": finished,
+                "duration_ns": finished - started,
+                "stderr_start_offset": start_offset, "stderr_end_offset": end_offset,
+                "expected_seq_ids": sorted(expected_seq_ids), "evidence": evidence,
+            }
+        if server.poll() is not None:
+            raise RunnerError(f"server exited while waiting for replay phase {phase_id}")
+        if time.monotonic() >= deadline:
+            finished = time.monotonic_ns()
+            return {
+                "status": "timeout", "phase_id": phase_id,
+                "started_mono_ns": started, "completed_mono_ns": finished,
+                "duration_ns": finished - started,
+                "stderr_start_offset": start_offset, "stderr_end_offset": last_offset,
+                "expected_seq_ids": sorted(expected_seq_ids), "evidence": None,
+            }
+        time.sleep(0.02)
+
 
 def complete_stderr_suffix(path: pathlib.Path, start_offset: int) -> tuple[str, int]:
     data = path.read_bytes()
@@ -1325,6 +1545,38 @@ def complete_stderr_suffix(path: pathlib.Path, start_offset: int) -> tuple[str, 
         return "", effective_start
     complete = suffix[:newline + 1]
     return complete.decode("utf-8", errors="replace"), effective_start + len(complete)
+
+
+def complete_stderr_window(
+        path: pathlib.Path, start_offset: int, end_offset: int) -> str:
+    if (
+        isinstance(start_offset, bool)
+        or not isinstance(start_offset, int)
+        or isinstance(end_offset, bool)
+        or not isinstance(end_offset, int)
+        or start_offset < 0
+        or end_offset < start_offset
+    ):
+        raise RunnerError("server stderr window offsets are invalid")
+    length = end_offset - start_offset
+    with path.open("rb") as stream:
+        stream.seek(start_offset)
+        segment = stream.read(length)
+        if len(segment) != length:
+            raise RunnerError("server stderr window ended outside the captured file")
+        previous = b"\n"
+        if start_offset > 0:
+            stream.seek(start_offset - 1)
+            previous = stream.read(1)
+    if start_offset > 0 and previous != b"\n":
+        newline = segment.find(b"\n")
+        if newline < 0:
+            return ""
+        segment = segment[newline + 1:]
+    if segment and not segment.endswith(b"\n"):
+        newline = segment.rfind(b"\n")
+        segment = b"" if newline < 0 else segment[:newline + 1]
+    return segment.decode("utf-8", errors="replace")
 
 
 def wait_real_offload_barrier(
@@ -1796,13 +2048,15 @@ def request_completion_replay(
     tokens_evaluated: int | None = None
     tokens_predicted: int | None = None
     response_slot: int | None = None
+    response_tokens: list[int] | None = None
     if isinstance(parsed, dict):
         response_slot = parsed.get("id_slot")
         tokens_evaluated = parsed.get("tokens_evaluated")
         tokens_predicted = parsed.get("tokens_predicted")
         tokens = parsed.get("tokens")
         if isinstance(tokens, list) and all(isinstance(t, int) and not isinstance(t, bool) and t >= 0 for t in tokens):
-            token_sha = sha256_bytes(json.dumps(tokens, separators=(",", ":")).encode("utf-8"))
+            response_tokens = list(tokens)
+            token_sha = sha256_bytes(json.dumps(response_tokens, separators=(",", ":")).encode("utf-8"))
     return {
         **event,
         "slot_id": slot_id,
@@ -1823,33 +2077,48 @@ def request_completion_replay(
         "body_bytes": len(response_body),
         "body_sha256": sha256_bytes(response_body),
         "response_json": parsed,
+        "response_tokens": response_tokens,
         "response_slot_id": response_slot,
         "tokens_evaluated": tokens_evaluated,
         "tokens_predicted": tokens_predicted,
         "response_token_sha256": token_sha,
+        "response_token_count": len(response_tokens) if response_tokens is not None else None,
         "error": error,
     }
 
 
 def validate_replay_model_binding(replay_plan: Any, spec: dict[str, Any]) -> None:
-    """Bind a model-bound transcript to the replay model, not its materializer binary."""
-    if replay_plan.schema != "gt-trace-1b-a/v1":
+    """Bind model-bound replay and derived fixtures to production model identity."""
+    if replay_plan.schema not in {"gt-trace-1b-a/v1", "gt-trace-1b-q1-derived/v1"}:
         return
     try:
         document = json.loads(pathlib.Path(replay_plan.source_path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise RunnerError(f"cannot reload model-bound replay transcript: {exc}") from exc
-    model = document.get("model")
+        raise RunnerError(f"cannot reload model-bound replay source: {exc}") from exc
+    model_document = document
+    if replay_plan.schema == "gt-trace-1b-q1-derived/v1":
+        contract = replay_plan.fixture_contract or {}
+        if contract.get("parent_transcript_path") is None:
+            raise RunnerError("derived replay fixture has no verified parent transcript")
+        try:
+            model_document = json.loads(pathlib.Path(contract["parent_transcript_path"]).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RunnerError(f"cannot reload derived replay parent transcript: {exc}") from exc
+        if contract.get("parent_transcript_sha256") != model_document.get("transcript_sha256"):
+            raise RunnerError("derived replay parent transcript oracle identity drift")
+    model = model_document.get("model")
     if not isinstance(model, dict):
-        raise RunnerError("model-bound replay transcript has no model identity")
+        raise RunnerError("model-bound replay source has no model identity")
     expected_model_sha = model.get("model_sha256")
     transcript_binary_sha = model.get("binary_sha256")
     if not isinstance(expected_model_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_model_sha):
-        raise RunnerError("model-bound replay transcript model SHA is invalid")
+        raise RunnerError("model-bound replay source model SHA is invalid")
     if not isinstance(transcript_binary_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", transcript_binary_sha):
-        raise RunnerError("model-bound replay transcript binary SHA is invalid")
+        raise RunnerError("model-bound replay source binary SHA is invalid")
     if sha256_file(pathlib.Path(spec["model"])) != expected_model_sha:
         raise RunnerError("replay model bytes differ from the model-bound transcript")
+    if replay_plan.schema == "gt-trace-1b-q1-derived/v1" and sha256_file(pathlib.Path(spec["binary"])) != transcript_binary_sha:
+        raise RunnerError("derived replay binary bytes differ from the model-bound parent transcript")
 
 
 def validate_replay_slot_capacity(
@@ -2356,7 +2625,8 @@ def run_one_replay_lifecycle(
                          str(server_cgroup.get("memory_current_file", "")) if server_cgroup else ""],
         "request_loop_started": request_loop_started, "request_count": len(request_records),
         "qualification": {"idle_seconds": None, "offload_timeout_seconds": None, "resume_request_id": None,
-                          "idle": None, "offload_barrier": None, "resume": None},
+                          "idle": None, "offload_barrier": None, "resume": None,
+                          "phase_windows": [], "erase_actions": []},
         "characterization": {"idle_seconds": None, "settle_timeout_seconds": None, "target_tolerance_bytes": None,
                              "resume_request_id": None, "requested_target_bytes": None, "action_target_bytes": None,
                              "after_fill": None, "idle": None, "settle": None, "release_settled": None,
@@ -2414,6 +2684,8 @@ def run_one_replay(
     runner_cgroup = cgroup_identity(os.getpid())
     request_records: list[dict[str, Any]] = []
     admission_records: list[dict[str, Any]] = []
+    phase_windows: list[dict[str, Any]] = []
+    erase_actions: list[dict[str, Any]] = []
     lifecycle_error: str | None = None
     server_cleanup = {"pid": None, "pgid": None, "exit_code": None, "stop_requested": False,
                        "stop_signal": None, "term_timed_out": False, "kill_timed_out": False,
@@ -2470,9 +2742,15 @@ def run_one_replay(
         queued_recorded: set[str] = set()
         dispatch_count = 0
         blocked_since: float | None = None
+        derived_contract = replay_plan.fixture_contract
+        phase_order = list(derived_contract["phase_order"]) if derived_contract is not None else []
+        phase_index = 0
+        phase_start_offset = stderr_path.stat().st_size
+        session_bindings: dict[str, dict[str, int]] = {}
+        final_selected_seq_id: int | None = None
 
         with ThreadPoolExecutor(max_workers=replay_cfg["n_parallel"]) as executor:
-            while pending or inflight:
+            while pending or inflight or phase_index < len(phase_order):
                 progressed = False
 
                 # Retire completed HTTP requests first.  Results are kept in
@@ -2505,14 +2783,118 @@ def run_one_replay(
                     session_available_us[sid] = actual["completed_us"]
                     session_next_turn[sid] += 1
                     if first["turn"] == session_last_turn[sid]:
-                        finish = admission.finish(sid, actual["completed_us"])
-                        admission_records.append({**first, **finish})
+                        if replay_plan.fixture_contract is not None:
+                            contract = replay_plan.fixture_contract
+                            erase_contract = contract["explicit_erase"]
+                            if sid == erase_contract["session_id"] and first["phase_id"] == erase_contract["phase_id"]:
+                                erase = erase_replay_slot(
+                                    port, meta["binding"]["slot_id"],
+                                    spec["request_timeout_seconds"])
+                                verify_name = f"slots_after_erase_{first['event_seq']:06d}.json"
+                                verify_snapshot = capture_slots(
+                                    port, run_dir / verify_name,
+                                    spec["request_timeout_seconds"])
+                                cleared = validate_replay_erased_slot_snapshot(
+                                    verify_snapshot, meta["binding"]["slot_id"])
+                                erase_actions.append({
+                                    "logical_session_id": sid, "phase_id": first["phase_id"],
+                                    "event_seq": first["event_seq"], "slot_id": meta["binding"]["slot_id"],
+                                    "erase": erase, "verify_path": verify_name, "cleared": cleared,
+                                })
+                                finish = admission.release(sid, actual["completed_us"])
+                                admission_records.append({**first, **finish})
+                            elif sid in {"A", "B"}:
+                                # A/B completion is not a prompt-clear boundary in the
+                                # derived qualification.  Keep the slot and KV lineage
+                                # live through final selection and post-final restore.
+                                admission_records.append({
+                                    **first, "status": "lineage_live",
+                                    "completed_us": actual["completed_us"],
+                                    **meta["binding"],
+                                })
+                            else:
+                                raise RunnerError(
+                                    f"derived replay final turn has no declared erase policy: {sid}")
+                        else:
+                            finish = admission.finish(sid, actual["completed_us"])
+                            admission_records.append({**first, **finish})
                     progressed = True
+
+                if derived_contract is not None and phase_index < len(phase_order):
+                    phase_id = phase_order[phase_index]
+                    phase_pending = [
+                        item for item in pending if item["phase_id"] == phase_id
+                    ]
+                    phase_inflight = [
+                        meta for meta in inflight.values()
+                        if meta["event"]["phase_id"] == phase_id
+                    ]
+                    if not phase_pending and not phase_inflight:
+                        expected_session_ids = {"A", "B"}
+                        if not expected_session_ids.issubset(session_bindings):
+                            raise RunnerError(
+                                f"replay phase {phase_id} has no live A/B slot bindings")
+                        candidate_seq_ids = {
+                            session_bindings[sid]["seq_id"] for sid in expected_session_ids
+                        }
+                        expected_seq_ids = set(candidate_seq_ids)
+                        if phase_id == "post-final-restore":
+                            if final_selected_seq_id is None:
+                                raise RunnerError("post-final-restore has no selected final claimant")
+                            expected_seq_ids = {final_selected_seq_id}
+                        phase_start = phase_start_offset
+                        barrier = wait_replay_phase_barrier(
+                            stderr_path, phase_start, max(
+                                float(replay_cfg["admission_timeout_seconds"]),
+                                float(spec["request_timeout_seconds"]),
+                            ), phase_id, pressure_basis_source(spec["pressure_basis"]),
+                            expected_seq_ids, server)
+                        if barrier["status"] != "passed":
+                            raise RunnerError(
+                                f"replay phase {phase_id} did not reach a production barrier")
+                        phase_windows.append({
+                            **barrier,
+                            "phase_index": phase_index,
+                            "session_ids": sorted(expected_session_ids),
+                            "seq_ids": sorted(expected_seq_ids),
+                        })
+                        if phase_id == "final-competition":
+                            phase_text = complete_stderr_window(
+                                stderr_path, barrier["stderr_start_offset"],
+                                barrier["stderr_end_offset"])
+                            final_actions = [
+                                parse_marker_fields(line, "kv_pressure_unified_action")
+                                for line in phase_text.splitlines()
+                            ]
+                            final_actions = [item for item in final_actions if item is not None]
+                            if not final_actions:
+                                raise RunnerError("final-competition has no action marker")
+                            # The final victim must come from the unique qualifying
+                            # state-changing OFFLOAD + transaction-local resident-drop
+                            # pair within the final window, scoped to the A/B
+                            # candidate set — NOT from the last action marker, so a
+                            # trailing no-op cannot mis-advance the post-final restore
+                            # barrier. Zero or multiple qualifying victims fail closed.
+                            victim = final_competition_victim(
+                                phase_text,
+                                pressure_basis_source(spec["pressure_basis"]),
+                                candidate_seq_ids)
+                            if victim is None:
+                                raise RunnerError(
+                                    "final-competition has no unique qualifying "
+                                    "state-changing OFFLOAD victim within A/B candidates")
+                            final_selected_seq_id = victim["seq_id"]
+                        phase_start_offset = barrier["stderr_end_offset"]
+                        phase_index += 1
+                        progressed = True
+                        continue
 
                 now_us = (time.monotonic_ns() - started_at_ns) // 1000
                 ready = [
                     item for item in pending
                     if item["planned_arrival_us"] <= now_us
+                    and (derived_contract is None
+                         or item["phase_id"] == phase_order[phase_index])
                 ]
 
                 # Dispatch independent sessions concurrently, up to n_parallel.
@@ -2533,6 +2915,7 @@ def run_one_replay(
 
                     if sid in admission.bindings:
                         binding = admission.binding(sid)
+                        session_bindings[sid] = dict(binding)
                         admitted_us = max(
                             first["planned_arrival_us"], session_available_us[sid])
                     else:
@@ -2557,6 +2940,7 @@ def run_one_replay(
                         }
                         admitted_us = max(first["planned_arrival_us"], now_us)
 
+                    session_bindings[sid] = dict(binding)
                     if not 0 <= binding["slot_id"] < replay_cfg["n_parallel"]:
                         raise RunnerError("replay slot binding is out of range")
 
@@ -2603,6 +2987,8 @@ def run_one_replay(
                     continue
 
                 if not pending:
+                    if derived_contract is not None and phase_index < len(phase_order):
+                        continue
                     break
 
                 # No request is in flight.  If all current slots are held by
@@ -2653,6 +3039,11 @@ def run_one_replay(
     replay_record = {"plan": replay_plan.to_dict(), "schedule": schedule,
                      "admission": admission_records, "events": request_records,
                      "workload_fidelity": fidelity}
+    if replay_plan.fixture_contract is not None:
+        replay_record["phase_evidence"] = {
+            "phase_windows": phase_windows,
+            "erase_actions": erase_actions,
+        }
     dump(run_dir / "replay.json", replay_record)
     execution = {
         "run_id": run["run_id"], "round": run["round"], "run_order": run["run_order"],
@@ -2666,13 +3057,17 @@ def run_one_replay(
                          str(server_cgroup.get("memory_current_file", "")) if server_cgroup else ""],
         "request_loop_started": request_loop_started, "request_count": len(request_records),
         "qualification": {"idle_seconds": None, "offload_timeout_seconds": None, "resume_request_id": None,
-                          "idle": None, "offload_barrier": None, "resume": None},
+                          "idle": None, "offload_barrier": None, "resume": None,
+                          "phase_windows": phase_windows, "erase_actions": erase_actions},
         "characterization": {"idle_seconds": None, "settle_timeout_seconds": None, "target_tolerance_bytes": None,
                              "resume_request_id": None, "requested_target_bytes": None, "action_target_bytes": None,
                              "after_fill": None, "idle": None, "settle": None, "release_settled": None,
                              "settled": None, "resume": None, "after_measurement": None},
         "replay": replay_record,
     }
+    if replay_plan.fixture_contract is not None:
+        execution["qualification"]["phase_windows"] = phase_windows
+        execution["qualification"]["erase_actions"] = erase_actions
     dump(run_dir / "execution.json", execution)
     if not responses_path.exists():
         responses_path.write_text("", encoding="utf-8")

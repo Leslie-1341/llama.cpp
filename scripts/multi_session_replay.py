@@ -64,6 +64,11 @@ class ReplayEvent:
     prompt_sha256: str
     n_predict: int
     source: str
+    source_lineage_id: int = 0
+    source_turn: int = 0
+    reference_completion_tokens: tuple[int, ...] = ()
+    reference_completion_sha256: str = ""
+    phase_id: str = "replay"
 
     @property
     def request_id(self) -> str:
@@ -91,6 +96,7 @@ class ReplayPlan:
     excluded_sessions: tuple[dict[str, Any], ...]
     planned_arrival_origin_us: int
     lifecycle: dict[str, Any] | None = None
+    fixture_contract: dict[str, Any] | None = None
 
     @property
     def planned_session_count(self) -> int:
@@ -122,6 +128,12 @@ class ReplayPlan:
                     "prompt_tokens": list(e.prompt_tokens),
                     "prompt_sha256": e.prompt_sha256,
                     "n_predict": e.n_predict,
+                    "source": e.source,
+                    "source_lineage_id": e.source_lineage_id,
+                    "source_turn": e.source_turn,
+                    "reference_completion_tokens": list(e.reference_completion_tokens),
+                    "reference_completion_sha256": e.reference_completion_sha256,
+                    "phase_id": e.phase_id,
                     "request_id": e.request_id,
                 }
                 for e in self.events
@@ -129,6 +141,8 @@ class ReplayPlan:
         }
         if self.lifecycle is not None:
             result["lifecycle"] = dict(self.lifecycle)
+        if self.fixture_contract is not None:
+            result["fixture_contract"] = dict(self.fixture_contract)
         return result
 
 
@@ -136,7 +150,10 @@ def _prompt_sha(tokens: Iterable[int]) -> str:
     return _sha256_json(list(tokens))
 
 
-def _normalize_turn(raw: dict[str, Any], source: str, event_seq: int, *, session_id: str, lineage_id: int) -> ReplayEvent:
+def _normalize_turn(
+        raw: dict[str, Any], source: str, event_seq: int, *, session_id: str,
+        lineage_id: int, default_phase_id: str = "replay",
+        parent_turn: dict[str, Any] | None = None) -> ReplayEvent:
     turn = _strict_int(raw.get("turn"), f"{source}.turn", 1)
     timestamp = raw.get("timestamp", raw.get("planned_ts_us"))
     if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)) or not math.isfinite(float(timestamp)):
@@ -144,19 +161,46 @@ def _normalize_turn(raw: dict[str, Any], source: str, event_seq: int, *, session
     planned_ts_us = int(round(float(timestamp) * (1_000_000 if isinstance(timestamp, float) else 1)))
     if planned_ts_us < 0:
         raise ReplayError(f"{source}.timestamp must be non-negative")
-    tokens = raw.get("prompt_tokens")
+    parent = parent_turn or {}
+    parent_prompt = parent.get("prompt_tokens")
+    tokens = raw.get("prompt_tokens", parent_prompt)
     if not isinstance(tokens, list) or not tokens or any(isinstance(t, bool) or not isinstance(t, int) or t < 0 for t in tokens):
         raise ReplayError(f"{source}.prompt_tokens must be a non-empty integer array")
-    prompt_sha = raw.get("prompt_sha256")
-    computed = _prompt_sha(tokens)
-    if prompt_sha is not None and prompt_sha != computed:
+    if parent_prompt is not None and tokens != parent_prompt:
+        raise ReplayError(f"{source}.prompt_tokens differ from parent transcript")
+    prompt_sha = raw.get("prompt_sha256", parent.get("prompt_sha256"))
+    computed_prompt_sha = _prompt_sha(tokens)
+    if prompt_sha is not None and prompt_sha != computed_prompt_sha:
         raise ReplayError(f"{source}.prompt_sha256 mismatch")
-    n_predict = raw.get("n_predict", raw.get("request_plan", {}).get("n_predict"))
+    n_predict = raw.get("n_predict", parent.get("n_predict", raw.get("request_plan", {}).get("n_predict")))
     n_predict = _strict_int(n_predict, f"{source}.n_predict", 0)
+    parent_completion = parent.get("reference_completion_tokens", [])
+    completion = raw.get("reference_completion_tokens", parent_completion)
+    if not isinstance(completion, list) or any(isinstance(t, bool) or not isinstance(t, int) or t < 0 for t in completion):
+        raise ReplayError(f"{source}.reference_completion_tokens must be an integer array")
+    if parent.get("reference_completion_tokens") is not None and completion != parent_completion:
+        raise ReplayError(f"{source}.reference_completion_tokens differ from parent transcript")
+    if completion and len(completion) != n_predict:
+        raise ReplayError(f"{source}.reference_completion_tokens length differs from n_predict")
+    completion_sha = raw.get("reference_completion_sha256", parent.get("reference_completion_sha256"))
+    computed_completion_sha = _prompt_sha(completion) if completion else ""
+    if completion_sha is not None and completion_sha != computed_completion_sha:
+        raise ReplayError(f"{source}.reference_completion_sha256 mismatch")
+    source_lineage = _strict_int(raw.get("source_lineage_id", raw.get("lineage_id", lineage_id)),
+                                 f"{source}.source_lineage_id", 0)
+    source_turn = _strict_int(raw.get("source_turn", turn), f"{source}.source_turn", 1)
+    phase_id = raw.get("phase_id", default_phase_id)
+    if not isinstance(phase_id, str) or not phase_id:
+        raise ReplayError(f"{source}.phase_id must be a non-empty string")
     lineage = _strict_int(raw.get("lineage_id", lineage_id), f"{source}.lineage_id", 0)
-    return ReplayEvent(event_seq=event_seq, logical_session_id=session_id, lineage_id=lineage,
-                       turn=turn, planned_ts_us=planned_ts_us, prompt_tokens=tuple(tokens),
-                       prompt_sha256=computed, n_predict=n_predict, source=source)
+    return ReplayEvent(
+        event_seq=event_seq, logical_session_id=session_id, lineage_id=lineage,
+        turn=turn, planned_ts_us=planned_ts_us, prompt_tokens=tuple(tokens),
+        prompt_sha256=computed_prompt_sha, n_predict=n_predict, source=source,
+        source_lineage_id=source_lineage, source_turn=source_turn,
+        reference_completion_tokens=tuple(completion),
+        reference_completion_sha256=computed_completion_sha, phase_id=phase_id,
+    )
 
 
 def _load_json(path: Path) -> tuple[Any, str]:
@@ -186,7 +230,7 @@ def _strict_positive_float(value: Any, label: str) -> float:
     return float(value)
 
 
-def _load_parent_manifest(parent: Any) -> dict[str, Any]:
+def _load_parent_manifest(parent: Any, *, require_event_stream: bool = False) -> dict[str, Any]:
     if not isinstance(parent, dict):
         raise ReplayError("transcript parent identity is missing")
     path_value = parent.get("manifest_path_at_materialization")
@@ -206,6 +250,13 @@ def _load_parent_manifest(parent: Any) -> dict[str, Any]:
     for key in ("trace_key", "trace_repo_head", "trace_file", "trace_file_sha256"):
         if parent.get(key) != manifest.get(key):
             raise ReplayError(f"transcript parent trace identity mismatch at {key}")
+    parent_event_sha = parent.get("event_stream_sha256")
+    manifest_event_sha = manifest.get("event_stream_sha256")
+    if require_event_stream or parent_event_sha is not None or manifest_event_sha is not None:
+        parent_event_sha = _strict_sha(parent_event_sha, "parent.event_stream_sha256")
+        manifest_event_sha = _strict_sha(manifest_event_sha, "parent manifest.event_stream_sha256")
+        if parent_event_sha != manifest_event_sha:
+            raise ReplayError("transcript parent event stream SHA mismatch")
     identity = manifest.get("ttl_calibration_identity")
     if not isinstance(identity, dict):
         raise ReplayError("parent ttl_calibration_identity is missing")
@@ -214,12 +265,15 @@ def _load_parent_manifest(parent: Any) -> dict[str, Any]:
         "ttl_seconds": ttl,
         "parent_manifest_path": str(path),
         "parent_manifest_sha256": manifest_sha,
-        "parent_event_stream_sha256": parent.get("event_stream_sha256"),
+        "parent_event_stream_sha256": parent_event_sha,
         "trace_identity": {
             "trace_key": manifest["trace_key"],
             "trace_repo_head": manifest["trace_repo_head"],
             "trace_file": manifest["trace_file"],
             "trace_file_sha256": manifest["trace_file_sha256"],
+            "event_stream_sha256": manifest_event_sha,
+            "schema_version": manifest["schema_version"],
+            "slice_class": manifest.get("slice_class"),
         },
     }
 
@@ -238,14 +292,247 @@ def _fixture_lifecycle(raw: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _transcript_lifecycle(raw: dict[str, Any]) -> dict[str, Any]:
-    value = _load_parent_manifest(raw.get("parent"))
+    value = _load_parent_manifest(raw.get("parent"), require_event_stream=True)
     value["source"] = "transcript"
     return value
 
+def _load_model_bound_parent(path: Path, expected_sha: str) -> tuple[dict[str, Any], str]:
+    raw_bytes = path.read_bytes()
+    file_sha = _sha256_bytes(raw_bytes)
+    try:
+        raw = json.loads(raw_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReplayError(f"derived fixture parent transcript is not valid JSON: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ReplayError("derived fixture parent transcript is not an object")
+    if raw.get("schema_version") != "gt-trace-1b-a/v1":
+        raise ReplayError("derived fixture parent transcript schema is unsupported")
+    if not isinstance(raw.get("parent"), dict):
+        raise ReplayError("derived fixture parent transcript identity is missing")
+    if raw.get("materialization_status") != "MODEL_BOUND_REAL" or raw.get("materialize_mode") != "direct_token_ids":
+        raise ReplayError("derived fixture parent must be MODEL_BOUND_REAL direct_token_ids")
+    transcript_sha = _strict_sha(raw.get("transcript_sha256"), "derived parent transcript_sha256")
+    if transcript_sha != expected_sha:
+        raise ReplayError("derived fixture parent transcript SHA mismatch")
+    try:
+        from trace_compiler.runtime_materialize import load_transcript
+        load_transcript(path)
+    except Exception as exc:
+        raise ReplayError(f"derived fixture parent transcript validation failed: {exc}") from exc
+    reference_pass = raw.get("reference_pass")
+    if not isinstance(reference_pass, dict):
+        raise ReplayError("derived fixture parent reference pass is missing")
+    if reference_pass.get("completed") is not True:
+        raise ReplayError("derived fixture parent reference completion is incomplete")
+    if reference_pass.get("reference_completion_role") != "qualification_observation_only":
+        raise ReplayError("derived fixture parent reference completion role is unsupported")
+    if reference_pass.get("formal_correctness_oracle") != "future_resident_multi_session_baseline":
+        raise ReplayError("derived fixture parent formal correctness oracle is unsupported")
+    turns = raw.get("turns")
+    if not isinstance(turns, list) or not turns:
+        raise ReplayError("derived fixture parent has no turns")
+    for index, turn in enumerate(turns, 1):
+        if not isinstance(turn, dict):
+            raise ReplayError(f"derived fixture parent turn {index} is not an object")
+        completion = turn.get("reference_completion_tokens")
+        completion_sha = turn.get("reference_completion_sha256")
+        n_predict = turn.get("n_predict")
+        if not isinstance(completion, list) or not completion_sha:
+            raise ReplayError(f"derived fixture parent turn {index} lacks reference completion oracle")
+        if isinstance(n_predict, bool) or not isinstance(n_predict, int) or n_predict != len(completion):
+            raise ReplayError(f"derived fixture parent turn {index} completion length is invalid")
+        _strict_sha(completion_sha, f"derived parent turn {index}.reference_completion_sha256")
+        if completion_sha != _prompt_sha(completion):
+            raise ReplayError(f"derived fixture parent turn {index} completion SHA mismatch")
+    model = raw.get("model")
+    if not isinstance(model, dict) or model.get("identity_status") != "REAL":
+        raise ReplayError("derived fixture parent model identity is not REAL")
+    for key in ("model_sha256", "binary_sha256"):
+        _strict_sha(model.get(key), f"derived parent model.{key}")
+    return raw, file_sha
+
+
+def _derived_fixture_contract(raw: dict[str, Any], path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    derived = raw.get("derived_from")
+    if not isinstance(derived, dict) or set(derived) != {"transcript_path", "transcript_sha256"}:
+        raise ReplayError("derived fixture must declare transcript_path and transcript_sha256")
+    transcript_path_value = derived.get("transcript_path")
+    if not isinstance(transcript_path_value, str) or not transcript_path_value:
+        raise ReplayError("derived fixture transcript_path is invalid")
+    transcript_path = Path(transcript_path_value).expanduser().resolve()
+    transcript_sha = _strict_sha(derived.get("transcript_sha256"), "derived_from.transcript_sha256")
+    parent, parent_file_sha = _load_model_bound_parent(transcript_path, transcript_sha)
+    parent_lifecycle = _transcript_lifecycle(parent)
+    qualification = raw.get("qualification")
+    if not isinstance(qualification, dict):
+        raise ReplayError("derived fixture qualification contract is missing")
+    allowed_qualification = {"control_session_id", "explicit_erase", "phase_order"}
+    if set(qualification) - allowed_qualification:
+        raise ReplayError("derived fixture qualification contract contains unsupported fields")
+    if qualification.get("control_session_id") != "C":
+        raise ReplayError("derived fixture control_session_id must be C")
+    erase = qualification.get("explicit_erase")
+    if not isinstance(erase, dict) or set(erase) != {"session_id", "phase_id"}:
+        raise ReplayError("derived fixture explicit_erase must name only session_id and phase_id")
+    if erase.get("session_id") != "C":
+        raise ReplayError("derived fixture may explicitly erase only control session C")
+    if not isinstance(erase.get("phase_id"), str) or not erase["phase_id"]:
+        raise ReplayError("derived fixture explicit_erase phase_id is invalid")
+    phase_order = qualification.get("phase_order", [
+        "prepare-offload", "prepare-restore", "final-competition", "post-final-restore",
+    ])
+    if (
+        not isinstance(phase_order, list)
+        or phase_order != ["prepare-offload", "prepare-restore", "final-competition", "post-final-restore"]
+        or len(set(phase_order)) != len(phase_order)
+    ):
+        raise ReplayError("derived fixture phase_order must use the canonical policy-independent four phases")
+    contract = {
+        "kind": "derived_controlled",
+        "parent_transcript_path": str(transcript_path),
+        "parent_transcript_sha256": transcript_sha,
+        "parent_file_sha256": parent_file_sha,
+        "parent_manifest_path": parent_lifecycle["parent_manifest_path"],
+        "parent_manifest_sha256": parent_lifecycle["parent_manifest_sha256"],
+        "parent_event_stream_sha256": parent_lifecycle["parent_event_stream_sha256"],
+        "parent_model_sha256": parent["model"]["model_sha256"],
+        "parent_binary_sha256": parent["model"]["binary_sha256"],
+        "parent_ttl_seconds": parent_lifecycle["ttl_seconds"],
+        "control_session_id": "C",
+        "explicit_erase": {"session_id": "C", "phase_id": erase["phase_id"]},
+        "phase_order": list(phase_order),
+    }
+    return parent, contract
+
+
+def _parent_turn_index(parent: dict[str, Any]) -> dict[tuple[int, int], dict[str, Any]]:
+    turns = parent.get("turns")
+    if not isinstance(turns, list):
+        raise ReplayError("derived fixture parent has no turns")
+    index: dict[tuple[int, int], dict[str, Any]] = {}
+    for item in turns:
+        if not isinstance(item, dict):
+            raise ReplayError("derived fixture parent turn is not an object")
+        lineage = _strict_int(item.get("lineage_id"), "derived parent turn lineage_id", 0)
+        turn = _strict_int(item.get("turn"), "derived parent turn", 1)
+        key = (lineage, turn)
+        if key in index:
+            raise ReplayError("derived fixture parent repeats a lineage/turn")
+        index[key] = item
+    return index
+
+def _resequence_events(events: Iterable[ReplayEvent]) -> tuple[ReplayEvent, ...]:
+    ordered = sorted(events, key=lambda e: (e.planned_ts_us, e.event_seq))
+    return tuple(
+        ReplayEvent(
+            event_seq=index, logical_session_id=event.logical_session_id,
+            lineage_id=event.lineage_id, turn=event.turn,
+            planned_ts_us=event.planned_ts_us, prompt_tokens=event.prompt_tokens,
+            prompt_sha256=event.prompt_sha256, n_predict=event.n_predict,
+            source=event.source, source_lineage_id=event.source_lineage_id,
+            source_turn=event.source_turn,
+            reference_completion_tokens=event.reference_completion_tokens,
+            reference_completion_sha256=event.reference_completion_sha256,
+            phase_id=event.phase_id,
+        )
+        for index, event in enumerate(ordered)
+    )
+
+
+def _load_derived_fixture(path: Path, raw: dict[str, Any], source_sha: str,
+                          n_parallel: int, selected: set[str] | None) -> ReplayPlan:
+    parent, contract = _derived_fixture_contract(raw, path)
+    parent_turns = _parent_turn_index(parent)
+    sessions_raw = raw.get("sessions")
+    if not isinstance(sessions_raw, list) or not sessions_raw:
+        raise ReplayError("derived fixture has no sessions")
+    sessions: list[ReplaySession] = []
+    excluded: list[dict[str, Any]] = []
+    event_seq = 0
+    seen_session_ids: set[str] = set()
+    phases: dict[str, list[ReplayEvent]] = {}
+    for index, item in enumerate(sessions_raw):
+        if not isinstance(item, dict):
+            raise ReplayError(f"derived fixture.sessions[{index}] is not an object")
+        sid = item.get("logical_session_id")
+        if not isinstance(sid, str) or not sid or sid in seen_session_ids:
+            raise ReplayError(f"derived fixture session id is invalid or duplicated: {sid!r}")
+        seen_session_ids.add(sid)
+        if selected is not None and sid not in selected:
+            if sid == "C":
+                raise ReplayError("derived fixture selection cannot omit control session C")
+            continue
+        if sid == "C" and item.get("context_eligible", True) is not True:
+            raise ReplayError("derived fixture control session C cannot be context-ineligible")
+        eligible = item.get("context_eligible", True)
+        if not isinstance(eligible, bool):
+            raise ReplayError(f"derived fixture session {sid} context_eligible is invalid")
+        if not eligible:
+            excluded.append({"logical_session_id": sid, "reason": item.get("eligibility_reason", "context_ineligible")})
+            continue
+        lineage = _strict_int(item.get("lineage_id", index), f"derived fixture session {sid}.lineage_id", 0)
+        turns_raw = item.get("turns")
+        if not isinstance(turns_raw, list) or not turns_raw:
+            raise ReplayError(f"derived fixture session {sid} has no turns")
+        normalized: list[ReplayEvent] = []
+        for turn_index, turn in enumerate(turns_raw):
+            if not isinstance(turn, dict):
+                raise ReplayError(f"derived fixture session {sid} turn is not an object")
+            if "source_lineage_id" not in turn or "source_turn" not in turn:
+                raise ReplayError(f"derived fixture {sid} must declare source_lineage_id/source_turn")
+            source_lineage = _strict_int(turn["source_lineage_id"], f"derived fixture {sid}.source_lineage_id", 0)
+            source_turn = _strict_int(turn["source_turn"], f"derived fixture {sid}.source_turn", 1)
+            parent_turn = parent_turns.get((source_lineage, source_turn))
+            if parent_turn is None:
+                raise ReplayError(
+                    f"derived fixture {sid} source lineage/turn is absent from parent: {source_lineage}/{source_turn}")
+            normalized.append(_normalize_turn(
+                turn, f"derived.sessions[{index}].turns[{turn_index}]", event_seq + turn_index,
+                session_id=sid, lineage_id=lineage,
+                default_phase_id=str(turn.get("phase_id", "replay")), parent_turn=parent_turn))
+        turns = tuple(normalized)
+        _validate_session_turns(sid, turns)
+        sessions.append(ReplaySession(sid, lineage, turns, True, None))
+        for event in turns:
+            phases.setdefault(event.phase_id, []).append(event)
+        event_seq += len(turns)
+    required_sessions = {"A", "B", "C"}
+    actual_sessions = {session.logical_session_id for session in sessions}
+    if not required_sessions.issubset(actual_sessions):
+        raise ReplayError("derived fixture must include eligible sessions A, B, and control session C")
+    phase_order = contract["phase_order"]
+    if any(event.phase_id not in phase_order for event in (e for session in sessions for e in session.turns)):
+        raise ReplayError("derived fixture contains an event outside the declared phase schedule")
+    if any(not phases.get(phase) for phase in phase_order):
+        raise ReplayError("derived fixture declared phase has no source event")
+    erase_phase = contract["explicit_erase"]["phase_id"]
+    if erase_phase not in phase_order:
+        raise ReplayError("derived fixture explicit erase phase is outside phase schedule")
+    erase_events = phases.get(erase_phase, [])
+    if len(erase_events) != 1 or erase_events[0].logical_session_id != "C":
+        raise ReplayError("derived fixture explicit erase phase must identify exactly one C event")
+    c_events = [event for session in sessions if session.logical_session_id == "C" for event in session.turns]
+    if erase_events[0].turn != c_events[-1].turn:
+        raise ReplayError("derived fixture explicit erase must target the final C turn")
+    events = _resequence_events(event for session in sessions for event in session.turns)
+    origin = min(event.planned_ts_us for event in events)
+    lifecycle = _fixture_lifecycle(raw)
+    if lifecycle is not None and abs(lifecycle["ttl_seconds"] - contract["parent_ttl_seconds"]) > 1e-9:
+        raise ReplayError("derived fixture TTL differs from parent calibration")
+    if lifecycle is None:
+        lifecycle = {"ttl_seconds": contract["parent_ttl_seconds"], "source": "derived_parent"}
+    return ReplayPlan(raw["schema"], str(path), source_sha, 1.0, n_parallel,
+                      tuple(sessions), events, tuple(excluded), origin,
+                      lifecycle, contract)
+
 def _load_fixture(path: Path, n_parallel: int, selected: set[str] | None) -> ReplayPlan:
     raw, source_sha = _load_json(path)
-    if not isinstance(raw, dict) or raw.get("schema") not in {"generic-replay/v1", "gt-trace-1b-b/v1"}:
+    if not isinstance(raw, dict) or raw.get("schema") not in {
+        "generic-replay/v1", "gt-trace-1b-b/v1", "gt-trace-1b-q1-derived/v1",
+    }:
         raise ReplayError("controlled replay fixture schema is unsupported")
+    if raw.get("schema") == "gt-trace-1b-q1-derived/v1":
+        return _load_derived_fixture(path, raw, source_sha, n_parallel, selected)
     sessions_raw = raw.get("sessions")
     if not isinstance(sessions_raw, list) or not sessions_raw:
         raise ReplayError("controlled replay fixture has no sessions")
@@ -270,19 +557,20 @@ def _load_fixture(path: Path, n_parallel: int, selected: set[str] | None) -> Rep
         turns_raw = item.get("turns")
         if not isinstance(turns_raw, list) or not turns_raw:
             raise ReplayError(f"fixture session {sid} has no turns")
-        turns = tuple(_normalize_turn(turn, f"fixture.sessions[{index}].turns", event_seq + i,
-                                      session_id=sid, lineage_id=lineage)
-                      for i, turn in enumerate(turns_raw))
+        turns = tuple(
+            _normalize_turn(
+                turn, f"fixture.sessions[{index}].turns", event_seq + i,
+                session_id=sid, lineage_id=lineage,
+                default_phase_id=str(turn.get("phase_id", "replay")) if isinstance(turn, dict) else "replay",
+            )
+            for i, turn in enumerate(turns_raw)
+        )
         _validate_session_turns(sid, turns)
         event_seq += len(turns)
         sessions.append(ReplaySession(sid, lineage, turns, True, None))
     if not sessions:
         raise ReplayError("controlled replay has no context-eligible selected session")
-    events = tuple(sorted((event for session in sessions for event in session.turns),
-                          key=lambda e: (e.planned_ts_us, e.logical_session_id, e.turn)))
-    events = tuple(ReplayEvent(i, e.logical_session_id, e.lineage_id, e.turn, e.planned_ts_us,
-                               e.prompt_tokens, e.prompt_sha256, e.n_predict, e.source)
-                   for i, e in enumerate(events))
+    events = _resequence_events(event for session in sessions for event in session.turns)
     origin = min(e.planned_ts_us for e in events)
     return ReplayPlan(raw["schema"], str(path), source_sha, 1.0, n_parallel,
                       tuple(sessions), events, tuple(excluded), origin,
@@ -340,11 +628,7 @@ def _load_transcript(path: Path, n_parallel: int, selected: set[str] | None) -> 
         raise ReplayError("replay transcript has no context-eligible selected session")
     sessions = tuple(ReplaySession(sid, lineage_by_sid[sid], tuple(sorted(events, key=lambda e: e.turn)), True, None)
                      for sid, events in sorted(grouped.items()))
-    events = tuple(sorted((e for session in sessions for e in session.turns),
-                          key=lambda e: (e.planned_ts_us, e.event_seq)))
-    events = tuple(ReplayEvent(i, e.logical_session_id, e.lineage_id, e.turn, e.planned_ts_us,
-                               e.prompt_tokens, e.prompt_sha256, e.n_predict, e.source)
-                   for i, e in enumerate(events))
+    events = _resequence_events(e for session in sessions for e in session.turns)
     origin = min(e.planned_ts_us for e in events)
     return ReplayPlan("gt-trace-1b-a/v1", str(path), source_sha, 1.0,
                       n_parallel, sessions, events, tuple(excluded), origin,
@@ -369,9 +653,11 @@ def load_replay(source: str, path: str | Path, *, n_parallel: int, time_dilation
         raise ReplayError("replay source is unsupported")
     if lifecycle and plan.lifecycle is None:
         raise ReplayError("lifecycle replay source has no TTL calibration")
-    return ReplayPlan(plan.schema, plan.source_path, plan.source_sha256, float(time_dilation),
-                      n_parallel, plan.sessions, plan.events, plan.excluded_sessions,
-                      plan.planned_arrival_origin_us, plan.lifecycle if lifecycle else None)
+    return ReplayPlan(
+        plan.schema, plan.source_path, plan.source_sha256, float(time_dilation),
+        n_parallel, plan.sessions, plan.events, plan.excluded_sessions,
+        plan.planned_arrival_origin_us, plan.lifecycle if lifecycle else None,
+        plan.fixture_contract)
 
 
 class SlotAdmission:
@@ -441,6 +727,12 @@ def expand_schedule(plan: ReplayPlan) -> list[dict[str, Any]]:
             "prompt_tokens": list(event.prompt_tokens),
             "prompt_sha256": event.prompt_sha256,
             "n_predict": event.n_predict,
+            "source": event.source,
+            "source_lineage_id": event.source_lineage_id,
+            "source_turn": event.source_turn,
+            "reference_completion_tokens": list(event.reference_completion_tokens),
+            "reference_completion_sha256": event.reference_completion_sha256,
+            "phase_id": event.phase_id,
             "request_id": event.request_id,
         })
     return output
@@ -476,7 +768,12 @@ def check_fidelity(plan: ReplayPlan, executed: list[dict[str, Any]], *, n_parall
             errors.append(f"session {sid} turn dispatch order is invalid")
         last_turn_by_session[sid] = turn
     for index, (expected, actual) in enumerate(zip(planned, actual_by_seq)):
-        for key in ("event_seq", "logical_session_id", "lineage_id", "turn", "planned_ts_us", "planned_arrival_us", "n_predict", "prompt_sha256", "request_id"):
+        for key in (
+            "event_seq", "logical_session_id", "lineage_id", "turn", "planned_ts_us",
+            "planned_arrival_us", "n_predict", "prompt_sha256", "source",
+            "source_lineage_id", "source_turn", "reference_completion_tokens",
+            "reference_completion_sha256", "phase_id", "request_id",
+        ):
             if actual.get(key) != expected[key]:
                 errors.append(f"event {index} {key} drift")
         if actual.get("prompt_token_count", len(actual.get("prompt_tokens", []))) != len(expected["prompt_tokens"]):
@@ -507,6 +804,15 @@ def check_fidelity(plan: ReplayPlan, executed: list[dict[str, Any]], *, n_parall
             errors.append(f"event {index} HTTP status is not 200")
         if actual.get("response_token_sha256") is None:
             errors.append(f"event {index} response token SHA is missing")
+        expected_tokens = expected.get("reference_completion_tokens", [])
+        actual_tokens = actual.get("response_tokens")
+        if expected_tokens:
+            if actual_tokens != expected_tokens:
+                errors.append(f"event {index} reference completion token drift")
+            elif actual.get("response_token_sha256") != expected.get("reference_completion_sha256"):
+                errors.append(f"event {index} reference completion SHA drift")
+        elif actual_tokens is not None and not isinstance(actual_tokens, list):
+            errors.append(f"event {index} response token payload is invalid")
         admitted_us = actual.get("admitted_us")
         dispatched_us = actual.get("dispatched_us")
         completed_us = actual.get("completed_us")
@@ -582,7 +888,8 @@ def run_fake_schedule(plan: ReplayPlan, *, now_us: Callable[[], int] | None = No
                          "arrival_lag_us": max(0, decision["admitted_us"] - first["planned_arrival_us"]),
                          "admission_wait_us": max(0, decision["admitted_us"] - first["planned_arrival_us"]),
                          "service_us": 1, "http_status": 200, "prompt_token_count": len(first["prompt_tokens"]),
-                         "response_token_sha256": _sha256_json([])})
+                         "response_tokens": list(first.get("reference_completion_tokens", [])),
+                         "response_token_sha256": first.get("reference_completion_sha256") or _sha256_json([])})
         pending.remove(first)
         next_turn[sid] += 1
         fake_clock = completed
