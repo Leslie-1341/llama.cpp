@@ -3013,6 +3013,8 @@ private:
 
         llama_kv_release_budget_snapshot kv_budget;
         uint64_t confirmed_kv_physical_credit_bytes = 0;
+        uint64_t confirmed_kv_physical_object_id = 0;
+        uint64_t confirmed_kv_physical_generation = 0;
         bool kv_memory_present = false;
         if (ctx_tgt && llama_get_memory(ctx_tgt)) {
             kv_memory_present = true;
@@ -3023,6 +3025,8 @@ private:
                     kv_physical_credit_pending.object_id == physical_view.object_id &&
                     kv_physical_credit_pending.generation == physical_view.generation) {
                 confirmed_kv_physical_credit_bytes = kv_physical_credit_pending.value;
+                confirmed_kv_physical_object_id = kv_physical_credit_pending.object_id;
+                confirmed_kv_physical_generation = kv_physical_credit_pending.generation;
             }
             if (memory_governor_legacy_kv_actions_enabled) {
                 kv_budget = mem->sample_kv_release_budget();
@@ -5134,6 +5138,8 @@ private:
             << " reallocation_pending_remaining_bytes=" << reallocation_pending_remaining_bytes
             << " reallocation_observed_drop_bytes=" << reallocation_observed_drop_bytes
             << " reallocation_confirmed_kv_physical_credit_bytes=" << confirmed_kv_physical_credit_bytes
+            << " reallocation_confirmed_kv_physical_object_id=" << confirmed_kv_physical_object_id
+            << " reallocation_confirmed_kv_physical_generation=" << confirmed_kv_physical_generation
             << " reallocation_kv_physical_credit_earned_bytes=" << reallocation_kv_physical_credit_earned_bytes
             << " reallocation_confirm_limit_bytes=" << reallocation_confirm_limit_bytes
             << " reallocation_credit_earned_bytes=" << reallocation_credit_earned_bytes
