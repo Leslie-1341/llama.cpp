@@ -765,6 +765,15 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
         {"stop_type",           stop_type_to_str(stop)},
         {"stopping_word",       stopping_word},
         {"tokens_cached",       n_tokens_cached},
+        {"live_kv_pos_min",     live_kv_pos_min},
+        {"live_kv_pos_max",     live_kv_pos_max},
+        {"live_kv_cells",       live_kv_cells},
+        {"live_kv_blocks",      live_kv_blocks},
+        {"live_kv_object_id",   live_kv_object_id},
+        {"live_kv_generation",  live_kv_generation},
+        {"live_kv_block_aligned", live_kv_block_aligned},
+        {"live_kv_authoritative", live_kv_authoritative},
+        {"live_kv_shared",      live_kv_shared},
         {"timings",             timings.to_json()},
     };
     if (!stream && !probs_output.empty()) {

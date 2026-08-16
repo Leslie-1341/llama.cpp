@@ -9,7 +9,7 @@ import math
 import pathlib
 import re
 import sys
-from typing import Any
+from typing import Any, Sequence
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from multi_session_replay import ReplayError, check_fidelity, expand_schedule, load_replay
@@ -21,6 +21,7 @@ SCHEMA_VERSION = 2
 SUPPORTED_POLICIES = {"resident", "release_only", "v2", "idle_age", "v3"}
 BUDGET_POLICIES = {"release_only", "v2", "idle_age", "v3"}
 SWAP_POLICIES = {"v2", "idle_age", "v3"}
+Q3_POLICIES = {"v2", "idle_age", "v3"}
 SUPPORTED_KV_REPRESENTATIONS = {"paged"}
 SUPPORTED_LOADING_MODES = {"exact"}
 SUPPORTED_RESTORES = {"k1_sync", "k2_pipeline"}
@@ -339,6 +340,7 @@ def normalize_replay(value: Any) -> dict[str, Any]:
         value,
         {"source", "path", "time_dilation", "n_parallel", "session_ids", "admission_timeout_seconds", "lifecycle"},
         "spec.workload.replay",
+        {"source_lineage_id", "alignment_family_id"},
     )
     if replay["source"] not in {"transcript", "fixture"}:
         raise ParseError("spec.workload.replay.source is invalid")
@@ -388,16 +390,69 @@ def normalize_replay(value: Any) -> dict[str, Any]:
             lifecycle["trace_identity"] = dict(raw_lifecycle["trace_identity"])
     if lifecycle["enabled"] and float(replay["time_dilation"]) <= 0:
         raise ParseError("spec.workload.replay.lifecycle requires time_dilation > 0")
+    family_keys = {"source_lineage_id", "alignment_family_id"}
+    if bool(family_keys & set(replay)):
+        lineage = replay.get("source_lineage_id")
+        family = replay.get("alignment_family_id")
+        if isinstance(lineage, bool) or not isinstance(lineage, int) or lineage < 0:
+            raise ParseError("spec.workload.replay.source_lineage_id is invalid")
+        if not isinstance(family, str) or not family:
+            raise ParseError("spec.workload.replay.alignment_family_id is invalid")
     return {**replay, "time_dilation": float(replay["time_dilation"]),
             "admission_timeout_seconds": admission_timeout, "lifecycle": lifecycle}
 
+
+Q2Q3_RUNTIME_CONTRACT_KEYS = {
+    "ctx_size", "executor", "kv_unified", "parallel", "cache_type_k", "cache_type_v",
+    "no_cache_idle_slots", "no_context_shift", "paged_block_size",
+    "action_target_bytes", "max_blocks",
+}
+
+
+def normalize_runtime_contract(value: Any, label: str = "spec.runtime_contract") -> dict[str, Any] | None:
+    if value is None:
+        return None
+    contract = exact(value, Q2Q3_RUNTIME_CONTRACT_KEYS, label)
+    ctx_size = contract["ctx_size"]
+    if isinstance(ctx_size, bool) or not isinstance(ctx_size, int) or ctx_size <= 0:
+        raise ParseError(f"{label}.ctx_size is invalid")
+    if not isinstance(contract["executor"], str) or not contract["executor"]:
+        raise ParseError(f"{label}.executor is invalid")
+    for key in ("kv_unified", "no_cache_idle_slots", "no_context_shift"):
+        if contract[key] is not True:
+            raise ParseError(f"{label}.{key} must be true")
+    if contract["parallel"] != 3:
+        raise ParseError(f"{label}.parallel must be 3")
+    for key in ("cache_type_k", "cache_type_v"):
+        if contract[key] != "f16":
+            raise ParseError(f"{label}.{key} must be f16")
+    if contract["paged_block_size"] != 16:
+        raise ParseError(f"{label}.paged_block_size must be 16")
+    for key in ("action_target_bytes", "max_blocks"):
+        if isinstance(contract[key], bool) or not isinstance(contract[key], int) or contract[key] <= 0:
+            raise ParseError(f"{label}.{key} is invalid")
+    return dict(contract)
+
+
+def _argv_option_value(argv: list[str], option: str) -> str | None:
+    for index, item in enumerate(argv):
+        if item == option and index + 1 < len(argv):
+            return argv[index + 1]
+        if item.startswith(option + "="):
+            return item.split("=", 1)[1]
+    return None
 
 def normalize_resident_preflight(value: Any) -> dict[str, Any] | None:
     if value is None:
         return None
     config = exact(
         value,
-        {"sample_interval_seconds", "min_samples", "window_timeout_seconds"},
+        {
+            "sample_interval_seconds", "min_samples", "window_timeout_seconds",
+            "max_sample_gap_seconds", "normalized_resident_spread_bytes",
+            "normalized_resident_spread_ratio", "claimant_relief_spread_bytes",
+            "claimant_relief_spread_ratio",
+        },
         "spec.workload.resident_preflight",
     )
     interval = require_finite_positive(
@@ -418,10 +473,29 @@ def normalize_resident_preflight(value: Any) -> dict[str, Any] | None:
         raise ParseError(
             "spec.workload.resident_preflight.window_timeout_seconds is too short "
             "for the requested sample window")
+    max_gap = require_finite_positive(
+        config["max_sample_gap_seconds"],
+        "spec.workload.resident_preflight.max_sample_gap_seconds",
+    )
+    if max_gap < interval:
+        raise ParseError("spec.workload.resident_preflight.max_sample_gap_seconds is shorter than sample interval")
+    for key in ("normalized_resident_spread_bytes", "claimant_relief_spread_bytes"):
+        item = config[key]
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            raise ParseError(f"spec.workload.resident_preflight.{key} is invalid")
+    for key in ("normalized_resident_spread_ratio", "claimant_relief_spread_ratio"):
+        ratio = config[key]
+        if isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or not math.isfinite(ratio) or not 0 <= ratio <= 1:
+            raise ParseError(f"spec.workload.resident_preflight.{key} must be in [0, 1]")
     return {
         "sample_interval_seconds": interval,
         "min_samples": min_samples,
         "window_timeout_seconds": timeout,
+        "max_sample_gap_seconds": max_gap,
+        "normalized_resident_spread_bytes": config["normalized_resident_spread_bytes"],
+        "normalized_resident_spread_ratio": float(config["normalized_resident_spread_ratio"]),
+        "claimant_relief_spread_bytes": config["claimant_relief_spread_bytes"],
+        "claimant_relief_spread_ratio": float(config["claimant_relief_spread_ratio"]),
     }
 
 
@@ -703,8 +777,83 @@ def validate_cross_policy_single_switch(plan: list[dict[str, Any]], label: str =
             raise ParseError(
                 f"{label}: policies {reference_policy} and {policy} differ outside policy")
 
+def load_target_freeze_record(
+        reference: Any, runtime_contract: dict[str, Any], workload: dict[str, Any],
+        label: str = "spec.target_freeze_record") -> dict[str, Any] | None:
+    if reference is None:
+        return None
+    verify_identity(reference, label)
+    path = pathlib.Path(reference["path"])
+    record = read_json(path)
+    if not isinstance(record, dict) or record.get("kind") != "resident_preflight_target_freeze":
+        raise ParseError(f"{label} has an invalid record kind")
+    if record.get("status") != "FROZEN" or record.get("frozen") is not True:
+        raise ParseError(f"{label} is not frozen")
+    frozen_t = record.get("frozen_T")
+    if isinstance(frozen_t, bool) or not isinstance(frozen_t, int) or frozen_t <= 0:
+        raise ParseError(f"{label}.frozen_T is invalid")
+    if record.get("runtime_contract") != runtime_contract:
+        raise ParseError(f"{label} runtime contract mismatch")
+    identity = record.get("identity")
+    required = {
+        "transcript_sha256", "fixture_sha256", "transcript_identity", "fixture_identity",
+        "parent_transcript_identity", "preflight_fixture_identity", "q2_evidence_identity",
+        "source_lineage_id", "alignment_family_id",
+    }
+    if not isinstance(identity, dict) or not required.issubset(identity):
+        raise ParseError(f"{label} identity is missing required Q2 provenance")
+    replay_path = pathlib.Path(workload["replay"]["path"]).resolve()
+    preflight_fixture = identity["preflight_fixture_identity"]
+    verify_identity(preflight_fixture, f"{label}.preflight_fixture_identity")
+    if pathlib.Path(preflight_fixture["path"]).resolve() != replay_path:
+        raise ParseError(f"{label} preflight fixture path differs from workload replay")
+    if identity["transcript_sha256"] != preflight_fixture["sha256"]:
+        raise ParseError(f"{label} preflight fixture SHA mismatch")
+    legacy_transcript = identity.get("transcript_identity")
+    if not isinstance(legacy_transcript, dict) or legacy_transcript != preflight_fixture:
+        raise ParseError(f"{label} transcript identity is not the preflight fixture")
+    verify_identity(identity["parent_transcript_identity"], f"{label}.parent_transcript_identity")
+    verify_identity(identity["q2_evidence_identity"], f"{label}.q2_evidence_identity")
+    legacy_fixture = identity.get("fixture_identity")
+    if not isinstance(legacy_fixture, dict) or legacy_fixture != identity["q2_evidence_identity"]:
+        raise ParseError(f"{label} fixture identity is not Q2 evidence")
+    if identity["fixture_sha256"] != identity["q2_evidence_identity"]["sha256"]:
+        raise ParseError(f"{label} Q2 evidence SHA mismatch")
+    source_lineage_id = identity["source_lineage_id"]
+    if isinstance(source_lineage_id, bool) or not isinstance(source_lineage_id, int) or source_lineage_id < 0:
+        raise ParseError(f"{label} source lineage identity is invalid")
+    if not isinstance(identity["alignment_family_id"], str) or not identity["alignment_family_id"]:
+        raise ParseError(f"{label} alignment family identity is invalid")
+    return record
+
+
+def bind_target_freeze_cases(
+        cases: dict[str, dict[str, Any]], record: dict[str, Any] | None,
+        runtime_contract: dict[str, Any] | None) -> None:
+    if record is None:
+        return
+    if runtime_contract is None:
+        raise ParseError("target_freeze_record requires runtime_contract")
+    frozen_t = record["frozen_T"]
+    action_target = runtime_contract["action_target_bytes"]
+    for case_id, case in cases.items():
+        if case["policy"] not in BUDGET_POLICIES:
+            continue
+        if case["kv_target_bytes"] is not None or case["action_target_bytes"] is not None:
+            raise ParseError(
+                f"{case_id}: target_freeze_record forbids manual resident/action targets")
+        case["kv_target_bytes"] = frozen_t
+        case["action_target_bytes"] = action_target
+
 def validate_spec(spec: Any) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
-    value = exact(spec, SPEC_KEYS, "spec", {"budget_sweep"})
+    spec_keys = set(SPEC_KEYS)
+    if isinstance(spec, dict) and "budget_sweep" in spec:
+        spec_keys.add("budget_sweep")
+    if isinstance(spec, dict) and "runtime_contract" in spec:
+        spec_keys.add("runtime_contract")
+    if isinstance(spec, dict) and "target_freeze_record" in spec:
+        spec_keys.add("target_freeze_record")
+    value = exact(spec, spec_keys, "spec")
     if value["schema_version"] != SCHEMA_VERSION or value["protocol"] != PROTOCOL:
         raise ParseError("spec protocol/schema mismatch")
     if value["phase"] not in {"resident_baseline", "coarse_target", "local_target", "representative"}:
@@ -724,6 +873,11 @@ def validate_spec(spec: Any) -> tuple[dict[str, dict[str, Any]], list[dict[str, 
         not isinstance(key, str) or not isinstance(item, str) for key, item in value["environment"].items()
     ):
         raise ParseError("spec.environment is invalid")
+    runtime_contract = normalize_runtime_contract(value.get("runtime_contract"))
+    if value["run_mode"] == "resident_preflight" and runtime_contract is None:
+        raise ParseError("resident_preflight requires an explicit runtime_contract")
+    if runtime_contract is not None and runtime_contract["max_blocks"] != value["max_blocks"]:
+        raise ParseError("spec.runtime_contract.max_blocks must match spec.max_blocks")
     reject_canonical_kv_environment(value["environment"], "spec.environment")
     pressure_basis = normalize_pressure_basis(value["pressure_basis"])
     workload = normalize_workload(value["workload"])
@@ -748,6 +902,17 @@ def validate_spec(spec: Any) -> tuple[dict[str, dict[str, Any]], list[dict[str, 
     elif workload["characterization"] is None or workload["qualification"] is not None:
         raise ParseError(
             "characterization mode requires only workload.characterization configuration")
+    target_freeze_record = None
+    if value.get("target_freeze_record") is not None:
+        if value["phase"] != "representative" or value["run_mode"] == "resident_preflight":
+            raise ParseError("target_freeze_record is restricted to representative Q3")
+        if runtime_contract is None:
+            raise ParseError("target_freeze_record requires runtime_contract")
+        target_freeze_record = load_target_freeze_record(
+            value["target_freeze_record"], runtime_contract, workload)
+    elif value["phase"] == "representative" and runtime_contract is not None \
+            and value["run_mode"] != "resident_preflight":
+        raise ParseError("representative Q3 requires target_freeze_record")
     cases: dict[str, dict[str, Any]] = {}
     if not isinstance(value["cases"], list) or not value["cases"]:
         raise ParseError("spec.cases must be non-empty")
@@ -770,10 +935,11 @@ def validate_spec(spec: Any) -> tuple[dict[str, dict[str, Any]], list[dict[str, 
         if case["policy"] == "resident":
             if target is not None or action_target is not None:
                 raise ParseError(f"{case_id}: resident policy cannot have resident/action targets")
-        elif case["policy"] in BUDGET_POLICIES and (target is None or action_target is None):
+        elif case["policy"] in BUDGET_POLICIES and (target is None or action_target is None) and target_freeze_record is None:
             raise ParseError(
                 f"{case_id}: {case['policy']} policy requires explicit kv_target_bytes and action_target_bytes")
         cases[case_id] = case
+    bind_target_freeze_cases(cases, target_freeze_record, runtime_contract)
     action_targets = {
         case["action_target_bytes"] for case in cases.values()
         if case["policy"] in BUDGET_POLICIES
@@ -821,6 +987,13 @@ def validate_spec(spec: Any) -> tuple[dict[str, dict[str, Any]], list[dict[str, 
             item["policy"] != "resident" for item in plan):
         raise ParseError("resident_preflight is policy-neutral and requires resident cases")
     validate_cross_policy_single_switch(plan)
+    if value["phase"] == "representative":
+        q3_policies = {item["policy"] for item in plan}
+        if q3_policies != Q3_POLICIES or any(
+                sum(item["policy"] == policy for item in plan) != 1
+                for policy in Q3_POLICIES):
+            raise ParseError(
+                "representative Q3 run must contain exactly one each of v2, idle_age, and v3")
     validate_budget_sweep(
         value.get("budget_sweep"), cases, plan, max_blocks, value["run_kind"])
     if (
@@ -853,8 +1026,13 @@ def parse_fields(line: str, token: str, required: set[str], label: str) -> dict[
             raise ParseError(f"{label}: duplicate or empty field {key!r}")
         fields[key] = value
     missing = required - set(fields)
-    if missing:
-        raise ParseError(f"{label}: missing fields {sorted(missing)}")
+    extra = (
+        set(fields) - required
+        if required and token == "kv_resident_preflight_observation" else set()
+    )
+    if missing or extra:
+        raise ParseError(
+            f"{label}: marker schema mismatch missing={sorted(missing)} extra={sorted(extra)}")
     return fields
 
 
@@ -1534,7 +1712,8 @@ def validate_resident_observation(value: Any, label: str) -> dict[str, Any]:
 RESIDENT_PREFLIGHT_WHOLE_REQUIRED = {
     "timestamp_mono_ns", "sample_count", "whole_valid", "resident_available",
     "reclaimable_available", "swapped_metadata_consistent", "object_id", "generation",
-    "page_size", "total_bytes", "resident_bytes", "transient_staging_bound_bytes",
+    "page_size", "native_block_bytes", "total_bytes", "resident_bytes", "dead_resident_reclaimable_bytes",
+    "swapped_authoritative_bytes", "transient_staging_bound_bytes",
     "n_blocks", "n_owned_blocks", "n_shared_blocks", "resident_block_count",
     "swapped_block_count", "released_block_count", "pending_write_block_count",
     "invalid_block_count", "unused_block_count", "global_target_enabled",
@@ -1624,7 +1803,30 @@ def validate_slot_snapshot(
     return snapshot
 
 
+def validate_runtime_execution_identity(
+        execution: dict[str, Any], spec: dict[str, Any], label: str) -> None:
+    contract = spec.get("runtime_contract")
+    if contract is None:
+        return
+    argv = execution.get("argv")
+    if not isinstance(argv, list) or any(not isinstance(item, str) for item in argv) or not argv:
+        raise ParseError(f"{label}: execution argv is invalid")
+    if pathlib.Path(argv[0]).name != contract["executor"]:
+        raise ParseError(f"{label}: runtime identity executor mismatch")
+    if _argv_option_value(argv, "--parallel") != "3":
+        raise ParseError(f"{label}: runtime identity requires --parallel 3")
+    if _argv_option_value(argv, "--cache-type-k") != "f16" or _argv_option_value(argv, "--cache-type-v") != "f16":
+        raise ParseError(f"{label}: runtime identity requires F16 K/V cache")
+    if "--kv-unified" not in argv or "--no-cache-idle-slots" not in argv or "--no-context-shift" not in argv:
+        raise ParseError(f"{label}: runtime identity is missing unified/idle/context flags")
+    if _argv_option_value(argv, "--ctx-size") != str(contract["ctx_size"]):
+        raise ParseError(f"{label}: runtime identity ctx-size mismatch")
+    env = execution.get("environment")
+    if not isinstance(env, dict) or env.get("LLAMA_KV_PAGED_BLOCK_SIZE") != "16":
+        raise ParseError(f"{label}: runtime identity block-size mismatch")
+
 def validate_execution_environment(execution: dict[str, Any], case: dict[str, Any], label: str, spec: dict[str, Any]) -> None:
+    validate_runtime_execution_identity(execution, spec, label)
     env = execution["environment"]
     if not isinstance(env, dict) or any(not isinstance(key, str) or not isinstance(value, str) for key, value in env.items()):
         raise ParseError(f"{label}: environment is invalid")
@@ -3578,8 +3780,42 @@ def _resident_preflight_summary(values: list[int]) -> dict[str, Any]:
     if not values:
         raise ParseError("resident_preflight window has no resident samples")
     return {
-        "n": len(values), "min": min(values), "median": percentile(values, 0.50),
-        "max": max(values), "spread": max(values) - min(values),
+        "n": len(values),
+        "min": min(values),
+        "median": percentile(values, 0.50),
+        "max": max(values),
+        "spread": max(values) - min(values),
+    }
+
+
+def _resident_preflight_stability(
+        values: list[int], config: dict[str, Any], label: str,
+        bytes_key: str, ratio_key: str) -> dict[str, Any]:
+    summary = _resident_preflight_summary(values)
+    allowed = max(
+        int(config[bytes_key]),
+        int(math.ceil(summary["max"] * config[ratio_key])),
+    )
+    summary["allowed_spread"] = allowed
+    if summary["spread"] > allowed:
+        raise ParseError(f"{label}: stability threshold exceeded")
+    return summary
+
+
+def _resident_preflight_interval_summary(samples: list[dict[str, Any]], config: dict[str, Any], label: str) -> dict[str, Any]:
+    intervals = [
+        samples[index]["timestamp_mono_ns"] - samples[index - 1]["timestamp_mono_ns"]
+        for index in range(1, len(samples))
+    ]
+    if not intervals:
+        raise ParseError(f"{label}: resident_preflight window has no sample interval")
+    max_gap_ns = int(config["max_sample_gap_seconds"] * 1_000_000_000)
+    if max(intervals) > max_gap_ns:
+        raise ParseError(f"{label}: resident_preflight sample gap exceeds frozen max_sample_gap_seconds")
+    return {
+        "min_seconds": min(intervals) / 1_000_000_000,
+        "median_seconds": percentile(intervals, 0.50) / 1_000_000_000,
+        "max_seconds": max(intervals) / 1_000_000_000,
     }
 
 
@@ -3623,6 +3859,152 @@ def validate_resident_preflight_action_free(
         if any(int(io[key]) != 0 for key in RESTORE_ACTIVITY_FIELDS):
             raise ParseError(f"{label}: resident_preflight observed restore activity")
 
+
+def freeze_resident_preflight_target(
+        preflight: dict[str, Any], runtime_contract: dict[str, Any],
+        label: str = "resident_preflight") -> dict[str, Any]:
+    if not isinstance(runtime_contract, dict):
+        raise ParseError(f"{label}: runtime contract is missing for target freeze")
+    required = {"normalized_R_AB", "normalized_R_ABC", "Relief_A", "Relief_B", "native_block_bytes"}
+    if not required.issubset(preflight):
+        raise ParseError(f"{label}: normalized target inputs are incomplete")
+    ab_hi = int(preflight["normalized_R_AB"]["max"])
+    abc_lo = int(preflight["normalized_R_ABC"]["min"])
+    abc_hi = int(preflight["normalized_R_ABC"]["max"])
+    relief_a = int(preflight["Relief_A"]["resident_bytes_lower_bound"])
+    relief_b = int(preflight["Relief_B"]["resident_bytes_lower_bound"])
+    blocks_a = int(preflight["Relief_A"].get("resident_blocks_lower_bound", 0))
+    blocks_b = int(preflight["Relief_B"].get("resident_blocks_lower_bound", 0))
+    relief_lower_bound = min(relief_a, relief_b)
+    action_target = int(runtime_contract["action_target_bytes"])
+    max_blocks = int(runtime_contract["max_blocks"])
+    alignment_quantum = int(preflight["native_block_bytes"])
+    if min(ab_hi, abc_lo, abc_hi, relief_lower_bound, action_target,
+           max_blocks, alignment_quantum, blocks_a, blocks_b) <= 0:
+        raise ParseError(f"{label}: target-freeze inputs are non-positive or claimant block authority is missing")
+    if relief_a < blocks_a * alignment_quantum or relief_b < blocks_b * alignment_quantum:
+        raise ParseError(f"{label}: claimant physical relief is inconsistent with native block capacity")
+    conservative_block_capacity = alignment_quantum
+    max_blocks_cap = max_blocks * conservative_block_capacity
+    single_action_relief_cap = min(relief_lower_bound, action_target, max_blocks_cap)
+    freeze_margin = max(
+        int(preflight["normalized_R_AB"].get("allowed_spread", 0)),
+        int(preflight["normalized_R_ABC"].get("allowed_spread", 0)),
+        alignment_quantum,
+    )
+    lower_raw = max(
+        ab_hi + freeze_margin,
+        abc_hi - single_action_relief_cap,
+    )
+    upper_raw = abc_lo - freeze_margin
+    lower = ((lower_raw + alignment_quantum - 1) // alignment_quantum) * alignment_quantum
+    upper = (upper_raw // alignment_quantum) * alignment_quantum
+    formula = (
+        "T=ceil_q(max(AB_hi+margin, ABC_hi-single_action_relief_cap)); "
+        "single_action_relief_cap=min(Relief_lower_bound, action_target, "
+        "max_blocks*native_block_bytes); require T<=floor_q(ABC_lo-margin)"
+    )
+    record = {
+        "status": "FROZEN" if lower <= upper else "TARGET_WINDOW_UNAVAILABLE",
+        "frozen": lower <= upper,
+        "frozen_T": upper if lower <= upper else None,
+        "safe_interval": {"lower": lower, "upper": upper},
+        "inputs": {
+            "AB_hi": ab_hi, "ABC_lo": abc_lo, "ABC_hi": abc_hi,
+            "Relief_A_lower_bound": relief_a,
+            "Relief_B_lower_bound": relief_b,
+            "Relief_A_blocks_lower_bound": blocks_a,
+            "Relief_B_blocks_lower_bound": blocks_b,
+            "Relief_lower_bound": relief_lower_bound,
+            "action_cap": action_target,
+            "max_blocks": max_blocks,
+            "conservative_block_capacity": conservative_block_capacity,
+            "max_blocks_cap": max_blocks_cap,
+            "single_action_relief_cap": single_action_relief_cap,
+        },
+        "alignment_quantum": alignment_quantum,
+        "freeze_margin": freeze_margin,
+        "formula": formula,
+        "normalized_summaries": {
+            "AB": preflight["normalized_R_AB"],
+            "ABC": preflight["normalized_R_ABC"],
+        },
+    }
+    if lower > upper:
+        raise ParseError(f"{label}: TARGET_WINDOW_UNAVAILABLE {record}")
+    return record
+
+
+def resident_preflight_identity(
+        artifact: pathlib.Path, manifest: dict[str, Any], spec: dict[str, Any],
+        preflight: dict[str, Any], run_dir: pathlib.Path) -> dict[str, Any]:
+    provenance = manifest["provenance"]
+    replay = spec["workload"]["replay"]
+    replay_path = pathlib.Path(replay["path"]).resolve()
+    samples_path = (run_dir / preflight["sample_path"]).resolve()
+
+    def identity(path: pathlib.Path, label: str) -> dict[str, Any]:
+        if not path.is_file():
+            raise ParseError(f"{label} is missing: {path}")
+        return {
+            "path": str(path), "present": True,
+            "size": path.stat().st_size, "sha256": sha256_file(path),
+        }
+
+    if "source_lineage_id" not in replay or "alignment_family_id" not in replay:
+        raise ParseError("resident_preflight replay lineage/family identity is missing")
+    source_lineage_id = replay["source_lineage_id"]
+    alignment_family_id = replay["alignment_family_id"]
+    if isinstance(source_lineage_id, bool) or not isinstance(source_lineage_id, int) or source_lineage_id < 0:
+        raise ParseError("resident_preflight source lineage identity is invalid")
+    if not isinstance(alignment_family_id, str) or not alignment_family_id:
+        raise ParseError("resident_preflight alignment family identity is invalid")
+
+    preflight_fixture_identity = identity(replay_path, "resident_preflight fixture")
+    source = read_json(replay_path)
+    if not isinstance(source, dict):
+        raise ParseError("resident_preflight replay fixture is not an object")
+    derived = source.get("derived_from")
+    if isinstance(derived, dict):
+        parent_path_value = derived.get("transcript_path")
+        parent_sha = derived.get("transcript_sha256")
+        if not isinstance(parent_path_value, str) or not parent_path_value:
+            raise ParseError("resident_preflight parent transcript path is missing")
+        if not isinstance(parent_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", parent_sha):
+            raise ParseError("resident_preflight parent transcript SHA is invalid")
+        parent_path = pathlib.Path(parent_path_value).expanduser().resolve()
+        parent_transcript_identity = identity(parent_path, "resident_preflight parent transcript")
+        if parent_transcript_identity["sha256"] != parent_sha:
+            raise ParseError("resident_preflight parent transcript identity drift")
+        parent_source = read_json(parent_path)
+        if not isinstance(parent_source, dict) or parent_source.get("transcript_sha256") != parent_sha:
+            raise ParseError("resident_preflight parent transcript oracle identity mismatch")
+    elif source.get("schema_version") == "gt-trace-1b-a/v1":
+        parent_transcript_identity = dict(preflight_fixture_identity)
+    else:
+        raise ParseError("resident_preflight replay has no verifiable parent transcript")
+
+    q2_evidence_identity = identity(samples_path, "resident_preflight Q2 evidence")
+    return {
+        "artifact_id": manifest["artifact_id"],
+        "head": provenance["git"]["head"],
+        "binary_sha256": provenance["binary"].get("sha256"),
+        "model_sha256": provenance["model"].get("sha256"),
+        "transcript_sha256": preflight_fixture_identity["sha256"],
+        "fixture_sha256": q2_evidence_identity["sha256"],
+        "transcript_identity": dict(preflight_fixture_identity),
+        "fixture_identity": dict(q2_evidence_identity),
+        "parent_transcript_identity": parent_transcript_identity,
+        "preflight_fixture_identity": preflight_fixture_identity,
+        "q2_evidence_identity": q2_evidence_identity,
+        "source_lineage_id": source_lineage_id,
+        "alignment_family_id": alignment_family_id,
+        "runtime_contract": spec["runtime_contract"],
+        "cgroup": spec["cgroup"],
+        "executor": pathlib.Path(spec["binary"]).name,
+        "object_id": preflight["object_id"],
+        "generation": preflight["generation"],
+    }
 
 def validate_resident_preflight_samples(
         run_dir: pathlib.Path, record: dict[str, Any], workload: dict[str, Any],
@@ -3708,8 +4090,13 @@ def validate_resident_preflight_samples(
                 or not whole["swapped_metadata_consistent"]
                 or not whole["observation_only"]):
             raise ParseError(f"{label}: resident_preflight whole-KV authority is unavailable")
-        if whole["object_id"] <= 0 or whole["generation"] <= 0 or whole["page_size"] <= 0 or whole["total_bytes"] <= 0:
+        if (whole["object_id"] <= 0 or whole["generation"] <= 0 or whole["page_size"] <= 0
+                or whole["native_block_bytes"] <= 0 or whole["total_bytes"] <= 0):
             raise ParseError(f"{label}: resident_preflight whole-KV identity is invalid")
+        if whole["dead_resident_reclaimable_bytes"] > whole["resident_bytes"]:
+            raise ParseError(f"{label}: dead reclaimable bytes exceed resident bytes")
+        if whole["swapped_authoritative_bytes"] > whole["total_bytes"]:
+            raise ParseError(f"{label}: swapped authoritative bytes exceed total bytes")
         if whole["global_target_enabled"] or whole["global_target_bytes"] != 0 or whole["global_target_source"] not in {"none", "UNAVAILABLE"}:
             raise ParseError(f"{label}: resident_preflight contains a Global dynamic target")
         claimants = row["claimants"]
@@ -3743,7 +4130,7 @@ def validate_resident_preflight_samples(
             if claimant is None:
                 raise ParseError(f"{label}: resident_preflight {sid} claimant sample is missing")
             if not claimant["valid"] or not claimant["available"] or not claimant["authoritative"] or claimant["shared"]:
-                raise ParseError(f"{label}: resident_preflight {sid} claimant authority is unavailable/shared")
+                raise ParseError(f"{label}: INVALID_FIXTURE {sid} claimant authority is unavailable/shared")
             if claimant["active"]:
                 raise ParseError(f"{label}: resident_preflight {sid} is not idle")
         c_claimant = decoded_claimants.get(bindings["C"]["seq_id"])
@@ -3786,22 +4173,46 @@ def validate_resident_preflight_samples(
                 if (
                         sample["sample_count"] != previous["sample_count"] + 1
                         or delta_ns < expected_interval_ns // 2
-                        or delta_ns > expected_interval_ns * 2):
-                    raise ParseError(f"{label}: resident_preflight {window_name} samples are not consecutive 100ms observations")
+                        or delta_ns > int(expected["max_sample_gap_seconds"] * 1_000_000_000)):
+                    raise ParseError(f"{label}: resident_preflight {window_name} samples are not consecutive within the frozen gap contract")
             previous = sample
     if windows["ABC_ACTIVE"]["dispatch_started_mono_ns"] <= windows["AB_RESIDENT"]["finished_mono_ns"]:
         raise ParseError(f"{label}: ABC_ACTIVE dispatch overlaps AB_RESIDENT window")
+    interval_summaries = {
+        name: _resident_preflight_interval_summary(samples, expected, f"{label}: {name}")
+        for name, samples in rows.items()
+    }
     resident_values = {
         name: [sample["whole"]["resident_bytes"] for sample in samples]
         for name, samples in rows.items()
     }
+    normalized_values = {
+        name: [sample["whole"]["resident_bytes"] - sample["whole"]["dead_resident_reclaimable_bytes"] for sample in samples]
+        for name, samples in rows.items()
+    }
+    normalized_summaries = {
+        name: _resident_preflight_stability(
+            values, expected, f"{label}: {name} normalized resident",
+            "normalized_resident_spread_bytes", "normalized_resident_spread_ratio")
+        for name, values in normalized_values.items()
+    }
     combined_samples = all_rows
     exclusive = {}
+    relief_values: dict[str, list[int]] = {}
     for sid in ("A", "B"):
         seq_id = bindings[sid]["seq_id"]
         values = [sample["claimants"][seq_id]["exclusive_resident_bytes"] for sample in combined_samples]
         blocks = [sample["claimants"][seq_id]["exclusive_resident_blocks"] for sample in combined_samples]
+        if min(values) <= 0:
+            raise ParseError(f"{label}: INVALID_FIXTURE {sid} has no positive exclusive resident bytes")
+        relief_values[sid] = values
         exclusive[sid] = {"resident_bytes_lower_bound": min(values), "resident_blocks_lower_bound": min(blocks)}
+    relief_summaries = {
+        sid: _resident_preflight_stability(
+            values, expected, f"{label}: {sid} claimant relief",
+            "claimant_relief_spread_bytes", "claimant_relief_spread_ratio")
+        for sid, values in relief_values.items()
+    }
     combined_bytes = [
         sample["claimants"][bindings["A"]["seq_id"]]["exclusive_resident_bytes"]
         + sample["claimants"][bindings["B"]["seq_id"]]["exclusive_resident_bytes"]
@@ -3817,6 +4228,9 @@ def validate_resident_preflight_samples(
         "sample_path": str(sample_path),
         "R_AB": _resident_preflight_summary(resident_values["AB_RESIDENT"]),
         "R_ABC": _resident_preflight_summary(resident_values["ABC_ACTIVE"]),
+        "normalized_R_AB": normalized_summaries["AB_RESIDENT"],
+        "normalized_R_ABC": normalized_summaries["ABC_ACTIVE"],
+        "intervals": interval_summaries,
         "exclusive_estimate": {
             "authority": "claimant_physical_view",
             "A": exclusive["A"], "B": exclusive["B"],
@@ -3828,6 +4242,8 @@ def validate_resident_preflight_samples(
         "combined_exclusive_resident_bytes_lower_bound": min(combined_bytes),
         "combined_exclusive_resident_blocks_lower_bound": min(combined_blocks),
         "object_id": next(iter(identity))[0], "generation": next(iter(identity))[1],
+        "page_size": all_rows[0]["whole"]["page_size"],
+        "native_block_bytes": all_rows[0]["whole"]["native_block_bytes"],
         "windows": {name: {"sample_count": len(samples), "first_sample_count": samples[0]["sample_count"],
                             "last_sample_count": samples[-1]["sample_count"]}
                     for name, samples in rows.items()},
@@ -3944,11 +4360,15 @@ def parse_replay_run(
                     "prompt_tokens", "prompt_sha256", "prompt_token_count", "n_predict", "request_id", "slot_id", "seq_id",
                     "source", "source_lineage_id", "source_turn", "phase_id", "reference_completion_tokens",
                     "reference_completion_sha256", "runner_generation", "cache_prompt", "claimant_epoch",
-                    "physical_object_id", "physical_generation", "dispatch_order", "admitted_us", "dispatched_us",
+                    "physical_object_id", "physical_generation", "expected_live_kv_cells", "dispatch_order",
+                    "admitted_us", "dispatched_us",
                     "completed_us", "arrival_lag_us", "admission_wait_us", "service_us", "started_mono_ns",
                     "started_us", "finished_mono_ns", "http_status", "headers", "request_sha256", "body_path",
                     "body_bytes", "body_sha256", "response_json", "response_tokens", "response_slot_id",
-                    "tokens_evaluated", "tokens_predicted", "response_token_sha256", "response_token_count", "error"}
+                    "tokens_evaluated", "tokens_predicted", "live_kv_pos_min", "live_kv_pos_max",
+                    "live_kv_cells", "live_kv_blocks", "live_kv_object_id", "live_kv_generation",
+                    "live_kv_block_aligned", "live_kv_authoritative", "live_kv_shared",
+                    "response_token_sha256", "response_token_count", "error"}
         if replay_cfg.get("lifecycle", {}).get("enabled", False):
             required.update({"lifecycle_trigger", "lifecycle_generation"})
         if set(row) != required:
@@ -3975,6 +4395,41 @@ def parse_replay_run(
             value = row[key]
             if value != "UNAVAILABLE" and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
                 raise ParseError(f"{label}: replay {key} is neither a valid telemetry value nor UNAVAILABLE")
+        live_keys = (
+            "live_kv_pos_min", "live_kv_pos_max", "live_kv_cells", "live_kv_blocks",
+            "live_kv_object_id", "live_kv_generation", "live_kv_block_aligned",
+            "live_kv_authoritative", "live_kv_shared",
+        )
+        live_values = [row[key] for key in live_keys]
+        if any(value is not None for value in live_values):
+            if any(value is None for value in live_values):
+                raise ParseError(f"{label}: replay live-KV telemetry is incomplete")
+            if any(isinstance(row[key], bool) or not isinstance(row[key], int)
+                   for key in live_keys[:6]):
+                raise ParseError(f"{label}: replay live-KV numeric telemetry is invalid")
+            if any(row[key] < 0 for key in live_keys[:2]) or any(
+                    row[key] <= 0 for key in live_keys[2:6]):
+                raise ParseError(f"{label}: replay live-KV numeric telemetry is out of range")
+            if row["live_kv_pos_max"] < row["live_kv_pos_min"]:
+                raise ParseError(f"{label}: replay live-KV position range is invalid")
+            if any(not isinstance(row[key], bool)
+                   for key in live_keys[6:]):
+                raise ParseError(f"{label}: replay live-KV boolean telemetry is invalid")
+            if not row["live_kv_block_aligned"] or not row["live_kv_authoritative"] \
+                    or row["live_kv_shared"]:
+                raise ParseError(f"{label}: replay live-KV authority is not exclusive and aligned")
+            runtime_contract = spec.get("runtime_contract")
+            quantum = runtime_contract.get("paged_block_size", 16) \
+                if isinstance(runtime_contract, dict) else 16
+            if row["live_kv_cells"] != row["live_kv_blocks"] * quantum:
+                raise ParseError(f"{label}: replay live-KV cells do not fill paged blocks")
+            expected_cells = row["expected_live_kv_cells"]
+            if expected_cells is not None and (
+                    isinstance(expected_cells, bool) or not isinstance(expected_cells, int)
+                    or expected_cells <= 0 or row["live_kv_cells"] != expected_cells):
+                raise ParseError(f"{label}: replay live-KV cells differ from expected footprint")
+        elif row["expected_live_kv_cells"] is not None:
+            raise ParseError(f"{label}: expected live-KV footprint lacks telemetry")
         if isinstance(row["dispatch_order"], bool) or not isinstance(row["dispatch_order"], int) or row["dispatch_order"] < 0:
             raise ParseError(f"{label}: replay dispatch order is invalid")
         expected_request = {
@@ -4496,7 +4951,8 @@ def validate_formal_pressure_authority(
 
 
 def validate_replay_model_binding(
-        model_binding: Any, artifact_model_sha: Any, artifact_binary_sha: Any) -> None:
+        model_binding: Any, artifact_model_sha: Any, artifact_binary_sha: Any,
+        runtime_contract: Any = None) -> None:
     """Bind replay to the transcript model while retaining binary provenance validation."""
     if not isinstance(model_binding, dict):
         raise ParseError("replay transcript model identity is missing")
@@ -4510,14 +4966,33 @@ def validate_replay_model_binding(
         raise ParseError("replay transcript model SHA differs from artifact model identity")
     if transcript_binary_sha != artifact_binary_sha:
         raise ParseError("replay transcript binary SHA differs from artifact binary identity")
+    transcript_runtime_contract = model_binding.get("runtime_contract")
+    if not isinstance(transcript_runtime_contract, dict) or set(transcript_runtime_contract) != Q2Q3_RUNTIME_CONTRACT_KEYS:
+        raise ParseError("replay transcript runtime contract is missing or malformed")
+    if runtime_contract is not None and transcript_runtime_contract != runtime_contract:
+        raise ParseError("replay transcript runtime contract differs from spec runtime contract")
 
 
 def validate_derived_replay_parent(
         source: dict[str, Any], artifact_model_sha: Any,
-        artifact_binary_sha: Any, label: str) -> None:
+        artifact_binary_sha: Any, label: str,
+        runtime_contract: Any = None) -> None:
     derived = source.get("derived_from")
-    if not isinstance(derived, dict) or set(derived) != {"transcript_path", "transcript_sha256"}:
-        raise ParseError(f"{label}: derived_from parent identity is missing")
+    required_derived = {
+        "transcript_path", "transcript_sha256", "parent_file_sha256",
+        "source_lineage_id", "alignment_family_id",
+        "q2_preflight_fixture_identity", "q2_evidence_identity",
+    }
+    if not isinstance(derived, dict) or set(derived) != required_derived:
+        raise ParseError(f"{label}: derived_from provenance identity schema is invalid")
+    verify_identity(derived["q2_preflight_fixture_identity"], f"{label}.q2_preflight_fixture_identity")
+    verify_identity(derived["q2_evidence_identity"], f"{label}.q2_evidence_identity")
+    source_lineage_id = derived["source_lineage_id"]
+    if isinstance(source_lineage_id, bool) or not isinstance(source_lineage_id, int) or source_lineage_id < 0:
+        raise ParseError(f"{label}: source lineage identity is invalid")
+    alignment_family_id = derived["alignment_family_id"]
+    if not isinstance(alignment_family_id, str) or not alignment_family_id:
+        raise ParseError(f"{label}: alignment family identity is invalid")
     parent_path_value = derived.get("transcript_path")
     if not isinstance(parent_path_value, str) or not parent_path_value:
         raise ParseError(f"{label}: parent transcript path is invalid")
@@ -4526,6 +5001,11 @@ def validate_derived_replay_parent(
     if not isinstance(parent, dict):
         raise ParseError(f"{label}: parent transcript is not an object")
     parent_file_sha = sha256_file(parent_path)
+    if derived["parent_file_sha256"] != parent_file_sha:
+        raise ParseError(f"{label}: parent file SHA differs from derived identity")
+    parent_identity = derived["q2_preflight_fixture_identity"]
+    if pathlib.Path(parent_identity["path"]).resolve() == parent_path:
+        raise ParseError(f"{label}: Q2 preflight fixture must remain distinct from parent transcript")
     transcript_sha = derived.get("transcript_sha256")
     if not isinstance(transcript_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", transcript_sha):
         raise ParseError(f"{label}: parent transcript SHA is invalid")
@@ -4570,8 +5050,17 @@ def validate_derived_replay_parent(
         raise ParseError(f"{label}: parent model SHA differs from artifact model")
     if isinstance(artifact_binary_sha, str) and model["binary_sha256"] != artifact_binary_sha:
         raise ParseError(f"{label}: parent binary SHA differs from artifact binary")
-    if source.get("derived_from", {}).get("parent_file_sha256") is not None and source["derived_from"]["parent_file_sha256"] != parent_file_sha:
-        raise ParseError(f"{label}: parent file SHA differs from derived identity")
+    parent_runtime_contract = parent.get("runtime_contract")
+    if not isinstance(parent_runtime_contract, dict) or set(parent_runtime_contract) != Q2Q3_RUNTIME_CONTRACT_KEYS:
+        raise ParseError(f"{label}: parent runtime contract is missing or malformed")
+    if runtime_contract is not None and parent_runtime_contract != runtime_contract:
+        raise ParseError(f"{label}: parent runtime contract differs from spec runtime contract")
+    parent_lineages = {
+        turn.get("lineage_id") for turn in turns
+        if isinstance(turn, dict) and isinstance(turn.get("lineage_id"), int)
+    }
+    if source_lineage_id not in parent_lineages:
+        raise ParseError(f"{label}: source lineage is absent from parent transcript")
 
 
 
@@ -4893,6 +5382,107 @@ def validate_replay_phase_evidence(
         },
     }
 
+def _normalize_q3_argv(argv: list[str]) -> list[str]:
+    normalized = list(argv)
+    for index, item in enumerate(normalized[:-1]):
+        if item == "--port":
+            normalized[index + 1] = "<dynamic-port>"
+    return normalized
+
+
+def _normalize_q3_environment(environment: dict[str, str]) -> dict[str, str]:
+    return {
+        key: value for key, value in environment.items()
+        if key not in {"LLAMA_KV_PRESSURE_POLICY", "LLAMA_KV_SWAP_DIR"}
+    }
+
+
+def validate_q3_policy_only_identity(
+        artifact: pathlib.Path, manifest: dict[str, Any], plan: list[dict[str, Any]],
+        spec: dict[str, Any]) -> None:
+    if spec.get("phase") != "representative" or spec.get("runtime_contract") is None:
+        return
+    if [item["policy"] for item in plan].count("v2") != 1 or \
+            [item["policy"] for item in plan].count("idle_age") != 1 or \
+            [item["policy"] for item in plan].count("v3") != 1:
+        raise ParseError("representative Q3 requires exactly one execution per pressure policy")
+    baseline_argv: list[str] | None = None
+    baseline_env: dict[str, str] | None = None
+    baseline_cgroup: dict[str, Any] | None = None
+    baseline_case: dict[str, Any] | None = None
+    for item in plan:
+        run_dir = artifact / "runs" / item["run_id"]
+        execution = exact(
+            read_json(run_dir / "execution.json"), EXECUTION_KEYS,
+            f"{item['run_id']}.execution", {"replay", "lifecycle", "resident_preflight"})
+        argv = execution.get("argv")
+        environment = execution.get("environment")
+        cgroup = execution.get("server_cgroup")
+        if not isinstance(argv, list) or any(not isinstance(value, str) for value in argv):
+            raise ParseError(f"{item['run_id']}: Q3 execution argv is invalid")
+        if not isinstance(environment, dict) or any(
+                not isinstance(key, str) or not isinstance(value, str)
+                for key, value in environment.items()):
+            raise ParseError(f"{item['run_id']}: Q3 execution environment is invalid")
+        if not isinstance(cgroup, dict):
+            raise ParseError(f"{item['run_id']}: Q3 execution cgroup is missing")
+        normalized_argv = _normalize_q3_argv(argv)
+        normalized_env = _normalize_q3_environment(environment)
+        normalized_cgroup = {
+            key: cgroup.get(key) for key in ("scope", "memory_max")
+        }
+        if baseline_argv is None:
+            baseline_argv = normalized_argv
+            baseline_env = normalized_env
+            baseline_cgroup = normalized_cgroup
+            baseline_case = item
+            continue
+        if normalized_argv != baseline_argv:
+            raise ParseError(f"{item['run_id']}: Q3 argv drifts outside dynamic port")
+        if normalized_env != baseline_env:
+            raise ParseError(f"{item['run_id']}: Q3 environment drifts outside pressure policy/swap directory")
+        if normalized_cgroup != baseline_cgroup:
+            raise ParseError(f"{item['run_id']}: Q3 cgroup contract drifts")
+        for key in ("kv_representation", "loading_mode", "restore", "prefault", "kv_target_bytes", "action_target_bytes"):
+            if item[key] != baseline_case[key]:
+                raise ParseError(f"{item['run_id']}: Q3 case field drifts at {key}")
+
+def validate_target_freeze_provenance(
+        manifest: dict[str, Any], spec: dict[str, Any], workload: dict[str, Any]) -> None:
+    reference = spec.get("target_freeze_record")
+    if reference is None:
+        return
+    record = load_target_freeze_record(
+        reference, spec["runtime_contract"], workload, "manifest.target_freeze_record")
+    identity = record["identity"]
+    provenance = manifest["provenance"]
+    if identity.get("head") != provenance["git"]["head"]:
+        raise ParseError("target-freeze HEAD identity does not match Q3 manifest")
+    if identity.get("binary_sha256") != provenance["binary"].get("sha256"):
+        raise ParseError("target-freeze binary identity does not match Q3 manifest")
+    if identity.get("model_sha256") != provenance["model"].get("sha256"):
+        raise ParseError("target-freeze model identity does not match Q3 manifest")
+    if identity.get("executor") != pathlib.Path(spec["binary"]).name:
+        raise ParseError("target-freeze executor identity does not match Q3 spec")
+    if identity.get("cgroup") != spec["cgroup"]:
+        raise ParseError("target-freeze cgroup contract does not match Q3 spec")
+    replay_path = pathlib.Path(workload["replay"]["path"])
+    replay_source = read_json(replay_path)
+    derived = replay_source.get("derived_from") if isinstance(replay_source, dict) else None
+    if not isinstance(derived, dict):
+        raise ParseError("Q3 replay must be a derived four-phase fixture")
+    if identity["source_lineage_id"] != derived.get("source_lineage_id"):
+        raise ParseError("Q2/Q3 source lineage identity mismatch")
+    if identity["alignment_family_id"] != derived.get("alignment_family_id"):
+        raise ParseError("Q2/Q3 alignment family identity mismatch")
+    parent_identity = identity["parent_transcript_identity"]
+    if parent_identity["sha256"] != derived.get("transcript_sha256"):
+        raise ParseError("Q2/Q3 parent transcript identity mismatch")
+    if identity["preflight_fixture_identity"] != derived.get("q2_preflight_fixture_identity"):
+        raise ParseError("Q2/Q3 preflight fixture identity mismatch")
+    if identity["q2_evidence_identity"] != derived.get("q2_evidence_identity"):
+        raise ParseError("Q2/Q3 evidence identity mismatch")
+
 def validate_manifest(artifact: pathlib.Path) -> tuple[dict[str, Any], dict[str, dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     manifest = exact(read_json(artifact / "manifest.json"), MANIFEST_REQUIRED, "manifest", MANIFEST_OPTIONAL)
     reject_runner_verdict(manifest)
@@ -4919,17 +5509,20 @@ def validate_manifest(artifact: pathlib.Path) -> tuple[dict[str, Any], dict[str,
     if git["capture_mode"] not in {"archival_clean", "diagnostic_dirty"}:
         raise ParseError("manifest.provenance.git capture_mode is invalid")
     cases, plan, workload = validate_spec(manifest["spec"])
+    validate_target_freeze_provenance(manifest, manifest["spec"], workload)
     if "replay" in workload:
         replay_path = pathlib.Path(workload["replay"]["path"])
         replay_source = read_json(replay_path)
         if workload["replay"]["source"] == "transcript":
             model_binding = replay_source.get("model") if isinstance(replay_source, dict) else None
             validate_replay_model_binding(
-                model_binding, provenance["model"]["sha256"], provenance["binary"].get("sha256"))
+                model_binding, provenance["model"]["sha256"], provenance["binary"].get("sha256"),
+                manifest["spec"].get("runtime_contract"))
         elif isinstance(replay_source, dict) and replay_source.get("schema") == "gt-trace-1b-q1-derived/v1":
             validate_derived_replay_parent(
                 replay_source, provenance["model"]["sha256"],
-                provenance["binary"]["sha256"], "manifest.derived_replay")
+                provenance["binary"]["sha256"], "manifest.derived_replay",
+                manifest["spec"].get("runtime_contract"))
     if manifest["spec"]["run_kind"] == "formal" and (git["capture_mode"] != "archival_clean" or git["dirty_status"]):
         raise ParseError("formal artifact is not from a clean worktree")
     for item in plan:
@@ -4989,6 +5582,33 @@ def validate_manifest(artifact: pathlib.Path) -> tuple[dict[str, Any], dict[str,
             raise ParseError(f"run directories differ from plan: actual={actual_dirs} expected={sorted(expected_ids)}")
     return manifest, cases, plan, workload
 
+
+def write_target_freeze_record(artifact: pathlib.Path, result: dict[str, Any]) -> None:
+    if result.get("verdict") != "RESIDENT_PREFLIGHT_PASS":
+        return
+    target = result.get("target_freeze")
+    if (not isinstance(target, dict) or target.get("status") != "FROZEN"
+            or target.get("frozen") is not True or not isinstance(target.get("frozen_T"), int)):
+        raise ParseError("resident_preflight pass is missing a frozen target record")
+    identity = target.get("identity")
+    if not isinstance(identity, dict):
+        raise ParseError("resident_preflight target freeze has ambiguous identity records")
+    if not isinstance(identity.get("runtime_contract"), dict):
+        raise ParseError("resident_preflight target freeze is missing runtime contract identity")
+    record = dict(target)
+    record.update({
+        "schema_version": SCHEMA_VERSION,
+        "protocol": PROTOCOL,
+        "kind": "resident_preflight_target_freeze",
+        "status": "FROZEN",
+        "frozen": True,
+        "runtime_contract": identity["runtime_contract"],
+    })
+    dump_path = artifact / "target-freeze.json"
+    dump_path.write_text(
+        json.dumps(record, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 def write_verdict(artifact: pathlib.Path, status: str, result: dict[str, Any]) -> None:
     parser_record = {
@@ -5659,6 +6279,33 @@ def summarize_characterization(
     }
 
 
+def aggregate_target_freeze_records(
+        records: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    if not records:
+        raise ParseError("resident_preflight produced no target-freeze record")
+    first = records[0]
+    frozen_t = first.get("frozen_T")
+    identity = first.get("identity")
+    if (first.get("status") != "FROZEN" or first.get("frozen") is not True
+            or isinstance(frozen_t, bool) or not isinstance(frozen_t, int)
+            or not isinstance(identity, dict)):
+        raise ParseError("resident_preflight target-freeze record is invalid")
+    for index, record in enumerate(records[1:], start=1):
+        if (record.get("status") != "FROZEN" or record.get("frozen") is not True
+                or record.get("frozen_T") != frozen_t):
+            raise ParseError(
+                f"resident_preflight target-freeze round {index} disagrees on frozen_T")
+        round_identity = record.get("identity")
+        if not isinstance(round_identity, dict) or round_identity != identity:
+            raise ParseError(
+                f"resident_preflight target-freeze round {index} disagrees on identity")
+    aggregate = dict(first)
+    aggregate["round_count"] = len(records)
+    aggregate["rounds"] = [dict(record) for record in records]
+    aggregate["identity"] = dict(identity)
+    return aggregate
+
+
 def parse_artifact(artifact: pathlib.Path) -> tuple[str, dict[str, Any]]:
     try:
         manifest, cases, plan, workload = validate_manifest(artifact)
@@ -5682,6 +6329,7 @@ def parse_artifact(artifact: pathlib.Path) -> tuple[str, dict[str, Any]]:
                 parse_run(artifact, item, cases[item["case_id"]], workload, index, manifest["spec"])
                 for index, item in enumerate(plan)
             ]
+            validate_q3_policy_only_identity(artifact, manifest, plan, manifest["spec"])
             fidelity = {
                 "status": "PASS" if all(item["workload_fidelity"]["status"] == "PASS" for item in replay_results) else "FAIL",
                 "runs": [item["workload_fidelity"] for item in replay_results],
@@ -5692,10 +6340,54 @@ def parse_artifact(artifact: pathlib.Path) -> tuple[str, dict[str, Any]]:
             }
             if manifest["spec"]["run_mode"] == "resident_preflight":
                 preflight_runs = [item["resident_preflight"] for item in replay_results]
+                target_records: list[dict[str, Any]] = []
+                target_error: str | None = None
                 if fidelity["status"] != "PASS":
                     verdict = "INVALID_ARTIFACT"
                 else:
-                    verdict = "RESIDENT_PREFLIGHT_PASS"
+                    for index, preflight in enumerate(preflight_runs):
+                        label = f"resident_preflight[{index}]"
+                        try:
+                            target = freeze_resident_preflight_target(
+                                preflight, manifest["spec"]["runtime_contract"], label)
+                        except ParseError as exc:
+                            if str(exc).startswith(f"{label}: TARGET_WINDOW_UNAVAILABLE"):
+                                target_error = str(exc)
+                                break
+                            raise
+                        identity = resident_preflight_identity(
+                            artifact, manifest, manifest["spec"], preflight,
+                            artifact / "runs" / replay_results[index]["run_id"])
+                        target["identity"] = identity
+                        target_records.append(target)
+                    if target_error is not None:
+                        verdict = "TARGET_WINDOW_UNAVAILABLE"
+                    elif not target_records:
+                        raise ParseError("resident_preflight produced no target-freeze record")
+                    else:
+                        frozen_values = {record["frozen_T"] for record in target_records}
+                        if len(frozen_values) != 1:
+                            raise ParseError(
+                                "resident_preflight target-freeze records disagree on frozen_T")
+                        verdict = "RESIDENT_PREFLIGHT_PASS"
+                target_record: dict[str, Any]
+                if target_error is not None:
+                    target_record = {
+                        "status": "TARGET_WINDOW_UNAVAILABLE",
+                        "frozen": False,
+                        "frozen_T": None,
+                        "error": target_error,
+                        "partial_records": target_records,
+                    }
+                elif target_records:
+                    target_record = aggregate_target_freeze_records(target_records)
+                else:
+                    target_record = {
+                        "status": "NOT_COMPUTED",
+                        "frozen": False,
+                        "frozen_T": None,
+                        "error": None,
+                    }
                 result = {
                     "schema_version": SCHEMA_VERSION,
                     "protocol": PROTOCOL,
@@ -5703,15 +6395,21 @@ def parse_artifact(artifact: pathlib.Path) -> tuple[str, dict[str, Any]]:
                     "run_kind": manifest["spec"]["run_kind"],
                     "run_mode": manifest["spec"]["run_mode"],
                     "verdict": verdict,
-                    "errors": [],
+                    "errors": [target_error] if target_error else [],
                     "planned_runs": plan,
                     "workload_fidelity": fidelity,
                     "replay_runs": replay_results,
                     "resident_preflight_runs": preflight_runs,
                     "R_AB": preflight_runs[0]["R_AB"] if len(preflight_runs) == 1 else [item["R_AB"] for item in preflight_runs],
                     "R_ABC": preflight_runs[0]["R_ABC"] if len(preflight_runs) == 1 else [item["R_ABC"] for item in preflight_runs],
+                    "normalized_R_AB": preflight_runs[0]["normalized_R_AB"] if len(preflight_runs) == 1 else [item["normalized_R_AB"] for item in preflight_runs],
+                    "normalized_R_ABC": preflight_runs[0]["normalized_R_ABC"] if len(preflight_runs) == 1 else [item["normalized_R_ABC"] for item in preflight_runs],
                     "exclusive_estimate": preflight_runs[0]["exclusive_estimate"] if len(preflight_runs) == 1 else [item["exclusive_estimate"] for item in preflight_runs],
-                    "target": {"status": "NOT_COMPUTED", "frozen": False},
+                    "target": target_record,
+                    "target_freeze": target_record,
+                    "resident_preflight_identity": (
+                        target_record.get("identity")
+                        if isinstance(target_record.get("identity"), dict) else None),
                     "telemetry_gaps": TELEMETRY_GAPS,
                 }
                 return result["verdict"], result
@@ -5721,8 +6419,10 @@ def parse_artifact(artifact: pathlib.Path) -> tuple[str, dict[str, Any]]:
                 "artifact_id": manifest["artifact_id"],
                 "run_kind": manifest["spec"]["run_kind"],
                 "run_mode": manifest["spec"]["run_mode"],
-                "verdict": "QUALIFICATION_PASS" if fidelity["status"] == "PASS" else "INVALID_ARTIFACT",
-                "errors": [],
+                "verdict": "INVALID_ARTIFACT",
+                "errors": [
+                    "generic replay lacks derived four-phase phase evidence; workload fidelity alone cannot qualify Q3"
+                ],
                 "planned_runs": plan,
                 "workload_fidelity": fidelity,
                 "replay_runs": replay_results,
@@ -5905,6 +6605,8 @@ def main() -> int:
         print(f"parser error: artifact directory missing: {artifact}", file=sys.stderr)
         return 2
     status, result = parse_artifact(artifact)
+    if status == "RESIDENT_PREFLIGHT_PASS":
+        write_target_freeze_record(artifact, result)
     write_verdict(artifact, status, result)
     print(json.dumps({"artifact": str(artifact), "status": status}))
     return {

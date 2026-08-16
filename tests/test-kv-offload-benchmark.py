@@ -2718,9 +2718,12 @@ class LifecycleReplayIntegrationTest(unittest.TestCase):
         runner = self.helper.run_runner(spec, artifact)
         self.assertEqual(runner.returncode, 0, runner.stderr)
         parsed = self.helper.run_parser(artifact)
-        self.assertEqual(parsed.returncode, 0, parsed.stderr)
+        self.assertEqual(parsed.returncode, 1, parsed.stderr)
         result = json.loads((artifact / 'result.json').read_text(encoding='utf-8'))
-        self.assertEqual(result['verdict'], 'QUALIFICATION_PASS')
+        self.assertEqual(result['verdict'], 'INVALID_ARTIFACT')
+        self.assertTrue(any(
+            'generic replay lacks derived four-phase phase evidence' in error
+            for error in result['errors']))
         replay = json.loads(next(artifact.glob('runs/*/replay.json')).read_text(encoding='utf-8'))
         events = replay['lifecycle']
         self.assertTrue(any(item.get('event') == 'REVISIT' for item in events))

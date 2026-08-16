@@ -113,8 +113,11 @@ static std::string format_kv_resident_preflight_observation(
         << " object_id=" << view.object_id
         << " generation=" << view.generation
         << " page_size=" << view.page_size
+        << " native_block_bytes=" << view.native_block_bytes
         << " total_bytes=" << view.total_bytes
         << " resident_bytes=" << view.resident_bytes
+        << " dead_resident_reclaimable_bytes=" << view.dead_resident_reclaimable_bytes
+        << " swapped_authoritative_bytes=" << view.swapped_authoritative_bytes
         << " transient_staging_bound_bytes=" << view.transient_staging_bound_bytes
         << " n_blocks=" << view.n_blocks
         << " n_owned_blocks=" << view.n_owned_blocks
@@ -6784,6 +6787,24 @@ private:
         res->n_prompt_tokens       = slot.task->n_tokens();
         res->n_prompt_tokens_cache = slot.n_prompt_tokens_cache;
         res->n_tokens_cached       = slot.prompt.n_tokens();
+
+        if (kv_g0_s1_resident_preflight) {
+            const auto claimant_views = llama_get_memory(ctx_tgt)->sample_kv_claimant_physical_views({slot.id});
+            if (claimant_views.size() == 1) {
+                const auto & claimant = claimant_views.front();
+                res->live_kv_pos_min       = claimant.live_kv_pos_min;
+                res->live_kv_pos_max       = claimant.live_kv_pos_max;
+                res->live_kv_cells         = claimant.live_kv_cells > 0
+                    ? static_cast<int64_t>(claimant.live_kv_cells) : -1;
+                res->live_kv_blocks        = claimant.live_kv_blocks > 0
+                    ? static_cast<int64_t>(claimant.live_kv_blocks) : -1;
+                res->live_kv_object_id     = claimant.live_kv_object_id;
+                res->live_kv_generation    = claimant.live_kv_generation;
+                res->live_kv_block_aligned = claimant.live_kv_block_aligned;
+                res->live_kv_authoritative = claimant.live_kv_authoritative;
+                res->live_kv_shared        = claimant.shared;
+            }
+        }
         res->has_new_line          = slot.has_new_line;
         res->stopping_word         = slot.stopping_word;
         res->stop                  = slot.stop;

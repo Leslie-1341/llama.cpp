@@ -3134,12 +3134,62 @@ llama_kv_cache::sample_kv_claimant_physical_views(
         result[i].seq_id = seq_ids[i];
     }
 
-#if defined(__linux__)
     const bool paged_layout_valid = kv_paged_enabled && !v_trans && n_stream == 1 &&
         paged_block_size != 0 && paged_n_blocks != 0 &&
-        paged_block_states.size() == paged_n_blocks && !v_cells.empty() &&
-        !layers.empty();
-    if (!paged_layout_valid || paged_write_context_invalid || !paged_mincore_enabled || seq_ids.empty()) {
+        paged_block_states.size() == paged_n_blocks && !v_cells.empty();
+    if (!paged_layout_valid || paged_write_context_invalid || seq_ids.empty()) {
+        return result;
+    }
+
+    // Derive the logical live footprint from the authoritative cell table,
+    // rather than from the position span, which may contain holes.  A block is
+    // aligned only when every block containing the claimant is fully occupied
+    // by that claimant's live cells and the physical mapping is valid.
+    std::vector<uint8_t> claimant_footprint_valid(seq_ids.size(), 0);
+    for (size_t i = 0; i < result.size(); ++i) {
+        auto & view = result[i];
+        if (view.seq_id < 0 || (size_t) view.seq_id >= seq_to_stream.size()) {
+            continue;
+        }
+        const auto & cells = v_cells[seq_to_stream[view.seq_id]];
+        std::vector<uint32_t> block_live_counts(paged_n_blocks, 0);
+        std::set<uint32_t> live_blocks;
+        bool mapping_valid = true;
+        for (uint32_t logical_cell = 0; logical_cell < cells.used_max_p1(); ++logical_cell) {
+            if (cells.is_empty(logical_cell) || !cells.seq_has(logical_cell, view.seq_id)) {
+                continue;
+            }
+            const llama_pos position = cells.pos_get(logical_cell);
+            const uint32_t physical_cell = paged_resolve(logical_cell);
+            if (position < 0 || physical_cell == PAGED_BLOCK_INVALID ||
+                    physical_cell / paged_block_size >= paged_n_blocks) {
+                mapping_valid = false;
+                break;
+            }
+            const uint32_t block = physical_cell / paged_block_size;
+            view.live_kv_cells += 1;
+            view.live_kv_pos_min = view.live_kv_pos_min < 0
+                ? position : std::min<int64_t>(view.live_kv_pos_min, position);
+            view.live_kv_pos_max = std::max<int64_t>(view.live_kv_pos_max, position);
+            block_live_counts[block] += 1;
+            live_blocks.insert(block);
+        }
+        if (!mapping_valid || view.live_kv_cells == 0) {
+            continue;
+        }
+        view.live_kv_blocks = (uint32_t) live_blocks.size();
+        view.live_kv_block_aligned = view.live_kv_blocks != 0;
+        for (const uint32_t block : live_blocks) {
+            if (block_live_counts[block] != paged_block_size) {
+                view.live_kv_block_aligned = false;
+                break;
+            }
+        }
+        claimant_footprint_valid[i] = 1;
+    }
+
+#if defined(__linux__)
+    if (!paged_mincore_enabled) {
         return result;
     }
 
@@ -3291,11 +3341,17 @@ llama_kv_cache::sample_kv_claimant_physical_views(
 
     for (size_t i = 0; i < result.size(); ++i) {
         auto & view = result[i];
+        if (!claimant_footprint_valid[i]) {
+            continue;
+        }
         view.valid = true;
         view.available = true;
         view.authoritative = true;
         view.object_id = paged_resident_object_id;
         view.generation = paged_resident_generation;
+        view.live_kv_object_id = paged_resident_object_id;
+        view.live_kv_generation = paged_resident_generation;
+        view.live_kv_authoritative = true;
         for (uint32_t block = 0; block < paged_n_blocks; ++block) {
             if (!candidate_owns[i][block]) {
                 continue;
@@ -7311,6 +7367,11 @@ llama_kv_physical_budget_view llama_kv_cache::sample_kv_physical_budget_view() c
     if (row_sum == 0 || bytes_per_cell == 0) {
         return result;
     }
+    const uint64_t native_block_bytes = bytes_per_cell * (uint64_t) paged_block_size;
+    if (native_block_bytes == 0) {
+        return result;
+    }
+    result.native_block_bytes = native_block_bytes;
     result.total_bytes = (uint64_t) paged_kv_size * row_sum;
 
     // SWAPPED authoritative bytes — direct sum of paged_swap_sizes[c] for

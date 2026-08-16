@@ -53,6 +53,28 @@ def _strict_sha(value: Any, label: str) -> str:
     return value
 
 
+def _strict_file_identity(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {"path", "present", "size", "sha256"}:
+        raise ReplayError(f"{label} identity schema is invalid")
+    path_value = value["path"]
+    if not isinstance(path_value, str) or not path_value:
+        raise ReplayError(f"{label}.path is invalid")
+    if value["present"] is not True:
+        raise ReplayError(f"{label} must identify a present file")
+    size = value["size"]
+    if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+        raise ReplayError(f"{label}.size is invalid")
+    sha = _strict_sha(value["sha256"], f"{label}.sha256")
+    path = Path(path_value).expanduser().resolve()
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise ReplayError(f"{label} cannot be read: {path}") from exc
+    if len(raw) != size or _sha256_bytes(raw) != sha:
+        raise ReplayError(f"{label} identity drift: {path}")
+    return {"path": str(path), "present": True, "size": size, "sha256": sha}
+
+
 @dataclass(frozen=True)
 class ReplayEvent:
     event_seq: int
@@ -69,6 +91,7 @@ class ReplayEvent:
     reference_completion_tokens: tuple[int, ...] = ()
     reference_completion_sha256: str = ""
     phase_id: str = "replay"
+    expected_live_kv_cells: int | None = None
 
     @property
     def request_id(self) -> str:
@@ -134,6 +157,8 @@ class ReplayPlan:
                     "reference_completion_tokens": list(e.reference_completion_tokens),
                     "reference_completion_sha256": e.reference_completion_sha256,
                     "phase_id": e.phase_id,
+                    **({"expected_live_kv_cells": e.expected_live_kv_cells}
+                       if e.expected_live_kv_cells is not None else {}),
                     "request_id": e.request_id,
                 }
                 for e in self.events
@@ -193,6 +218,9 @@ def _normalize_turn(
     if not isinstance(phase_id, str) or not phase_id:
         raise ReplayError(f"{source}.phase_id must be a non-empty string")
     lineage = _strict_int(raw.get("lineage_id", lineage_id), f"{source}.lineage_id", 0)
+    expected_live_kv_cells = raw.get("expected_live_kv_cells", parent.get("expected_live_kv_cells"))
+    if expected_live_kv_cells is not None:
+        expected_live_kv_cells = _strict_int(expected_live_kv_cells, f"{source}.expected_live_kv_cells", 1)
     return ReplayEvent(
         event_seq=event_seq, logical_session_id=session_id, lineage_id=lineage,
         turn=turn, planned_ts_us=planned_ts_us, prompt_tokens=tuple(tokens),
@@ -200,6 +228,7 @@ def _normalize_turn(
         source_lineage_id=source_lineage, source_turn=source_turn,
         reference_completion_tokens=tuple(completion),
         reference_completion_sha256=computed_completion_sha, phase_id=phase_id,
+        expected_live_kv_cells=expected_live_kv_cells,
     )
 
 
@@ -354,14 +383,41 @@ def _load_model_bound_parent(path: Path, expected_sha: str) -> tuple[dict[str, A
 
 def _derived_fixture_contract(raw: dict[str, Any], path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     derived = raw.get("derived_from")
-    if not isinstance(derived, dict) or set(derived) != {"transcript_path", "transcript_sha256"}:
-        raise ReplayError("derived fixture must declare transcript_path and transcript_sha256")
+    required_derived = {
+        "transcript_path", "transcript_sha256", "parent_file_sha256",
+        "source_lineage_id", "alignment_family_id",
+        "q2_preflight_fixture_identity", "q2_evidence_identity",
+    }
+    if not isinstance(derived, dict) or set(derived) != required_derived:
+        raise ReplayError(
+            "derived fixture must declare parent, source-lineage, alignment-family, "
+            "Q2 fixture, and Q2 evidence identities")
     transcript_path_value = derived.get("transcript_path")
     if not isinstance(transcript_path_value, str) or not transcript_path_value:
         raise ReplayError("derived fixture transcript_path is invalid")
     transcript_path = Path(transcript_path_value).expanduser().resolve()
     transcript_sha = _strict_sha(derived.get("transcript_sha256"), "derived_from.transcript_sha256")
+    declared_parent_file_sha = _strict_sha(
+        derived.get("parent_file_sha256"), "derived_from.parent_file_sha256")
+    source_lineage_id = _strict_int(
+        derived.get("source_lineage_id"), "derived_from.source_lineage_id", 0)
+    alignment_family_id = derived.get("alignment_family_id")
+    if not isinstance(alignment_family_id, str) or not alignment_family_id:
+        raise ReplayError("derived_from.alignment_family_id is invalid")
+    q2_fixture_identity = _strict_file_identity(
+        derived.get("q2_preflight_fixture_identity"),
+        "derived_from.q2_preflight_fixture_identity")
+    q2_evidence_identity = _strict_file_identity(
+        derived.get("q2_evidence_identity"), "derived_from.q2_evidence_identity")
     parent, parent_file_sha = _load_model_bound_parent(transcript_path, transcript_sha)
+    if declared_parent_file_sha != parent_file_sha:
+        raise ReplayError("derived fixture parent file SHA mismatch")
+    parent_lineages = {
+        _strict_int(item.get("lineage_id"), "derived parent turn lineage_id", 0)
+        for item in parent.get("turns", []) if isinstance(item, dict)
+    }
+    if source_lineage_id not in parent_lineages:
+        raise ReplayError("derived fixture source lineage is absent from parent")
     parent_lifecycle = _transcript_lifecycle(parent)
     qualification = raw.get("qualification")
     if not isinstance(qualification, dict):
@@ -392,6 +448,10 @@ def _derived_fixture_contract(raw: dict[str, Any], path: Path) -> tuple[dict[str
         "parent_transcript_path": str(transcript_path),
         "parent_transcript_sha256": transcript_sha,
         "parent_file_sha256": parent_file_sha,
+        "source_lineage_id": source_lineage_id,
+        "alignment_family_id": alignment_family_id,
+        "q2_preflight_fixture_identity": q2_fixture_identity,
+        "q2_evidence_identity": q2_evidence_identity,
         "parent_manifest_path": parent_lifecycle["parent_manifest_path"],
         "parent_manifest_sha256": parent_lifecycle["parent_manifest_sha256"],
         "parent_event_stream_sha256": parent_lifecycle["parent_event_stream_sha256"],
@@ -732,6 +792,7 @@ def expand_schedule(plan: ReplayPlan) -> list[dict[str, Any]]:
             "source_turn": event.source_turn,
             "reference_completion_tokens": list(event.reference_completion_tokens),
             "reference_completion_sha256": event.reference_completion_sha256,
+            "expected_live_kv_cells": event.expected_live_kv_cells,
             "phase_id": event.phase_id,
             "request_id": event.request_id,
         })

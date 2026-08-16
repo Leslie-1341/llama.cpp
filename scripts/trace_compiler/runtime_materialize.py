@@ -50,6 +50,42 @@ MATERIALIZER_IDENTITY = "sha256-prf-safe-alphabet/v2"
 # invariant of the next turn's input.
 REFERENCE_COMPLETION_ROLE = "qualification_observation_only"
 FORMAL_CORRECTNESS_ORACLE = "future_resident_multi_session_baseline"
+RUNTIME_CONTRACT_KEYS = {
+    "ctx_size",
+    "executor",
+    "kv_unified",
+    "parallel",
+    "cache_type_k",
+    "cache_type_v",
+    "no_cache_idle_slots",
+    "no_context_shift",
+    "paged_block_size",
+    "action_target_bytes",
+    "max_blocks",
+}
+
+
+def _strict_runtime_contract(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != RUNTIME_CONTRACT_KEYS:
+        raise MaterializationError(f"{label} schema mismatch")
+    contract = dict(value)
+    if isinstance(contract["ctx_size"], bool) or not isinstance(contract["ctx_size"], int) or contract["ctx_size"] <= 0:
+        raise MaterializationError(f"{label}.ctx_size is invalid")
+    if not isinstance(contract["executor"], str) or not contract["executor"]:
+        raise MaterializationError(f"{label}.executor is invalid")
+    for key in ("kv_unified", "no_cache_idle_slots", "no_context_shift"):
+        if contract[key] is not True:
+            raise MaterializationError(f"{label}.{key} must be true")
+    if contract["parallel"] != 3:
+        raise MaterializationError(f"{label}.parallel must be 3")
+    if contract["cache_type_k"] != "f16" or contract["cache_type_v"] != "f16":
+        raise MaterializationError(f"{label} cache types must be f16")
+    if contract["paged_block_size"] != 16:
+        raise MaterializationError(f"{label}.paged_block_size must be 16")
+    for key in ("action_target_bytes", "max_blocks"):
+        if isinstance(contract[key], bool) or not isinstance(contract[key], int) or contract[key] <= 0:
+            raise MaterializationError(f"{label}.{key} is invalid")
+    return contract
 
 # Fixed UTF-8 material.  It is intentionally small and stable: it is a
 # calibration corpus, not a workload prompt and never enters formal replay.
@@ -946,6 +982,40 @@ def _cmdline_contains_path(cmdline: Sequence[str], expected: Path, cwd: str) -> 
     return False
 
 
+def _cmdline_has_flag(cmdline: Sequence[str], name: str) -> bool:
+    return name in cmdline
+
+
+def _validate_runtime_contract_cmdline(
+        cmdline: Sequence[str], runtime_contract: Mapping[str, Any]) -> None:
+    for option, key in (
+        (("--cache-type-k", "-ctk"), "cache_type_k"),
+        (("--cache-type-v", "-ctv"), "cache_type_v"),
+        (("--parallel", "-np"), "parallel"),
+    ):
+        actual = _cmdline_option_value(cmdline, set(option))
+        expected = str(runtime_contract[key])
+        if actual != expected:
+            raise ServerProcessIdentityError(
+                f"/proc/PID/cmdline {option[0]} differs from runtime contract"
+            )
+    for key, flag in (
+        ("kv_unified", "--kv-unified"),
+        ("no_cache_idle_slots", "--no-cache-idle-slots"),
+        ("no_context_shift", "--no-context-shift"),
+    ):
+        expected = runtime_contract[key] is True
+        if _cmdline_has_flag(cmdline, flag) != expected:
+            raise ServerProcessIdentityError(
+                f"/proc/PID/cmdline {flag} disagrees with runtime contract"
+            )
+    ctx_size = _cmdline_option_value(cmdline, {"--ctx-size"})
+    if ctx_size != str(runtime_contract["ctx_size"]):
+        raise ServerProcessIdentityError(
+            "/proc/PID/cmdline --ctx-size differs from runtime contract"
+        )
+
+
 def verify_server_process_identity(
     authority: ServerAuthority,
     *,
@@ -955,6 +1025,7 @@ def verify_server_process_identity(
     binary_path: str | os.PathLike[str],
     model_sha256: Optional[str] = None,
     binary_sha256: Optional[str] = None,
+    runtime_contract: Optional[Mapping[str, Any]] = None,
     proc_root: str | os.PathLike[str] = "/proc",
 ) -> dict[str, Any]:
     """Bind the HTTP authority to one local llama-server process.
@@ -1034,6 +1105,8 @@ def verify_server_process_identity(
         raise ServerProcessIdentityError(
             f"base-url port {base_port} differs from server cmdline port {cmdline_port}"
         )
+    if runtime_contract is not None:
+        _validate_runtime_contract_cmdline(cmdline, runtime_contract)
     proc_stat_starttime = _read_proc_stat_starttime(proc_dir)
 
     identity = {
@@ -1396,6 +1469,7 @@ class TokenTranscript:
     materializer: dict[str, Any]
     reference_pass: dict[str, Any]
     turns: list[TurnTranscript]
+    runtime_contract: dict[str, Any] | None = None
     transcript_sha256: str = ""
 
     def unsigned_dict(self) -> dict[str, Any]:
@@ -1410,6 +1484,7 @@ class TokenTranscript:
             "materializer": self.materializer,
             "reference_pass": self.reference_pass,
             "turns": [turn.to_dict() for turn in self.turns],
+            "runtime_contract": self.runtime_contract,
         }
 
     def finalize(self) -> "TokenTranscript":
@@ -1633,6 +1708,7 @@ def load_transcript(path: str | os.PathLike[str]) -> TokenTranscript:
         "materializer",
         "reference_pass",
         "turns",
+        "runtime_contract",
         "transcript_sha256",
     }
     if set(document) != required:
@@ -1661,6 +1737,12 @@ def load_transcript(path: str | os.PathLike[str]) -> TokenTranscript:
     ):
         if not isinstance(document[name], Mapping):
             raise MaterializationError(f"transcript {name} must be an object")
+    runtime_contract: dict[str, Any] | None
+    if document["runtime_contract"] is None:
+        runtime_contract = None
+    else:
+        runtime_contract = _strict_runtime_contract(document["runtime_contract"], "transcript.runtime_contract")
+
     model = dict(document["model"])
     if set(model) != {"model_sha256", "binary_sha256", "identity_status", "server_process_identity"}:
         raise MaterializationError("transcript model schema mismatch")
@@ -1943,6 +2025,8 @@ def load_transcript(path: str | os.PathLike[str]) -> TokenTranscript:
     if model_process is not None:
         model_process = _strict_process_identity(model_process, "model.server_process_identity")
     if is_real:
+        if runtime_contract is None:
+            raise MaterializationError("REAL transcript runtime contract is missing")
         if calibration["real_model"] is not True:
             raise MaterializationError("REAL transcript calibration is not marked real_model")
         if not isinstance(model_sha, str) or not isinstance(binary_sha, str):
@@ -1971,6 +2055,8 @@ def load_transcript(path: str | os.PathLike[str]) -> TokenTranscript:
                 "REAL transcript process start identity is not stable or bound to authority"
             )
     else:
+        if runtime_contract is not None:
+            raise MaterializationError("OPEN transcript cannot carry runtime contract")
         if calibration["real_model"] is not False:
             raise MaterializationError("OPEN transcript cannot carry real calibration")
         if model_sha is not None or binary_sha is not None or model_process is not None:
@@ -2023,6 +2109,7 @@ def load_transcript(path: str | os.PathLike[str]) -> TokenTranscript:
         materializer=materializer,
         reference_pass=reference_pass,
         turns=turns,
+        runtime_contract=runtime_contract,
         transcript_sha256=expected_sha,
     )
 
@@ -2151,10 +2238,17 @@ def materialize_reference_transcript(
     authority: Optional[ServerAuthority] = None,
     slot_id: int = 0,
     materializer: Optional[SafeAlphabetMaterializer] = None,
+    runtime_contract: Optional[dict[str, Any]] = None,
 ) -> TokenTranscript:
     """Run exactly one sequential Resident reference pass and freeze tokens."""
     if not isinstance(calibration, TokenCalibration):
         raise CalibrationError("reference materialization requires TokenCalibration")
+    if calibration.real_model:
+        if runtime_contract is None:
+            raise DirectTokenContractError("real materialization requires runtime contract")
+        runtime_contract = _strict_runtime_contract(runtime_contract, "runtime_contract")
+    elif runtime_contract is not None:
+        raise DirectTokenContractError("OPEN materialization cannot carry runtime contract")
     materializer = materializer or SafeAlphabetMaterializer(calibration.safe_alphabet)
     if authority is None:
         authority = preflight_direct_token_contract(
@@ -2343,6 +2437,7 @@ def materialize_reference_transcript(
         materializer=materializer.identity(),
         reference_pass=reference_pass,
         turns=frozen_turns,
+        runtime_contract=runtime_contract if is_real else None,
     )
     return transcript.finalize()
 
@@ -2453,6 +2548,8 @@ def _cli_parser() -> argparse.ArgumentParser:
     run.add_argument("--server-pid", type=int)
     run.add_argument("--real-model", action="store_true")
     run.add_argument("--timeout", type=float, default=30.0)
+    run.add_argument("--runtime-contract",
+                     help="JSON file containing the exact runtime contract for REAL materialization")
     return parser
 
 
@@ -2466,6 +2563,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(json.dumps(plan, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
     client = LlamaServerClient(args.base_url, args.timeout)
+    runtime_contract = None
+    if args.runtime_contract:
+        runtime_contract_document = _strict_json_object(
+            Path(args.runtime_contract).read_bytes(), args.runtime_contract)
+        runtime_contract = _strict_runtime_contract(
+            runtime_contract_document, "runtime_contract")
+    elif args.real_model:
+        raise DirectTokenContractError(
+            "real materialization requires --runtime-contract"
+        )
     if args.real_model:
         if not args.model_path or not args.binary_path or args.server_pid is None:
             raise ServerProcessIdentityError(
@@ -2500,6 +2607,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             binary_path=args.binary_path,
             model_sha256=model_sha,
             binary_sha256=binary_sha,
+            runtime_contract=runtime_contract,
         )
         authority = authority.bind_process_identity(identity)
 
@@ -2521,6 +2629,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         client,
         authority=authority,
         slot_id=args.slot,
+        runtime_contract=runtime_contract,
     )
     transcript.write(args.out)
     print(json.dumps({

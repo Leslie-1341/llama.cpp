@@ -38,6 +38,7 @@ SCHEMA_VERSION = 2
 SUPPORTED_POLICIES = {"resident", "release_only", "v2", "idle_age", "v3"}
 BUDGET_POLICIES = {"release_only", "v2", "idle_age", "v3"}
 SWAP_POLICIES = {"v2", "idle_age", "v3"}
+Q3_POLICIES = {"v2", "idle_age", "v3"}
 SUPPORTED_KV_REPRESENTATIONS = {"paged"}
 SUPPORTED_LOADING_MODES = {"exact"}
 SUPPORTED_RESTORES = {"k1_sync", "k2_pipeline"}
@@ -391,11 +392,13 @@ def safe_component(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
 
 
-def validate_mapping(value: Any, expected: set[str], label: str) -> dict[str, Any]:
+def validate_mapping(value: Any, expected: set[str], label: str,
+                     optional: set[str] | None = None) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise RunnerError(f"{label} must be an object")
+    optional = optional or set()
     missing = expected - set(value)
-    extra = set(value) - expected
+    extra = set(value) - expected - optional
     if missing or extra:
         raise RunnerError(f"{label} schema mismatch missing={sorted(missing)} extra={sorted(extra)}")
     return value
@@ -448,6 +451,7 @@ def normalize_replay(value: Any) -> dict[str, Any]:
         value,
         {"source", "path", "time_dilation", "n_parallel", "session_ids", "admission_timeout_seconds", "lifecycle"},
         "workload.replay",
+        {"source_lineage_id", "alignment_family_id"},
     )
     if replay["source"] not in {"transcript", "fixture"}:
         raise RunnerError("workload.replay.source must be transcript or fixture")
@@ -500,6 +504,14 @@ def normalize_replay(value: Any) -> dict[str, Any]:
             lifecycle["trace_identity"] = dict(raw_lifecycle["trace_identity"])
     if lifecycle["enabled"] and time_dilation <= 0:
         raise RunnerError("workload.replay.lifecycle requires time_dilation > 0")
+    family_keys = {"source_lineage_id", "alignment_family_id"}
+    if bool(family_keys & set(replay)):
+        lineage = replay.get("source_lineage_id")
+        family = replay.get("alignment_family_id")
+        if isinstance(lineage, bool) or not isinstance(lineage, int) or lineage < 0:
+            raise RunnerError("workload.replay.source_lineage_id must be a non-negative integer")
+        if not isinstance(family, str) or not family:
+            raise RunnerError("workload.replay.alignment_family_id must be a non-empty string")
     return {
         "source": replay["source"],
         "path": replay["path"],
@@ -508,6 +520,7 @@ def normalize_replay(value: Any) -> dict[str, Any]:
         "session_ids": session_ids,
         "admission_timeout_seconds": admission_timeout,
         "lifecycle": lifecycle,
+        **({key: replay[key] for key in family_keys if key in replay}),
     }
 
 
@@ -538,12 +551,58 @@ def load_replay_plan(replay: dict[str, Any]) -> Any:
     return plan
 
 
+Q2Q3_RUNTIME_CONTRACT_KEYS = {
+    "ctx_size", "executor", "kv_unified", "parallel", "cache_type_k", "cache_type_v",
+    "no_cache_idle_slots", "no_context_shift", "paged_block_size",
+    "action_target_bytes", "max_blocks",
+}
+
+
+def normalize_runtime_contract(value: Any, label: str = "runtime_contract") -> dict[str, Any] | None:
+    if value is None:
+        return None
+    contract = validate_mapping(value, Q2Q3_RUNTIME_CONTRACT_KEYS, label)
+    ctx_size = contract["ctx_size"]
+    if isinstance(ctx_size, bool) or not isinstance(ctx_size, int) or ctx_size <= 0:
+        raise RunnerError(f"{label}.ctx_size must be positive")
+    executor = contract["executor"]
+    if not isinstance(executor, str) or not executor:
+        raise RunnerError(f"{label}.executor must be non-empty")
+    for key in ("kv_unified", "no_cache_idle_slots", "no_context_shift"):
+        if contract[key] is not True:
+            raise RunnerError(f"{label}.{key} must be true")
+    if contract["parallel"] != 3:
+        raise RunnerError(f"{label}.parallel must be 3")
+    for key in ("cache_type_k", "cache_type_v"):
+        if contract[key] != "f16":
+            raise RunnerError(f"{label}.{key} must be f16")
+    if contract["paged_block_size"] != 16:
+        raise RunnerError(f"{label}.paged_block_size must be 16")
+    for key in ("action_target_bytes", "max_blocks"):
+        if isinstance(contract[key], bool) or not isinstance(contract[key], int) or contract[key] <= 0:
+            raise RunnerError(f"{label}.{key} must be positive")
+    return dict(contract)
+
+
+def _argv_option_value(argv: list[str], option: str) -> str | None:
+    for index, item in enumerate(argv):
+        if item == option and index + 1 < len(argv):
+            return argv[index + 1]
+        if item.startswith(option + "="):
+            return item.split("=", 1)[1]
+    return None
+
 def normalize_resident_preflight(value: Any) -> dict[str, Any]:
     if value is None:
         return None
     config = validate_mapping(
         value,
-        {"sample_interval_seconds", "min_samples", "window_timeout_seconds"},
+        {
+            "sample_interval_seconds", "min_samples", "window_timeout_seconds",
+            "max_sample_gap_seconds", "normalized_resident_spread_bytes",
+            "normalized_resident_spread_ratio", "claimant_relief_spread_bytes",
+            "claimant_relief_spread_ratio",
+        },
         "workload.resident_preflight",
     )
     interval = require_finite_positive(
@@ -564,10 +623,33 @@ def normalize_resident_preflight(value: Any) -> dict[str, Any]:
         raise RunnerError(
             "workload.resident_preflight.window_timeout_seconds is too short "
             "for the requested sample window")
+    max_gap = require_finite_positive(
+        config["max_sample_gap_seconds"],
+        "workload.resident_preflight.max_sample_gap_seconds",
+    )
+    if max_gap < interval:
+        raise RunnerError("workload.resident_preflight.max_sample_gap_seconds is shorter than sample interval")
+    normalized_resident_spread_bytes = config["normalized_resident_spread_bytes"]
+    claimant_relief_spread_bytes = config["claimant_relief_spread_bytes"]
+    for key, item in {
+        "normalized_resident_spread_bytes": normalized_resident_spread_bytes,
+        "claimant_relief_spread_bytes": claimant_relief_spread_bytes,
+    }.items():
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            raise RunnerError(f"workload.resident_preflight.{key} must be non-negative")
+    for key in ("normalized_resident_spread_ratio", "claimant_relief_spread_ratio"):
+        ratio = config[key]
+        if isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or not math.isfinite(ratio) or not 0 <= ratio <= 1:
+            raise RunnerError(f"workload.resident_preflight.{key} must be in [0, 1]")
     return {
         "sample_interval_seconds": interval,
         "min_samples": min_samples,
         "window_timeout_seconds": timeout,
+        "max_sample_gap_seconds": max_gap,
+        "normalized_resident_spread_bytes": normalized_resident_spread_bytes,
+        "normalized_resident_spread_ratio": float(config["normalized_resident_spread_ratio"]),
+        "claimant_relief_spread_bytes": claimant_relief_spread_bytes,
+        "claimant_relief_spread_ratio": float(config["claimant_relief_spread_ratio"]),
     }
 
 
@@ -678,7 +760,111 @@ def normalize_workload(value: Any) -> dict[str, Any]:
     }
 
 
-def normalize_cases(value: Any) -> dict[str, dict[str, Any]]:
+def load_target_freeze_record(
+        reference: Any, runtime_contract: dict[str, Any], workload: dict[str, Any],
+        spec: dict[str, Any], label: str = "spec.target_freeze_record") -> dict[str, Any] | None:
+    if reference is None:
+        return None
+    ref = validate_mapping(reference, {"path", "present", "size", "sha256"}, label)
+    if ref["present"] is not True or not isinstance(ref["path"], str) or not ref["path"]:
+        raise RunnerError(f"{label} must point to an existing record")
+    path = pathlib.Path(ref["path"])
+    if not path.is_file() or path.stat().st_size != ref["size"] or sha256_file(path) != ref["sha256"]:
+        raise RunnerError(f"{label} identity drift: {path}")
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RunnerError(f"{label} cannot be read: {exc}") from exc
+    if not isinstance(record, dict) or record.get("kind") != "resident_preflight_target_freeze":
+        raise RunnerError(f"{label} has an invalid record kind")
+    if record.get("status") != "FROZEN" or record.get("frozen") is not True:
+        raise RunnerError(f"{label} is not frozen")
+    frozen_t = record.get("frozen_T")
+    if isinstance(frozen_t, bool) or not isinstance(frozen_t, int) or frozen_t <= 0:
+        raise RunnerError(f"{label}.frozen_T is invalid")
+    if record.get("runtime_contract") != runtime_contract:
+        raise RunnerError(f"{label} runtime contract mismatch")
+    identity = record.get("identity")
+    required = {
+        "transcript_sha256", "fixture_sha256", "transcript_identity", "fixture_identity",
+        "parent_transcript_identity", "preflight_fixture_identity", "q2_evidence_identity",
+        "source_lineage_id", "alignment_family_id",
+    }
+    if not isinstance(identity, dict) or not required.issubset(identity):
+        raise RunnerError(f"{label} identity is missing required Q2 provenance")
+    if identity.get("binary_sha256") != file_identity(pathlib.Path(spec["binary"])).get("sha256"):
+        raise RunnerError(f"{label} binary identity mismatch")
+    if identity.get("model_sha256") != file_identity(pathlib.Path(spec["model"])).get("sha256"):
+        raise RunnerError(f"{label} model identity mismatch")
+    if identity.get("head") != git_provenance()["head"]:
+        raise RunnerError(f"{label} HEAD identity mismatch")
+    replay_path = pathlib.Path(workload["replay"]["path"]).resolve()
+
+    def check_identity(value: Any, field: str) -> dict[str, Any]:
+        item = validate_mapping(value, {"path", "present", "size", "sha256"}, f"{label}.{field}")
+        if item["present"] is not True or not isinstance(item["path"], str) or not item["path"]:
+            raise RunnerError(f"{label}.{field} is unavailable")
+        item_path = pathlib.Path(item["path"])
+        if not item_path.is_file() or item_path.stat().st_size != item["size"] or sha256_file(item_path) != item["sha256"]:
+            raise RunnerError(f"{label}.{field} identity drift")
+        return item
+
+    preflight_fixture = check_identity(identity["preflight_fixture_identity"], "preflight_fixture_identity")
+    if pathlib.Path(preflight_fixture["path"]).resolve() != replay_path:
+        raise RunnerError(f"{label} preflight fixture path differs from workload replay")
+    if identity["transcript_sha256"] != preflight_fixture["sha256"]:
+        raise RunnerError(f"{label} preflight fixture SHA mismatch")
+    if identity.get("transcript_identity") != preflight_fixture:
+        raise RunnerError(f"{label} transcript identity is not the preflight fixture")
+    check_identity(identity["parent_transcript_identity"], "parent_transcript_identity")
+    q2_evidence = check_identity(identity["q2_evidence_identity"], "q2_evidence_identity")
+    if identity.get("fixture_identity") != q2_evidence or identity["fixture_sha256"] != q2_evidence["sha256"]:
+        raise RunnerError(f"{label} Q2 evidence identity mismatch")
+    source_lineage_id = identity["source_lineage_id"]
+    if isinstance(source_lineage_id, bool) or not isinstance(source_lineage_id, int) or source_lineage_id < 0:
+        raise RunnerError(f"{label} source lineage identity is invalid")
+    if not isinstance(identity["alignment_family_id"], str) or not identity["alignment_family_id"]:
+        raise RunnerError(f"{label} alignment family identity is invalid")
+    try:
+        replay_source = json.loads(replay_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RunnerError(f"{label} Q3 replay fixture cannot be read: {exc}") from exc
+    derived = replay_source.get("derived_from") if isinstance(replay_source, dict) else None
+    if not isinstance(derived, dict):
+        raise RunnerError(f"{label} Q3 replay must be a derived four-phase fixture")
+    if identity["source_lineage_id"] != derived.get("source_lineage_id"):
+        raise RunnerError(f"{label} Q2/Q3 source lineage identity mismatch")
+    if identity["alignment_family_id"] != derived.get("alignment_family_id"):
+        raise RunnerError(f"{label} Q2/Q3 alignment family identity mismatch")
+    if identity["parent_transcript_identity"]["sha256"] != derived.get("transcript_sha256"):
+        raise RunnerError(f"{label} Q2/Q3 parent transcript identity mismatch")
+    if identity["preflight_fixture_identity"] != derived.get("q2_preflight_fixture_identity"):
+        raise RunnerError(f"{label} Q2/Q3 preflight fixture identity mismatch")
+    if identity["q2_evidence_identity"] != derived.get("q2_evidence_identity"):
+        raise RunnerError(f"{label} Q2/Q3 evidence identity mismatch")
+    return record
+
+
+def bind_target_freeze_cases(
+        cases: dict[str, dict[str, Any]], record: dict[str, Any] | None,
+        runtime_contract: dict[str, Any] | None) -> None:
+    if record is None:
+        return
+    if runtime_contract is None:
+        raise RunnerError("target_freeze_record requires runtime_contract")
+    frozen_t = record["frozen_T"]
+    action_target = runtime_contract["action_target_bytes"]
+    for case_id, case in cases.items():
+        if case["policy"] not in BUDGET_POLICIES:
+            continue
+        if case["kv_target_bytes"] is not None or case["action_target_bytes"] is not None:
+            raise RunnerError(
+                f"{case_id}: target_freeze_record forbids manual resident/action targets")
+        case["kv_target_bytes"] = frozen_t
+        case["action_target_bytes"] = action_target
+
+def normalize_cases(
+        value: Any, target_freeze_record: dict[str, Any] | None = None) -> dict[str, dict[str, Any]]:
     if not isinstance(value, list) or not value:
         raise RunnerError("cases must be a non-empty array")
     cases: dict[str, dict[str, Any]] = {}
@@ -709,7 +895,7 @@ def normalize_cases(value: Any) -> dict[str, dict[str, Any]]:
         if item["policy"] == "resident":
             if target is not None or action_target is not None:
                 raise RunnerError(f"{case_id}: resident policy cannot have resident/action targets")
-        elif item["policy"] in BUDGET_POLICIES and (target is None or action_target is None):
+        elif item["policy"] in BUDGET_POLICIES and (target is None or action_target is None) and target_freeze_record is None:
             raise RunnerError(
                 f"{case_id}: {item['policy']} policy requires explicit kv_target_bytes and action_target_bytes")
         cases[case_id] = dict(item)
@@ -902,6 +1088,10 @@ def validate_spec(raw: Any) -> tuple[dict[str, Any], dict[str, dict[str, Any]], 
     }
     if isinstance(raw, dict) and "budget_sweep" in raw:
         spec_keys.add("budget_sweep")
+    if isinstance(raw, dict) and "runtime_contract" in raw:
+        spec_keys.add("runtime_contract")
+    if isinstance(raw, dict) and "target_freeze_record" in raw:
+        spec_keys.add("target_freeze_record")
     spec = validate_mapping(raw, spec_keys, "spec")
     if spec["schema_version"] != SCHEMA_VERSION or spec["protocol"] != PROTOCOL:
         raise RunnerError("spec protocol/schema version is unsupported")
@@ -926,6 +1116,11 @@ def validate_spec(raw: Any) -> tuple[dict[str, Any], dict[str, dict[str, Any]], 
     ):
         raise RunnerError("spec.environment must map strings to strings")
     reject_canonical_kv_environment(spec["environment"])
+    runtime_contract = normalize_runtime_contract(spec.get("runtime_contract"))
+    if spec["run_mode"] == "resident_preflight" and runtime_contract is None:
+        raise RunnerError("resident_preflight requires an explicit runtime_contract")
+    if runtime_contract is not None and runtime_contract["max_blocks"] != spec["max_blocks"]:
+        raise RunnerError("runtime_contract.max_blocks must match spec.max_blocks")
     if spec["run_mode"] != "resident_preflight" and "LLAMA_KV_RESIDENT_PREFLIGHT" in spec["environment"]:
         raise RunnerError("LLAMA_KV_RESIDENT_PREFLIGHT is restricted to resident_preflight")
     pressure_basis = normalize_pressure_basis(spec["pressure_basis"])
@@ -943,9 +1138,37 @@ def validate_spec(raw: Any) -> tuple[dict[str, Any], dict[str, dict[str, Any]], 
     if ("replay" in workload and workload["replay"].get("lifecycle", {}).get("enabled", False)
             and any(item == "--slot-save-path" or item.startswith("--slot-save-path=") for item in spec["server_args"])):
         raise RunnerError("lifecycle replay owns --slot-save-path server option")
-    cases = normalize_cases(spec["cases"])
+    target_freeze_record = None
+    if spec.get("target_freeze_record") is not None:
+        if spec["phase"] != "representative" or spec["run_mode"] == "resident_preflight":
+            raise RunnerError("target_freeze_record is restricted to representative Q3")
+        if runtime_contract is None:
+            raise RunnerError("target_freeze_record requires runtime_contract")
+        target_freeze_record = load_target_freeze_record(
+            spec["target_freeze_record"], runtime_contract, workload, spec)
+    elif spec["phase"] == "representative" and runtime_contract is not None and spec["run_mode"] != "resident_preflight":
+        raise RunnerError("representative Q3 requires target_freeze_record")
+    cases = normalize_cases(spec["cases"], target_freeze_record)
+    bind_target_freeze_cases(cases, target_freeze_record, runtime_contract)
+    if runtime_contract is not None:
+        if spec["run_mode"] == "resident_preflight":
+            if _argv_option_value(spec["server_args"], "--cache-type-k") != "f16" or _argv_option_value(spec["server_args"], "--cache-type-v") != "f16":
+                raise RunnerError("resident_preflight runtime identity requires F16 K/V server args")
+            if "--kv-unified" not in spec["server_args"]:
+                raise RunnerError("resident_preflight runtime identity requires --kv-unified")
+            if _argv_option_value(spec["server_args"], "--ctx-size") != str(runtime_contract["ctx_size"]):
+                raise RunnerError("resident_preflight runtime identity requires explicit ctx-size")
+            if pathlib.Path(spec["binary"]).name != runtime_contract["executor"]:
+                raise RunnerError("resident_preflight runtime identity executor does not match binary")
     plan = normalize_plan(spec["run_order"], cases)
     validate_cross_policy_single_switch(cases, plan)
+    if spec["phase"] == "representative":
+        q3_policies = {item["policy"] for item in plan}
+        if q3_policies != Q3_POLICIES or any(
+                sum(item["policy"] == policy for item in plan) != 1
+                for policy in Q3_POLICIES):
+            raise RunnerError(
+                "representative Q3 run must contain exactly one each of v2, idle_age, and v3")
     budget_sweep = normalize_budget_sweep(
         spec.get("budget_sweep"), cases, plan, max_blocks, spec["run_kind"])
     if (
@@ -985,6 +1208,7 @@ def validate_spec(raw: Any) -> tuple[dict[str, Any], dict[str, dict[str, Any]], 
             raise RunnerError("formal qualification run requires repeat >= 2")
     normalized = dict(spec)
     normalized["pressure_basis"] = pressure_basis
+    normalized["runtime_contract"] = runtime_contract
     normalized["workload"] = workload
     normalized["sampler"] = {"interval_seconds": sampler_interval}
     normalized["cgroup"] = dict(cgroup)
@@ -1055,6 +1279,7 @@ def runtime_environment(
         "LLAMA_KV_PAGED_MINCORE": "1",
         "LLAMA_KV_PAGED_IO_STATS": "1",
         "LLAMA_KV_PAGED_PREFETCH_PHASE_TRACE": "0",
+        "LLAMA_KV_PAGED_BLOCK_SIZE": str(spec["runtime_contract"]["paged_block_size"]) if spec.get("runtime_contract") else "16",
         "LLAMA_KV_RESUME_STAGE_TIMING": "1",
         "LLAMA_KV_G0_S1_RESIDENT_OBSERVATION": (
             "both" if case["policy"] in SWAP_POLICIES and spec["run_mode"] == "characterization"
@@ -1152,8 +1377,22 @@ def server_argv(spec: dict[str, Any], port: int) -> list[str]:
         *spec["server_args"],
     ]
     replay = spec.get("workload", {}).get("replay") if isinstance(spec.get("workload"), dict) else None
+    contract = spec.get("runtime_contract")
     if replay is not None:
+        if contract is not None and replay["n_parallel"] != 3:
+            raise RunnerError("resident/Q3 replay identity requires --parallel 3")
         args.extend(["--parallel", str(replay["n_parallel"]), "--no-cache-idle-slots", "--no-context-shift"])
+    if contract is not None:
+        if _argv_option_value(args, "--parallel") != "3":
+            raise RunnerError("runtime identity requires --parallel 3")
+        if _argv_option_value(args, "--cache-type-k") != "f16" or _argv_option_value(args, "--cache-type-v") != "f16":
+            raise RunnerError("runtime identity requires F16 K/V cache")
+        if "--kv-unified" not in args or "--no-cache-idle-slots" not in args or "--no-context-shift" not in args:
+            raise RunnerError("runtime identity is missing unified/idle/context flags")
+        if _argv_option_value(args, "--ctx-size") != str(contract["ctx_size"]):
+            raise RunnerError("runtime identity ctx-size mismatch")
+        if pathlib.Path(args[0]).name != contract["executor"]:
+            raise RunnerError("runtime identity executor mismatch")
     return args
 
 
@@ -2144,9 +2383,27 @@ def request_completion_replay(
     tokens_evaluated: int | None = None
     tokens_predicted: int | None = None
     response_slot: int | None = None
+    live_kv_pos_min: int | None = None
+    live_kv_pos_max: int | None = None
+    live_kv_cells: int | None = None
+    live_kv_blocks: int | None = None
+    live_kv_object_id: int | None = None
+    live_kv_generation: int | None = None
+    live_kv_block_aligned: bool | None = None
+    live_kv_authoritative: bool | None = None
+    live_kv_shared: bool | None = None
     response_tokens: list[int] | None = None
     if isinstance(parsed, dict):
         response_slot = parsed.get("id_slot")
+        live_kv_pos_min = parsed.get("live_kv_pos_min")
+        live_kv_pos_max = parsed.get("live_kv_pos_max")
+        live_kv_cells = parsed.get("live_kv_cells")
+        live_kv_blocks = parsed.get("live_kv_blocks")
+        live_kv_object_id = parsed.get("live_kv_object_id")
+        live_kv_generation = parsed.get("live_kv_generation")
+        live_kv_block_aligned = parsed.get("live_kv_block_aligned")
+        live_kv_authoritative = parsed.get("live_kv_authoritative")
+        live_kv_shared = parsed.get("live_kv_shared")
         tokens_evaluated = parsed.get("tokens_evaluated")
         tokens_predicted = parsed.get("tokens_predicted")
         tokens = parsed.get("tokens")
@@ -2177,6 +2434,15 @@ def request_completion_replay(
         "response_slot_id": response_slot,
         "tokens_evaluated": tokens_evaluated,
         "tokens_predicted": tokens_predicted,
+        "live_kv_pos_min": live_kv_pos_min,
+        "live_kv_pos_max": live_kv_pos_max,
+        "live_kv_cells": live_kv_cells,
+        "live_kv_blocks": live_kv_blocks,
+        "live_kv_object_id": live_kv_object_id,
+        "live_kv_generation": live_kv_generation,
+        "live_kv_block_aligned": live_kv_block_aligned,
+        "live_kv_authoritative": live_kv_authoritative,
+        "live_kv_shared": live_kv_shared,
         "response_token_sha256": token_sha,
         "response_token_count": len(response_tokens) if response_tokens is not None else None,
         "error": error,
@@ -2215,6 +2481,12 @@ def validate_replay_model_binding(replay_plan: Any, spec: dict[str, Any]) -> Non
         raise RunnerError("replay model bytes differ from the model-bound transcript")
     if sha256_file(pathlib.Path(spec["binary"])) != transcript_binary_sha:
         raise RunnerError("replay binary bytes differ from the model-bound transcript")
+    runtime_contract = model_document.get("runtime_contract")
+    expected_runtime_contract = spec.get("runtime_contract")
+    if not isinstance(runtime_contract, dict) or set(runtime_contract) != Q2Q3_RUNTIME_CONTRACT_KEYS:
+        raise RunnerError("model-bound replay source runtime contract is missing or malformed")
+    if not isinstance(expected_runtime_contract, dict) or runtime_contract != expected_runtime_contract:
+        raise RunnerError("replay runtime contract differs from the Q2/Q3 runtime contract")
 
 
 def validate_replay_slot_capacity(
@@ -3205,7 +3477,7 @@ def collect_resident_preflight_window(
     whole_required = {
         "timestamp_mono_ns", "sample_count", "whole_valid", "resident_available",
         "reclaimable_available", "swapped_metadata_consistent", "object_id", "generation",
-        "page_size", "total_bytes", "resident_bytes", "transient_staging_bound_bytes",
+        "page_size", "native_block_bytes", "total_bytes", "resident_bytes", "dead_resident_reclaimable_bytes", "swapped_authoritative_bytes", "transient_staging_bound_bytes",
         "n_blocks", "n_owned_blocks", "n_shared_blocks", "resident_block_count",
         "swapped_block_count", "released_block_count", "pending_write_block_count",
         "invalid_block_count", "unused_block_count", "global_target_enabled",
@@ -3279,8 +3551,18 @@ def collect_resident_preflight_window(
             return False
         if not whole["reclaimable_available"] or not whole["swapped_metadata_consistent"]:
             raise RunnerError("resident_preflight whole-KV reclaim/swap authority is unavailable")
-        if whole["object_id"] <= 0 or whole["generation"] <= 0 or whole["page_size"] <= 0 or whole["total_bytes"] <= 0:
+        if (
+                whole["object_id"] <= 0
+                or whole["generation"] <= 0
+                or whole["page_size"] <= 0
+                or whole["native_block_bytes"] <= 0
+                or whole["total_bytes"] <= 0
+        ):
             raise RunnerError("resident_preflight whole-KV identity is invalid")
+        if whole["dead_resident_reclaimable_bytes"] > whole["resident_bytes"]:
+            raise RunnerError("resident_preflight dead reclaimable bytes exceed resident bytes")
+        if whole["swapped_authoritative_bytes"] > whole["total_bytes"]:
+            raise RunnerError("resident_preflight swapped authoritative bytes exceed total bytes")
         if not whole["observation_only"] or whole["global_target_enabled"] or whole["global_target_bytes"] != 0:
             raise RunnerError("resident_preflight observed a Global target")
         if whole["global_target_source"] not in {"none", "UNAVAILABLE"}:
@@ -3293,6 +3575,9 @@ def collect_resident_preflight_window(
                 raise RunnerError("resident_preflight A/B claimant authority is unavailable or shared")
             if view["active"]:
                 return False
+            if view["exclusive_resident_bytes"] <= 0 or view["exclusive_resident_blocks"] <= 0:
+                raise RunnerError(
+                    f"resident_preflight INVALID_FIXTURE claimant seq {seq_id} has no positive exclusive resident view")
         c_view = claimants.get(c_seq_id) if c_seq_id is not None else None
         if window == "ABC_ACTIVE":
             return (
@@ -3321,8 +3606,8 @@ def collect_resident_preflight_window(
                     key[1] == run[-1][0][1] + 1
                     and key[0] > run[-1][0][0]
                     and key[0] - run[-1][0][0] <= int(
-                        float(config["sample_interval_seconds"])
-                        * 1_000_000_000 * 2)):
+                        float(config["max_sample_gap_seconds"])
+                        * 1_000_000_000)):
                 run.append((key, group))
             else:
                 run = [(key, group)]
@@ -3344,6 +3629,39 @@ def collect_resident_preflight_window(
                 }
         time.sleep(0.01)
     raise RunnerError(f"resident_preflight {window} sample window is incomplete")
+
+
+def validate_resident_prepare_footprint(
+        event: dict[str, Any], actual: dict[str, Any], runtime_contract: dict[str, Any],
+        label: str) -> None:
+    expected = event.get("expected_live_kv_cells")
+    if isinstance(expected, bool) or not isinstance(expected, int) or expected <= 0:
+        raise RunnerError(f"INVALID_FIXTURE {label}: expected_live_kv_cells is missing")
+    live_cells = actual.get("live_kv_cells")
+    live_blocks = actual.get("live_kv_blocks")
+    pos_min = actual.get("live_kv_pos_min")
+    pos_max = actual.get("live_kv_pos_max")
+    object_id = actual.get("live_kv_object_id")
+    generation = actual.get("live_kv_generation")
+    aligned = actual.get("live_kv_block_aligned")
+    authoritative = actual.get("live_kv_authoritative")
+    shared = actual.get("live_kv_shared")
+    if any(isinstance(value, bool) or not isinstance(value, int)
+           for value in (live_cells, live_blocks, pos_min, pos_max, object_id, generation)):
+        raise RunnerError(f"INVALID_FIXTURE {label}: completion live-KV authority is missing")
+    if not isinstance(aligned, bool) or not isinstance(authoritative, bool) or not isinstance(shared, bool):
+        raise RunnerError(f"INVALID_FIXTURE {label}: completion live-KV authority flags are missing")
+    if (not authoritative or shared or not aligned or live_cells <= 0 or live_blocks <= 0
+            or object_id <= 0 or generation <= 0 or pos_min < 0 or pos_max < pos_min):
+        raise RunnerError(f"INVALID_FIXTURE {label}: completion live-KV authority is invalid")
+    quantum = runtime_contract["paged_block_size"]
+    if live_cells != live_blocks * quantum:
+        raise RunnerError(
+            f"INVALID_FIXTURE {label}: live KV cells {live_cells} do not fill "
+            f"{live_blocks} paged blocks of {quantum}")
+    if live_cells != expected:
+        raise RunnerError(
+            f"INVALID_FIXTURE {label}: expected live KV cells {expected} != observed {live_cells}")
 
 
 def run_one_resident_preflight_replay(
@@ -3454,11 +3772,13 @@ def run_one_resident_preflight_replay(
                 futures[future] = (sid, event, binding, order)
                 return future
 
-            dispatch("A")
-            dispatch("B")
-            for future in list(futures):
-                sid, event, binding, order = futures[future]
+            def finish_prepare(sid: str, future: Any) -> dict[str, Any]:
+                sid_actual, event, binding, order = futures[future]
+                if sid_actual != sid:
+                    raise RunnerError(f"resident_preflight dispatch identity drift for {sid}")
                 actual = future.result()
+                validate_resident_prepare_footprint(
+                    event, actual, spec["runtime_contract"], f"prepare-{sid}")
                 actual.update({
                     "dispatch_order": order, "admitted_us": actual["started_us"],
                     "dispatched_us": actual["started_us"], "planned_arrival_us": event["planned_arrival_us"],
@@ -3469,6 +3789,14 @@ def run_one_resident_preflight_replay(
                 })
                 request_records.append(actual)
                 admission_records.append({**event, **binding, "status": "resident_idle", "completed_us": actual["completed_us"]})
+                return actual
+
+            # A/B preparation is deliberately block-exclusive: A must complete
+            # and pass completion-time KV authority before B is admitted.
+            future_a = dispatch("A")
+            finish_prepare("A", future_a)
+            future_b = dispatch("B")
+            finish_prepare("B", future_b)
             ab_offset = stderr_path.stat().st_size
             ab_samples, ab_window = collect_resident_preflight_window(
                 stderr_path, ab_offset, preflight_cfg,

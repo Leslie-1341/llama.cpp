@@ -302,6 +302,19 @@ def _promote_realish(transcript) -> dict:
         "identity_status": "REAL",
         "server_process_identity": identity,
     }
+    document["runtime_contract"] = {
+        "ctx_size": 128,
+        "executor": "llama-server",
+        "kv_unified": True,
+        "parallel": 3,
+        "cache_type_k": "f16",
+        "cache_type_v": "f16",
+        "no_cache_idle_slots": True,
+        "no_context_shift": True,
+        "paged_block_size": 16,
+        "action_target_bytes": 4096,
+        "max_blocks": 8,
+    }
     authority = document["effective_n_ctx_authority"]
     authority.update({
         "source": "server_props_and_slots",
@@ -590,6 +603,65 @@ class RuntimeMaterializeTest(unittest.TestCase):
                     **kwargs,
                 )
             self.assertEqual(MATERIALIZE_MODE_REAL, "direct_token_ids")
+
+    def test_real_server_identity_binds_runtime_contract_to_proc_argv(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = root / "model.gguf"
+            binary = root / "llama-server"
+            model.write_bytes(b"model-a")
+            binary.write_bytes(b"binary-a")
+            proc = root / "proc" / "1234"
+            proc.mkdir(parents=True)
+            (proc / "exe").symlink_to(binary)
+            (proc / "cwd").symlink_to(root)
+            runtime_contract = {
+                "ctx_size": 128,
+                "executor": "llama-server",
+                "kv_unified": True,
+                "parallel": 3,
+                "cache_type_k": "f16",
+                "cache_type_v": "f16",
+                "no_cache_idle_slots": True,
+                "no_context_shift": True,
+                "paged_block_size": 16,
+                "action_target_bytes": 4096,
+                "max_blocks": 8,
+            }
+            def write_cmdline(cache_type: str = "f16", parallel: int = 3):
+                argv = [
+                    str(binary), "--model", str(model), "--port", "8080",
+                    "--ctx-size", "128", "--cache-type-k", cache_type,
+                    "--cache-type-v", cache_type, "--parallel", str(parallel),
+                    "--kv-unified", "--no-cache-idle-slots", "--no-context-shift",
+                ]
+                (proc / "cmdline").write_bytes("\0".join(argv).encode("utf-8") + b"\0")
+            write_cmdline()
+            stat_tail = ["S"] + ["0"] * 18 + ["4242"]
+            (proc / "stat").write_text(
+                f"1234 (llama-server) {' '.join(stat_tail)}", encoding="utf-8"
+            )
+            authority = replace(
+                ServerAuthority.fixture(128),
+                source="server_props_and_slots",
+                props_model_path=str(model),
+            )
+            kwargs = {
+                "authority": authority,
+                "base_url": "http://127.0.0.1:8080",
+                "server_pid": 1234,
+                "model_path": model,
+                "binary_path": binary,
+                "proc_root": root / "proc",
+                "runtime_contract": runtime_contract,
+            }
+            verify_server_process_identity(**kwargs)
+            write_cmdline(cache_type="f32")
+            with self.assertRaises(ServerProcessIdentityError):
+                verify_server_process_identity(**kwargs)
+            write_cmdline(parallel=2)
+            with self.assertRaises(ServerProcessIdentityError):
+                verify_server_process_identity(**kwargs)
 
     def test_previous_partial_tail_reminder_change_is_legal(self):
         # Alibaba semantics (A): a sub-block partial block is NOT stable

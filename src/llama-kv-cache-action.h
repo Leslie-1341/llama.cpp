@@ -119,8 +119,16 @@ struct llama_kv_claimant_physical_view {
     uint64_t generation = 0;
     uint64_t estimated_exclusive_resident_bytes = 0;
     uint64_t estimated_swapped_bytes = 0;
+    uint64_t live_kv_object_id = 0;
+    uint64_t live_kv_generation = 0;
+    int64_t live_kv_pos_min = -1;
+    int64_t live_kv_pos_max = -1;
+    uint32_t live_kv_cells = 0;
+    uint32_t live_kv_blocks = 0;
     uint32_t exclusive_resident_blocks = 0;
     uint32_t swapped_blocks = 0;
+    bool live_kv_block_aligned = false;
+    bool live_kv_authoritative = false;
 };
 
 // A read-only, whole-KV mincore sample.  `available` distinguishes a valid
@@ -159,6 +167,9 @@ struct llama_kv_resident_sample {
 //   - resident_bytes: page-aligned mincore count across all K/V tensors,
 //     identical to `sample_kv_resident().resident_bytes`.  `resident_available`
 //     distinguishes a true zero from an unsupported / failed probe.
+//   - native_block_bytes: logical bytes in one complete paged KV block,
+//     derived from the production cell layout and `paged_block_size`; this is
+//     the alignment quantum for block-granular actions, not the OS page size.
 //   - dead_resident_reclaimable_bytes: bytes that a destructive RELEASE in
 //     the current layout could actually free — ownership-gated and
 //     restricted to RESIDENT/UNUSED unowned blocks.  Identical to
@@ -204,6 +215,7 @@ struct llama_kv_physical_budget_view {
     uint64_t object_id = 0;
     uint64_t generation = 0;
     uint64_t page_size = 0;
+    uint64_t native_block_bytes = 0;
     uint64_t total_bytes = 0;
     uint64_t resident_bytes = 0;
     uint64_t dead_resident_reclaimable_bytes = 0;

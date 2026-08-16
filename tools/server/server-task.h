@@ -345,6 +345,15 @@ struct server_task_result_cmpl_final : server_task_result {
     int32_t n_prompt_tokens;
     int32_t n_prompt_tokens_cache;
     int32_t n_tokens_cached;
+    int64_t live_kv_pos_min = -1;
+    int64_t live_kv_pos_max = -1;
+    int64_t live_kv_cells = -1;
+    int64_t live_kv_blocks = -1;
+    uint64_t live_kv_object_id = 0;
+    uint64_t live_kv_generation = 0;
+    bool live_kv_block_aligned = false;
+    bool live_kv_authoritative = false;
+    bool live_kv_shared = false;
     bool has_new_line;
     std::string stopping_word;
     stop_type stop = STOP_TYPE_NONE;

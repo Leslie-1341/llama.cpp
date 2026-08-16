@@ -15,7 +15,9 @@ class ResidentPreflightStaticTest(unittest.TestCase):
         formatter = CONTEXT[start:end]
         for field in (
             "timestamp_mono_ns=", "sample_count=", "whole_valid=", "resident_available=",
-            "object_id=", "generation=", "resident_bytes=", "transient_staging_bound_bytes=",
+            "object_id=", "generation=", "resident_bytes=",
+            "dead_resident_reclaimable_bytes=", "swapped_authoritative_bytes=",
+            "transient_staging_bound_bytes=", "native_block_bytes=",
             "resident_block_count=", "swapped_block_count=", "released_block_count=",
             "pending_write_block_count=", "global_target_enabled=", "global_target_source=",
             "observation_only=",
@@ -32,6 +34,20 @@ class ResidentPreflightStaticTest(unittest.TestCase):
         self.assertNotIn("execute_action", block)
         self.assertNotIn("server_kv_pressure_execute_governor", block)
         self.assertNotIn("prefetch_seq", block)
+
+    def test_completion_live_kv_scan_is_gated_and_preserves_fields(self) -> None:
+        start = CONTEXT.index("void send_final_response(")
+        end = CONTEXT.index("\n    void ", start + len("void send_final_response("))
+        block = CONTEXT[start:end]
+        gate = block.index("if (kv_g0_s1_resident_preflight)")
+        scan = block.index("sample_kv_claimant_physical_views", gate)
+        response_tail = block.index("res->has_new_line", scan)
+        gated = block[gate:response_tail]
+        self.assertLess(gate, scan)
+        self.assertIn("sample_kv_claimant_physical_views", gated)
+        self.assertIn("res->live_kv_authoritative", gated)
+        self.assertIn("res->live_kv_generation", gated)
+        self.assertNotIn("sample_kv_claimant_physical_views", block[:gate])
 
     def test_preflight_marker_is_observation_only(self) -> None:
         helper_start = CONTEXT.index("void emit_resident_preflight_observation(")

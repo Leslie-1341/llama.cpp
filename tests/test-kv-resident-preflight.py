@@ -23,6 +23,21 @@ PARSER = load_module(ROOT / "scripts/parse-kv-offload-benchmark.py", "resident_p
 RUNNER = load_module(ROOT / "scripts/run-kv-offload-benchmark.py", "resident_preflight_runner")
 
 
+RUNTIME_CONTRACT = {
+    "ctx_size": 4096,
+    "executor": "server",
+    "kv_unified": True,
+    "parallel": 3,
+    "cache_type_k": "f16",
+    "cache_type_v": "f16",
+    "no_cache_idle_slots": True,
+    "no_context_shift": True,
+    "paged_block_size": 16,
+    "action_target_bytes": 4096,
+    "max_blocks": 64,
+}
+
+
 class ResidentPreflightParserTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(prefix="resident_preflight_")
@@ -32,6 +47,11 @@ class ResidentPreflightParserTest(unittest.TestCase):
                 "sample_interval_seconds": 0.1,
                 "min_samples": 10,
                 "window_timeout_seconds": 5.0,
+                "max_sample_gap_seconds": 0.5,
+                "normalized_resident_spread_bytes": 64,
+                "normalized_resident_spread_ratio": 0.0,
+                "claimant_relief_spread_bytes": 0,
+                "claimant_relief_spread_ratio": 0.0,
             }
         }
         self.record = {
@@ -76,8 +96,11 @@ class ResidentPreflightParserTest(unittest.TestCase):
             "object_id": 7,
             "generation": generation,
             "page_size": 4096,
+            "native_block_bytes": 2048,
             "total_bytes": 65536,
             "resident_bytes": 32768 + sample_count,
+            "dead_resident_reclaimable_bytes": 1024,
+            "swapped_authoritative_bytes": 0,
             "transient_staging_bound_bytes": 0,
             "n_blocks": 16,
             "n_owned_blocks": 4,
@@ -168,6 +191,9 @@ class ResidentPreflightParserTest(unittest.TestCase):
         self.assertEqual(result["R_ABC"]["n"], 10)
         self.assertEqual(result["R_AB"]["min"], 32778)
         self.assertEqual(result["R_AB"]["max"], 32787)
+        self.assertEqual(result["normalized_R_AB"]["min"], 31754)
+        self.assertEqual(result["normalized_R_ABC"]["max"], 31783)
+        self.assertEqual(result["intervals"]["AB_RESIDENT"]["max_seconds"], 0.1)
         self.assertEqual(result["exclusive_estimate"]["combined_resident_bytes_lower_bound"], 8192)
 
     def test_sample_shortfall_fails_closed(self) -> None:
@@ -273,7 +299,16 @@ class ResidentPreflightParserTest(unittest.TestCase):
             "binary": "/tmp/server",
             "model": "/tmp/model.gguf",
             "model_quantization": "synthetic",
-            "server_args": [],
+            "server_args": [
+                "--ctx-size", "4096", "--cache-type-k", "f16", "--cache-type-v", "f16",
+                "--kv-unified",
+            ],
+            "runtime_contract": {
+                "ctx_size": 4096, "executor": "server", "kv_unified": True, "parallel": 3,
+                "cache_type_k": "f16", "cache_type_v": "f16", "no_cache_idle_slots": True,
+                "no_context_shift": True, "paged_block_size": 16, "action_target_bytes": 4096,
+                "max_blocks": 64,
+            },
             "environment": {},
             "pressure_basis": {
                 "authority": "rss_absolute",
@@ -288,11 +323,17 @@ class ResidentPreflightParserTest(unittest.TestCase):
                     "source": "fixture", "path": "/tmp/replay.json",
                     "time_dilation": 1.0, "n_parallel": 3, "session_ids": None,
                     "admission_timeout_seconds": 1.0, "lifecycle": None,
+                    "source_lineage_id": 0, "alignment_family_id": "family-q2",
                 },
                 "resident_preflight": {
                     "sample_interval_seconds": 0.1,
                     "min_samples": 10,
                     "window_timeout_seconds": 5.0,
+                "max_sample_gap_seconds": 0.5,
+                "normalized_resident_spread_bytes": 64,
+                "normalized_resident_spread_ratio": 0.0,
+                "claimant_relief_spread_bytes": 0,
+                "claimant_relief_spread_ratio": 0.0,
                 },
             },
             "cases": [{
@@ -370,13 +411,19 @@ class ResidentPreflightParserTest(unittest.TestCase):
         transcript_path.write_text(json.dumps({
             "schema": "gt-trace-1b-a/v1",
             "model": {"model_sha256": model_sha, "binary_sha256": binary_sha},
+            "runtime_contract": RUNTIME_CONTRACT,
         }), encoding="utf-8")
         replay_plan = types.SimpleNamespace(
             schema="gt-trace-1b-a/v1", source_path=str(transcript_path), fixture_contract=None)
-        spec = {"model": str(model_path), "binary": str(binary_path)}
+        spec = {
+            "model": str(model_path), "binary": str(binary_path),
+            "runtime_contract": RUNTIME_CONTRACT,
+        }
         RUNNER.validate_replay_model_binding(replay_plan, spec)
         PARSER.validate_replay_model_binding(
-            {"model_sha256": model_sha, "binary_sha256": binary_sha}, model_sha, binary_sha)
+            {"model_sha256": model_sha, "binary_sha256": binary_sha,
+             "runtime_contract": RUNTIME_CONTRACT},
+            model_sha, binary_sha, RUNTIME_CONTRACT)
 
     def test_model_bound_replay_rejects_stale_binary(self) -> None:
         model_path = self.root / "model.bin"
@@ -399,6 +446,264 @@ class ResidentPreflightParserTest(unittest.TestCase):
             PARSER.validate_replay_model_binding(
                 {"model_sha256": model_sha, "binary_sha256": stale_binary_sha},
                 model_sha, RUNNER.sha256_file(binary_path))
+
+
+    def test_target_freeze_record_persists_and_rejects_fixture_drift(self) -> None:
+        replay_path = self.root / "replay.json"
+        parent_path = self.root / "parent.json"
+        fixture_path = self.root / "fixture.jsonl"
+        replay_path.write_text("replay\n", encoding="utf-8")
+        parent_path.write_text("parent\n", encoding="utf-8")
+        fixture_path.write_text("fixture\n", encoding="utf-8")
+        runtime_contract = {
+            "ctx_size": 4096, "executor": "server", "kv_unified": True, "parallel": 3,
+            "cache_type_k": "f16", "cache_type_v": "f16", "no_cache_idle_slots": True,
+            "no_context_shift": True, "paged_block_size": 16, "action_target_bytes": 4096,
+            "max_blocks": 64,
+        }
+        preflight_identity = {
+            "path": str(replay_path), "present": True,
+            "size": replay_path.stat().st_size, "sha256": PARSER.sha256_file(replay_path),
+        }
+        evidence_identity = {
+            "path": str(fixture_path), "present": True,
+            "size": fixture_path.stat().st_size, "sha256": PARSER.sha256_file(fixture_path),
+        }
+        parent_identity = {
+            "path": str(parent_path), "present": True,
+            "size": parent_path.stat().st_size, "sha256": PARSER.sha256_file(parent_path),
+        }
+        target = {
+            "status": "FROZEN", "frozen": True, "frozen_T": 8192,
+            "identity": {
+                "transcript_sha256": preflight_identity["sha256"],
+                "fixture_sha256": evidence_identity["sha256"],
+                "transcript_identity": preflight_identity,
+                "fixture_identity": evidence_identity,
+                "parent_transcript_identity": parent_identity,
+                "preflight_fixture_identity": preflight_identity,
+                "q2_evidence_identity": evidence_identity,
+                "source_lineage_id": 0,
+                "alignment_family_id": "family-q2",
+                "runtime_contract": runtime_contract,
+            },
+        }
+        PARSER.write_target_freeze_record(
+            self.root, {"verdict": "RESIDENT_PREFLIGHT_PASS", "target_freeze": target})
+        freeze_path = self.root / "target-freeze.json"
+        record = json.loads(freeze_path.read_text(encoding="utf-8"))
+        reference = {
+            "path": str(freeze_path), "present": True,
+            "size": freeze_path.stat().st_size, "sha256": PARSER.sha256_file(freeze_path),
+        }
+        loaded = PARSER.load_target_freeze_record(
+            reference, runtime_contract, {"replay": {"path": str(replay_path)}}, "fixture")
+        self.assertEqual(loaded["frozen_T"], 8192)
+        fixture_path.write_text("drifted fixture\n", encoding="utf-8")
+        with self.assertRaisesRegex(PARSER.ParseError, "fixture_identity|q2_evidence_identity"):
+            PARSER.load_target_freeze_record(
+                reference, runtime_contract, {"replay": {"path": str(replay_path)}}, "fixture")
+
+    def test_multi_round_target_freeze_aggregates_and_round_trips(self) -> None:
+        replay_path = self.root / "replay-multi.json"
+        parent_path = self.root / "parent-multi.json"
+        fixture_path = self.root / "fixture-multi.jsonl"
+        replay_path.write_text("replay\n", encoding="utf-8")
+        parent_path.write_text("parent\n", encoding="utf-8")
+        fixture_path.write_text("fixture\n", encoding="utf-8")
+        runtime_contract = dict(RUNTIME_CONTRACT)
+        replay_identity = {
+            "path": str(replay_path), "present": True,
+            "size": replay_path.stat().st_size,
+            "sha256": PARSER.sha256_file(replay_path),
+        }
+        evidence_identity = {
+            "path": str(fixture_path), "present": True,
+            "size": fixture_path.stat().st_size,
+            "sha256": PARSER.sha256_file(fixture_path),
+        }
+        parent_identity = {
+            "path": str(parent_path), "present": True,
+            "size": parent_path.stat().st_size,
+            "sha256": PARSER.sha256_file(parent_path),
+        }
+        identity = {
+            "transcript_sha256": replay_identity["sha256"],
+            "fixture_sha256": evidence_identity["sha256"],
+            "transcript_identity": replay_identity,
+            "fixture_identity": evidence_identity,
+            "parent_transcript_identity": parent_identity,
+            "preflight_fixture_identity": replay_identity,
+            "q2_evidence_identity": evidence_identity,
+            "source_lineage_id": 0,
+            "alignment_family_id": "family-q2-multi",
+            "runtime_contract": runtime_contract,
+        }
+        round_one = {"status": "FROZEN", "frozen": True, "frozen_T": 8192,
+                     "identity": identity}
+        round_two = json.loads(json.dumps(round_one))
+        aggregate = PARSER.aggregate_target_freeze_records([round_one, round_two])
+        self.assertEqual(aggregate["round_count"], 2)
+        self.assertIsInstance(aggregate["identity"], dict)
+        PARSER.write_target_freeze_record(
+            self.root, {"verdict": "RESIDENT_PREFLIGHT_PASS", "target_freeze": aggregate})
+        freeze_path = self.root / "target-freeze.json"
+        reference = {
+            "path": str(freeze_path), "present": True,
+            "size": freeze_path.stat().st_size,
+            "sha256": PARSER.sha256_file(freeze_path),
+        }
+        loaded = PARSER.load_target_freeze_record(
+            reference, runtime_contract, {"replay": {"path": str(replay_path)}}, "multi")
+        self.assertEqual(loaded["frozen_T"], 8192)
+        self.assertEqual(loaded["round_count"], 2)
+        drifted = json.loads(json.dumps(round_one))
+        drifted["identity"]["source_lineage_id"] = 1
+        with self.assertRaisesRegex(PARSER.ParseError, "identity"):
+            PARSER.aggregate_target_freeze_records([round_one, drifted])
+
+    def test_target_freeze_binding_rejects_manual_override_and_injects_cap(self) -> None:
+        runtime_contract = dict(RUNTIME_CONTRACT)
+        record = {"frozen_T": 8192}
+        base = {
+            "case_id": "v2", "policy": "v2", "kv_target_bytes": None,
+            "action_target_bytes": None,
+        }
+        cases = {"v2": dict(base)}
+        PARSER.bind_target_freeze_cases(cases, record, runtime_contract)
+        self.assertEqual(cases["v2"]["kv_target_bytes"], 8192)
+        self.assertEqual(cases["v2"]["action_target_bytes"], 4096)
+        cases["v2"]["kv_target_bytes"] = 123
+        with self.assertRaisesRegex(PARSER.ParseError, "forbids manual"):
+            PARSER.bind_target_freeze_cases(cases, record, runtime_contract)
+
+    def test_target_freeze_uses_normalized_bounds_and_alignment(self) -> None:
+        preflight = {
+            "normalized_R_AB": {"max": 16384, "allowed_spread": 0},
+            "normalized_R_ABC": {"min": 24576, "max": 24576, "allowed_spread": 0},
+            "Relief_A": {"resident_bytes_lower_bound": 4096, "resident_blocks_lower_bound": 2},
+            "Relief_B": {"resident_bytes_lower_bound": 8192, "resident_blocks_lower_bound": 4},
+            "native_block_bytes": 2048,
+        }
+        record = PARSER.freeze_resident_preflight_target(
+            preflight, RUNTIME_CONTRACT)
+        self.assertEqual(record["status"], "FROZEN")
+        self.assertTrue(record["frozen"])
+        self.assertEqual(record["frozen_T"], 22528)
+        self.assertEqual(record["safe_interval"], {"lower": 20480, "upper": 22528})
+        self.assertEqual(record["inputs"]["AB_hi"], 16384)
+        self.assertEqual(record["inputs"]["Relief_lower_bound"], 4096)
+
+    def test_target_freeze_reports_unavailable_window(self) -> None:
+        preflight = {
+            "normalized_R_AB": {"max": 30000, "allowed_spread": 0},
+            "normalized_R_ABC": {"min": 30001, "max": 30001, "allowed_spread": 0},
+            "Relief_A": {"resident_bytes_lower_bound": 4096, "resident_blocks_lower_bound": 2},
+            "Relief_B": {"resident_bytes_lower_bound": 4096, "resident_blocks_lower_bound": 2},
+            "native_block_bytes": 2048,
+        }
+        with self.assertRaisesRegex(PARSER.ParseError, "TARGET_WINDOW_UNAVAILABLE"):
+            PARSER.freeze_resident_preflight_target(
+                preflight, RUNTIME_CONTRACT)
+
+
+    def test_production_resident_marker_schema_is_exact_and_native_block_bytes_passes(self) -> None:
+        whole = self._whole(1_000_000_000, 10)
+        token = "kv_resident_preflight_observation"
+        line = "srv " + token + " " + " ".join(
+            f"{key}={int(value) if isinstance(value, bool) else value}"
+            for key, value in whole.items())
+        fields = RUNNER.parse_marker_fields(line, token)
+        self.assertIsNotNone(fields)
+        assert fields is not None
+        required = set(fields)
+        numeric = required - {
+            "whole_valid", "resident_available", "reclaimable_available",
+            "swapped_metadata_consistent", "global_target_enabled", "observation_only",
+            "global_target_source",
+        }
+        booleans = {
+            "whole_valid", "resident_available", "reclaimable_available",
+            "swapped_metadata_consistent", "global_target_enabled", "observation_only",
+        }
+        decoded = RUNNER._resident_preflight_decode_marker(
+            fields, numeric, booleans, required, "resident observation")
+        self.assertEqual(decoded["native_block_bytes"], 2048)
+        self.assertEqual(
+            PARSER.parse_fields(
+                line, token, required, "fixture.marker"),
+            fields,
+        )
+
+        missing = dict(fields)
+        missing.pop("native_block_bytes")
+        with self.assertRaisesRegex(RUNNER.RunnerError, "schema mismatch"):
+            RUNNER._resident_preflight_decode_marker(
+                missing, numeric, booleans, required, "resident observation")
+        duplicate_line = line + " native_block_bytes=2048"
+        self.assertIsNone(RUNNER.parse_marker_fields(duplicate_line, token))
+        extra = dict(fields)
+        extra["unexpected"] = "1"
+        with self.assertRaisesRegex(RUNNER.RunnerError, "schema mismatch"):
+            RUNNER._resident_preflight_decode_marker(
+                extra, numeric, booleans, required, "resident observation")
+        with self.assertRaisesRegex(PARSER.ParseError, "schema mismatch"):
+            PARSER.parse_fields(
+                line + " unexpected=1", token,
+                required, "fixture.marker")
+
+    def test_completion_live_kv_authority_requires_real_aligned_exclusive_view(self) -> None:
+        event = {"expected_live_kv_cells": 32}
+        actual = {
+            "live_kv_pos_min": 10,
+            "live_kv_pos_max": 100,
+            "live_kv_cells": 32,
+            "live_kv_blocks": 2,
+            "live_kv_object_id": 7,
+            "live_kv_generation": 3,
+            "live_kv_block_aligned": True,
+            "live_kv_authoritative": True,
+            "live_kv_shared": False,
+        }
+        RUNNER.validate_resident_prepare_footprint(
+            event, actual, RUNTIME_CONTRACT, "prepare-A")
+        for field, value in (
+                ("live_kv_block_aligned", False),
+                ("live_kv_authoritative", False),
+                ("live_kv_shared", True)):
+            bad = dict(actual)
+            bad[field] = value
+            with self.assertRaisesRegex(RUNNER.RunnerError, "authority is invalid"):
+                RUNNER.validate_resident_prepare_footprint(
+                    event, bad, RUNTIME_CONTRACT, f"bad-{field}")
+        bad = dict(actual, live_kv_cells=31)
+        with self.assertRaisesRegex(RUNNER.RunnerError, "do not fill"):
+            RUNNER.validate_resident_prepare_footprint(
+                event, bad, RUNTIME_CONTRACT, "bad-cell-alignment")
+        bad = dict(actual, live_kv_blocks=1)
+        with self.assertRaisesRegex(RUNNER.RunnerError, "do not fill"):
+            RUNNER.validate_resident_prepare_footprint(
+                event, bad, RUNTIME_CONTRACT, "bad-block-count")
+
+    def test_target_freeze_uses_max_blocks_in_single_action_cap(self) -> None:
+        preflight = {
+            "normalized_R_AB": {"max": 16384, "allowed_spread": 0},
+            "normalized_R_ABC": {"min": 32768, "max": 32768, "allowed_spread": 0},
+            "Relief_A": {"resident_bytes_lower_bound": 65536, "resident_blocks_lower_bound": 32},
+            "Relief_B": {"resident_bytes_lower_bound": 65536, "resident_blocks_lower_bound": 32},
+            "native_block_bytes": 2048,
+        }
+        limited = dict(RUNTIME_CONTRACT, action_target_bytes=65536, max_blocks=2)
+        record = PARSER.freeze_resident_preflight_target(preflight, limited)
+        self.assertEqual(record["inputs"]["max_blocks_cap"], 4096)
+        self.assertEqual(record["inputs"]["single_action_relief_cap"], 4096)
+        self.assertEqual(record["frozen_T"], record["safe_interval"]["upper"])
+        uncapped = PARSER.freeze_resident_preflight_target(
+            preflight, dict(limited, max_blocks=64))
+        self.assertGreater(
+            uncapped["inputs"]["single_action_relief_cap"],
+            record["inputs"]["single_action_relief_cap"],
+        )
 
 
 if __name__ == "__main__":
