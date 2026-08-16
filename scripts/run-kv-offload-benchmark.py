@@ -405,7 +405,10 @@ def validate_mapping(value: Any, expected: set[str], label: str,
 
 
 def normalize_request(value: Any, label: str) -> dict[str, Any]:
-    item = validate_mapping(value, {"request_id", "prompt", "n_predict", "stream"}, label)
+    item = validate_mapping(
+        value, {"request_id", "prompt", "n_predict", "stream"}, label,
+        optional={"temperature", "seed"},
+    )
     request_id = item["request_id"]
     if not isinstance(request_id, str) or not CASE_ID_RE.fullmatch(request_id):
         raise RunnerError(f"{label}.request_id is invalid")
@@ -415,6 +418,15 @@ def normalize_request(value: Any, label: str) -> dict[str, Any]:
         raise RunnerError(f"{label}.n_predict must be a non-negative integer")
     if not isinstance(item["stream"], bool):
         raise RunnerError(f"{label}.stream must be boolean")
+    if "temperature" in item and (
+        isinstance(item["temperature"], bool) or not isinstance(item["temperature"], (int, float))
+        or not math.isfinite(float(item["temperature"])) or float(item["temperature"]) < 0
+    ):
+        raise RunnerError(f"{label}.temperature must be a finite non-negative number")
+    if "seed" in item and (
+        isinstance(item["seed"], bool) or not isinstance(item["seed"], int)
+    ):
+        raise RunnerError(f"{label}.seed must be an integer")
     return dict(item)
 
 
@@ -551,6 +563,22 @@ def load_replay_plan(replay: dict[str, Any]) -> Any:
     return plan
 
 
+FINAL_F16_PROFILE = "final_f16"
+FINAL_F16_ISOLATION = {
+    "LLAMA_MEMORY_GOVERNOR_AUTO_BACKENDS": "0",
+    "LLAMA_MEMORY_GOVERNOR_CLEAN_RECLAIM": "0",
+    "LLAMA_MEMORY_GOVERNOR_KV_RELEASE": "0",
+    "LLAMA_MEMORY_GOVERNOR_KV_OFFLOAD": "0",
+    "LLAMA_MEMORY_GOVERNOR_KV_SOFT_BUDGET": "0",
+    "LLAMA_MEMORY_GOVERNOR_PREFETCH_BUDGET_AUTO": "0",
+    "LLAMA_MEMORY_GOVERNOR_GLOBAL_OPTIMIZER": "0",
+    "LLAMA_MEMORY_GOVERNOR_REALLOCATION": "0",
+    "LLAMA_MEMORY_GOVERNOR_DENSE_REPIN": "0",
+    "LLAMA_MEMORY_GOVERNOR_DENSE_RING_SHRINK": "0",
+    "LLAMA_MEMORY_GOVERNOR_MOE_BUDGET_DYNAMIC": "0",
+    "LLAMA_MEMORY_GOVERNOR_ASYNC_ACTIONS": "0",
+}
+
 Q2Q3_RUNTIME_CONTRACT_KEYS = {
     "ctx_size", "executor", "kv_unified", "parallel", "cache_type_k", "cache_type_v",
     "no_cache_idle_slots", "no_context_shift", "paged_block_size",
@@ -558,10 +586,13 @@ Q2Q3_RUNTIME_CONTRACT_KEYS = {
 }
 
 
-def normalize_runtime_contract(value: Any, label: str = "runtime_contract") -> dict[str, Any] | None:
+def normalize_runtime_contract(
+        value: Any, label: str = "runtime_contract", profile: str | None = None) -> dict[str, Any] | None:
     if value is None:
         return None
-    contract = validate_mapping(value, Q2Q3_RUNTIME_CONTRACT_KEYS, label)
+    final = profile == FINAL_F16_PROFILE
+    expected = Q2Q3_RUNTIME_CONTRACT_KEYS | ({"restore_path", "prefault"} if final else set())
+    contract = validate_mapping(value, expected, label)
     ctx_size = contract["ctx_size"]
     if isinstance(ctx_size, bool) or not isinstance(ctx_size, int) or ctx_size <= 0:
         raise RunnerError(f"{label}.ctx_size must be positive")
@@ -571,13 +602,17 @@ def normalize_runtime_contract(value: Any, label: str = "runtime_contract") -> d
     for key in ("kv_unified", "no_cache_idle_slots", "no_context_shift"):
         if contract[key] is not True:
             raise RunnerError(f"{label}.{key} must be true")
-    if contract["parallel"] != 3:
-        raise RunnerError(f"{label}.parallel must be 3")
+    expected_parallel = 1 if final else 3
+    if contract["parallel"] != expected_parallel:
+        raise RunnerError(f"{label}.parallel must be {expected_parallel}")
     for key in ("cache_type_k", "cache_type_v"):
         if contract[key] != "f16":
             raise RunnerError(f"{label}.{key} must be f16")
     if contract["paged_block_size"] != 16:
         raise RunnerError(f"{label}.paged_block_size must be 16")
+    if final:
+        if contract["restore_path"] != "k2_pipeline" or contract["prefault"] != "r2":
+            raise RunnerError(f"{label} must bind restore_path=k2_pipeline and prefault=r2")
     for key in ("action_target_bytes", "max_blocks"):
         if isinstance(contract[key], bool) or not isinstance(contract[key], int) or contract[key] <= 0:
             raise RunnerError(f"{label}.{key} must be positive")
@@ -864,7 +899,8 @@ def bind_target_freeze_cases(
         case["action_target_bytes"] = action_target
 
 def normalize_cases(
-        value: Any, target_freeze_record: dict[str, Any] | None = None) -> dict[str, dict[str, Any]]:
+        value: Any, target_freeze_record: dict[str, Any] | None = None,
+        profile: str | None = None) -> dict[str, dict[str, Any]]:
     if not isinstance(value, list) or not value:
         raise RunnerError("cases must be a non-empty array")
     cases: dict[str, dict[str, Any]] = {}
@@ -875,13 +911,16 @@ def normalize_cases(
                 "case_id", "policy", "kv_representation", "loading_mode", "restore", "prefault",
                 "kv_target_bytes", "action_target_bytes",
             },
-            f"cases[{index}]",
+            f"cases[{index}]", optional={"role"},
         )
         case_id = item["case_id"]
         if not isinstance(case_id, str) or not CASE_ID_RE.fullmatch(case_id):
             raise RunnerError(f"cases[{index}].case_id is invalid")
         if case_id in cases:
             raise RunnerError(f"duplicate case_id: {case_id}")
+        role = item.get("role")
+        if role is not None and role not in {"resident_baseline", "release_target", "release_floor_probe", "offload_target"}:
+            raise RunnerError(f"{case_id}.role is invalid")
         for factor in ("policy", "kv_representation", "loading_mode", "restore", "prefault"):
             if not isinstance(item[factor], str):
                 raise RunnerError(f"{case_id}.{factor} must be a string")
@@ -889,27 +928,39 @@ def normalize_cases(
         action_target = item["action_target_bytes"]
         if target is not None and (isinstance(target, bool) or not isinstance(target, int) or target <= 0):
             raise RunnerError(f"{case_id}.kv_target_bytes must be null or positive")
-        if action_target is not None and (
-                isinstance(action_target, bool) or not isinstance(action_target, int) or action_target <= 0):
+        if action_target is not None and (isinstance(action_target, bool) or not isinstance(action_target, int) or action_target <= 0):
             raise RunnerError(f"{case_id}.action_target_bytes must be null or positive")
         if item["policy"] == "resident":
             if target is not None or action_target is not None:
                 raise RunnerError(f"{case_id}: resident policy cannot have resident/action targets")
+            if profile == FINAL_F16_PROFILE and role != "resident_baseline":
+                raise RunnerError(f"{case_id}: final_f16 Resident case must have role resident_baseline")
         elif item["policy"] in BUDGET_POLICIES and (target is None or action_target is None) and target_freeze_record is None:
-            raise RunnerError(
-                f"{case_id}: {item['policy']} policy requires explicit kv_target_bytes and action_target_bytes")
-        cases[case_id] = dict(item)
-    action_targets = {
-        case["action_target_bytes"] for case in cases.values()
-        if case["policy"] in BUDGET_POLICIES
-    }
+            raise RunnerError(f"{case_id}: {item['policy']} policy requires explicit kv_target_bytes and action_target_bytes")
+        if profile == FINAL_F16_PROFILE:
+            expected_roles = {"release_target", "release_floor_probe"} if item["policy"] == "release_only" else {"offload_target"} if item["policy"] == "v2" else {"resident_baseline"}
+            if role not in expected_roles:
+                raise RunnerError(f"{case_id}: final_f16 role must be one of {sorted(expected_roles)}")
+            if item["policy"] in SWAP_POLICIES and (item["restore"] != "k2_pipeline" or item["prefault"] != "r2"):
+                raise RunnerError(f"{case_id}: final_f16 swap cases require k2_pipeline/r2")
+        normalized = dict(item)
+        if profile != FINAL_F16_PROFILE:
+            normalized.pop("role", None)
+        cases[case_id] = normalized
+    action_targets = {case["action_target_bytes"] for case in cases.values() if case["policy"] in BUDGET_POLICIES}
     if len(action_targets) > 1:
-        raise RunnerError(
-            "all budget cases must use the same explicit action_target_bytes")
+        raise RunnerError("all budget cases must use the same explicit action_target_bytes")
+    if profile == FINAL_F16_PROFILE:
+        release_cases = [case for case in cases.values() if case["policy"] == "release_only"]
+        floor_cases = [case for case in release_cases if case.get("role") == "release_floor_probe"]
+        if len(floor_cases) != 1:
+            raise RunnerError("final_f16 requires exactly one release_floor_probe case")
+        if len(release_cases) < 2:
+            raise RunnerError("final_f16 requires at least one ordinary release_target and one floor probe")
     return cases
 
 
-def normalize_plan(value: Any, cases: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+def normalize_plan(value: Any, cases: dict[str, dict[str, Any]], profile: str | None = None) -> list[dict[str, Any]]:
     if not isinstance(value, list) or not value:
         raise RunnerError("run_order must be a non-empty array")
     plan: list[dict[str, Any]] = []
@@ -917,8 +968,7 @@ def normalize_plan(value: Any, cases: dict[str, dict[str, Any]]) -> list[dict[st
     run_ids: set[str] = set()
     for index, raw in enumerate(value):
         item = validate_mapping(raw, {"round", "run_order", "case_id"}, f"run_order[{index}]")
-        round_id, order = item["round"], item["run_order"]
-        case_id = item["case_id"]
+        round_id, order, case_id = item["round"], item["run_order"], item["case_id"]
         if isinstance(round_id, bool) or not isinstance(round_id, int) or round_id <= 0 or isinstance(order, bool) or not isinstance(order, int) or order <= 0:
             raise RunnerError(f"run_order[{index}] round/run_order must be positive integers")
         if case_id not in cases:
@@ -932,24 +982,20 @@ def normalize_plan(value: Any, cases: dict[str, dict[str, Any]]) -> list[dict[st
             raise RunnerError(f"run_id collision: {run_id}")
         run_ids.add(run_id)
         case = cases[case_id]
-        plan.append({
-            "run_id": run_id,
-            "round": round_id,
-            "run_order": order,
-            "case_id": case_id,
-            "policy": case["policy"],
-            "kv_representation": case["kv_representation"],
-            "loading_mode": case["loading_mode"],
-            "restore": case["restore"],
-            "prefault": case["prefault"],
-            "kv_target_bytes": case["kv_target_bytes"],
-            "action_target_bytes": case["action_target_bytes"],
-        })
+        planned = {
+            "run_id": run_id, "round": round_id, "run_order": order, "case_id": case_id,
+            "policy": case["policy"], "kv_representation": case["kv_representation"],
+            "loading_mode": case["loading_mode"], "restore": case["restore"], "prefault": case["prefault"],
+            "kv_target_bytes": case["kv_target_bytes"], "action_target_bytes": case["action_target_bytes"],
+        }
+        if profile == FINAL_F16_PROFILE:
+            planned["role"] = case["role"]
+        plan.append(planned)
     return plan
 
 
-def budget_case_signature(item: dict[str, Any]) -> tuple[str, int | None]:
-    return item["policy"], item["kv_target_bytes"]
+def budget_case_signature(item: dict[str, Any]) -> tuple[str, str | None, int | None]:
+    return item["policy"], item.get("role"), item["kv_target_bytes"]
 
 
 def normalize_budget_sweep(
@@ -958,63 +1004,81 @@ def normalize_budget_sweep(
         plan: list[dict[str, Any]],
         max_blocks: int,
         run_kind: str,
+        profile: str | None = None,
 ) -> dict[str, Any] | None:
     if value is None:
         return None
     sweep = validate_mapping(
         value,
-        {
-            "release_targets_bytes", "offload_targets_bytes", "action_target_bytes",
-            "max_blocks", "rounds", "order_mode",
-        },
+        {"release_targets_bytes", "offload_targets_bytes", "action_target_bytes", "max_blocks", "rounds", "order_mode"},
         "budget_sweep",
     )
 
     def target_list(raw: Any, label: str) -> tuple[int, ...]:
-        if not isinstance(raw, list) or any(
-                isinstance(item, bool) or not isinstance(item, int) or item <= 0
-                for item in raw):
+        if not isinstance(raw, list) or any(isinstance(item, bool) or not isinstance(item, int) or item <= 0 for item in raw):
             raise RunnerError(f"{label} must be a list of positive absolute byte values")
         if len(raw) != len(set(raw)) or raw != sorted(raw, reverse=True):
             raise RunnerError(f"{label} must be unique and in descending explicit-byte order")
         return tuple(raw)
 
-    release_targets = target_list(
-        sweep["release_targets_bytes"], "budget_sweep.release_targets_bytes")
-    offload_targets = target_list(
-        sweep["offload_targets_bytes"], "budget_sweep.offload_targets_bytes")
-    if release_targets != CANONICAL_BUDGET_RELEASE_TARGETS:
-        raise RunnerError(
-            "budget_sweep.release_targets_bytes must use the canonical 2.50/2.00/1.50 GiB bytes")
-    if offload_targets != CANONICAL_BUDGET_OFFLOAD_TARGETS:
-        raise RunnerError(
-            "budget_sweep.offload_targets_bytes must use the canonical 1.00/0.75/0.50/0.25 GiB bytes")
+    release_targets = target_list(sweep["release_targets_bytes"], "budget_sweep.release_targets_bytes")
+    offload_targets = target_list(sweep["offload_targets_bytes"], "budget_sweep.offload_targets_bytes")
     action_target = sweep["action_target_bytes"]
     if isinstance(action_target, bool) or not isinstance(action_target, int) or action_target <= 0:
         raise RunnerError("budget_sweep.action_target_bytes must be a positive absolute byte value")
-    if action_target != CANONICAL_BUDGET_ACTION_TARGET_BYTES:
-        raise RunnerError("budget_sweep.action_target_bytes must be exactly 256 MiB")
-    if any(
-            item["policy"] in BUDGET_POLICIES
-            and item["action_target_bytes"] != action_target
-            for item in cases.values()):
-        raise RunnerError("budget_sweep.action_target_bytes differs from a budget case")
     sweep_max_blocks = sweep["max_blocks"]
     if isinstance(sweep_max_blocks, bool) or not isinstance(sweep_max_blocks, int) or sweep_max_blocks <= 0:
         raise RunnerError("budget_sweep.max_blocks must be a positive integer")
-    if sweep_max_blocks != CANONICAL_BUDGET_MAX_BLOCKS or max_blocks != sweep_max_blocks:
-        raise RunnerError("budget_sweep and spec.max_blocks must both be exactly 64")
+    if run_kind == "formal" and sweep["rounds"] != 2:
+        raise RunnerError("formal budget_sweep requires exactly two independent rounds")
     rounds = sweep["rounds"]
     if isinstance(rounds, bool) or not isinstance(rounds, int) or rounds <= 0:
         raise RunnerError("budget_sweep.rounds must be a positive integer")
-    if run_kind == "formal" and rounds != 2:
-        raise RunnerError("formal budget_sweep requires exactly two independent rounds")
     if sweep["order_mode"] != BUDGET_SWEEP_ORDER_MODE:
         raise RunnerError("budget_sweep.order_mode must be interleaved_reverse")
+    if any(item["policy"] in BUDGET_POLICIES and item["action_target_bytes"] != action_target for item in cases.values()):
+        raise RunnerError("budget_sweep.action_target_bytes differs from a budget case")
 
-    expected_signatures = [("resident", None)]
-    expected_signatures.extend(("release_only", target) for target in release_targets)
-    expected_signatures.extend(("v2", target) for target in offload_targets)
+    if profile == FINAL_F16_PROFILE:
+        if max_blocks != sweep_max_blocks:
+            raise RunnerError("final_f16 budget_sweep.max_blocks must match spec.max_blocks")
+        release_cases = [
+            case for case in cases.values()
+            if case["policy"] == "release_only" and case.get("role") == "release_target"
+        ]
+        floor_cases = [
+            case for case in cases.values()
+            if case["policy"] == "release_only" and case.get("role") == "release_floor_probe"
+        ]
+        offload_cases = [case for case in cases.values() if case["policy"] == "v2"]
+        release_targets_expected = tuple(case["kv_target_bytes"] for case in release_cases)
+        offload_targets_expected = tuple(case["kv_target_bytes"] for case in offload_cases)
+        if release_targets != tuple(sorted(release_targets_expected, reverse=True)):
+            raise RunnerError("final_f16 release targets must exactly match ordinary RELEASE cases")
+        if offload_targets != tuple(sorted(offload_targets_expected, reverse=True)):
+            raise RunnerError("final_f16 offload targets must exactly match explicit V2 cases")
+        if len(floor_cases) != 1:
+            raise RunnerError("final_f16 requires exactly one RELEASE floor probe")
+        floor_targets = {case["kv_target_bytes"] for case in floor_cases}
+        if len(floor_targets) != 1 or max(floor_targets) >= min(
+            case["kv_target_bytes"] for case in release_cases if case.get("role") == "release_target"):
+            raise RunnerError("final_f16 floor probe target must be below ordinary RELEASE targets")
+        expected_signatures = [
+            (case["policy"], case.get("role"), case["kv_target_bytes"])
+            for case in cases.values()
+        ]
+    else:
+        if release_targets != CANONICAL_BUDGET_RELEASE_TARGETS:
+            raise RunnerError("budget_sweep.release_targets_bytes must use the canonical 2.50/2.00/1.50 GiB bytes")
+        if offload_targets != CANONICAL_BUDGET_OFFLOAD_TARGETS:
+            raise RunnerError("budget_sweep.offload_targets_bytes must use the canonical 1.00/0.75/0.50/0.25 GiB bytes")
+        if action_target != CANONICAL_BUDGET_ACTION_TARGET_BYTES:
+            raise RunnerError("budget_sweep.action_target_bytes must be exactly 256 MiB")
+        if sweep_max_blocks != CANONICAL_BUDGET_MAX_BLOCKS or max_blocks != sweep_max_blocks:
+            raise RunnerError("budget_sweep and spec.max_blocks must both be exactly 64")
+        expected_signatures = [("resident", None, None)]
+        expected_signatures.extend(("release_only", None, target) for target in release_targets)
+        expected_signatures.extend(("v2", None, target) for target in offload_targets)
     expected_set = set(expected_signatures)
     planned_rounds: dict[int, list[dict[str, Any]]] = {}
     for item in plan:
@@ -1026,22 +1090,17 @@ def normalize_budget_sweep(
             raise RunnerError(f"budget_sweep round {round_id} run_order must be consecutive")
         signatures = [budget_case_signature(item) for item in entries]
         if len(entries) != len(expected_signatures) or set(signatures) != expected_set:
-            raise RunnerError(
-                f"budget_sweep round {round_id} must contain one Resident, all RELEASE targets, and all V2 targets")
+            raise RunnerError(f"budget_sweep round {round_id} does not contain the declared case matrix")
         if len(signatures) != len(set(signatures)):
             raise RunnerError(f"budget_sweep round {round_id} contains duplicate target cases")
         budget_signatures = [signature for signature in signatures if signature[0] != "resident"]
-        if any(
-                budget_signatures[index][0] == budget_signatures[index + 1][0]
-                for index in range(len(budget_signatures) - 1)):
-            raise RunnerError(
-                f"budget_sweep round {round_id} must interleave RELEASE and V2 cases")
+        if any(budget_signatures[index][0] == budget_signatures[index + 1][0] for index in range(len(budget_signatures) - 1)):
+            raise RunnerError(f"budget_sweep round {round_id} must interleave RELEASE and V2 cases")
     if rounds == 2:
         first = [budget_case_signature(item) for item in planned_rounds[1]]
         second = [budget_case_signature(item) for item in planned_rounds[2]]
         if second != list(reversed(first)):
             raise RunnerError("budget_sweep rounds must use reverse order without randomization")
-
     return {
         "release_targets_bytes": list(release_targets),
         "offload_targets_bytes": list(offload_targets),
@@ -1092,7 +1151,14 @@ def validate_spec(raw: Any) -> tuple[dict[str, Any], dict[str, dict[str, Any]], 
         spec_keys.add("runtime_contract")
     if isinstance(raw, dict) and "target_freeze_record" in raw:
         spec_keys.add("target_freeze_record")
-    spec = validate_mapping(raw, spec_keys, "spec")
+    spec = validate_mapping(raw, spec_keys, "spec", optional={"profile", "global_governor_isolation"})
+    profile = spec.get("profile")
+    if profile not in {None, FINAL_F16_PROFILE}:
+        raise RunnerError("spec.profile is unsupported")
+    if profile == FINAL_F16_PROFILE and (
+        spec["run_mode"] != "characterization" or spec["run_kind"] != "formal"
+    ):
+        raise RunnerError("final_f16 profile requires formal characterization")
     if spec["schema_version"] != SCHEMA_VERSION or spec["protocol"] != PROTOCOL:
         raise RunnerError("spec protocol/schema version is unsupported")
     if spec["phase"] not in {"resident_baseline", "coarse_target", "local_target", "representative"}:
@@ -1116,9 +1182,13 @@ def validate_spec(raw: Any) -> tuple[dict[str, Any], dict[str, dict[str, Any]], 
     ):
         raise RunnerError("spec.environment must map strings to strings")
     reject_canonical_kv_environment(spec["environment"])
-    runtime_contract = normalize_runtime_contract(spec.get("runtime_contract"))
+    runtime_contract = normalize_runtime_contract(spec.get("runtime_contract"), profile=spec.get("profile"))
     if spec["run_mode"] == "resident_preflight" and runtime_contract is None:
         raise RunnerError("resident_preflight requires an explicit runtime_contract")
+    if profile == FINAL_F16_PROFILE and runtime_contract is None:
+        raise RunnerError("final_f16 requires an explicit runtime_contract")
+    if profile == FINAL_F16_PROFILE and spec.get("global_governor_isolation") not in (None, FINAL_F16_ISOLATION):
+        raise RunnerError("final_f16 global_governor_isolation must equal the canonical disabled governor set")
     if runtime_contract is not None and runtime_contract["max_blocks"] != spec["max_blocks"]:
         raise RunnerError("runtime_contract.max_blocks must match spec.max_blocks")
     if spec["run_mode"] != "resident_preflight" and "LLAMA_KV_RESIDENT_PREFLIGHT" in spec["environment"]:
@@ -1135,6 +1205,11 @@ def validate_spec(raw: Any) -> tuple[dict[str, Any], dict[str, dict[str, Any]], 
     health_timeout = require_finite_positive(spec["health_timeout_seconds"], "health_timeout_seconds")
     request_timeout = require_finite_positive(spec["request_timeout_seconds"], "request_timeout_seconds")
     workload = normalize_workload(spec["workload"])
+    if profile == FINAL_F16_PROFILE:
+        for request in workload["warmup"] + workload["requests"]:
+            if "temperature" not in request or "seed" not in request:
+                raise RunnerError(
+                    "final_f16 workload requests require explicit temperature and seed")
     if ("replay" in workload and workload["replay"].get("lifecycle", {}).get("enabled", False)
             and any(item == "--slot-save-path" or item.startswith("--slot-save-path=") for item in spec["server_args"])):
         raise RunnerError("lifecycle replay owns --slot-save-path server option")
@@ -1148,7 +1223,7 @@ def validate_spec(raw: Any) -> tuple[dict[str, Any], dict[str, dict[str, Any]], 
             spec["target_freeze_record"], runtime_contract, workload, spec)
     elif spec["phase"] == "representative" and runtime_contract is not None and spec["run_mode"] != "resident_preflight":
         raise RunnerError("representative Q3 requires target_freeze_record")
-    cases = normalize_cases(spec["cases"], target_freeze_record)
+    cases = normalize_cases(spec["cases"], target_freeze_record, profile)
     bind_target_freeze_cases(cases, target_freeze_record, runtime_contract)
     if runtime_contract is not None:
         if spec["run_mode"] == "resident_preflight":
@@ -1160,7 +1235,7 @@ def validate_spec(raw: Any) -> tuple[dict[str, Any], dict[str, dict[str, Any]], 
                 raise RunnerError("resident_preflight runtime identity requires explicit ctx-size")
             if pathlib.Path(spec["binary"]).name != runtime_contract["executor"]:
                 raise RunnerError("resident_preflight runtime identity executor does not match binary")
-    plan = normalize_plan(spec["run_order"], cases)
+    plan = normalize_plan(spec["run_order"], cases, profile)
     validate_cross_policy_single_switch(cases, plan)
     if spec["phase"] == "representative":
         q3_policies = {item["policy"] for item in plan}
@@ -1170,7 +1245,9 @@ def validate_spec(raw: Any) -> tuple[dict[str, Any], dict[str, dict[str, Any]], 
             raise RunnerError(
                 "representative Q3 run must contain exactly one each of v2, idle_age, and v3")
     budget_sweep = normalize_budget_sweep(
-        spec.get("budget_sweep"), cases, plan, max_blocks, spec["run_kind"])
+        spec.get("budget_sweep"), cases, plan, max_blocks, spec["run_kind"], profile)
+    if profile == FINAL_F16_PROFILE and budget_sweep is None:
+        raise RunnerError("final_f16 requires an explicit budget_sweep")
     if (
         budget_sweep is not None
         and spec["run_kind"] == "formal"
@@ -1207,6 +1284,9 @@ def validate_spec(raw: Any) -> tuple[dict[str, Any], dict[str, dict[str, Any]], 
         if spec["run_mode"] == "qualification" and workload["repeat"] < 2:
             raise RunnerError("formal qualification run requires repeat >= 2")
     normalized = dict(spec)
+    if profile == FINAL_F16_PROFILE:
+        normalized["profile"] = FINAL_F16_PROFILE
+        normalized["global_governor_isolation"] = dict(FINAL_F16_ISOLATION)
     normalized["pressure_basis"] = pressure_basis
     normalized["runtime_contract"] = runtime_contract
     normalized["workload"] = workload
@@ -1237,6 +1317,8 @@ def expanded_request_plan(
             "measurement_phase": measurement_phase,
             "n_predict": item["n_predict"],
             "prompt_sha256": sha256_bytes(item["prompt"].encode("utf-8")),
+            "temperature": item.get("temperature"),
+            "seed": item.get("seed"),
             "stream": item["stream"],
         })
         sequence += 1
@@ -1322,6 +1404,8 @@ def runtime_environment(
             "LLAMA_KV_CRITICAL_RSS_KB": str(pressure_basis["critical_kb"]),
         })
     env.update(spec["environment"])
+    if spec.get("profile") == FINAL_F16_PROFILE:
+        env.update(FINAL_F16_ISOLATION)
     if resident_preflight:
         env.update({
             "LLAMA_MEMORY_GOVERNOR": "0",
@@ -1383,8 +1467,9 @@ def server_argv(spec: dict[str, Any], port: int) -> list[str]:
             raise RunnerError("resident/Q3 replay identity requires --parallel 3")
         args.extend(["--parallel", str(replay["n_parallel"]), "--no-cache-idle-slots", "--no-context-shift"])
     if contract is not None:
-        if _argv_option_value(args, "--parallel") != "3":
-            raise RunnerError("runtime identity requires --parallel 3")
+        expected_parallel = "1" if spec.get("profile") == FINAL_F16_PROFILE else "3"
+        if _argv_option_value(args, "--parallel") != expected_parallel:
+            raise RunnerError(f"runtime identity requires --parallel {expected_parallel}")
         if _argv_option_value(args, "--cache-type-k") != "f16" or _argv_option_value(args, "--cache-type-v") != "f16":
             raise RunnerError("runtime identity requires F16 K/V cache")
         if "--kv-unified" not in args or "--no-cache-idle-slots" not in args or "--no-context-shift" not in args:
@@ -1474,6 +1559,18 @@ def captured_resident_bytes(
     return values[0]
 
 
+def normalized_completion_sha256(value: Any) -> str | None:
+    content: Any = value
+    if isinstance(value, dict):
+        for key in ("content", "text", "completion", "generated_text"):
+            if key in value:
+                content = value[key]
+                break
+    if content is None or isinstance(content, (bool, int, float)):
+        return None
+    encoded = json.dumps(content, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return sha256_bytes(encoded)
+
 def request_completion(
         port: int,
         plan_item: dict[str, Any],
@@ -1484,6 +1581,8 @@ def request_completion(
         "prompt": request["prompt"],
         "n_predict": request["n_predict"],
         "cache_prompt": True,
+        **({"temperature": request["temperature"]} if "temperature" in request else {}),
+        **({"seed": request["seed"]} if "seed" in request else {}),
         "id_slot": 0,
         "stream": request["stream"],
     }
@@ -1527,6 +1626,9 @@ def request_completion(
         "measurement": plan_item["measurement"],
         "measurement_phase": plan_item["measurement_phase"],
         "n_predict": plan_item["n_predict"],
+        "prompt_sha256": sha256_bytes(request["prompt"].encode("utf-8")),
+        "temperature": request.get("temperature"),
+        "seed": request.get("seed"),
         "stream": plan_item["stream"],
         "started_mono_ns": started_mono,
         "started_realtime_ns": started_realtime,
@@ -1537,6 +1639,7 @@ def request_completion(
         "body_path": str(body_path.relative_to(raw_dir.parent)),
         "body_bytes": len(response_body),
         "body_sha256": sha256_bytes(response_body),
+        "completion_sha256": normalized_completion_sha256(parsed),
         "response_json": parsed,
         "error": error,
     }
@@ -4335,6 +4438,7 @@ def run_one(
         "round": run["round"],
         "run_order": run["run_order"],
         "execution_index": execution_index,
+        **({"role": run["role"]} if spec.get("profile") == FINAL_F16_PROFILE else {}),
         "directory": str(run_dir.relative_to(artifact)),
         "status": "complete" if complete else "incomplete",
         "error": lifecycle_error,
@@ -4375,6 +4479,11 @@ def base_manifest(
         "planned_runs": plan,
         "run_results": [],
         "unsupported": None,
+        **({
+            "profile": spec["profile"],
+            "runtime_contract": dict(spec["runtime_contract"]),
+            "global_governor_isolation": dict(spec["global_governor_isolation"]),
+        } if spec.get("profile") == FINAL_F16_PROFILE else {}),
     }
 
 

@@ -577,6 +577,247 @@ class CanonicalBenchmarkTest(unittest.TestCase):
         value["cases"][0]["restore"] = restore
         return value
 
+    def final_f16_spec(self) -> dict[str, object]:
+        value = self.characterization_spec(policy="resident")
+        value["run_kind"] = "formal"
+        value["server_args"] = [
+            "--parallel", "1", "--cache-type-k", "f16", "--cache-type-v", "f16",
+            "--kv-unified", "--no-cache-idle-slots", "--no-context-shift", "--ctx-size", "4096",
+        ]
+        value["environment"] = {"KV_SYNTHETIC_MODE": "complete"}
+        value["profile"] = "final_f16"
+        value["runtime_contract"] = {
+            "ctx_size": 4096,
+            "executor": self.fake_server.name,
+            "parallel": 1,
+            "cache_type_k": "f16",
+            "cache_type_v": "f16",
+            "kv_unified": True,
+            "no_cache_idle_slots": True,
+            "no_context_shift": True,
+            "paged_block_size": 16,
+            "action_target_bytes": 8192,
+            "max_blocks": 64,
+            "restore_path": "k2_pipeline",
+            "prefault": "r2",
+        }
+        value["workload"]["repeat"] = 2
+        for request in value["workload"]["warmup"] + value["workload"]["requests"]:
+            request["temperature"] = 0.0
+            request["seed"] = 17
+        value["cases"] = [
+            {
+                "case_id": "resident",
+                "role": "resident_baseline",
+                "policy": "resident",
+                "kv_representation": "paged",
+                "loading_mode": "exact",
+                "restore": "k2_pipeline",
+                "prefault": "r2",
+                "kv_target_bytes": None,
+                "action_target_bytes": None,
+            },
+            {
+                "case_id": "release_hi",
+                "role": "release_target",
+                "policy": "release_only",
+                "kv_representation": "paged",
+                "loading_mode": "exact",
+                "restore": "k2_pipeline",
+                "prefault": "r2",
+                "kv_target_bytes": 9000,
+                "action_target_bytes": 8192,
+            },
+            {
+                "case_id": "floor",
+                "role": "release_floor_probe",
+                "policy": "release_only",
+                "kv_representation": "paged",
+                "loading_mode": "exact",
+                "restore": "k2_pipeline",
+                "prefault": "r2",
+                "kv_target_bytes": 1000,
+                "action_target_bytes": 8192,
+            },
+            {
+                "case_id": "offload",
+                "role": "offload_target",
+                "policy": "v2",
+                "kv_representation": "paged",
+                "loading_mode": "exact",
+                "restore": "k2_pipeline",
+                "prefault": "r2",
+                "kv_target_bytes": 7000,
+                "action_target_bytes": 8192,
+            },
+        ]
+        value["run_order"] = [
+            {"round": 1, "run_order": 1, "case_id": "resident"},
+            {"round": 1, "run_order": 2, "case_id": "release_hi"},
+            {"round": 1, "run_order": 3, "case_id": "offload"},
+            {"round": 1, "run_order": 4, "case_id": "floor"},
+            {"round": 2, "run_order": 1, "case_id": "floor"},
+            {"round": 2, "run_order": 2, "case_id": "offload"},
+            {"round": 2, "run_order": 3, "case_id": "release_hi"},
+            {"round": 2, "run_order": 4, "case_id": "resident"},
+        ]
+        value["budget_sweep"] = {
+            "release_targets_bytes": [9000],
+            "offload_targets_bytes": [7000],
+            "action_target_bytes": 8192,
+            "max_blocks": 64,
+            "rounds": 2,
+            "order_mode": "interleaved_reverse",
+        }
+        return value
+
+    def test_final_f16_accepts_explicit_arbitrary_matrix(self) -> None:
+        runner = load_runner_module()
+        value = self.final_f16_spec()
+        normalized, cases, plan, _ = runner.validate_spec(value)
+        self.assertEqual(normalized["profile"], "final_f16")
+        self.assertEqual(normalized["runtime_contract"]["parallel"], 1)
+        self.assertEqual(cases["floor"]["role"], "release_floor_probe")
+        self.assertEqual(sum(item["role"] == "release_floor_probe" for item in plan), 2)
+
+    def test_final_f16_rejects_missing_runtime_identity(self) -> None:
+        runner = load_runner_module()
+        value = self.final_f16_spec()
+        value["runtime_contract"] = dict(value["runtime_contract"])
+        del value["runtime_contract"]["kv_unified"]
+        with self.assertRaises(runner.RunnerError):
+            runner.validate_spec(value)
+
+    def test_final_f16_rejects_missing_deterministic_request_identity(self) -> None:
+        runner = load_runner_module()
+        parser = load_parser_module()
+        value = self.final_f16_spec()
+        del value["workload"]["requests"][0]["seed"]
+        with self.assertRaisesRegex(runner.RunnerError, "temperature and seed"):
+            runner.validate_spec(value)
+        value["global_governor_isolation"] = dict(parser.FINAL_F16_ISOLATION)
+        with self.assertRaisesRegex(parser.ParseError, "temperature and seed"):
+            parser.validate_spec(value)
+
+    def test_final_f16_rejects_floor_target_in_release_curve(self) -> None:
+        runner = load_runner_module()
+        value = self.final_f16_spec()
+        value["budget_sweep"] = dict(value["budget_sweep"])
+        value["budget_sweep"]["release_targets_bytes"] = [9000, 1000]
+        with self.assertRaises(runner.RunnerError):
+            runner.validate_spec(value)
+
+    def test_final_f16_runtime_identity_uses_parallel_one(self) -> None:
+        runner = load_runner_module()
+        value = self.final_f16_spec()
+        normalized, _, _, _ = runner.validate_spec(value)
+        argv = runner.server_argv(normalized, 12345)
+        self.assertEqual(argv[argv.index("--parallel") + 1], "1")
+
+
+    def _final_f16_completion_runs(self) -> list[dict[str, object]]:
+        def response(completion: str, prompt_sha256: str = "a" * 64) -> dict[str, object]:
+            return {
+                "request_id": "session-1",
+                "repeat_index": 0,
+                "n_predict": 8,
+                "stream": False,
+                "measurement": True,
+                "prompt_sha256": prompt_sha256,
+                "temperature": 0.0,
+                "seed": 17,
+                "completion_sha256": completion,
+                "http_status": 200,
+                "error": None,
+            }
+
+        completion = "b" * 64
+        roles = ["resident_baseline", "release_target", "release_floor_probe", "offload_target"]
+        return [
+            {
+                "run_id": role,
+                "round": 1,
+                "role": role,
+                "responses": [response(completion)],
+            }
+            for role in roles
+        ]
+
+    def test_final_f16_completion_exact_uses_resident_oracle(self) -> None:
+        parser = load_parser_module()
+        result = parser.validate_final_f16_completion_exact(self._final_f16_completion_runs())
+        self.assertTrue(result["completion_exact"])
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(len(result["comparisons"]), 3)
+
+    def test_final_f16_completion_exact_rejects_completion_drift(self) -> None:
+        parser = load_parser_module()
+        runs = self._final_f16_completion_runs()
+        runs[1]["responses"][0]["completion_sha256"] = "c" * 64
+        with self.assertRaisesRegex(parser.ParseError, "completion drift"):
+            parser.validate_final_f16_completion_exact(runs)
+
+    def test_final_f16_completion_exact_rejects_workload_identity_drift(self) -> None:
+        parser = load_parser_module()
+        runs = self._final_f16_completion_runs()
+        runs[2]["responses"][0]["prompt_sha256"] = "d" * 64
+        with self.assertRaisesRegex(parser.ParseError, "workload identity drift.*prompt_sha256"):
+            parser.validate_final_f16_completion_exact(runs)
+
+    def test_final_f16_completion_exact_rejects_missing_workload_identity(self) -> None:
+        parser = load_parser_module()
+        runs = self._final_f16_completion_runs()
+        del runs[3]["responses"][0]["seed"]
+        with self.assertRaisesRegex(parser.ParseError, "missing field seed"):
+            parser.validate_final_f16_completion_exact(runs)
+
+    def test_response_json_must_match_hash_verified_body(self) -> None:
+        artifact = self.run_characterization_artifact(
+            policy="resident", mode="characterization_resident", restore="k1_sync")
+        run_dir = next(artifact.glob("runs/*"))
+        responses_path = run_dir / "responses.jsonl"
+        record = json.loads(responses_path.read_text(encoding="utf-8").splitlines()[0])
+        record["response_json"] = {"tampered": True}
+        responses_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+        parsed = self.run_parser(artifact)
+        self.assertNotEqual(parsed.returncode, 0)
+        result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["verdict"], "INVALID_ARTIFACT")
+        self.assertIn("differs from hash-verified response body", result["errors"][0])
+
+    def test_final_f16_curve_exposes_auxiliary_memory_without_physical_authority(self) -> None:
+        parser = load_parser_module()
+        baseline = {
+            "run_id": "resident", "case_id": "resident", "round": 1,
+            "policy": "resident", "status": "RESIDENT_BASELINE",
+            "resident_after_fill": 12000,
+            "memory": {"vmrss_kb": {"min": 10, "max": 20}},
+        }
+        target = {
+            "run_id": "release", "case_id": "release", "round": 1,
+            "policy": "release_only", "role": "release_target",
+            "status": "RELEASE_SETTLED", "performance_eligible": True,
+            "release_terminal": "release_settled", "requested_target_bytes": 9000,
+            "resident_after_release_settle": 9000,
+            "resident_after_release_settle_authority": "slots_physical",
+            "release_physical_relief_bytes": 3000,
+            "release_physical_relief_authority": "phase_boundary_slots",
+            "offload_physical_relief_bytes": 0,
+            "offload_physical_relief_authority": "not_applicable",
+            "total_physical_relief_bytes": 3000,
+            "total_physical_relief_authority": "sum_of_independent_physical_authorities",
+            "memory_saved_bytes": 3000, "memory_saved_ratio": 0.25,
+            "release": {"actions": 1, "blocks": 1}, "offload": {"actions": 0, "blocks": 0},
+            "io": {}, "resume": {}, "k2": {}, "transient_staging_peak_bytes": 0,
+            "transient_staging_bound_bytes": 0, "performance": {},
+            "memory": {"vmrss_kb": {"min": 11, "max": 21}},
+        }
+        point = parser.curve_point(target, "release_segment", baseline)
+        self.assertEqual(point["actual_settled_resident_bytes"], 9000)
+        self.assertEqual(point["rss_cgroup_auxiliary"]["authority"], "auxiliary_only")
+        self.assertEqual(point["rss_cgroup_auxiliary"]["memory_samples"]["vmrss_kb"]["max"], 21)
+        self.assertNotEqual(point["rss_cgroup_auxiliary"]["authority"], "physical_kv")
+
     def write_spec(self, value: dict[str, object], name: str = "spec.json") -> pathlib.Path:
         path = self.root / name
         path.write_text(json.dumps(value), encoding="utf-8")
@@ -2202,6 +2443,8 @@ class CanonicalBenchmarkTest(unittest.TestCase):
         point = curve["offload_segment"]["points"][0]
         self.assertIn("resume_restored_bytes", point)
         self.assertIn("k2_prefault", point)
+        self.assertIn("rss_cgroup_auxiliary", point)
+        self.assertEqual(point["rss_cgroup_auxiliary"]["authority"], "auxiliary_only")
         self.assertEqual(
             point["total_physical_relief_bytes"],
             point["release_physical_relief_bytes"] + point["offload_physical_relief_bytes"],
