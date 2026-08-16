@@ -1,4 +1,4 @@
-# Stage 12-C: Real ShareGPT-backed KV Trace Replay Results
+# Historical Stage 12-C: ShareGPT-backed Synthetic KV Trace Replay Results
 
 ## 1. 阶段目标
 
@@ -621,7 +621,7 @@ T5 相比 T4：
 
 ## 12. Fast-maintenance 前的结果口径
 
-在加入 fast-maintenance 前，本阶段形成了两个阶段性结果口径。最终推荐配置见第 17 节。
+在加入 fast-maintenance 前，本阶段形成了两个阶段性结果口径。本历史阶段推荐的 fast-maintenance V5 配置见第 17 节。
 
 ### 12.1 Low-overhead 模式
 
@@ -900,7 +900,7 @@ LLAMA_KV_PAGED_IDLE_SWAP_MIN_IDLE_STEPS=16
 | V4 every8 + budget8 + debug off          | True |  10.092739 |        84020.801 |           102442.304 |       8787704 | 533.133 MiB |          52.064% |   -7.194% |         +7.751% |
 | V5 every8 + budget8 + idle16 + debug off | True |  10.548073 |        80393.828 |            98810.429 |       8707064 | 611.883 MiB |          59.754% |   -3.007% |         +3.100% |
 
-V5 是当前最优配置。相比 V4，V5 同时获得了更大的 RSS drop 和更小的 TPS 回退：
+在本历史 workload 中，V5 是阶段内相对 V4 的较优配置。相比 V4，V5 同时获得了更大的 RSS drop 和更小的 TPS 回退：
 
 ```text
 V4:
@@ -946,7 +946,7 @@ max seq resume avg delta:
 
 ### 17.3 Updated final result
 
-更新后的 Stage 12-C 推荐结果为：
+更新后的历史 Stage 12-C 推荐结果为：
 
 ```text
 workload:
@@ -1045,7 +1045,7 @@ paged_swap_rss_drop_sum_kb = 241920
 
 ### 17.6 Final complete metric summary
 
-本阶段最终推荐结果采用 V5 fast-maintenance 配置：
+本历史阶段采用 fast-maintenance V5 配置作为推荐结果：
 
 ```text
 LLAMA_KV_PAGED_IDLE_SWAP_DEBUG_PROBES=0
@@ -1133,7 +1133,7 @@ fast-maintenance V5:
   resume first-token weighted avg delta ≈ +1.24 ms
 ```
 
-因此，fast-maintenance V5 在保留主要 KV cache 物理页回收收益的同时，显著降低了 idle swap 主路径开销，是当前 Stage 12-C 的最终推荐配置。
+因此，在本历史 Stage 12-C workload 中，fast-maintenance V5 在保留主要 KV cache 物理页回收收益的同时，显著降低了 idle swap 主路径开销，是该阶段的推荐配置。它不承担当前 Final F16 或 Global Route A 的 formal benchmark authority。
 
 ## 18. Larger KV-ratio ctx8192 validation
 
@@ -1236,7 +1236,7 @@ ctx8192 结果显示，fast-maintenance V5 在更大 theoretical KV capacity 下
 
 ### 18.5 Updated conclusion with ctx8192 validation
 
-ctx8192 验证进一步强化了 Stage 12-C 结论：
+ctx8192 验证进一步强化了该历史 Stage 12-C 结论，但不替代当前 Final F16 或 Global Route A 的 formal benchmark：
 
 ```text
 fast-maintenance V5 不仅在 ctx4096 下能以约 3% TPS 回退释放约 611.9 MiB RSS；

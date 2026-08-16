@@ -6,7 +6,7 @@
 1. 构建相关 example driver；
 2. 运行最小 smoke；
 3. 生成 ShareGPT-backed trace；
-4. 复现 Stage 12-C final V5 配置；
+4. 复现 historical Stage 12-C fast-maintenance V5 配置；
 5. 复现 ctx4096 / ctx8192 RSS 与性能结果；
 6. 复现 mincore KV resident page 诊断；
 7. 判断 correctness / safety 是否通过。
@@ -380,9 +380,9 @@ COMMON_ARGS_8192=(
 
 ---
 
-## 7. Final V5 配置
+## 7. Historical Stage 12-C V5 配置
 
-最终推荐配置：
+以下是 historical ShareGPT-backed synthetic trace replay 使用的阶段性推荐配置，不是当前 Final F16 formal benchmark 配置：
 
 ```bash
 export LLAMA_KV_LAZY_TAIL=1

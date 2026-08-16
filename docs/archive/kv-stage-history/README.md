@@ -4,7 +4,7 @@
 
 最终提交材料位于：
 
-- `README_KV_OPT.md`
+- `README.md`（当前唯一高层入口）
 - `docs/final_technical_report.md`
 - `docs/reproduce_kv_cache_optimization.md`
 - `docs/kv_trace_replay_stage12c_real_sharegpt_results.md`

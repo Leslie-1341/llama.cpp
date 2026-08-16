@@ -24,7 +24,7 @@
 - 在 `load_all_data()` 的layer tensor分支强制拷贝数据
 - 验证通过：Native和Lazy模式输出一致
 
-**文档**: [LAZY_LOADING_FIX_STATUS.md](LAZY_LOADING_FIX_STATUS.md)
+**文档**: 本阶段状态材料已裁剪；详见本目录保留的实现状态报告。
 
 ### 阶段2：分层内存策略尝试 ⚠️
 
@@ -47,7 +47,7 @@
 3. **测试显示**: RSS仅降低5.56%，未达到目标
 4. **DONTNEED: 0次** - 机制未生效
 
-**文档**: [LAZY_LOADING_TIERED_STRATEGY.md](LAZY_LOADING_TIERED_STRATEGY.md)
+**文档**: 分层策略材料属于已裁剪的中间文档；本报告保留其结论摘要。
 
 ### 阶段3：安全基线回退 ✅
 
@@ -196,13 +196,11 @@ struct llama_model_params {
 
 ### 文档清单
 
-- [LAZY_LOADING_INVESTIGATION.md](LAZY_LOADING_INVESTIGATION.md) - 初始问题调查
-- [LAZY_LOADING_FIX_PLAN.md](LAZY_LOADING_FIX_PLAN.md) - 修复方案设计
-- [LAZY_LOADING_FIX_STATUS.md](LAZY_LOADING_FIX_STATUS.md) - 乱码修复状态
-- [LAZY_LOADING_FIX_SUMMARY.md](LAZY_LOADING_FIX_SUMMARY.md) - 修复总结
-- [LAZY_LOADING_TIERED_STRATEGY.md](LAZY_LOADING_TIERED_STRATEGY.md) - 分层策略
+- 本目录已裁剪的调查、计划、状态、总结和分层策略中间文档：其结论已吸收进本报告
 - [LAZY_LOADING_VM_DISCOVERY.md](LAZY_LOADING_VM_DISCOVERY.md) - VM系统发现
 - [LAZY_LOADING_FINAL_REPORT.md](LAZY_LOADING_FINAL_REPORT.md) - 本文档
+- [IMPLEMENTATION_STATUS_REPORT.md](IMPLEMENTATION_STATUS_REPORT.md) - 实现状态
+- [IMPLEMENTATION_VS_DESIGN_COMPARISON.md](IMPLEMENTATION_VS_DESIGN_COMPARISON.md) - 实现与设计对比
 
 ---
 

@@ -47,9 +47,8 @@
 ### 4. 文档和工具 (100% 完成)
 
 - ✅ 设计文档 (`LAZY_LOADING_OPTIMIZATION_DESIGN.md`)
-- ✅ 使用文档 (`LAZY_V2_USAGE.md`)
+- ✅ 使用、对比和实现状态结论已汇总到本目录保留报告
 - ✅ 对比分析 (`IMPLEMENTATION_VS_DESIGN_COMPARISON.md`)
-- ✅ 实现总结 (`LAZY_V2_IMPLEMENTATION_SUMMARY.md`)
 - ✅ 测试脚本 (`test_lazy_v2.sh`)
 
 ---

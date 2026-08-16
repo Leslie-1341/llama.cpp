@@ -6,7 +6,7 @@
 
 本项目面向“操作系统功能赛 / 边缘设备上的 LLM 推理优化”方向，在 `llama.cpp` 上实现并验证了一套 KV cache 运行时内存回收机制。项目从原始 KV cache 访存路径分析出发，先后实现 tail/lazy reclaim、paged row index、idle KV block swap-out、`madvise(MADV_DONTNEED)` 物理页释放、resume swap-in、prefetch/defer、fast maintenance、trace replay workload 和 mincore resident page 诊断。最终系统能够在 idle session 暂停期间将其 KV block 写入 backing store 并释放对应物理页，在 session resume 时按需恢复，从而在保持 correctness / safety 的同时降低进程 current RSS。
 
-最终推荐配置为 fast-maintenance V5。在 ShareGPT-backed trace replay workload、Llama-3-8B-Instruct Q4_K_M、CPU KV path、K/V cache f32 配置下，ctx4096 场景实现 611.883 MiB process RSS drop，约 6.713% total RSS drop，active TPS 回退约 3.007%；ctx8192 场景实现 1619.195 MiB process RSS drop，约 15.997% total RSS drop，active TPS 回退约 1.006%。mincore 诊断进一步显示，ctx8192 下 baseline-like KV resident 约 2047.75 MiB，而 V5 final KV resident 约 426.0 MiB，KV resident drop 约 1621.75 MiB，证明 RSS 下降主要来自 KV cache 物理驻留页减少，而非统计噪声或其他进程内存波动。
+历史 ShareGPT-backed synthetic trace replay 的代表配置为 fast-maintenance V5。在 Llama-3-8B-Instruct Q4_K_M、CPU KV path、K/V cache f32 配置下，ctx4096 场景实现 611.883 MiB process RSS drop，约 6.713% total RSS drop，active TPS 回退约 3.007%；ctx8192 场景实现 1619.195 MiB process RSS drop，约 15.997% total RSS drop，active TPS 回退约 1.006%。mincore 诊断进一步显示，ctx8192 下 baseline-like KV resident 约 2047.75 MiB，而 V5 final KV resident 约 426.0 MiB，KV resident drop 约 1621.75 MiB，证明该历史实验中的 RSS 下降主要来自 KV cache 物理驻留页减少，而非统计噪声或其他进程内存波动。该结果不是当前 Final F16 formal benchmark，也不是 Global Route A formal performance result。
 
 需要强调的是，本项目当前是比赛原型与研究性系统实现，不声称已经完成生产级 llama-server scheduler、完整异步 prefetch、GPU backend 支持或完整复刻 vLLM PagedAttention。项目核心贡献在于：在 `llama.cpp` 现有架构内，以较小改动引入 block-level KV reclaim 机制，并用可复现实验链证明 idle KV 的物理页可以被安全释放和恢复。
 
@@ -685,7 +685,7 @@ runs:
 S5 的进程 RSS 下降量约等于当前 KV buffer 总容量的 78.9%。
 ```
 
-### 6.5 Stage 12-C：ShareGPT-backed trace replay 最终结果
+### 6.5 Historical Stage 12-C：ShareGPT-backed synthetic trace replay 结果
 
 最终结果使用 ShareGPT-backed trace replay workload，并采用 fast-maintenance V5 配置。
 
@@ -792,7 +792,7 @@ process RSS drop 与 KV resident drop 数量级高度一致，
 说明最终 RSS 下降主要来自 KV resident pages 减少。
 ```
 
-ctx4096 和 ctx8192 的 V5 final KV resident 都约为 426 MiB，这说明在相同 trace workload 下，优化后最终实际驻留 KV 与“当前活跃/必要 KV”更相关，而不是与预分配 ctx-size 线性绑定。
+在该历史 trace workload 中，ctx4096 和 ctx8192 的 V5 final KV resident 都约为 426 MiB，这说明当时优化后的实际驻留 KV 与“当前活跃/必要 KV”更相关，而不是与预分配 ctx-size 线性绑定。该观察不外推为当前 Final F16 或 Global Route A 的 formal 结果。
 
 ---
 
@@ -916,14 +916,18 @@ example / trace driver:
 最终文档结构：
 
 ```text
-README_KV_OPT.md
+README.md
 docs/reproduce_kv_cache_optimization.md
 docs/final_technical_report.md
 docs/kv_trace_replay_stage12c_real_sharegpt_results.md
+docs/kv_lifecycle_evidence_protocol.md
+docs/kv_block_lifecycle_contract.md
+docs/kv_pressure_scheduler_contract.md
+docs/current_memory_governor_architecture.md
 docs/archive/kv-stage-history/
 ```
 
-历史阶段文档被归档保留，最终入口保持清晰。
+README.md 是决赛仓库唯一高层入口；其他文档分别承担复现、历史结果、目标契约和架构说明职责。历史阶段文档被归档保留，不与当前入口竞争 authority。
 
 ---
 
