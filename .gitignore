@@ -189,5 +189,19 @@ trace_prompts/
 /Testing/
 
 # RSS stage experiment results
+# Keep the long-lived MoE sidecar evidence; ignore transient stage/time-stamped runs.
+/rss-stage-results/*/
+!/rss-stage-results/moe-sidecar-current/
 
-rss-stage-results/1
+# Local root experiment outputs (do NOT ignore tools/results/ tracked sources).
+/results/
+
+# Codegraph local index database, WAL, sockets, locks, logs.
+/.codegraph/
+
+# Serena regenerateable caches, logs, and project config backups.
+# Keep project.yml, project.local.yml, and memories (human-managed).
+/.serena/cache/
+/.serena/logs/
+/.serena/*.bak
+/.serena/*.bak-*
