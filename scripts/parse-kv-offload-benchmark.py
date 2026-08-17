@@ -4827,23 +4827,40 @@ def parse_run(artifact: pathlib.Path, plan: dict[str, Any], case: dict[str, Any]
             )
         )
     )
+    # Run-level slots_before / slots_after are lifecycle bookends, not physical
+    # metric authorities.  slots_before is captured immediately after wait_health()
+    # and before any warmup, so a real server's resident physical sample may not
+    # yet be established at that instant (status=unavailable is legitimate).  The
+    # characterization physical authorities are slots_after_fill / slots_settled /
+    # slots_release_settled / slots_after_measurement (validated with their own
+    # strict require_resident gates below) plus the transaction-local mincore
+    # qualification evidence.  Requiring a physical resident observation in the
+    # startup slots_before would therefore false-fail a genuine artifact with no
+    # evidence value of its own, so slots_before is always relaxed: the snapshot
+    # still passes the full HTTP/raw-body/hash/schema identity checks; only the
+    # "must already observe a physical resident" requirement is dropped.
     slots_before = validate_slot_snapshot(
         run_dir / "slots_before.json",
         f"{label}.slots_before",
-        require_resident=not allow_missing_v2_run_resident,
+        require_resident=False,
     )
+    # slots_after covers the post-run bookend and is treated symmetrically with
+    # the existing exception for V2 qualification / unmet_floor runs, where a
+    # missing terminal physical sample is a legitimate completion shape.  In all
+    # other runs slots_after is plentiful (Resident / target-reached /
+    # release-settled artifacts carry a real resident at run end) so require it.
     slots_after = validate_slot_snapshot(
         run_dir / "slots_after.json",
         f"{label}.slots_after",
         require_resident=not allow_missing_v2_run_resident,
     )
-    if allow_missing_v2_run_resident:
-        slots_before_resident = optional_authoritative_slot_resident(
-            slots_before, f"{label}.slots_before")
-        slots_after_resident = optional_authoritative_slot_resident(
-            slots_after, f"{label}.slots_after")
-        if (slots_before_resident is None) != (slots_after_resident is None):
-            raise ParseError(f"{label}: V2 run-level resident snapshots are partially missing")
+    # The former symmetric "slots_before-resident is None == slots_after-resident
+    # is None" requirement encoded an artificial bookend parity between two
+    # lifecycle moments (startup vs. post-completion) that the real server
+    # startup sequence does not guarantee and the characterization physical
+    # authorities above (slots_after_fill / slots_settled / slots_release_settled
+    # / slots_after_measurement plus transaction-local mincore) do not depend on,
+    # so it is removed rather than enforced when allow_missing_v2_run_resident.
     cleanup = exact(read_json(run_dir / "cleanup.json"), CLEANUP_KEYS, f"{label}.cleanup")
     server_cleanup = validate_cleanup_record(cleanup["server"], f"{label}.cleanup.server")
     sampler_cleanup = validate_cleanup_record(cleanup["sampler"], f"{label}.cleanup.sampler")

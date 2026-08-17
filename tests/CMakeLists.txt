@@ -213,12 +213,18 @@ if (UNIX)
         target_include_directories(test-server-kv-resume PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/src)
         llama_build_and_test(test-server-kv-pressure-action.cpp ${PROJECT_SOURCE_DIR}/tools/server/server-kv-pressure-action.cpp ${PROJECT_SOURCE_DIR}/tools/server/server-kv-budget-adapter.cpp ${PROJECT_SOURCE_DIR}/tools/server/server-kv-resume.cpp ${PROJECT_SOURCE_DIR}/src/llama-kv-pressure.cpp)
         target_include_directories(test-server-kv-pressure-action PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/src)
+        llama_build_and_test(test-server-kv-slots-resident-observation.cpp)
+        target_include_directories(test-server-kv-slots-resident-observation PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/common)
         llama_test_cmd(python3 NAME test-server-kv-pressure-static
             ARGS ${PROJECT_SOURCE_DIR}/tests/test-server-kv-pressure-static.py LABEL python)
         llama_test_cmd(python3 NAME test-server-kv-resume-static
             ARGS ${PROJECT_SOURCE_DIR}/tests/test-server-kv-resume-static.py LABEL python)
         llama_test_cmd(python3 NAME test-server-kv-pressure-action-static
             ARGS ${PROJECT_SOURCE_DIR}/tests/test-server-kv-pressure-action-static.py LABEL python)
+        llama_test_cmd(python3 NAME test-server-kv-resident-preflight-static
+            ARGS ${PROJECT_SOURCE_DIR}/tests/test-server-kv-resident-preflight-static.py LABEL python)
+        llama_test_cmd(python3 NAME test-server-kv-slots-resident-observation-static
+            ARGS ${PROJECT_SOURCE_DIR}/tests/test-server-kv-slots-resident-observation-static.py LABEL python)
         llama_test_cmd(python3 NAME test-kv-governor-g0-s1-parser
             ARGS ${PROJECT_SOURCE_DIR}/tests/test-kv-governor-g0-s1-parser.py LABEL python)
         llama_test_cmd(python3 NAME test-memory-governor-observe-static

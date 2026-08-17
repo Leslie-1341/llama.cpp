@@ -939,6 +939,31 @@ class CanonicalBenchmarkTest(unittest.TestCase):
         snapshot["body_sha256"] = hashlib.sha256(raw).hexdigest()
         snapshot_path.write_text(json.dumps(snapshot), encoding="utf-8")
 
+    def set_slot_resident_unavailable(self, artifact: pathlib.Path, filename: str) -> None:
+        """Rewrite a slot snapshot's kv_resident to the legitimate startup form.
+
+        This mirrors the real llama-server preflight shape captured immediately
+        after wait_health() and before warmup, when health is ready but no
+        resident physical sample has been established yet: each slot carries
+        {"kv_resident": {"status": "unavailable"}} instead of a physical
+        observation.  validate_optional_resident_observation accepts this shape;
+        the snapshot still passes the full HTTP / raw-body / hash / schema
+        identity checks.
+        """
+        snapshot_path = next(artifact.glob(f"runs/*/{filename}"))
+        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        body_path = snapshot_path.parent / snapshot["body_path"]
+        body = json.loads(body_path.read_text(encoding="utf-8"))
+        for slot in body:
+            if isinstance(slot, dict):
+                slot["kv_resident"] = {"status": "unavailable"}
+        raw = json.dumps(body).encode("utf-8")
+        body_path.write_bytes(raw)
+        snapshot["body_json"] = body
+        snapshot["body_bytes"] = len(raw)
+        snapshot["body_sha256"] = hashlib.sha256(raw).hexdigest()
+        snapshot_path.write_text(json.dumps(snapshot), encoding="utf-8")
+
     def run_incomplete_artifact(self, mode: str) -> tuple[pathlib.Path, subprocess.CompletedProcess[str]]:
         value = self.spec()
         value["environment"]["KV_SYNTHETIC_MODE"] = mode
@@ -2121,14 +2146,133 @@ class CanonicalBenchmarkTest(unittest.TestCase):
         self.assertEqual(result["verdict"], "INVALID_ARTIFACT")
         self.assertIn("transaction-local", result["errors"][0])
 
-    def test_v2_target_reached_resident_missing_is_invalid(self) -> None:
+    def test_v2_target_reached_startup_unavailable_slots_before_is_valid(self) -> None:
+        # A real server's resident physical sample may not be established yet at
+        # the wait_health()->capture_slots(slots_before) instant, so the startup
+        # bookend legitimately carries no kv_resident.  The V2 target-reached
+        # physical authority is slots_after_fill / slots_settled plus the
+        # transaction-local mincore observations, none of which involve
+        # slots_before, so the parser must not fat-fail a genuine TARGET_REACHED
+        # artifact purely because the startup snapshot lacks a resident.
         artifact = self.run_characterization_artifact(mode="characterization_target")
-        self.remove_slot_resident(artifact, "slots_before.json")
+        self.set_slot_resident_unavailable(artifact, "slots_before.json")
+        parsed = self.run_parser(artifact)
+        self.assertEqual(parsed.returncode, 0, parsed.stderr)
+        result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["verdict"], "TARGET_REACHED")
+        run = result["characterization"]["runs"][0]
+        self.assertEqual(run["status"], "TARGET_REACHED")
+        # slots_after_fill physical authority is unaffected by the startup bookend.
+        self.assertGreater(run["resident_after_fill"], 0)
+        self.assertEqual(run["resident_after_fill_authority"], "slots_physical")
+        # The terminal V2 settle physical authority is likewise independent of
+        # slots_before, since it derives from slots_settled / transaction-local
+        # mincore rather than the startup bookend.
+        self.assertEqual(run.get("resident_settled_authority"), "slots_physical")
+        self.assertIn(run["status"], {"TARGET_REACHED"})
+
+    def test_resident_characterization_startup_unavailable_slots_before_is_valid(self) -> None:
+        # Resident characterization: the startup bookend carries no resident
+        # because the sample is not established yet, while slots_after_fill and
+        # slots_after_measurement still carry the real physical authority.  This
+        # is exactly the Final F16 Probe A shape (Resident workload executes to
+        # completion but slots_before lacks kv_resident).  The parser must PASS.
+        # B_full must still come from the same-round resident slots_after_fill
+        # (resident_after_fill is slots_physical authority), and RELEASE/OFFLOAD
+        # relief remain zero.
+        artifact = self.run_characterization_artifact(
+            policy="resident", mode="characterization_resident", restore="k1_sync")
+        baseline = self.run_parser(artifact)
+        self.assertEqual(baseline.returncode, 0, baseline.stderr)
+        # Record the unmodified B_full authority before mutating the startup bookend.
+        baseline_result = json.loads(
+            (artifact / "result.json").read_text(encoding="utf-8"))
+        baseline_b_full = baseline_result["characterization"]["runs"][0]["resident_after_fill"]
+        baseline_after_fill = baseline_result["characterization"]["runs"][0][
+            "resident_after_fill_authority"]
+        baseline_release_relief = baseline_result["characterization"]["runs"][0][
+            "release_physical_relief_bytes"]
+        baseline_offload_relief = baseline_result["characterization"]["runs"][0][
+            "offload_physical_relief_bytes"]
+
+        self.set_slot_resident_unavailable(artifact, "slots_before.json")
+        parsed = self.run_parser(artifact)
+        self.assertEqual(parsed.returncode, 0, parsed.stderr)
+        result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["verdict"], "TARGET_REACHED")
+        run = result["characterization"]["runs"][0]
+        self.assertEqual(run["status"], "RESIDENT_BASELINE")
+        # B_full still comes from same-round resident slots_after_fill physical.
+        self.assertEqual(run["resident_after_fill"], baseline_b_full)
+        self.assertEqual(run["resident_after_fill_authority"], "slots_physical")
+        self.assertEqual(baseline_after_fill, "slots_physical")
+        # RELEASE/OFFLOAD relief remain zero for the Resident baseline.
+        self.assertEqual(run["release_physical_relief_bytes"], 0)
+        self.assertEqual(run["offload_physical_relief_bytes"], 0)
+        self.assertEqual(run["total_physical_relief_bytes"], 0)
+        self.assertEqual(baseline_release_relief, 0)
+        self.assertEqual(baseline_offload_relief, 0)
+        self.assertEqual(
+            result["characterization"]["b_full"]["status"], "AVAILABLE")
+        self.assertEqual(
+            result["characterization"]["b_full"]["observations"][0]["bytes"], 12288)
+
+    def test_release_only_startup_unavailable_slots_before_is_valid(self) -> None:
+        # RELEASE-only characterization: startup bookend lacks the resident
+        # sample (real server preflight), but after_fill / release-settle /
+        # settled / after_measurement physical observations remain intact, so
+        # the parser still PASSES and the RELEASE physical relief is unchanged.
+        artifact = self.run_characterization_artifact(
+            policy="release_only", mode="characterization_release", restore="k1_sync")
+        baseline = self.run_parser(artifact)
+        self.assertEqual(baseline.returncode, 0, baseline.stderr)
+        baseline_ref = json.loads(
+            (artifact / "result.json").read_text(encoding="utf-8"))
+        baseline_relief = baseline_ref["characterization"]["runs"][0][
+            "release_physical_relief_bytes"]
+        baseline_settled = baseline_ref["characterization"]["runs"][0][
+            "resident_after_release_settle"]
+
+        self.set_slot_resident_unavailable(artifact, "slots_before.json")
+        parsed = self.run_parser(artifact)
+        self.assertEqual(parsed.returncode, 0, parsed.stderr)
+        result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["verdict"], "RELEASE_SETTLED")
+        run = result["characterization"]["runs"][0]
+        # RELEASE physical relief unaffected by the startup bookend.
+        self.assertEqual(run["release_physical_relief_bytes"], baseline_relief)
+        self.assertEqual(run["resident_after_release_settle"], baseline_settled)
+        self.assertGreater(run["release_physical_relief_bytes"], 0)
+
+    def test_resident_slots_after_fill_unavailable_is_invalid(self) -> None:
+        # Negative guard: this fix must not relax the real B_full physical
+        # authority.  A Resident characterization artifact whose
+        # slots_after_fill lacks a physical resident observation must remain
+        # INVALID_ARTIFACT --- B_full cannot become optional.
+        artifact = self.run_characterization_artifact(
+            policy="resident", mode="characterization_resident", restore="k1_sync")
+        self.remove_slot_resident(artifact, "slots_after_fill.json")
         parsed = self.run_parser(artifact)
         self.assertNotEqual(parsed.returncode, 0)
         result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
         self.assertEqual(result["verdict"], "INVALID_ARTIFACT")
         self.assertIn("no valid physical resident observation", result["errors"][0])
+
+    def test_resident_target_reached_startup_unavailable_does_not_leak_to_after_fill(self) -> None:
+        # V2 target-reached: relaxing slots_before must NOT also relax the
+        # terminal physical authorities.  Removing the resident from
+        # slots_after_fill on a target-reached artifact must still invalidate it:
+        # for a V2 swap policy slots_after_fill passes validate_slot_snapshot with
+        # require_resident=False, so the real authority is the V2 completeness
+        # check that requires resident_after_fill outside the UNMET_FLOOR path.
+        artifact = self.run_characterization_artifact(mode="characterization_target")
+        self.set_slot_resident_unavailable(artifact, "slots_before.json")
+        self.remove_slot_resident(artifact, "slots_after_fill.json")
+        parsed = self.run_parser(artifact)
+        self.assertNotEqual(parsed.returncode, 0)
+        result = json.loads((artifact / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["verdict"], "INVALID_ARTIFACT")
+        self.assertIn("incomplete outside UNMET_FLOOR", result["errors"][0])
 
     def test_v2_unrelated_positive_prefetch_cannot_satisfy_unmet_floor(self) -> None:
         artifact = self.run_characterization_artifact(mode="characterization_unmet")

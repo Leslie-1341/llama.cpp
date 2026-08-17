@@ -4,6 +4,7 @@
 #include "server-common.h"
 #include "server-http.h"
 #include "server-kv-resume.h"
+#include "server-kv-slots-resident-observation.h"
 #if defined(__linux__)
 #include "server-kv-budget-adapter.h"
 #include "server-kv-pressure-action.h"
@@ -1067,6 +1068,14 @@ private:
     uint64_t kv_decision_next = 0;
     bool kv_governor_claimant_trace = false;
     bool kv_g0_s1_resident_observation = false;
+    // Independent of `kv_g0_s1_resident_observation` (transaction-local OFFLOAD
+    // marker) and `kv_g0_s1_resident_preflight` (`LLAMA_KV_RESIDENT_PREFLIGHT=1`
+    // periodic whole-KV+claimant telemetry).  Selectively enables the production
+    // `/slots.kv_resident` physical authority — single whole-KV mincore sample
+    // copied verbatim into every slot's observation, run once in
+    // SERVER_TASK_TYPE_METRICS.  Never collapsed back into a single boolean with
+    // the other two flags (see commit 9aefabb1e for the prior regression).
+    bool kv_g0_s1_slots_resident_observation = false;
     bool kv_g0_s1_resident_preflight = false;
     bool kv_resume_stage_timing = false;
 
@@ -6099,6 +6108,19 @@ private:
             std::strcmp(resident_preflight, "1") == 0;
         const char * resume_stage_timing = std::getenv("LLAMA_KV_RESUME_STAGE_TIMING");
         kv_resume_stage_timing = resume_stage_timing && std::strcmp(resume_stage_timing, "1") == 0;
+        // MODE ROUTING MATRIX for LLAMA_KV_G0_S1_RESIDENT_OBSERVATION:
+        //   mode        transaction marker   /slots kv_resident
+        //   1            yes                 no
+        //   preflight    no                  yes
+        //   both         yes                 yes
+        //   empty/other  no                  no
+        // `kv_g0_s1_resident_observation` (transaction-local OFFLOAD marker,
+        // paths above) and the `/slots` snapshot below are separate contracts;
+        // `parse_kv_slots_resident_routing` is the unit-tested source of truth
+        // for this matrix.  `LLAMA_KV_RESIDENT_PREFLIGHT=1` controls only the
+        // periodic preflight telemetry and must not perturb this matrix.
+        const auto resident_route = parse_kv_slots_resident_routing(resident_observation);
+        kv_g0_s1_slots_resident_observation = resident_route.slots_observation;
 #if defined(__linux__)
         if (!init_kv_pressure_sampler()) {
             return false;
@@ -7110,8 +7132,33 @@ private:
                     int n_idle_slots       = 0;
                     int n_processing_slots = 0;
 
+                    // Whole-KV physical resident observation for the production
+                    // `/slots.kv_resident` authority.  When the slots-observation
+                    // mode is enabled we take exactly one paged-sample mincore
+                    // snapshot before iterating slots and copy the same
+                    // observation verbatim into every slot_data.  One sample per
+                    // METRICS task — never per slot — so slots stay mutually
+                    // consistent (no snapshot drift) and we avoid extra high-rate
+                    // mincore probes.  Unavailable probes fail closed via
+                    // format_kv_slots_resident_observation to a
+                    // `{"status": "unavailable"}` object rather than a zero.
+                    llama_kv_resident_sample slots_kv_resident {};
+                    if (kv_g0_s1_slots_resident_observation) {
+                        auto * mem = ctx_tgt ? llama_get_memory(ctx_tgt) : nullptr;
+                        if (mem) {
+                            slots_kv_resident = mem->sample_kv_resident();
+                        }
+                    }
+
                     for (server_slot & slot : slots) {
                         json slot_data = slot.to_json(slots_debug == 0);
+
+                        if (kv_g0_s1_slots_resident_observation) {
+                            // Same whole-KV observation for every slot — the sample
+                            // is captured once above, not per slot — so no drift.
+                            slot_data["kv_resident"] =
+                                format_kv_slots_resident_observation(slots_kv_resident);
+                        }
 
                         if (slot.is_processing()) {
                             n_processing_slots++;
