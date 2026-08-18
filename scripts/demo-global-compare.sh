@@ -410,14 +410,19 @@ if prompt_matches:
 if matches:
     ms, tokens, tps = matches[-1]
     print(f"  generation_tokens={tokens} generation_eval_ms={ms} generation_tok_s={tps}")
+physical_peak = cgroup_sample_peak
+if physical_peak is None and cgroup:
+    physical_peak = max(cgroup)
+if physical_peak is not None:
+    print(f"  physical_peak_for_paper_mb={physical_peak:.2f}")
 if cgroup:
-    print(f"  cgroup_physical_peak_mb={max(cgroup):.2f}")
+    print(f"  cgroup_pressure_peak_mb={max(cgroup):.2f}")
 if cgroup_sample_peak is not None:
     print(f"  cgroup_sample_peak_mb={cgroup_sample_peak:.2f}")
 if rss:
-    print(f"  rss_observed_peak_mb={max(rss):.2f}")
+    print(f"  process_or_window_rss_peak_mb={max(rss):.2f}")
 if window:
-    print(f"  window_peak_rss_mb={max(window):.2f}")
+    print(f"  window_observed_peak_mb={max(window):.2f}")
 if moe_resident:
     print(f"  moe_resident_peak_mb={max(moe_resident):.2f}")
 if decision:
